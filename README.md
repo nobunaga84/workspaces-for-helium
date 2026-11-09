@@ -218,6 +218,8 @@ I read every report, but I fix what I can, when I can (see below).
 
 - English only.
 - Dragging the sidebar's edge sticks near its default width (Helium's own behaviour).
+- After an update, the sidebar can come back once at its default width when the browser reopens your
+  windows ("Continue where you left off"). Drag its edge back once and it stays. Fixed in the next release.
 - Start the browser from its Start menu shortcut, or a taskbar pin made from it. Started as a bare
   `chrome.exe` while official Helium is open, it opens official Helium's window instead.
 - Helium's "back to opener" (Back on a tab opened from a link closes it) stays on; an anchored tab
