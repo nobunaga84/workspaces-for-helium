@@ -1,0 +1,53 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -17,6 +17,8 @@
+ #include "base/functional/callback.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+@@ -284,6 +286,17 @@ void WorkspaceRailView::Rebuild() {
+       base::BindRepeating(&WorkspaceRailView::OnNewWorkspacePressed,
+                           base::Unretained(this))));
+ 
++  // Tab search, last of all (E11): the owner wanted it "around the workspace
++  // UI", and Ctrl+Shift+A is Arc's global hotkey on this machine (LOCAL.md
++  // 31). A magnifier glyph, drawn like every other rail label. It runs
++  // Chromium's own IDC_TAB_SEARCH, which pins the toolbar button for a moment
++  // and opens the panel from it.
++  AddChildView(MakeRailButton(
++      u"\U0001F50D",  // magnifying glass, escaped like kIconPresets
++      l10n_util::GetStringUTF16(IDS_TOOLTIP_TAB_SEARCH),
++      base::BindRepeating(&WorkspaceRailView::OnTabSearchPressed,
++                          base::Unretained(this))));
++
+   SetVisible(true);
+   UpdateHighlight();
+ }
+@@ -320,6 +333,13 @@ void WorkspaceRailView::OnWorkspacePress
+   service->SwitchToWorkspace(guid);
+ }
+ 
++void WorkspaceRailView::OnTabSearchPressed() {
++  // browser_commands.h belongs to //chrome/browser/ui, which depends on this
++  // target, so no GN dep can name it; the build does not run gn check, and
++  // the include resolves. The same one-liner new_tab_button.cc uses (15).
++  chrome::ExecuteCommand(browser_, IDC_TAB_SEARCH);
++}
++
+ void WorkspaceRailView::OnNewWorkspacePressed() {
+   ShowNameBubble(
+       this, IDS_HELIUM_WORKSPACE_NEW, IDS_HELIUM_WORKSPACE_NAME_LABEL,
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -102,6 +102,7 @@ class WorkspaceRailView : public views::
+ 
+   void OnWorkspacePressed(const std::string& guid);
+   void OnNewWorkspacePressed();
++  void OnTabSearchPressed();
+ 
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+ 

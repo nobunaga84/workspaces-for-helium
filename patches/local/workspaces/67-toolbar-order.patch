@@ -1,0 +1,1571 @@
+--- a/chrome/browser/resources/side_panel/customize_chrome/BUILD.gn
++++ b/chrome/browser/resources/side_panel/customize_chrome/BUILD.gn
+@@ -33,6 +33,8 @@ build_webui("build") {
+     "customize_toolbar/customize_toolbar_api_proxy.ts",
+     "customize_toolbar/toolbar.html.ts",
+     "customize_toolbar/toolbar.ts",
++    "customize_toolbar/workspace_toolbar_list.html.ts",
++    "customize_toolbar/workspace_toolbar_list.ts",
+     "footer.html.ts",
+     "footer.ts",
+     "hover_button.html.ts",
+@@ -63,6 +65,7 @@ build_webui("build") {
+     "categories.css",
+     "check_mark_wrapper.css",
+     "customize_toolbar/toolbar.css",
++    "customize_toolbar/workspace_toolbar_list.css",
+     "footer.css",
+     "hover_button.css",
+     "shortcuts.css",
+--- a/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/toolbar.html.ts
++++ b/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/toolbar.html.ts
+@@ -14,41 +14,8 @@ export function getHtml(this: ToolbarEle
+       back-button-title="$i18n{backButton}">
+     <h2 slot="heading">$i18n{toolbarHeader}</h2>
+   </sp-heading>
+-  ${this.categories_.map((category, categoryIndex) => html`
+-    ${this.actions_.map(action => html`
+-      ${action.category === category.id ? html`
+-        ${!action.hasEnterpriseControlledPinnedState ? html`
+-          <div
+-              class="toggle-container choose-icons-row-container choose-icons-row"
+-              @click="${
+-                  this.getActionToggleHandler_(action.id, !action.pinned)}">
+-            <img class="toggle-icon" src="${action.iconUrl}" aria-hidden="true">
+-            <div class="toggle-title">${action.displayName}</div>
+-            <cr-toggle
+-                @change="${
+-                    this.getActionToggleHandler_(action.id, !action.pinned)}"
+-                ?checked="${action.pinned}" aria-label="${action.displayName}">
+-            </cr-toggle>
+-          </div>
+-        ` : html`
+-          <div class="choose-icons-row-container choose-icons-row">
+-            <img class="toggle-icon" src="${action.iconUrl}" aria-hidden="true">
+-            <div class="toggle-title">${action.displayName}</div>
+-            <div class="enterprise-enabled-text"
+-                aria-label="$i18n{managedA11yLabel}">
+-              $i18n{enterpriseEnabledLabel}
+-            </div>
+-            <img class="toggle-icon" src="icons/domain.svg"
+-                aria-label="$i18n{managedA11yLabel}"
+-                title="$i18n{managedA11yLabel}">
+-          </div>
+-        `}
+-      ` : ''}
+-    `)}
+-    ${categoryIndex !== this.categories_.length - 1 ? html`
+-      <hr class="sp-hr">
+-    ` : ''}
+-  `)}
++  <customize-chrome-workspace-toolbar-list>
++  </customize-chrome-workspace-toolbar-list>
+   <hr class="sp-hr">
+   <cr-button id="resetToDefaultButton"
+       @click="${this.onResetToDefaultClick_}"
+--- a/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/toolbar.ts
++++ b/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/toolbar.ts
+@@ -5,6 +5,7 @@
+ import 'chrome://customize-chrome-side-panel.top-chrome/shared/sp_heading.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_toggle/cr_toggle.js';
++import './workspace_toolbar_list.js';
+ 
+ import type {SpHeadingElement} from 'chrome://customize-chrome-side-panel.top-chrome/shared/sp_heading.js';
+ import {getInstance as getAnnouncerInstance} from 'chrome://resources/cr_elements/cr_a11y_announcer/cr_a11y_announcer.js';
+--- /dev/null
++++ b/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_list.css
+@@ -0,0 +1,43 @@
++/* Copyright 2026 The Helium Authors
++ * You can use, redistribute, and/or modify this source code under
++ * the terms of the GPL-3.0 license that can be found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  display: block;
++}
++
++/* Helium Workspaces (wish 6): the list is the toolbar, in order. The rows
++ * themselves are toolbar.css's (WorkspaceToolbarListElement's styles). */
++.address-bar-row {
++  background-color: var(--color-sys-tonal-container);
++  border-radius: 8px;
++  cursor: grab;
++  margin: 4px 8px;
++  padding: 8px;
++}
++
++.address-bar-row:focus-visible {
++  outline: 2px solid var(--cr-focus-outline-color);
++}
++
++.drop-before {
++  box-shadow: inset 0 2px 0 var(--cr-focus-outline-color);
++}
++
++.drop-after {
++  box-shadow: inset 0 -2px 0 var(--cr-focus-outline-color);
++}
++
++.toggle-icon {
++  -webkit-user-drag: none;
++}
++
++/* A click on a button's row selects it, to move it; only its switch pins. */
++.toggle-container:hover {
++  cursor: grab;
++}
+--- /dev/null
++++ b/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_list.html.ts
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {WorkspaceToolbarListElement} from './workspace_toolbar_list.js';
++
++export function getHtml(this: WorkspaceToolbarListElement) {
++  return html`<!--_html_template_start_-->
++<div id="actionList" @dragstart="${this.onRowDragstart_}"
++    @dragover="${this.onRowDragover_}" @drop="${this.onRowDrop_}"
++    @dragend="${this.onRowDragend_}" @keydown="${this.onRowKeydown_}">
++${
++    this.actions_.map(
++        (action, index) => this.isAddressBar_(action) ?
++            html`
++  <div class="choose-icons-row-container choose-icons-row address-bar-row ${
++                this.dropClass_(index)}"
++      draggable="true" tabindex="0" data-index="${index}">
++    <img class="toggle-icon" src="${action.iconUrl}"
++        aria-hidden="true"></img>
++    <div class="toggle-title">${action.displayName}</div>
++  </div>
++` :
++            html`${!action.hasEnterpriseControlledPinnedState ?
++            html`
++  <div
++    class="toggle-container choose-icons-row-container choose-icons-row ${
++                this.dropClass_(index)}"
++    draggable="true" tabindex="-1" data-index="${index}">
++    <img class="toggle-icon" src="${action.iconUrl}"
++        aria-hidden="true"></img>
++    <div class="toggle-title">${action.displayName}</div>
++    <cr-toggle @change="${
++                this.getActionToggleHandler_(action.id, !action.pinned)}"
++        ?checked="${action.pinned}" aria-label="${
++                action.displayName}"></cr-toggle>
++  </div>
++` :
++            html`
++  <div class="choose-icons-row-container choose-icons-row ${
++                this.dropClass_(index)}"
++      draggable="true" tabindex="0" data-index="${index}">
++    <img class="toggle-icon" src="${action.iconUrl}"
++        aria-hidden="true"></img>
++    <div class="toggle-title">${action.displayName}</div>
++    <div class="enterprise-enabled-text"
++        aria-label="$i18n{managedA11yLabel}">
++      $i18n{enterpriseEnabledLabel}
++    </div>
++    <img class="toggle-icon" src="icons/domain.svg"
++        aria-label="$i18n{managedA11yLabel}"
++        title="$i18n{managedA11yLabel}">
++    </img>
++  </div>
++`}`)}
++</div>
++<!--_html_template_end_-->`;
++}
+--- /dev/null
++++ b/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_list.ts
+@@ -0,0 +1,295 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Helium Workspaces (wish 6): Settings' Toolbar list as the toolbar, mounted
++// by one line in toolbar.html.ts in place of Chromium's list by category (the
++// hook shrink, part 5). The browser side is workspace_toolbar_rows.h.
++
++import 'chrome://resources/cr_elements/cr_toggle/cr_toggle.js';
++
++import {WebUiListenerMixinLit} from 'chrome://resources/cr_elements/web_ui_listener_mixin_lit.js';
++import {assert} from 'chrome://resources/js/assert.js';
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {Action} from '../customize_toolbar.mojom-webui.js';
++import {ActionId, CategoryId} from '../customize_toolbar.mojom-webui.js';
++
++import {CustomizeToolbarApiProxy} from './customize_toolbar_api_proxy.js';
++import {getCss as getToolbarCss} from './toolbar.css.js';
++import {getCss} from './workspace_toolbar_list.css.js';
++import {getHtml} from './workspace_toolbar_list.html.js';
++
++const WorkspaceToolbarListElementBase = WebUiListenerMixinLit(CrLitElement);
++
++// Where a dragged row would land: in front of (or after) the row at `index`.
++interface DropTarget {
++  index: number;
++  after: boolean;
++}
++
++export class WorkspaceToolbarListElement extends
++    WorkspaceToolbarListElementBase {
++  static get is() {
++    return 'customize-chrome-workspace-toolbar-list';
++  }
++
++  static override get styles() {
++    // The rows look as the page's own did (toolbar.css), then the list's own.
++    return [getToolbarCss(), getCss()];
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      actions_: {type: Array},
++      dropTarget_: {type: Object},
++    };
++  }
++
++  private apiProxy_: CustomizeToolbarApiProxy =
++      CustomizeToolbarApiProxy.getInstance();
++  private listenerIds_: number[] = [];
++
++  protected accessor actions_: Action[] = [];
++  protected accessor dropTarget_: DropTarget|null = null;
++  private dragIndex_: number = -1;
++  // The row a keyboard move left the focus on, refocused after each redraw.
++  private focusedId_: number|null = null;
++  // Counts this list's own moves: a list asked for before the latest move is
++  // older than what is on screen (a held Alt+Up outruns the browser's redraw).
++  private moves_: number = 0;
++
++  constructor() {
++    super();
++    this.populateUi_();
++  }
++
++  override connectedCallback() {
++    super.connectedCallback();
++
++    this.listenerIds_ = [
++      this.apiProxy_.callbackRouter.setActionPinned.addListener(
++          this.setActionPinned_.bind(this)),
++      this.apiProxy_.callbackRouter.notifyActionsUpdated.addListener(
++          this.populateUi_.bind(this)),
++    ];
++
++    // The page asks for theme changes (observeThemeChanges); the icons follow.
++    this.addWebUiListener('theme-changed', this.populateUi_.bind(this));
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++
++    this.listenerIds_.forEach(
++        id => this.apiProxy_.callbackRouter.removeListener(id));
++    this.listenerIds_ = [];
++  }
++
++  protected getActionToggleHandler_(actionId: number, nextValue: boolean) {
++    return (_event: CustomEvent<boolean>) => {
++      // The flip may re-sort the list (an unpinned button leaves the toolbar's
++      // order): the redraw keeps the focus on this button (populateUi_).
++      this.focusedId_ = actionId;
++      this.apiProxy_.handler.pinAction(actionId, nextValue);
++    };
++  }
++
++  // Helium Workspaces (wish 6): the list is the toolbar, left to right, and
++  // its rows are dragged (or moved with Alt+Up / Alt+Down) into a new order.
++  // The address bar is a row of its own: what is above it is left of it.
++  protected isAddressBar_(action: Action): boolean {
++    return action.id === ActionId.kAddressBar;
++  }
++
++  protected dropClass_(index: number): string {
++    const target = this.dropTarget_;
++    if (!target || target.index !== index) {
++      return '';
++    }
++    return target.after ? 'drop-after' : 'drop-before';
++  }
++
++  protected onRowDragstart_(e: DragEvent) {
++    const row = this.rowOf_(e);
++    // Never from a switch: cr-toggle drags sideways to flip itself.
++    if (!row || e.composedPath().some(
++                    el => el instanceof HTMLElement &&
++                        el.tagName === 'CR-TOGGLE')) {
++      e.preventDefault();
++      return;
++    }
++    this.dragIndex_ = Number(row.dataset['index']);
++    this.focusedId_ = null;
++    e.dataTransfer!.effectAllowed = 'move';
++  }
++
++  protected onRowDragover_(e: DragEvent) {
++    if (this.dragIndex_ < 0) {
++      return;
++    }
++    // Between rows (a margin) the last drop line stays and still counts.
++    e.preventDefault();
++    const row = this.rowOf_(e);
++    if (!row) {
++      return;
++    }
++    const rect = row.getBoundingClientRect();
++    const index = Number(row.dataset['index']);
++    const after = e.clientY > rect.top + rect.height / 2;
++    const target = this.dropTarget_;
++    if (!target || target.index !== index || target.after !== after) {
++      this.dropTarget_ = {index, after};
++    }
++  }
++
++  protected onRowDrop_(e: DragEvent) {
++    e.preventDefault();
++    if (this.dragIndex_ >= 0 && this.dropTarget_) {
++      const from = this.dragIndex_;
++      let to = this.dropTarget_.index + (this.dropTarget_.after ? 1 : 0);
++      const [first, last] = this.blockOf_(from);
++      if (first < last && to >= first && to <= last + 1) {
++        // Within Chrome's own group: reorder inside it.
++        this.moveRows_(from, from, to);
++      } else {
++        // Anywhere else the group moves whole, and nothing lands inside it.
++        const [groupFirst, groupLast] =
++            this.isGrouped_(to) && this.isGrouped_(to - 1) ? this.blockOf_(to) :
++                                                             [to, to];
++        if (to > groupFirst && to <= groupLast) {
++          to = to - groupFirst <= groupLast + 1 - to ? groupFirst :
++                                                       groupLast + 1;
++        }
++        this.moveRows_(first, last, to);
++      }
++    }
++    this.onRowDragend_();
++  }
++
++  protected onRowDragend_() {
++    this.dragIndex_ = -1;
++    this.dropTarget_ = null;
++  }
++
++  // A click focuses a button's row (tabindex -1: Tab stops on its switch).
++  protected onRowKeydown_(e: KeyboardEvent) {
++    const row = this.rowOf_(e);
++    if (!row || !e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) {
++      return;
++    }
++    e.preventDefault();
++    const up = e.key === 'ArrowUp';
++    const from = Number(row.dataset['index']);
++    // One step: past the neighbouring row, or past Chrome's whole group; a
++    // row of the group steps inside it, or takes the group along at its edge.
++    const inside =
++        this.isGrouped_(from) && this.isGrouped_(up ? from - 1 : from + 1);
++    const [first, last] = inside ? [from, from] : this.blockOf_(from);
++    const neighbour = up ? first - 1 : last + 1;
++    if (neighbour < 0 || neighbour >= this.actions_.length) {
++      return;
++    }
++    const [nextFirst, nextLast] =
++        inside ? [neighbour, neighbour] : this.blockOf_(neighbour);
++    this.focusedId_ = this.actions_[from]!.id;
++    this.moveRows_(first, last, up ? nextFirst : nextLast + 1);
++    this.refocus_();
++  }
++
++  // Chrome's pinned buttons are ONE group in the toolbar (wish 6a): their rows
++  // move as one block.
++  private isGrouped_(index: number): boolean {
++    const action = this.actions_[index];
++    return !!action && action.category === CategoryId.kTools && action.pinned;
++  }
++
++  // [first, last] of the block the row at `index` moves in: the group, or the
++  // row alone.
++  private blockOf_(index: number): [number, number] {
++    let first = index;
++    let last = index;
++    if (this.isGrouped_(index)) {
++      while (this.isGrouped_(first - 1)) {
++        first--;
++      }
++      while (this.isGrouped_(last + 1)) {
++        last++;
++      }
++    }
++    return [first, last];
++  }
++
++  private refocus_(fromServer = false) {
++    const id = this.focusedId_;
++    const moves = this.moves_;
++    this.updateComplete.then(() => {
++      const index = this.actions_.findIndex(action => action.id === id);
++      const row = this.shadowRoot.querySelector<HTMLElement>(
++          `[data-index="${index}"]`);
++      (row?.querySelector<HTMLElement>('cr-toggle') ?? row)?.focus();
++      // After the browser's redraw of this move, the user's focus is theirs.
++      if (this.moves_ === moves && this.focusedId_ === id && fromServer) {
++        this.focusedId_ = null;
++      }
++    });
++  }
++
++  private rowOf_(e: Event): HTMLElement|null {
++    return (e.target as HTMLElement).closest<HTMLElement>('[data-index]');
++  }
++
++  // Moves rows `first`..`last` in front of the row now at `to` (`to` may be
++  // the list's length: the end) and saves the new order.
++  private moveRows_(first: number, last: number, to: number) {
++    if (to >= first && to <= last + 1) {
++      return;
++    }
++    const actions = [...this.actions_];
++    const moved = actions.splice(first, last - first + 1);
++    actions.splice(to > last ? to - moved.length : to, 0, ...moved);
++    this.actions_ = actions;
++    this.moves_++;
++    this.apiProxy_.handler.setToolbarOrder(actions.map(action => action.id));
++  }
++
++  private setActionPinned_(actionId: number, pinned: boolean) {
++    this.actions_ = this.actions_.map((action) => {
++      if (action.id === actionId) {
++        action.pinned = pinned;
++      }
++
++      return action;
++    });
++  }
++
++  private populateUi_() {
++    const moves = this.moves_;
++    this.apiProxy_.handler.listActions().then(({actions}) => {
++      if (moves !== this.moves_) {
++        return;
++      }
++      this.actions_ = actions;
++      // Rows are drawn by index: keep the focus on the row a keyboard move
++      // left it on, not on whatever row now sits at that index.
++      if (this.focusedId_ !== null &&
++          this.shadowRoot.activeElement !== null) {
++        this.refocus_(/*fromServer=*/ true);
++      }
++      assert(this.actions_.every(action => action.iconUrl.startsWith('data:')));
++    });
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'customize-chrome-workspace-toolbar-list': WorkspaceToolbarListElement;
++  }
++}
++
++customElements.define(
++    WorkspaceToolbarListElement.is, WorkspaceToolbarListElement);
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -92,6 +92,19 @@ source_set("prefs") {
+   ]
+ }
+ 
++# The toolbar's buttons in the user's order, either side of the address bar
++# (wish 6): the rules the Customize Chrome side panel's Toolbar list and the
++# toolbar itself share. //base only, so tested whole in workspaces_unittests;
++# the side panel and the toolbar each depend on this leaf, never on each other.
++source_set("toolbar_order") {
++  sources = [
++    "toolbar_order.cc",
++    "toolbar_order.h",
++  ]
++
++  deps = [ "//base" ]
++}
++
+ # The workspace membership rules, as free functions over plain values.
+ #
+ # A second leaf target, for the same reason as ":prefs" but a different payoff:
+@@ -228,6 +241,7 @@ source_set("unit_tests") {
+     "workspace_archive_unittest.cc",
+     "workspace_pins_unittest.cc",
+     "workspace_prefs_unittest.cc",
++    "toolbar_order_unittest.cc",
+     "workspace_stamping_unittest.cc",
+   ]
+ 
+@@ -239,6 +253,7 @@ source_set("unit_tests") {
+     ":pins",
+     ":prefs",
+     ":stamping",
++    ":toolbar_order",
+     "//base",
+ 
+     # TaskEnvironment with mock time, for the pins store's delayed write.
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/toolbar_order.cc
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/toolbar_order.h"
++
++#include <algorithm>
++#include <functional>
++#include <iterator>
++#include <set>
++
++#include "base/no_destructor.h"
++
++namespace workspaces::toolbar_order {
++
++bool IsOwnButton(const std::string& name) {
++  // With nothing pinned and no others, the default order is exactly these.
++  static const base::NoDestructor<std::vector<std::string>> kOwn(
++      DefaultOrder({}, {}));
++  return std::ranges::contains(*kOwn, name);
++}
++
++std::vector<std::string> DefaultOrder(const std::vector<std::string>& pinned,
++                                      const std::vector<std::string>& others) {
++  // ToolbarView::Init's order, with Collapse where Helium's UpdateToolbarLayout
++  // puts it (first) and the address bar between Split and New tab.
++  std::vector<std::string> order = {kCollapse, kBack,   kForward,   kReload,
++                                    kHome,     kSplit,  kAddressBar, kNewTab,
++                                    kExtensions};
++  order.insert(order.end(), pinned.begin(), pinned.end());
++  for (const std::string& name : others) {
++    if (!std::ranges::contains(pinned, name)) {
++      order.push_back(name);
++    }
++  }
++  order.insert(order.end(), {kMedia, kAvatar, kMenu});
++  return order;
++}
++
++std::vector<std::string> Resolve(const std::vector<std::string>& saved,
++                                 const std::vector<std::string>& known) {
++  std::vector<std::string> order;
++  for (const std::string& name : saved) {
++    if (std::ranges::contains(known, name) &&
++        !std::ranges::contains(order, name)) {
++      order.push_back(name);
++    }
++  }
++  // known[i - 1] is always placed by the time known[i] is looked at: it was
++  // saved, or it was inserted on the previous turn.
++  for (size_t i = 0; i < known.size(); ++i) {
++    if (std::ranges::contains(order, known[i])) {
++      continue;
++    }
++    auto at = order.begin();
++    if (i > 0) {
++      at = std::next(std::ranges::find(order, known[i - 1]));
++    }
++    order.insert(at, known[i]);
++  }
++  return order;
++}
++
++std::vector<std::string> Arrange(const std::vector<std::string>& saved,
++                                 const std::vector<std::string>& pinned,
++                                 const std::vector<std::string>& others) {
++  std::vector<std::string> order = Resolve(saved, DefaultOrder(pinned, others));
++  if (pinned.empty()) {
++    return order;
++  }
++  const auto is_pinned = [&pinned](const std::string& name) {
++    return std::ranges::contains(pinned, name);
++  };
++  // The run goes where pinned.front() is, counted among the names that stay.
++  const auto anchor = std::ranges::find(order, pinned.front());
++  const auto at = std::count_if(order.begin(), anchor, std::not_fn(is_pinned));
++  std::erase_if(order, is_pinned);
++  order.insert(order.begin() + at, pinned.begin(), pinned.end());
++  return order;
++}
++
++std::vector<std::string> FromList(const base::ListValue& list) {
++  std::vector<std::string> names;
++  for (const base::Value& name : list) {
++    if (name.is_string()) {
++      names.push_back(name.GetString());
++    }
++  }
++  return names;
++}
++
++bool IsValid(const std::vector<std::string>& order) {
++  const std::set<std::string> unique(order.begin(), order.end());
++  return unique.size() == order.size() &&
++         std::ranges::count(order, std::string(kAddressBar)) == 1;
++}
++
++}  // namespace workspaces::toolbar_order
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/toolbar_order.h
+@@ -0,0 +1,77 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_TOOLBAR_ORDER_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_TOOLBAR_ORDER_H_
++
++#include <string>
++#include <vector>
++
++#include "base/values.h"
++
++// The toolbar's buttons in an order the user chose, either side of the address
++// bar (wish 6). One saved list of names, read by the Customize Chrome side
++// panel's Toolbar list and by the toolbar itself, so the two cannot disagree.
++//
++// //base only, so every rule here is tested in workspaces_unittests. Names are
++// actions::ActionIdMap strings ("kActionBack", "kActionShowDownloads", ...) --
++// the same strings toolbar.pinned_actions already stores -- plus kAddressBar.
++namespace workspaces::toolbar_order {
++
++// The address bar's place in the list. Not an action name: it has none.
++inline constexpr char kAddressBar[] = "location_bar";
++
++// Helium's own toolbar buttons -- the ones that are direct children of the
++// toolbar, not Chrome's pinned buttons -- and the address bar.
++inline constexpr char kCollapse[] = "kActionToggleCollapseVertical";
++inline constexpr char kBack[] = "kActionBack";
++inline constexpr char kForward[] = "kActionForward";
++inline constexpr char kReload[] = "kActionReload";
++inline constexpr char kHome[] = "kActionHome";
++inline constexpr char kSplit[] = "kActionSplitTab";
++inline constexpr char kNewTab[] = "kActionNewTab";
++inline constexpr char kExtensions[] = "kActionExtensions";
++inline constexpr char kMedia[] = "kActionMediaControls";
++inline constexpr char kAvatar[] = "kActionAvatar";
++inline constexpr char kMenu[] = "kActionShowAppMenu";
++
++// Whether `name` is one of the names above (kAddressBar included). Every other
++// name is one of Chrome's pinnable buttons.
++bool IsOwnButton(const std::string& name);
++
++// Today's toolbar, left to right -- what an empty saved list means. `pinned`
++// (Chrome's pinned buttons, in their saved order) and then `others` (Chrome
++// buttons that could be pinned but are not) sit between Extensions and Media,
++// where the pinned box is drawn.
++std::vector<std::string> DefaultOrder(const std::vector<std::string>& pinned,
++                                      const std::vector<std::string>& others);
++
++// `saved` made complete against `known`. Names in both keep their saved order
++// (the first of a repeated name wins); a name of `known` that `saved` lacks goes
++// right after the name before it in `known` -- a newly pinned button lands next
++// to its usual neighbour -- or first when it is first in `known`. Names that
++// `known` lacks are dropped.
++std::vector<std::string> Resolve(const std::vector<std::string>& saved,
++                                 const std::vector<std::string>& known);
++
++// The order the side panel lists and the toolbar draws: `saved` resolved
++// against DefaultOrder(pinned, others), with Chrome's pinned buttons as ONE
++// run, in `pinned` order, where pinned.front() is saved. The pinned box is one
++// rectangle that keeps its own order -- a drag inside it changes it -- so the
++// list shows what the toolbar can draw (wish 6a; 6b places them one by one).
++// A newly pinned button is appended to `pinned`, so it joins the run rather
++// than moving it to the place it had while it was off.
++std::vector<std::string> Arrange(const std::vector<std::string>& saved,
++                                 const std::vector<std::string>& pinned,
++                                 const std::vector<std::string>& others);
++
++// The names in the saved pref's list; anything that is not a string is skipped.
++std::vector<std::string> FromList(const base::ListValue& list);
++
++// Whether `order` can be saved: no name twice, kAddressBar exactly once.
++bool IsValid(const std::vector<std::string>& order);
++
++}  // namespace workspaces::toolbar_order
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_TOOLBAR_ORDER_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/toolbar_order_unittest.cc
+@@ -0,0 +1,112 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/toolbar_order.h"
++
++#include <string>
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace workspaces::toolbar_order {
++namespace {
++
++using Names = std::vector<std::string>;
++
++TEST(ToolbarOrderTest, DefaultIsTodaysToolbar) {
++  EXPECT_EQ(DefaultOrder({"kActionShowDownloads", "kActionDevTools"},
++                         {"kActionPrint", "kActionDevTools"}),
++            (Names{kCollapse, kBack, kForward, kReload, kHome, kSplit,
++                   kAddressBar, kNewTab, kExtensions, "kActionShowDownloads",
++                   "kActionDevTools", "kActionPrint", kMedia, kAvatar, kMenu}));
++}
++
++TEST(ToolbarOrderTest, EmptySavedIsKnown) {
++  const Names known = DefaultOrder({}, {});
++  EXPECT_EQ(Resolve({}, known), known);
++}
++
++TEST(ToolbarOrderTest, SavedOrderWinsAcrossTheAddressBar) {
++  const Names known = {kBack, kAddressBar, "kActionShowDownloads", kMenu};
++  EXPECT_EQ(Resolve({"kActionShowDownloads", kBack, kMenu, kAddressBar}, known),
++            (Names{"kActionShowDownloads", kBack, kMenu, kAddressBar}));
++}
++
++TEST(ToolbarOrderTest, MissingNameFollowsItsUsualNeighbour) {
++  const Names known = {kBack, kForward, kAddressBar, "kActionPrint", kMenu};
++  // Forward was never saved: it follows Back wherever Back went.
++  EXPECT_EQ(Resolve({kAddressBar, kBack, "kActionPrint", kMenu}, known),
++            (Names{kAddressBar, kBack, kForward, "kActionPrint", kMenu}));
++  // A newly pinned button lands after the one before it in `known`.
++  EXPECT_EQ(Resolve({kMenu, kBack, kForward, kAddressBar}, known),
++            (Names{kMenu, kBack, kForward, kAddressBar, "kActionPrint"}));
++}
++
++TEST(ToolbarOrderTest, MissingFirstNameGoesFirst) {
++  const Names known = {kCollapse, kBack, kAddressBar};
++  EXPECT_EQ(Resolve({kAddressBar, kBack}, known),
++            (Names{kCollapse, kAddressBar, kBack}));
++}
++
++TEST(ToolbarOrderTest, UnknownAndRepeatedNamesDropped) {
++  const Names known = {kBack, kAddressBar};
++  EXPECT_EQ(Resolve({"kActionGone", kAddressBar, kBack, kAddressBar}, known),
++            (Names{kAddressBar, kBack}));
++}
++
++TEST(ToolbarOrderTest, PinnedButtonsAreOneRunWhereTheBoxsFirstIs) {
++  // Saved (the whole list, as the side panel writes it): Downloads first, Dev
++  // tools after Print. The box's own order is Dev tools, Downloads (a drag
++  // inside the box): both go where Dev tools is saved, in the box's order.
++  const Names saved = {"kActionShowDownloads", kCollapse, kBack, kForward,
++                       kReload, kHome, kSplit, kAddressBar, kNewTab,
++                       kExtensions, "kActionPrint", "kActionDevTools", kMedia,
++                       kAvatar, kMenu};
++  EXPECT_EQ(Arrange(saved, {"kActionDevTools", "kActionShowDownloads"},
++                    {"kActionPrint"}),
++            (Names{kCollapse, kBack, kForward, kReload, kHome, kSplit,
++                   kAddressBar, kNewTab, kExtensions, "kActionPrint",
++                   "kActionDevTools", "kActionShowDownloads", kMedia, kAvatar,
++                   kMenu}));
++}
++
++TEST(ToolbarOrderTest, NewlyPinnedButtonJoinsTheRun) {
++  // The group was moved left of the address bar; Print, saved while it was
++  // off at the right, is now pinned (the box appends it): it joins the group.
++  const Names saved = {"kActionShowDownloads", kAddressBar, "kActionPrint",
++                       kMenu};
++  EXPECT_EQ(Arrange(saved, {"kActionShowDownloads", "kActionPrint"}, {}),
++            (Names{kCollapse, kBack, kForward, kReload, kHome, kSplit,
++                   "kActionShowDownloads", "kActionPrint", kAddressBar,
++                   kNewTab, kExtensions, kMedia, kAvatar, kMenu}));
++}
++
++TEST(ToolbarOrderTest, NothingPinnedLeavesTheResolvedOrder) {
++  const Names known = DefaultOrder({}, {"kActionPrint"});
++  EXPECT_EQ(Arrange({}, {}, {"kActionPrint"}), known);
++}
++
++TEST(ToolbarOrderTest, Valid) {
++  EXPECT_TRUE(IsValid({kBack, kAddressBar, kMenu}));
++  EXPECT_FALSE(IsValid({kBack, kMenu}));
++  EXPECT_FALSE(IsValid({kAddressBar, kBack, kAddressBar}));
++  EXPECT_FALSE(IsValid({kBack, kAddressBar, kBack}));
++}
++
++TEST(ToolbarOrderTest, FromListSkipsNonStrings) {
++  base::ListValue list;
++  list.Append(kBack);
++  list.Append(3);
++  list.Append(kAddressBar);
++  EXPECT_EQ(FromList(list), (Names{kBack, kAddressBar}));
++}
++
++TEST(ToolbarOrderTest, OwnButtons) {
++  EXPECT_TRUE(IsOwnButton(kAddressBar));
++  EXPECT_TRUE(IsOwnButton(kExtensions));
++  EXPECT_FALSE(IsOwnButton("kActionShowDownloads"));
++}
++
++}  // namespace
++}  // namespace workspaces::toolbar_order
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -69,6 +69,9 @@ void RegisterProfilePrefs(PrefRegistrySi
+ 
+   // On: as wide as the window allows, as the owner asked (E18, D14).
+   registry->RegisterBooleanPref(kHeliumWorkspacesWideSidebar, true);
++
++  // Empty: Helium's own toolbar until the user reorders it (wish 6).
++  registry->RegisterListPref(kHeliumWorkspacesToolbarOrder);
+ }
+ 
+ base::DictValue DefaultWorkspacesDict() {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -94,6 +94,13 @@ inline constexpr char kHeliumWorkspacesS
+ inline constexpr char kHeliumWorkspacesWideSidebar[] =
+     "helium.workspaces.wide_sidebar";
+ 
++// The toolbar's buttons, left to right, either side of the address bar (wish
++// 6): a list of toolbar_order.h names. Empty -- the default -- leaves Helium's
++// toolbar exactly as it is. This PC only: a toolbar order is a habit of one
++// screen, and the side panel writes it.
++inline constexpr char kHeliumWorkspacesToolbarOrder[] =
++    "helium.workspaces.toolbar_order";
++
+ // Keys inside kHeliumWorkspacesList.
+ inline constexpr char kSchemaVersionKey[] = "schema_version";
+ inline constexpr char kItemsKey[] = "items";
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -130,11 +130,13 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+   const std::string tab_row_height(kHeliumWorkspacesTabRowHeight);
+   const std::string smooth_scrolling(kHeliumWorkspacesSmoothScrolling);
+   const std::string wide_sidebar(kHeliumWorkspacesWideSidebar);
++  const std::string toolbar_order(kHeliumWorkspacesToolbarOrder);
+   for (const std::string& later : {imported_at, archive_after, tab_row_height,
+-                                   smooth_scrolling, wide_sidebar}) {
++                                   smooth_scrolling, wide_sidebar,
++                                   toolbar_order}) {
+     for (const std::string& other :
+          {enabled, list, imported_at, archive_after, tab_row_height,
+-          smooth_scrolling, wide_sidebar}) {
++          smooth_scrolling, wide_sidebar, toolbar_order}) {
+       if (other == later) {
+         continue;
+       }
+@@ -249,6 +251,21 @@ TEST(WorkspacePrefsTest, SmoothScrolling
+   EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesSmoothScrolling));
+ }
+ 
++// ---------------------------------------------------- toolbar order (wish 6)
++
++TEST(WorkspacePrefsTest, ToolbarOrderPrefNameIsStable) {
++  EXPECT_STREQ("helium.workspaces.toolbar_order",
++               kHeliumWorkspacesToolbarOrder);
++}
++
++// Empty is the default: Helium's own toolbar, untouched (D5).
++TEST(WorkspacePrefsTest, ToolbarOrderDefaultsToEmpty) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  EXPECT_TRUE(pref_service.GetList(kHeliumWorkspacesToolbarOrder).empty());
++}
++
+ // ---------------------------------------------------- wide sidebar (E18)
+ 
+ TEST(WorkspacePrefsTest, WideSidebarPrefNameIsStable) {
+--- a/chrome/browser/ui/views/toolbar/BUILD.gn
++++ b/chrome/browser/ui/views/toolbar/BUILD.gn
+@@ -216,6 +216,8 @@ source_set("impl") {
+     "webui_split_tabs_control.cc",
+     "webui_toolbar_extensions_container_wrapper.cc",
+     "webui_toolbar_web_view.cc",
++    "workspace_toolbar_order.cc",
++    "workspace_toolbar_order.h",
+   ]
+ 
+   if (is_mac) {
+@@ -300,6 +302,8 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs:tab_strip_model_observer",
+     "//chrome/browser/ui/tabs/saved_tab_groups",
++    "//chrome/browser/ui/tabs/workspaces:prefs",
++    "//chrome/browser/ui/tabs/workspaces:toolbar_order",
+     "//chrome/browser/ui/user_education",
+     "//chrome/browser/ui/views:intent_picker_bubble_view",
+     "//chrome/browser/ui/views:layout_provider",
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -122,6 +122,7 @@
+ #include "chrome/browser/ui/views/toolbar/toolbar_icon_container_view.h"
+ #include "chrome/browser/ui/views/toolbar/webui_back_forward_control.h"
+ #include "chrome/browser/ui/views/toolbar/webui_toolbar_web_view.h"
++#include "chrome/browser/ui/views/toolbar/workspace_toolbar_order.h"
+ #include "chrome/browser/ui/views/zoom/zoom_view_controller.h"
+ #include "chrome/browser/ui/waap/initial_webui_window_metrics_manager.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+@@ -2289,6 +2290,9 @@ void ToolbarView::UpdateToolbarLayout()
+   }
+ 
+   InvalidateLayout();
++  // Helium Workspaces (wish 6): last, so the saved order has the last word
++  // (workspace_toolbar_order.h).
++  workspaces::ApplyToolbarOrder(this);
+ }
+ 
+ void ToolbarView::AbortToolbarContainerAnimationsForZenReveal() {
+--- /dev/null
++++ b/chrome/browser/ui/views/toolbar/workspace_toolbar_order.cc
+@@ -0,0 +1,208 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/toolbar/workspace_toolbar_order.h"
++
++#include <algorithm>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/workspaces/toolbar_order.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model.h"
++#include "chrome/browser/ui/toolbar/toolbar_pref_names.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_service.h"
++#include "ui/actions/actions.h"
++#include "ui/base/class_property.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/views/view_class_properties.h"
++
++namespace workspaces {
++
++// Lays the toolbar out again when the saved order or the pinned buttons'
++// order changes -- in this window and, through the profile's prefs, in every
++// other. Owned by the toolbar as a class property, so it cannot outlive it.
++class ToolbarOrderWatcher {
++ public:
++  ToolbarOrderWatcher(ToolbarView* toolbar, PrefService* prefs) {
++    registrar_.Init(prefs);
++    // UpdateToolbarLayout, not ApplyToolbarOrder: Helium's own Collapse move
++    // runs first there, so the saved order always has the last word.
++    const base::RepeatingClosure relayout = base::BindRepeating(
++        &ToolbarView::UpdateToolbarLayout, base::Unretained(toolbar));
++    registrar_.Add(prefs::kHeliumWorkspacesToolbarOrder, relayout);
++    registrar_.Add(::prefs::kPinnedActions, relayout);
++  }
++
++ private:
++  PrefChangeRegistrar registrar_;
++};
++
++}  // namespace workspaces
++
++DEFINE_UI_CLASS_PROPERTY_TYPE(workspaces::ToolbarOrderWatcher*)
++
++namespace workspaces {
++
++namespace {
++
++DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(ToolbarOrderWatcher,
++                                   kToolbarOrderWatcherKey)
++
++// The toolbar's children the saved order names, by the element identifier each
++// already carries. The pinned box is named apart: it stands for its first
++// pinned button.
++std::optional<std::string> OwnButtonName(ui::ElementIdentifier id) {
++  const std::pair<ui::ElementIdentifier, const char*> kNamed[] = {
++      {kToolbarVerticalTabsCollapseButtonElementId, toolbar_order::kCollapse},
++      {kToolbarBackButtonElementId, toolbar_order::kBack},
++      {kToolbarForwardButtonElementId, toolbar_order::kForward},
++      {kReloadButtonElementId, toolbar_order::kReload},
++      {kToolbarHomeButtonElementId, toolbar_order::kHome},
++      {kToolbarSplitTabsToolbarButtonElementId, toolbar_order::kSplit},
++      {kLocationBarElementId, toolbar_order::kAddressBar},
++      {kToolbarDynamicNewTabButtonElementId, toolbar_order::kNewTab},
++      {kToolbarExtensionsContainerElementId, toolbar_order::kExtensions},
++      {kToolbarMediaButtonElementId, toolbar_order::kMedia},
++      {kToolbarAvatarButtonElementId, toolbar_order::kAvatar},
++      {kToolbarAppMenuButtonElementId, toolbar_order::kMenu},
++  };
++  for (const auto& [named_id, name] : kNamed) {
++    if (named_id == id) {
++      return name;
++    }
++  }
++  return std::nullopt;
++}
++
++// The first view in `list` carrying `id`, or list.end().
++template <typename List>
++auto FindById(const List& list, ui::ElementIdentifier id) {
++  return std::ranges::find_if(list, [id](views::View* view) {
++    return view->GetProperty(views::kElementIdentifierKey) == id;
++  });
++}
++
++}  // namespace
++
++void ApplyToolbarOrder(ToolbarView* toolbar) {
++  BrowserWindowInterface* const browser = toolbar->browser();
++  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++    return;
++  }
++  Profile* const profile = browser->GetProfile();
++  // The regular profile's prefs, also for an incognito window: the order is
++  // saved there, and its changes reach this window's watcher directly.
++  PrefService* const pref_service = profile->GetOriginalProfile()->GetPrefs();
++  const bool first_layout = !toolbar->GetProperty(kToolbarOrderWatcherKey);
++  if (first_layout) {
++    toolbar->SetProperty(
++        kToolbarOrderWatcherKey,
++        std::make_unique<ToolbarOrderWatcher>(toolbar, pref_service));
++  }
++
++  const std::vector<std::string> saved = toolbar_order::FromList(
++      pref_service->GetList(prefs::kHeliumWorkspacesToolbarOrder));
++
++  std::vector<std::string> pinned;
++  for (const actions::ActionId id :
++       PinnedToolbarActionsModel::Get(profile)->PinnedActionIds()) {
++    if (std::optional<std::string> name =
++            actions::ActionIdMap::ActionIdToString(id)) {
++      pinned.push_back(*name);
++    }
++  }
++  std::vector<std::string> order =
++      saved.empty() ? toolbar_order::DefaultOrder(pinned, /*others=*/{})
++                    : toolbar_order::Arrange(saved, pinned, /*others=*/{});
++  // Helium's UpdateToolbarLayout has just put Collapse first, or right after
++  // the menu when vertical tabs are on the right -- next to the sidebar it
++  // folds. Unnamed, it rides behind the menu there; with nothing saved, first
++  // is where it already is.
++  if (saved.empty() ||
++      FindById(toolbar->children(),
++               kToolbarVerticalTabsCollapseButtonElementId) >
++          FindById(toolbar->children(), kToolbarAppMenuButtonElementId)) {
++    std::erase(order, toolbar_order::kCollapse);
++  }
++
++  // The pinned box stands for its first button: the order keeps the box's
++  // buttons one run that starts there. With nothing pinned it is named nothing
++  // and rides like any unnamed child.
++  const std::optional<std::string> pinned_box_name =
++      pinned.empty() ? std::nullopt : std::optional(pinned.front());
++
++  // Each named child, with the unnamed ones that follow it today (battery
++  // saver, glic, the compact tab strip after the address bar, ...): they keep
++  // riding behind it wherever it goes. Unnamed children before any named one
++  // stay first.
++  std::map<std::string, std::vector<views::View*>> runs;
++  std::vector<views::View*> leading;
++  views::View* overflow = nullptr;
++  std::string previous;
++  for (views::View* child : toolbar->children()) {
++    const ui::ElementIdentifier id =
++        child->GetProperty(views::kElementIdentifierKey);
++    if (id == kToolbarOverflowButtonElementId) {
++      overflow = child;
++      continue;
++    }
++    std::optional<std::string> name =
++        id == kPinnedToolbarActionsContainerElementId ? pinned_box_name
++                                                      : OwnButtonName(id);
++    if (name && !runs.contains(*name) && std::ranges::contains(order, *name)) {
++      runs[*name].push_back(child);
++      previous = *name;
++    } else if (previous.empty()) {
++      leading.push_back(child);
++    } else {
++      runs[previous].push_back(child);
++    }
++  }
++
++  std::vector<views::View*> wanted = std::move(leading);
++  for (const std::string& name : order) {
++    if (auto run = runs.find(name); run != runs.end()) {
++      wanted.insert(wanted.end(), run->second.begin(), run->second.end());
++    }
++  }
++  // The >> button just before the menu, where Init puts it; last when the
++  // menu was moved left of the address bar.
++  if (overflow) {
++    const auto menu = FindById(wanted, kToolbarAppMenuButtonElementId);
++    const bool menu_right =
++        menu != wanted.end() && FindById(wanted, kLocationBarElementId) < menu;
++    wanted.insert(menu_right ? menu : wanted.end(), overflow);
++  }
++
++  // Every child exactly once by construction; if that ever breaks, leave the
++  // toolbar as it is rather than crash the window over a button's place.
++  DCHECK_EQ(wanted.size(), toolbar->children().size());
++  if (wanted.size() != toolbar->children().size()) {
++    return;
++  }
++  // DefaultOrder copies ToolbarView::Init by hand: if a rebase changes Init,
++  // the first layout of a toolbar with nothing saved would move buttons.
++  DCHECK(!first_layout || !saved.empty() ||
++         std::equal(wanted.begin(), wanted.end(), toolbar->children().begin(),
++                    toolbar->children().end()))
++      << "toolbar_order::DefaultOrder no longer matches ToolbarView::Init";
++  for (size_t i = 0; i < wanted.size(); ++i) {
++    if (toolbar->children()[i] != wanted[i]) {
++      toolbar->ReorderChildView(wanted[i], i);
++    }
++  }
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/views/toolbar/workspace_toolbar_order.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TOOLBAR_WORKSPACE_TOOLBAR_ORDER_H_
++#define CHROME_BROWSER_UI_VIEWS_TOOLBAR_WORKSPACE_TOOLBAR_ORDER_H_
++
++class ToolbarView;
++
++namespace workspaces {
++
++// Puts the toolbar's own buttons, the extensions and the pinned Chrome buttons
++// (as one group) in the user's saved order, either side of the address bar
++// (wish 6). Called at the end of Helium's own reorder in
++// ToolbarView::UpdateToolbarLayout, and again by itself whenever the saved order
++// or the pinned buttons change. Nothing saved means Helium's own order (what
++// Init built, so nothing moves -- unless a reset just cleared the order); a
++// window that is not a normal browser window is left alone.
++void ApplyToolbarOrder(ToolbarView* toolbar);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TOOLBAR_WORKSPACE_TOOLBAR_ORDER_H_
+--- a/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/BUILD.gn
++++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/BUILD.gn
+@@ -9,6 +9,12 @@ assert(!is_android)
+ source_set("customize_toolbar") {
+   sources = [ "customize_toolbar_handler.cc" ]
+   public = [ "customize_toolbar_handler.h" ]
++
++  # Helium Workspaces (wish 6): the bodies of the handler's hooks.
++  sources += [
++    "workspace_toolbar_rows.cc",
++    "workspace_toolbar_rows.h",
++  ]
+   public_deps = [
+     "//chrome/browser/ui/webui/side_panel/customize_chrome:mojo_bindings",
+     "//content/public/browser",
+@@ -21,7 +27,11 @@ source_set("customize_toolbar") {
+     "//chrome/browser/ui:ui_features",
+     "//chrome/browser/ui/actions",
+     "//chrome/browser/ui/actions:actions_headers",
++    "//chrome/browser/ui/helium:helium_layout_state_controller",
+     "//chrome/browser/ui/tabs:features",
++    "//chrome/browser/ui/tabs:tabs",
++    "//chrome/browser/ui/tabs/workspaces:prefs",
++    "//chrome/browser/ui/tabs/workspaces:toolbar_order",
+     "//chrome/browser/ui/toolbar/pinned_toolbar",
+     "//chrome/browser/ui/views/frame:browser_view_header",
+     "//chrome/browser/ui/webui:webui_util",
+--- a/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar.mojom
++++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar.mojom
+@@ -42,6 +42,9 @@ enum ActionId {
+   kTabSearch,
+   kSplitTab,
+   kContextualTasks,
++  // Helium Workspaces (wish 6): not a button -- the address bar's place in
++  // the toolbar order, a row of its own in the list.
++  kAddressBar,
+ };
+ 
+ // Unique identifiers for categories the actions can belong to.
+@@ -95,6 +98,9 @@ interface CustomizeToolbarHandler {
+   GetIsCustomized() => (bool customized);
+   // Resets the set of pinned action items to default.
+   ResetToDefault();
++  // Helium Workspaces (wish 6): saves the toolbar's order, left to right,
++  // with kAddressBar once among the actions.
++  SetToolbarOrder(array<ActionId> order);
+ };
+ 
+ // WebUI-side handler for requests from the browser.
+--- a/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar_handler.cc
++++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar_handler.cc
+@@ -16,6 +16,7 @@
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar.mojom.h"
++#include "chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_rows.h"
+ #include "chrome/browser/ui/webui/util/image_util.h"
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
+ #include "chrome/common/chrome_features.h"
+@@ -234,6 +235,12 @@ CustomizeToolbarHandler::CustomizeToolba
+       base::BindRepeating(&CustomizeToolbarHandler::OnActionPinnedChanged,
+                           base::Unretained(this), kActionMediaControls,
+                           prefs::kShowMediaButton));
++  // Helium Workspaces (wish 6): redraws on a saved toolbar order
++  // (workspace_toolbar_rows.h).
++  workspaces::WatchToolbarOrder(
++      pref_change_registrar_,
++      base::BindRepeating(&CustomizeToolbarHandler::OnActionsChanged,
++                          base::Unretained(this)));
+ }
+ 
+ CustomizeToolbarHandler::~CustomizeToolbarHandler() = default;
+@@ -512,6 +519,12 @@ void CustomizeToolbarHandler::ListAction
+   add_action(kActionShowChromeLabs,
+              side_panel::customize_chrome::mojom::CategoryId::kTools);
+ 
++  // Helium Workspaces (wish 6): the list in the toolbar's order, the address
++  // bar a row of its own (workspace_toolbar_rows.h).
++  workspaces::ArrangeToolbarRows(actions, bwi.get(), *prefs(), *model_,
++                                 provider, icon_color_id, scale_factor,
++                                 &ChromeActionForMojoAction);
++
+   std::move(callback).Run(std::move(actions));
+ }
+ 
+@@ -593,11 +606,23 @@ void CustomizeToolbarHandler::PinAction(
+ 
+ void CustomizeToolbarHandler::GetIsCustomized(
+     GetIsCustomizedCallback callback) {
+-  std::move(callback).Run(!model_->IsDefault());
++  std::move(callback).Run(!model_->IsDefault() ||
++                          workspaces::IsToolbarOrderSaved(*prefs()));
+ }
+ 
+ void CustomizeToolbarHandler::ResetToDefault() {
+   model_->ResetToDefault();
++  workspaces::ClearToolbarOrder(*prefs());
++}
++
++void CustomizeToolbarHandler::SetToolbarOrder(
++    const std::vector<side_panel::customize_chrome::mojom::ActionId>& order) {
++  // Helium Workspaces (wish 6): workspace_toolbar_rows.h.
++  workspaces::SaveToolbarOrder(
++      order, *prefs(), *model_,
++      Profile::FromBrowserContext(web_contents_->GetBrowserContext())
++          ->IsOffTheRecord(),
++      &ChromeActionForMojoAction, client_.get());
+ }
+ 
+ void CustomizeToolbarHandler::OnActionsChanged() {
+--- a/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar_handler.h
++++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar_handler.h
+@@ -7,6 +7,7 @@
+ 
+ #include <string_view>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+@@ -46,6 +47,9 @@ class CustomizeToolbarHandler
+                  bool pin) override;
+   void GetIsCustomized(GetIsCustomizedCallback callback) override;
+   void ResetToDefault() override;
++  void SetToolbarOrder(
++      const std::vector<side_panel::customize_chrome::mojom::ActionId>& order)
++      override;
+ 
+   // PinnedToolbarActionsModel::Observer:
+   void OnActionsChanged() override;
+--- /dev/null
++++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_rows.cc
+@@ -0,0 +1,201 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_rows.h"
++
++#include <algorithm>
++#include <functional>
++#include <iterator>
++#include <string>
++#include <utility>
++
++#include "base/check.h"
++#include "base/values.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/toolbar_order.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model.h"
++#include "chrome/browser/ui/webui/util/image_util.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_service.h"
++#include "components/strings/grit/components_strings.h"
++#include "components/vector_icons/vector_icons.h"
++#include "mojo/public/cpp/bindings/message.h"
++#include "ui/actions/actions.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/image/image_skia.h"
++#include "url/gurl.h"
++
++namespace workspaces {
++
++namespace {
++
++using side_panel::customize_chrome::mojom::ActionId;
++
++// A row's name in the saved toolbar order. Helium's own buttons are named
++// here: actions::ActionIdMap knows only the pinnable ones, and Back, Reload,
++// New tab, the menu and Collapse are not.
++std::optional<std::string> OrderName(ActionId action_id,
++                                     ChromeActionFor chrome_action_for) {
++  namespace order = toolbar_order;
++  switch (action_id) {
++    case ActionId::kAddressBar:
++      return order::kAddressBar;
++    case ActionId::kVerticalTabsCollapse:
++      return order::kCollapse;
++    case ActionId::kBack:
++      return order::kBack;
++    case ActionId::kForward:
++      return order::kForward;
++    case ActionId::kReload:
++      return order::kReload;
++    case ActionId::kHome:
++      return order::kHome;
++    case ActionId::kSplitTab:
++      return order::kSplit;
++    case ActionId::kDynamicNewTab:
++      return order::kNewTab;
++    case ActionId::kExtensions:
++      return order::kExtensions;
++    case ActionId::kMediaControls:
++      return order::kMedia;
++    case ActionId::kAvatar:
++      return order::kAvatar;
++    case ActionId::kMenu:
++      return order::kMenu;
++    default:
++      break;
++  }
++  const std::optional<actions::ActionId> chrome_action =
++      chrome_action_for(action_id);
++  return chrome_action ? actions::ActionIdMap::ActionIdToString(*chrome_action)
++                       : std::nullopt;
++}
++
++}  // namespace
++
++void WatchToolbarOrder(PrefChangeRegistrar& registrar,
++                       base::RepeatingClosure redraw) {
++  registrar.Add(prefs::kHeliumWorkspacesToolbarOrder, std::move(redraw));
++}
++
++void ArrangeToolbarRows(
++    std::vector<side_panel::customize_chrome::mojom::ActionPtr>& actions,
++    BrowserWindowInterface* browser,
++    const PrefService& pref_service,
++    const PinnedToolbarActionsModel& model,
++    const ui::ColorProvider& provider,
++    ui::ColorId icon_color_id,
++    float scale_factor,
++    ChromeActionFor chrome_action_for) {
++  // One list in the toolbar's order, left to right, with the address bar a
++  // row of its own between the two sides.
++  actions.push_back(side_panel::customize_chrome::mojom::Action::New(
++      ActionId::kAddressBar, l10n_util::GetStringUTF8(IDS_ACCNAME_LOCATION),
++      /*pinned=*/true, false,
++      side_panel::customize_chrome::mojom::CategoryId::kNavigation,
++      GURL(webui::EncodePNGAndMakeDataURI(
++          ui::ImageModel::FromVectorIcon(vector_icons::kSearchIcon,
++                                         icon_color_id)
++              .Rasterize(&provider),
++          scale_factor))));
++  std::vector<std::string> pinned;
++  for (const actions::ActionId id : model.PinnedActionIds()) {
++    if (std::optional<std::string> name =
++            actions::ActionIdMap::ActionIdToString(id)) {
++      pinned.push_back(*name);
++    }
++  }
++  std::vector<std::string> tools;
++  for (const auto& action : actions) {
++    if (std::optional<std::string> name =
++            OrderName(action->id, chrome_action_for);
++        name && !toolbar_order::IsOwnButton(*name)) {
++      tools.push_back(*name);
++    }
++  }
++  std::vector<std::string> order = toolbar_order::Arrange(
++      toolbar_order::FromList(
++          pref_service.GetList(prefs::kHeliumWorkspacesToolbarOrder)),
++      pinned, tools);
++  // With vertical tabs on the right Helium keeps Collapse right after the menu,
++  // next to the sidebar it folds, whatever the order says: list it there.
++  const auto* layout = HeliumLayoutStateController::From(browser);
++  const auto* tab_strip = tabs::VerticalTabStripStateController::From(browser);
++  if (layout && layout->IsVerticalLayout() && tab_strip &&
++      tab_strip->IsTabStripRightAligned()) {
++    std::erase(order, toolbar_order::kCollapse);
++    order.insert(std::next(std::ranges::find(order, toolbar_order::kMenu)),
++                 toolbar_order::kCollapse);
++  }
++  std::ranges::stable_sort(
++      actions, std::less<>(),
++      [&order, chrome_action_for](
++          const side_panel::customize_chrome::mojom::ActionPtr& action) {
++        const std::optional<std::string> name =
++            OrderName(action->id, chrome_action_for);
++        return name ? static_cast<size_t>(std::ranges::find(order, *name) -
++                                          order.begin())
++                    : order.size();
++      });
++}
++
++bool IsToolbarOrderSaved(const PrefService& pref_service) {
++  return !pref_service.GetList(prefs::kHeliumWorkspacesToolbarOrder).empty();
++}
++
++void ClearToolbarOrder(PrefService& pref_service) {
++  pref_service.ClearPref(prefs::kHeliumWorkspacesToolbarOrder);
++}
++
++void SaveToolbarOrder(
++    const std::vector<ActionId>& order,
++    PrefService& pref_service,
++    PinnedToolbarActionsModel& model,
++    bool off_the_record,
++    ChromeActionFor chrome_action_for,
++    side_panel::customize_chrome::mojom::CustomizeToolbarClient* client) {
++  std::vector<std::string> names;
++  for (const ActionId action_id : order) {
++    // Mojo has already refused ids outside the enum, so a name missing here is
++    // this file's own gap (a row added upstream): skip it, keep the page.
++    std::optional<std::string> name = OrderName(action_id, chrome_action_for);
++    DCHECK(name) << "no toolbar order name for row " << action_id;
++    if (name) {
++      names.push_back(*std::move(name));
++    }
++  }
++  if (!toolbar_order::IsValid(names)) {
++    mojo::ReportBadMessage("SetToolbarOrder called with an invalid order.");
++    return;
++  }
++  // Off the record the toolbar follows the order but cannot change it, as
++  // with Chrome's own pinning (PinnedToolbarActionsModel::CanUpdate).
++  if (off_the_record) {
++    client->NotifyActionsUpdated();
++    return;
++  }
++
++  base::ListValue list;
++  for (const std::string& name : names) {
++    list.Append(name);
++  }
++  pref_service.SetList(prefs::kHeliumWorkspacesToolbarOrder, std::move(list));
++
++  // The pinned box draws its buttons in its own order: give it the list's, so
++  // the two read the same (toolbar_order::Arrange).
++  int index = 0;
++  for (const std::string& name : names) {
++    const std::optional<actions::ActionId> id =
++        actions::ActionIdMap::StringToActionId(name);
++    if (id && model.Contains(*id)) {
++      model.MovePinnedAction(*id, index++);
++    }
++  }
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_rows.h
+@@ -0,0 +1,73 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SIDE_PANEL_CUSTOMIZE_CHROME_CUSTOMIZE_TOOLBAR_WORKSPACE_TOOLBAR_ROWS_H_
++#define CHROME_BROWSER_UI_WEBUI_SIDE_PANEL_CUSTOMIZE_CHROME_CUSTOMIZE_TOOLBAR_WORKSPACE_TOOLBAR_ROWS_H_
++
++#include <optional>
++#include <vector>
++
++#include "base/functional/callback_forward.h"
++#include "chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar.mojom.h"
++#include "ui/actions/action_id.h"
++#include "ui/color/color_id.h"
++
++class BrowserWindowInterface;
++class PinnedToolbarActionsModel;
++class PrefChangeRegistrar;
++class PrefService;
++
++namespace ui {
++class ColorProvider;
++}  // namespace ui
++
++// Helium Workspaces (wish 6): the bodies of CustomizeToolbarHandler's hooks
++// for Settings' Toolbar list, which shows the toolbar in its saved order, left
++// to right, with the address bar a row of its own (workspace_toolbar_list.ts
++// draws it). Each is asked in one line, so a rebase of Chromium's handler
++// moves a line, never a block (the hook shrink, part 5). Built in the
++// handler's own target.
++namespace workspaces {
++
++// The handler's map from a row to Chrome's action, for the rows
++// actions::ActionIdMap names (its ChromeActionForMojoAction).
++using ChromeActionFor = std::optional<actions::ActionId> (*)(
++    side_panel::customize_chrome::mojom::ActionId);
++
++// Redraws the list when the order is saved -- by this list or by another
++// window's.
++void WatchToolbarOrder(PrefChangeRegistrar& registrar,
++                       base::RepeatingClosure redraw);
++
++// ListActions: adds the address bar's row and sorts every row into the
++// toolbar's order. With vertical tabs on the right Helium keeps Collapse
++// right after the menu, whatever the order says; the list shows it there.
++void ArrangeToolbarRows(
++    std::vector<side_panel::customize_chrome::mojom::ActionPtr>& actions,
++    BrowserWindowInterface* browser,
++    const PrefService& pref_service,
++    const PinnedToolbarActionsModel& model,
++    const ui::ColorProvider& provider,
++    ui::ColorId icon_color_id,
++    float scale_factor,
++    ChromeActionFor chrome_action_for);
++
++// GetIsCustomized and ResetToDefault: an order is saved; forget it.
++bool IsToolbarOrderSaved(const PrefService& pref_service);
++void ClearToolbarOrder(PrefService& pref_service);
++
++// SetToolbarOrder: saves `order` and gives the pinned buttons the same
++// relative order. An order without the address bar, or with a row twice, is
++// a bad message. Off the record nothing is saved: `client` redraws the list.
++void SaveToolbarOrder(
++    const std::vector<side_panel::customize_chrome::mojom::ActionId>& order,
++    PrefService& pref_service,
++    PinnedToolbarActionsModel& model,
++    bool off_the_record,
++    ChromeActionFor chrome_action_for,
++    side_panel::customize_chrome::mojom::CustomizeToolbarClient* client);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SIDE_PANEL_CUSTOMIZE_CHROME_CUSTOMIZE_TOOLBAR_WORKSPACE_TOOLBAR_ROWS_H_

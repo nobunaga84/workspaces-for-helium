@@ -1,0 +1,329 @@
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -122,6 +122,7 @@
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_selection_state.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+@@ -622,6 +623,17 @@ bool IsTabSelectable(
+     return false;
+   }
+ 
++  // Workspaces: Ctrl+1..9 count what the user can actually see, so Ctrl+3
++  // means the third tab of the active workspace rather than the third tab in
++  // the window. One check here covers SelectNumberedTab and SelectLastTab,
++  // which both route through this helper since M153. Asked through the
++  // delegate so this and the close commands cannot drift apart, and it
++  // answers true wherever Workspaces does not apply, leaving stock behaviour
++  // untouched.
++  if (!model->delegate()->IsTabVisibleInActiveWorkspace(tab)) {
++    return false;
++  }
++
+   return true;
+ }
+ 
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -37,6 +37,7 @@
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_menu_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/unload_controller.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+@@ -386,6 +387,32 @@ BrowserTabStripModelDelegate::GetBrowser
+   return browser_;
+ }
+ 
++bool BrowserTabStripModelDelegate::IsTabVisibleInActiveWorkspace(
++    const tabs::TabInterface* tab) const {
++  // Pinned tabs sit outside the workspace system, and it is the *container*
++  // that puts them there rather than any predicate: the vertical strip draws
++  // them from PinnedTabContainerView, which the visibility check added in E6a
++  // never reaches, so a pinned tab stays on screen in every workspace whatever
++  // guid it happens to carry.
++  //
++  // Commands have to agree with what is drawn. Without this line Ctrl+3 and
++  // Ctrl+Tab would skip a pinned tab the user is looking at, because
++  // WorkspaceService::IsTabVisible() answers about guids and knows nothing
++  // about which container a tab is rendered from. Clearing the tag on pin
++  // (design 2.5, E7b) does not remove the need for this: an empty guid means
++  // the default workspace, not every workspace.
++  if (tab && tab->IsPinned()) {
++    return true;
++  }
++
++  // Fails open, exactly like the rendering path in
++  // TabStripCollectionController: a window with no service is a window
++  // Workspaces does not apply to, and every such tab is shown.
++  const workspaces::WorkspaceService* service =
++      workspaces::WorkspaceService::From(browser_);
++  return !service || service->IsTabVisible(tab);
++}
++
+ void BrowserTabStripModelDelegate::NewSplitTab(
+     std::vector<int> indices,
+     split_tabs::SplitTabLayout layout,
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.h
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.h
+@@ -84,6 +84,8 @@ class BrowserTabStripModelDelegate : pub
+   bool CanGoBack(content::WebContents* web_contents) override;
+   bool IsNormalWindow() override;
+   BrowserWindowInterface* GetBrowserWindowInterface() override;
++  bool IsTabVisibleInActiveWorkspace(
++      const tabs::TabInterface* tab) const override;
+   void NewSplitTab(std::vector<int> indices,
+                    split_tabs::SplitTabLayout layout,
+                    split_tabs::SplitTabCreatedSource source) override;
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -3994,6 +3994,13 @@ bool TabStripModel::HasIndicesClosedByCo
+     if (focused_group.has_value() && GetTabGroupForTab(i) != focused_group) {
+       continue;
+     }
++
++    // Workspaces: a tab the user cannot see is not a tab this command may
++    // close. Without this, "Close other tabs" in one workspace silently closes
++    // every tab of all the others, and Recently Closed is the only way back.
++    if (!delegate_->IsTabVisibleInActiveWorkspace(GetTabAtIndex(i))) {
++      continue;
++    }
+     if (!indices_to_exclude.Contains(gfx::Range(i, i + 1)) && !IsTabPinned(i) &&
+         (!is_selected || !IsTabSelected(i))) {
+       return true;
+@@ -4040,6 +4047,14 @@ std::vector<tabs::TabInterface*> TabStri
+       continue;
+     }
+ 
++    // Workspaces: the same rule as HasIndicesClosedByCommand, and the two must
++    // agree -- that one decides whether the menu item is enabled, this one
++    // decides what actually closes. Checked after the block above so the
++    // CommandCloseTabsToLeft break still fires on the invoked tab.
++    if (!delegate_->IsTabVisibleInActiveWorkspace(tab)) {
++      continue;
++    }
++
+     // If the tab that the context menu command is invoked on is not selected
+     // and also in a split, also exclude tabs from that split from being closed.
+     // We don't have to worry about the case when a split is selected, because
+@@ -4600,6 +4615,14 @@ void TabStripModel::SelectRelativeTab(Ta
+       return true;
+     }
+ 
++    // Workspaces: a tab the user cannot see is not a landing place either.
++    // Asked through delegate_, never WorkspaceService directly (no GN cycle).
++    // The loop below stops at start_index, so a workspace with nothing
++    // selectable falls through to "activate nothing" rather than spinning.
++    if (!delegate_->IsTabVisibleInActiveWorkspace(GetTabAtIndex(i))) {
++      return true;
++    }
++
+     // Do not select the tab if it is not part of the focused state.
+     return focused_group.has_value() &&
+            !tabs::TabStripModelSelectionState::IsTabValidInFocusedGroup(
+--- a/chrome/browser/ui/tabs/tab_strip_model_delegate.h
++++ b/chrome/browser/ui/tabs/tab_strip_model_delegate.h
+@@ -212,6 +212,26 @@ class TabStripModelDelegate {
+   // Returns the BrowserWindow that owns the TabStripModel. Never changes.
+   virtual BrowserWindowInterface* GetBrowserWindowInterface() = 0;
+ 
++  // Whether `tab` is currently drawn in this window, for the commands that
++  // enumerate the whole tab strip. Fork addition (Workspaces).
++  //
++  // Asked through the delegate rather than read straight from WorkspaceService
++  // because TabStripModel must not depend on the workspaces target: that
++  // target already depends on //chrome/browser/ui/tabs:tab_strip, so an edge
++  // back would close a dependency cycle, and GN fails outright on a cycle
++  // rather than warning. Arriving as a plain bool keeps the only
++  // workspace-aware implementation in //chrome/browser/ui, which may depend on
++  // it freely.
++  //
++  // Defined here rather than left pure so implementations that know nothing
++  // about workspaces keep stock behaviour untouched, and so the default is the
++  // safe direction: showing a tab that could have been hidden is recoverable,
++  // hiding one the user cannot reach is not.
++  virtual bool IsTabVisibleInActiveWorkspace(
++      const tabs::TabInterface* tab) const {
++    return true;
++  }
++
+   // Creates a split view with the active tab and the tabs at `indices`. If
+   // `indices` is empty, a new tab navigated to the split tab empty state page
+   // will be used for the split view instead.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -65,4 +65,32 @@ std::string RelativeWorkspaceGuid(const
+   return workspaces[target];
+ }
+ 
++int NextVisibleTabIndex(const std::vector<bool>& selectable,
++                        int start,
++                        int delta) {
++  const int size = static_cast<int>(selectable.size());
++  if (size == 0 || start < 0 || start >= size || delta == 0) {
++    return start;
++  }
++
++  // Runs to `size` inclusive rather than `size - 1` so the last candidate is
++  // `start` itself, which is what makes "only the active tab is selectable"
++  // return `start` instead of falling through to the fallback below. Every
++  // index is therefore visited exactly once.
++  for (int step = 1; step <= size; ++step) {
++    // The same modulo-sign trap RelativeWorkspaceGuid documents: in C++ the
++    // sign of a % b follows a, so a negative delta would index off the front
++    // of the vector. Taking the remainder first keeps the offset inside
++    // (-size, size), and adding one more `size` before the second modulo makes
++    // the result non-negative for any delta.
++    const int offset = (delta * step) % size;
++    const int candidate = (start + offset + size) % size;
++    if (selectable[candidate]) {
++      return candidate;
++    }
++  }
++
++  return start;
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -85,6 +85,34 @@ std::string RelativeWorkspaceGuid(const
+                                   std::string_view active_guid,
+                                   int offset);
+ 
++// The index of the tab `delta` steps away from `start`, skipping every tab
++// `selectable` marks false, wrapping at both ends. `selectable[i]` says whether
++// tab i can be landed on at all -- the caller folds together collapsed groups
++// and workspace visibility before calling.
++//
++// THE BOUND IS THE WHOLE POINT. The loop this replaces in
++// TabStripModel::SelectRelativeTab is an unbounded `while` that skips collapsed
++// groups, and it is safe only because Chromium guarantees the active tab is
++// never in a collapsed group, so the walk always has somewhere to stop. That
++// guarantee does not survive Workspaces: until the active tab follows a
++// workspace switch (E7b), switching leaves the active tab tagged for a
++// workspace that is not the active one, and then *every* entry here is false.
++// An unbounded walk in that state hangs the browser rather than crashing it,
++// which is far harder to diagnose than a crash and reaches the user as a
++// freeze on Ctrl+Tab. So this takes at most `selectable.size()` steps.
++//
++// Returns `start` unchanged when nothing is selectable, when `selectable` is
++// empty, when `start` is out of range, or when `delta` is zero. Staying put is
++// always safe, and there is no better answer when no tab may be shown --
++// Chromium's own comment on that loop calls falling back to the active tab the
++// intended behaviour.
++//
++// `start` itself is tested last, so a strip where only the active tab is
++// selectable returns `start` rather than wrapping past it.
++int NextVisibleTabIndex(const std::vector<bool>& selectable,
++                        int start,
++                        int delta);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -188,5 +188,97 @@ TEST(WorkspaceRelativeTest, LandedWorksp
+   }
+ }
+ 
++// ---------------------------------------------------------------------------
++// NextVisibleTabIndex -- moving between tabs when some of them are hidden.
++// ---------------------------------------------------------------------------
++
++TEST(WorkspaceNextVisibleTabTest, MovesToTheNeighbourWhenEveryTabShows) {
++  const std::vector<bool> all = {true, true, true};
++  EXPECT_EQ(2, NextVisibleTabIndex(all, 1, 1));
++  EXPECT_EQ(0, NextVisibleTabIndex(all, 1, -1));
++}
++
++TEST(WorkspaceNextVisibleTabTest, SkipsTabsOfAnotherWorkspace) {
++  const std::vector<bool> visible = {true, false, false, true};
++  EXPECT_EQ(3, NextVisibleTabIndex(visible, 0, 1));
++  EXPECT_EQ(3, NextVisibleTabIndex(visible, 0, -1));
++}
++
++// The modulo-sign trap RelativeWorkspaceGuid documents, reached from the other
++// direction: stepping backwards off index 0 must wrap to the last tab, not
++// index off the front of the vector.
++TEST(WorkspaceNextVisibleTabTest, BackwardFromTheFirstTabWrapsToTheLast) {
++  const std::vector<bool> all = {true, true, true};
++  EXPECT_EQ(2, NextVisibleTabIndex(all, 0, -1));
++}
++
++TEST(WorkspaceNextVisibleTabTest, ForwardFromTheLastTabWrapsToTheFirst) {
++  const std::vector<bool> all = {true, true, true};
++  EXPECT_EQ(0, NextVisibleTabIndex(all, 2, 1));
++}
++
++// The state this function exists for. Switching workspace does not yet move
++// the active tab (true until E7b), so the active tab can belong to a workspace
++// that is not the active one -- and then nothing at all is selectable. The
++// unbounded loop this replaces would spin here forever, freezing the browser
++// on Ctrl+Tab rather than crashing it.
++TEST(WorkspaceNextVisibleTabTest, NothingSelectableStaysOnTheActiveTab) {
++  const std::vector<bool> none = {false, false, false};
++  EXPECT_EQ(1, NextVisibleTabIndex(none, 1, 1));
++  EXPECT_EQ(1, NextVisibleTabIndex(none, 1, -1));
++}
++
++// Reached by closing every other tab of a workspace: there is nowhere to move
++// to, and the answer is the tab you are already on rather than a hidden one.
++TEST(WorkspaceNextVisibleTabTest, OnlyTheActiveTabSelectableStaysPut) {
++  const std::vector<bool> visible = {false, true, false};
++  EXPECT_EQ(1, NextVisibleTabIndex(visible, 1, 1));
++  EXPECT_EQ(1, NextVisibleTabIndex(visible, 1, -1));
++}
++
++// Every index is visited exactly once, so the one selectable tab is found from
++// any starting point in either direction.
++TEST(WorkspaceNextVisibleTabTest, FindsTheOnlySelectableTabFromAnywhere) {
++  constexpr int kCount = 5;
++  for (int target = 0; target < kCount; ++target) {
++    std::vector<bool> visible(kCount, false);
++    visible[target] = true;
++    for (int start = 0; start < kCount; ++start) {
++      for (int delta : {1, -1}) {
++        EXPECT_EQ(target, NextVisibleTabIndex(visible, start, delta))
++            << "target " << target << " start " << start << " delta " << delta;
++      }
++    }
++  }
++}
++
++// Inputs a caller should never pass, but which must not read out of bounds if
++// one ever does.
++TEST(WorkspaceNextVisibleTabTest, DegenerateInputsReturnStartUnchanged) {
++  const std::vector<bool> empty;
++  const std::vector<bool> two = {true, true};
++  EXPECT_EQ(0, NextVisibleTabIndex(empty, 0, 1));
++  EXPECT_EQ(7, NextVisibleTabIndex(two, 7, 1));
++  EXPECT_EQ(-1, NextVisibleTabIndex(two, -1, 1));
++  EXPECT_EQ(1, NextVisibleTabIndex(two, 1, 0));
++}
++
++// Whatever this lands on must be a tab the rendering predicate then draws. If
++// the two ever disagreed, Ctrl+Tab would activate a tab the user cannot see --
++// the same agreement LandedWorkspaceShowsItsOwnTabs pins for switching.
++TEST(WorkspaceNextVisibleTabTest, LandedTabIsOneTheStripActuallyDraws) {
++  const std::vector<std::string> tags = {"work", "default", "work"};
++  std::vector<bool> visible;
++  for (const std::string& tag : tags) {
++    visible.push_back(IsVisibleWhenEnabled(tag, "work"));
++  }
++
++  for (int delta : {1, -1}) {
++    const int landed = NextVisibleTabIndex(visible, 1, delta);
++    EXPECT_TRUE(IsVisibleWhenEnabled(tags[landed], "work"))
++        << "landed on index " << landed << " with delta " << delta;
++  }
++}
++
+ }  // namespace
+ }  // namespace workspaces

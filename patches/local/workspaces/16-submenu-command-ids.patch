@@ -1,0 +1,49 @@
+--- a/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
+@@ -48,6 +48,12 @@ class ExistingBaseSubMenuModel : public
+   static constexpr int kMinSplitTabSwapMenuModelCommandId = 1801;
+   static constexpr int kMinSplitViewLayoutMenuModelCommandId = 1901;
+   static constexpr int kMinSplitTabMuteMenuModelCommandId = 2001;
++  // Helium Workspaces. ExistingWorkspaceSubMenuModel does not derive from this
++  // class, but it takes a range from this list anyway: the list is what stops
++  // two submenus, or a submenu and its parent, from meaning different things
++  // by the same id. Registered here so the next range added does not overlap
++  // it.
++  static constexpr int kMinExistingWorkspaceCommandId = 2101;
+ 
+   ExistingBaseSubMenuModel(const ExistingBaseSubMenuModel&) = delete;
+   ExistingBaseSubMenuModel& operator=(const ExistingBaseSubMenuModel&) = delete;
+--- a/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.cc
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/ui/tabs/existing_base_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+@@ -21,10 +22,19 @@
+ 
+ namespace {
+ 
+-// Our own ids, because this model is its own delegate. They are NOT
+-// TabStripModel::ContextMenuCommand values and must not become them: only the
+-// submenu's parent item needs one of those.
+-constexpr int kFirstCommandId = 1;
++// A SUBMENU'S IDS SHARE A COMMAND SPACE WITH THE MENU THAT HOSTS IT, and being
++// its own delegate does not change that. This started at 1, which is
++// TabStripModel::CommandNewTabToRight -- CommandFirst is 0 -- so choosing the
++// first workspace in the submenu opened a new tab instead, in the workspace the
++// user was trying to move a tab OUT of. Shipped in E9d and found the first time
++// the menu was opened (LOCAL.md 21).
++//
++// ExistingBaseSubMenuModel keeps the registry of these ranges -- 1001 for
++// windows, 1301 for tab groups, 1701 for splits -- and that registry is the
++// thing this model threw away by not deriving from it. It takes a range from
++// the list anyway.
++constexpr int kFirstCommandId =
++    ExistingBaseSubMenuModel::kMinExistingWorkspaceCommandId;
+ 
+ // The name to show for a workspace: its title, or a localised "Home" for the
+ // default workspace, or the guid for anything else still unnamed.

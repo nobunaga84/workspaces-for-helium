@@ -1,0 +1,448 @@
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -168,6 +168,8 @@ if (!is_android) {
+     public_deps = [ "//chrome/browser:browser_public_dependencies" ]
+ 
+     sources = [
++      "existing_workspace_sub_menu_model.cc",
++      "existing_workspace_sub_menu_model.h",
+       "glic_tab_sub_menu_model.cc",
+       "tab_menu_model.cc",
+     ]
+@@ -187,6 +189,16 @@ if (!is_android) {
+       "//chrome/browser/ui:ui_features",
+       "//chrome/browser/ui/immersive:immersive_mode_controller",
+       "//chrome/browser/ui/send_tab_to_self",
++
++      # Workspaces: the "Move tab to workspace" submenu. Unlike ":tab_strip"
++      # below, this target CAN depend on the full ":workspaces" -- nothing
++      # ":workspaces" depends on reaches back here, so there is no cycle. That
++      # is what lets the submenu talk to WorkspaceService directly instead of
++      # routing through TabStripModelDelegate the way E7a had to.
++      "//chrome/browser/ui/tabs/workspaces",
++      "//chrome/browser/ui/tabs/workspaces:prefs",
++      "//chrome/browser/ui/tabs/workspaces:stamping",
++      "//chrome/browser/ui/tabs/workspaces:tab_data",
+       "//chrome/browser/ui/web_applications",
+       "//chrome/browser/user_education",
+       "//components/commerce/core:commerce_constants",
+--- /dev/null
++++ b/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.cc
+@@ -0,0 +1,152 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h"
++
++#include <stddef.h>
++
++#include <string>
++#include <vector>
++
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/base/l10n/l10n_util.h"
++
++namespace {
++
++// Our own ids, because this model is its own delegate. They are NOT
++// TabStripModel::ContextMenuCommand values and must not become them: only the
++// submenu's parent item needs one of those.
++constexpr int kFirstCommandId = 1;
++
++// The name to show for a workspace: its title, or a localised "Home" for the
++// default workspace, or the guid for anything else still unnamed.
++//
++// DUPLICATED, deliberately, from workspace_rail_view.cc. Sharing it would mean
++// either a new dependency edge from the lean :workspaces target onto //ui/base
++// and the grit headers, or a target of its own for eight lines. Two call sites
++// is the wrong number to pay either price for -- if a third appears, move it
++// onto WorkspaceService and delete both copies.
++std::u16string DisplayNameForWorkspace(
++    const workspaces::prefs::WorkspaceEntry& entry) {
++  if (!entry.title.empty()) {
++    return base::UTF8ToUTF16(entry.title);
++  }
++  if (entry.guid == workspaces::kDefaultWorkspaceGuid) {
++    return l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_DEFAULT_NAME);
++  }
++  return base::UTF8ToUTF16(entry.guid);
++}
++
++}  // namespace
++
++ExistingWorkspaceSubMenuModel::ExistingWorkspaceSubMenuModel(
++    BrowserWindowInterface* browser,
++    TabStripModel* tab_strip,
++    int context_index)
++    : ui::SimpleMenuModel(this),
++      browser_(browser),
++      tab_strip_(tab_strip),
++      context_index_(context_index) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return;
++  }
++
++  for (const workspaces::prefs::WorkspaceEntry& entry :
++       service->GetWorkspaces()) {
++    AddItem(kFirstCommandId + static_cast<int>(guids_.size()),
++            DisplayNameForWorkspace(entry));
++    guids_.push_back(entry.guid);
++  }
++}
++
++ExistingWorkspaceSubMenuModel::~ExistingWorkspaceSubMenuModel() = default;
++
++// static
++bool ExistingWorkspaceSubMenuModel::ShouldShowSubmenu(
++    BrowserWindowInterface* browser) {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  return service && service->IsEnabled() && service->GetWorkspaces().size() > 1;
++}
++
++std::string ExistingWorkspaceSubMenuModel::GuidForCommandId(
++    int command_id) const {
++  const size_t index = static_cast<size_t>(command_id - kFirstCommandId);
++  return index < guids_.size() ? guids_[index] : std::string();
++}
++
++bool ExistingWorkspaceSubMenuModel::IsCommandIdEnabled(int command_id) const {
++  const std::string guid = GuidForCommandId(command_id);
++  if (guid.empty() || !tab_strip_->ContainsIndex(context_index_)) {
++    return false;
++  }
++
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return false;
++  }
++
++  tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(context_index_);
++  if (!tab || !tab->GetContents()) {
++    return false;
++  }
++
++  // A pinned tab has no workspace to move out of -- it is drawn in all of them
++  // -- so every destination is disabled rather than quietly doing nothing.
++  if (tab->IsPinned()) {
++    return false;
++  }
++
++  // Disabled on the workspace the tab is already in. Resolved rather than
++  // compared raw, so a tab carrying a tag for a deleted workspace disables
++  // "Home" -- which is where the orphan rule already draws it, and where moving
++  // it would put it (workspace_stamping.h).
++  return workspaces::ResolveTabGuid(
++             workspaces::WorkspaceGuidForTab(tab->GetContents()),
++             service->known_guids()) != guid;
++}
++
++void ExistingWorkspaceSubMenuModel::ExecuteCommand(int command_id,
++                                                   int event_flags) {
++  const std::string guid = GuidForCommandId(command_id);
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (guid.empty() || !service) {
++    return;
++  }
++
++  // Chromium's tab-menu rule, and the reason this does not just call
++  // MoveSelectedTabsToWorkspace(): act on the selection if the right-clicked
++  // tab is part of it, otherwise on that tab alone -- so right-clicking an
++  // unselected tab moves that one and leaves the selection where it is.
++  //
++  // Spelled out rather than delegated, because TabStripModel's own
++  // GetIndicesForCommand(), which answers exactly this, is PRIVATE, and nothing
++  // is a friend of it. Four lines of public API is a better trade than another
++  // hunk in a header seven Helium patches already touch.
++  std::vector<tabs::TabInterface*> tabs;
++  if (tab_strip_->IsTabSelected(context_index_)) {
++    for (tabs::TabInterface* tab :
++         tab_strip_->selection_model().selected_tabs()) {
++      if (tab) {
++        tabs.push_back(tab);
++      }
++    }
++  } else if (tabs::TabInterface* tab =
++                 tab_strip_->GetTabAtIndex(context_index_)) {
++    tabs.push_back(tab);
++  }
++
++  service->MoveTabsToWorkspace(tabs, guid);
++}
+--- /dev/null
++++ b/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_EXISTING_WORKSPACE_SUB_MENU_MODEL_H_
++#define CHROME_BROWSER_UI_TABS_EXISTING_WORKSPACE_SUB_MENU_MODEL_H_
++
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "ui/menus/simple_menu_model.h"
++
++class BrowserWindowInterface;
++class TabStripModel;
++
++// "Move tab to workspace" on the tab context menu: one item per workspace
++// (design 5, and the owner request recorded there on 2026-09-10).
++//
++// E9c already put a move on the rail's own menu, which cost no upstream files
++// at all. This is the same capability where people actually look for it, and
++// it is not redundant: the rail's version acts on the SELECTION, while this one
++// follows Chromium's tab-menu rule -- the selection if the right-clicked tab is
++// part of it, otherwise that tab alone -- so it can move a tab the user never
++// selected.
++//
++// NOT BUILT ON ExistingBaseSubMenuModel, though that class exists for exactly
++// this shape. Its first item is always "add to a NEW object", routed to the
++// parent delegate through a command id the parent has to own, and
++// TabStripModel::IsContextMenuCommandEnabled DCHECKs the id range and ends in
++// NOTREACHED -- so using the base would mean a SECOND ContextMenuCommand value
++// in tab_strip_model.h, a file seven Helium patches touch, for a "move to new
++// workspace" item the rail's "+" already covers in two clicks. A plain
++// SimpleMenuModel we are our own delegate for needs one id instead of two, and
++// the layout is identical.
++class ExistingWorkspaceSubMenuModel : public ui::SimpleMenuModel,
++                                      public ui::SimpleMenuModel::Delegate {
++ public:
++  ExistingWorkspaceSubMenuModel(BrowserWindowInterface* browser,
++                                TabStripModel* tab_strip,
++                                int context_index);
++  ExistingWorkspaceSubMenuModel(const ExistingWorkspaceSubMenuModel&) = delete;
++  ExistingWorkspaceSubMenuModel& operator=(
++      const ExistingWorkspaceSubMenuModel&) = delete;
++  ~ExistingWorkspaceSubMenuModel() override;
++
++  // Whether the tab menu should offer this at all: Workspaces has to be live in
++  // this window, and there has to be somewhere to move a tab TO. With one
++  // workspace the submenu would hold a single, always-disabled item.
++  static bool ShouldShowSubmenu(BrowserWindowInterface* browser);
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override;
++  bool IsCommandIdEnabled(int command_id) const override;
++
++ private:
++  // The workspace a menu item moves tabs into, or empty if `command_id` is not
++  // one of ours.
++  std::string GuidForCommandId(int command_id) const;
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  const raw_ptr<TabStripModel> tab_strip_;
++  const int context_index_;
++
++  // Parallel to the menu items, in the order they were added.
++  std::vector<std::string> guids_;
++};
++
++#endif  // CHROME_BROWSER_UI_TABS_EXISTING_WORKSPACE_SUB_MENU_MODEL_H_
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/existing_tab_group_sub_menu_model.h"
++#include "chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/existing_window_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/glic_tab_sub_menu_model.h"
+@@ -436,6 +437,21 @@ void TabMenuModel::Build(int index) {
+     }
+   }
+ 
++  // Helium Workspaces: "Move tab to workspace", beside the tab-group submenu
++  // because it is the same kind of action -- put this tab somewhere else in
++  // the strip's organisation -- and because the group submenu is the shape it
++  // copies. Hidden entirely when there is nowhere to move a tab to.
++  if (ExistingWorkspaceSubMenuModel::ShouldShowSubmenu(
++          tab_strip_->delegate()->GetBrowserWindowInterface())) {
++    move_to_workspace_submenu_ =
++        std::make_unique<ExistingWorkspaceSubMenuModel>(
++            tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
++            index);
++    AddSubMenuWithStringId(TabStripModel::CommandMoveToWorkspace,
++                           IDS_HELIUM_WORKSPACE_MOVE_TAB_TO,
++                           move_to_workspace_submenu_.get());
++  }
++
+   if (ExistingTabGroupSubMenuModel::ShouldShowSubmenu(
+           tab_strip_, index, tab_menu_model_delegate_)) {
+     // Create submenu with existing groups
+--- a/chrome/browser/ui/tabs/tab_menu_model.h
++++ b/chrome/browser/ui/tabs/tab_menu_model.h
+@@ -91,6 +91,9 @@ class TabMenuModel : public ui::SimpleMe
+   extensions::ContextMenuMatcher* GetMatcherIfExtension(size_t index) const;
+ #endif
+ 
++  // Helium Workspaces. Held as the base type like every sibling here, so
++  // this header needs no include and no forward declaration for it.
++  std::unique_ptr<ui::SimpleMenuModel> move_to_workspace_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_group_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_window_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel>
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2755,6 +2755,15 @@ bool TabStripModel::IsContextMenuCommand
+   }
+ 
+   switch (command_id) {
++    case CommandMoveToWorkspace:
++      // Helium Workspaces. The submenu decides per item whether a destination
++      // makes sense; the parent is enabled whenever it exists at all, and
++      // ExistingWorkspaceSubMenuModel::ShouldShowSubmenu() is what decides
++      // that. A submenu parent is never executed, but it IS asked about, and
++      // the line after this switch is NOTREACHED. The fork's cases open both
++      // switches, so a rebase cannot carry them into the wrong one (review #4).
++      return true;
++
+     case CommandNewTabToRight:
+     case CommandCloseTab:
+       return true;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -270,9 +270,9 @@ void WorkspaceService::DeleteWorkspace(s
+                          prefs::RemoveWorkspace(GetWorkspaces(), guid));
+ }
+ 
+-std::vector<content::WebContents*> WorkspaceService::SelectedMovableTabs()
++std::vector<tabs::TabInterface*> WorkspaceService::SelectedMovableTabs()
+     const {
+-  std::vector<content::WebContents*> tabs;
++  std::vector<tabs::TabInterface*> tabs;
+   for (tabs::TabInterface* tab : tab_strip_->selection_model().selected_tabs()) {
+     // A pinned tab has no workspace -- it is drawn in all of them (design 2.5)
+     // -- so moving one would give it a guid and hide it everywhere but the
+@@ -280,7 +280,7 @@ std::vector<content::WebContents*> Works
+     // that happens to include a pinned tab should still move the others, and
+     // the count the menu shows has to agree with what actually happens.
+     if (tab && tab->GetContents() && !tab->IsPinned()) {
+-      tabs.push_back(tab->GetContents());
++      tabs.push_back(tab);
+     }
+   }
+   return tabs;
+@@ -291,6 +291,12 @@ int WorkspaceService::SelectedMovableTab
+ }
+ 
+ int WorkspaceService::MoveSelectedTabsToWorkspace(std::string_view guid) {
++  return MoveTabsToWorkspace(SelectedMovableTabs(), guid);
++}
++
++int WorkspaceService::MoveTabsToWorkspace(
++    const std::vector<tabs::TabInterface*>& tabs,
++    std::string_view guid) {
+   if (!IsEnabled()) {
+     return 0;
+   }
+@@ -303,17 +309,26 @@ int WorkspaceService::MoveSelectedTabsTo
+     return 0;
+   }
+ 
+-  const std::vector<content::WebContents*> moving = SelectedMovableTabs();
+-
+-  for (content::WebContents* contents : moving) {
+-    SetTag(contents, std::string(guid));
++  int moved = 0;
++  for (tabs::TabInterface* tab : tabs) {
++    // The pinned check is here as well as in SelectedMovableTabs(), because
++    // this is the door the tab context menu comes in through and it brings its
++    // own set. A pinned tab is drawn in every workspace precisely because it
++    // has no tag (design 2.5); giving it one would hide it everywhere but the
++    // destination. Skipped, not refused: a selection that happens to include a
++    // pinned tab should still move the others.
++    if (!tab || !tab->GetContents() || tab->IsPinned()) {
++      continue;
++    }
++    SetTag(tab->GetContents(), std::string(guid));
++    ++moved;
+   }
+ 
+-  if (moving.empty()) {
++  if (moved == 0) {
+     return 0;
+   }
+ 
+-  LOG(INFO) << "[workspaces] moved " << moving.size() << " tab(s) -> workspace '"
++  LOG(INFO) << "[workspaces] moved " << moved << " tab(s) -> workspace '"
+             << guid << "'";
+ 
+   // Nothing else would repaint. SetTag writes the tag and persists it, and the
+@@ -327,7 +342,7 @@ int WorkspaceService::MoveSelectedTabsTo
+   // the observer scope design 2.2 forbids mutating from.
+   EnsureActiveTabVisible();
+ 
+-  return static_cast<int>(moving.size());
++  return moved;
+ }
+ 
+ base::CallbackListSubscription
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -173,6 +173,15 @@ class WorkspaceService : public TabStrip
+   // the user was on is one of the ones that moved.
+   int MoveSelectedTabsToWorkspace(std::string_view guid);
+ 
++  // The same move, for a caller that has its own idea of which tabs it means.
++  // The tab context menu does: Chromium's rule there is "act on the selection
++  // if the right-clicked tab is part of it, otherwise on that tab alone", which
++  // is not the same set as the selection.
++  //
++  // Pinned tabs in `tabs` are skipped, not refused, for the reason above.
++  int MoveTabsToWorkspace(const std::vector<tabs::TabInterface*>& tabs,
++                          std::string_view guid);
++
+   // How many tabs MoveSelectedTabsToWorkspace() would actually move, so a menu
+   // item can say so. Excludes pinned tabs for the same reason the move does,
+   // which is the point of sharing one collector: a label that promised to move
+@@ -193,6 +202,11 @@ class WorkspaceService : public TabStrip
+   base::CallbackListSubscription RegisterWorkspaceListChangedCallback(
+       base::RepeatingClosure callback);
+ 
++  // Just the guids of the above, cached and refreshed by the pref itself, which
++  // is what ResolveTabGuid() takes. Cheaper than GetWorkspaces() for a caller
++  // that only needs to ask "does this guid still exist".
++  const std::vector<std::string>& known_guids() const { return known_guids_; }
++
+   // This profile's workspaces, in stored order. Never empty, and the default
+   // workspace is always in it (workspace_prefs.h).
+   //
+@@ -259,7 +273,7 @@ class WorkspaceService : public TabStrip
+ 
+   // The selected tabs that a move would actually touch: everything selected in
+   // this window except pinned tabs.
+-  std::vector<content::WebContents*> SelectedMovableTabs() const;
++  std::vector<tabs::TabInterface*> SelectedMovableTabs() const;
+ 
+   // The workspace `tab` belongs to, or empty for a tab that has never been
+   // stamped or has no contents. Empty means the default workspace, never "no
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -42,6 +42,11 @@ enum TabContextMenuCommand {
+   CommandToggleFocusGroup,
+   CommandDiscard,
+   CommandToggleTabMuted,
++  // Helium Workspaces: the parent item of the "Move tab to workspace"
++  // submenu. Only the PARENT needs to be here -- the submenu is its own
++  // delegate and its item ids are local to it
++  // (existing_workspace_sub_menu_model.h).
++  CommandMoveToWorkspace,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 

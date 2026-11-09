@@ -1,0 +1,872 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -4,6 +4,19 @@
+ 
+ import("//testing/test.gni")
+ 
++# Arc's StorableSidebar.json -> a plain-value import plan (E14b, design 5).
++# //base only, so the whole parser is tested in workspaces_unittests; the
++# importer that acts on a plan arrives in E14c and depends on this, never the
++# other way round.
++source_set("arc_import") {
++  sources = [
++    "arc_import_plan.cc",
++    "arc_import_plan.h",
++  ]
++
++  deps = [ "//base" ]
++}
++
+ # Pref declarations for Workspaces, deliberately split into their own leaf
+ # target rather than living in the main workspaces target that arrives in E5.
+ #
+@@ -147,6 +160,7 @@ source_set("unit_tests") {
+   testonly = true
+ 
+   sources = [
++    "arc_import_plan_unittest.cc",
+     "workspace_prefs_unittest.cc",
+     "workspace_stamping_unittest.cc",
+   ]
+@@ -154,6 +168,7 @@ source_set("unit_tests") {
+   # Leaf targets only. Adding ":workspaces" here would pull TabStripModel and
+   # most of //chrome into the test binary and undo the reason it exists.
+   deps = [
++    ":arc_import",
+     ":prefs",
+     ":stamping",
+     "//base",
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.cc
+@@ -0,0 +1,368 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/arc_import_plan.h"
++
++#include <map>
++#include <set>
++#include <utility>
++
++#include "base/json/json_reader.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversion_utils.h"
++#include "base/values.h"
++
++namespace workspaces::arc_import {
++namespace {
++
++// 2001-01-01 UTC in seconds since 1970: Arc stamps Apple reference dates.
++constexpr double kArcEpochOffsetSeconds = 978307200.0;
++
++// The owner's folders nest 5 deep. The visited set already stops a cycle; this
++// stops a hostile file from recursing the stack away with one long chain.
++constexpr int kMaxDepth = 64;
++
++// Keyed by views into the parsed tree, which outlives every index.
++using ItemIndex = std::map<std::string_view, const base::DictValue*>;
++
++bool IsWebUrl(std::string_view url) {
++  return base::StartsWith(url, "http://",
++                          base::CompareCase::INSENSITIVE_ASCII) ||
++         base::StartsWith(url, "https://",
++                          base::CompareCase::INSENSITIVE_ASCII);
++}
++
++std::string StringOr(const base::DictValue& dict,
++                     std::string_view key,
++                     std::string_view fallback) {
++  const std::string* const value = dict.FindString(key);
++  return std::string(value && !value->empty() ? *value : fallback);
++}
++
++// The main sidebar, never a Little Arc window. `containers` alternates a key
++// dict -- {"global":{}} or {"littleBrowser":{...}} -- and the container it
++// names, and a Little Arc pair can come first: "the first container that has
++// spaces", which E12's script takes, is a mini window in 2 of Arc's own 24
++// snapshots (LOCAL.md 37).
++const base::DictValue* MainContainer(const base::DictValue& root) {
++  const base::DictValue* const sidebar = root.FindDict("sidebar");
++  const base::ListValue* const containers =
++      sidebar ? sidebar->FindList("containers") : nullptr;
++  if (!containers) {
++    return nullptr;
++  }
++  for (size_t i = 0; i + 1 < containers->size(); ++i) {
++    const base::DictValue* const key = (*containers)[i].GetIfDict();
++    if (key && key->contains("global")) {
++      return (*containers)[i + 1].GetIfDict();
++    }
++  }
++  return nullptr;
++}
++
++// `items` and `spaces` both alternate an id string and a dict that carries the
++// same id itself, so the strings are skipped rather than paired up.
++ItemIndex IndexById(const base::ListValue* list) {
++  ItemIndex index;
++  if (!list) {
++    return index;
++  }
++  for (const base::Value& element : *list) {
++    const base::DictValue* const dict = element.GetIfDict();
++    const std::string* const id = dict ? dict->FindString("id") : nullptr;
++    if (id) {
++      index.emplace(*id, dict);
++    }
++  }
++  return index;
++}
++
++class Walker {
++ public:
++  explicit Walker(const ItemIndex& items) : items_(items) {}
++
++  int skipped() const { return skipped_; }
++
++  // The tree under a space's root container, flattened into strip order. Root
++  // level keeps Arc's order, loose tabs and folders interleaved.
++  std::vector<ArcUnit> Units(std::string_view container_id, bool anchored) {
++    std::vector<ArcUnit> out;
++    if (const base::DictValue* const root = Visit(container_id)) {
++      ArcUnit loose;
++      for (const base::DictValue* child : Children(*root)) {
++        if (!IsFolder(*child)) {
++          AppendItem(*child, anchored, loose);
++          continue;
++        }
++        Flush(loose, out);
++        WalkFolder(*child, StringOr(*child, "title", "Folder"), anchored,
++                   /*depth=*/1, out);
++      }
++      Flush(loose, out);
++    }
++    return out;
++  }
++
++  // Favorites: every tab under the container, in order, nothing grouped.
++  std::vector<ArcTab> Tabs(std::string_view container_id) {
++    std::vector<ArcTab> out;
++    for (ArcUnit& unit : Units(container_id, /*anchored=*/false)) {
++      for (ArcItem& item : unit.items) {
++        for (ArcTab& tab : item.tabs) {
++          out.push_back(std::move(tab));
++        }
++      }
++    }
++    return out;
++  }
++
++ private:
++  static bool IsFolder(const base::DictValue& item) {
++    const base::DictValue* const data = item.FindDict("data");
++    return data && data->contains("list");
++  }
++
++  static void Flush(ArcUnit& unit, std::vector<ArcUnit>& out) {
++    if (!unit.items.empty()) {
++      out.push_back(std::move(unit));
++    }
++    unit = ArcUnit();
++  }
++
++  // The item with this id, the first time it is asked for. A second visit is
++  // a cycle or a shared child; either way the file is lying and it is skipped.
++  const base::DictValue* Visit(std::string_view id) {
++    const auto found = items_.find(id);
++    if (found == items_.end()) {
++      return nullptr;
++    }
++    if (!visited_.insert(found->first).second) {
++      ++skipped_;
++      return nullptr;
++    }
++    return found->second;
++  }
++
++  std::vector<const base::DictValue*> Children(const base::DictValue& parent) {
++    std::vector<const base::DictValue*> children;
++    if (const base::ListValue* const ids = parent.FindList("childrenIds")) {
++      for (const base::Value& id : *ids) {
++        const base::DictValue* const child =
++            id.is_string() ? Visit(id.GetString()) : nullptr;
++        if (child) {
++          children.push_back(child);
++        }
++      }
++    }
++    return children;
++  }
++
++  // A folder's own tabs become one unit, then each subfolder its own: groups
++  // cannot nest, and a group has to be contiguous, so a folder's loose tabs
++  // are hoisted above its subfolders (owner, 2026-09-22; 5 of 28 folders).
++  void WalkFolder(const base::DictValue& folder,
++                  const std::string& path,
++                  bool anchored,
++                  int depth,
++                  std::vector<ArcUnit>& out) {
++    if (depth > kMaxDepth) {
++      ++skipped_;
++      return;
++    }
++    const std::vector<const base::DictValue*> children = Children(folder);
++    ArcUnit own;
++    own.group_title = path;
++    for (const base::DictValue* child : children) {
++      if (!IsFolder(*child)) {
++        AppendItem(*child, anchored, own);
++      }
++    }
++    Flush(own, out);
++    for (const base::DictValue* child : children) {
++      if (IsFolder(*child)) {
++        WalkFolder(*child, path + " > " + StringOr(*child, "title", "Folder"),
++                   anchored, depth + 1, out);
++      }
++    }
++  }
++
++  // A tab, or a split view as one item. Anything else Arc may hold is ignored.
++  void AppendItem(const base::DictValue& item, bool anchored, ArcUnit& unit) {
++    const base::DictValue* const data = item.FindDict("data");
++    if (!data) {
++      return;
++    }
++    if (data->contains("tab")) {
++      if (std::optional<ArcTab> tab = ToTab(item, anchored)) {
++        unit.items.push_back(ArcItem{{*std::move(tab)}});
++      }
++      return;
++    }
++    if (!data->contains("splitView")) {
++      return;
++    }
++    ArcItem split;
++    for (const base::DictValue* child : Children(item)) {
++      if (std::optional<ArcTab> tab = ToTab(*child, anchored)) {
++        split.tabs.push_back(*std::move(tab));
++      }
++    }
++    // A split here is exactly two tabs. Anything else arrives as plain tabs.
++    if (split.tabs.size() == 2) {
++      unit.items.push_back(std::move(split));
++      return;
++    }
++    for (ArcTab& tab : split.tabs) {
++      unit.items.push_back(ArcItem{{std::move(tab)}});
++    }
++  }
++
++  std::optional<ArcTab> ToTab(const base::DictValue& item, bool anchored) {
++    const base::DictValue* const data = item.FindDict("data");
++    const base::DictValue* const saved = data ? data->FindDict("tab") : nullptr;
++    if (!saved) {
++      return std::nullopt;
++    }
++    const std::string* const url = saved->FindString("savedURL");
++    if (!url || !IsWebUrl(*url)) {
++      ++skipped_;
++      return std::nullopt;
++    }
++    ArcTab tab;
++    tab.arc_id = StringOr(item, "id", "");
++    tab.url = *url;
++    tab.title = StringOr(*saved, "savedTitle", "");
++    const std::string typed = StringOr(item, "title", "");
++    if (typed != tab.title) {
++      tab.custom_title = typed;
++    }
++    tab.anchored = anchored;
++    // FindDouble also reads an integer, should Arc ever write a whole second.
++    if (const std::optional<double> created = item.FindDouble("createdAt")) {
++      tab.created = FromArcSeconds(*created);
++    }
++    const std::optional<double> active = saved->FindDouble("timeLastActiveAt");
++    tab.last_active = active ? FromArcSeconds(*active) : tab.created;
++    return tab;
++  }
++
++  const ItemIndex& items_;
++  std::set<std::string_view> visited_;
++  int skipped_ = 0;
++};
++
++// A space names its two root containers as [tag, id, tag, id], the tag a
++// string in `containerIDs` and a one-key dict in the newer `newContainerIDs`.
++std::string RootContainer(const base::DictValue& space, std::string_view tag) {
++  for (const char* key : {"containerIDs", "newContainerIDs"}) {
++    const base::ListValue* const list = space.FindList(key);
++    for (size_t i = 0; list && i + 1 < list->size(); i += 2) {
++      const base::Value& name = (*list)[i];
++      const bool matches =
++          name.is_string() ? name.GetString() == tag
++                           : name.is_dict() && name.GetDict().contains(tag);
++      if (matches && (*list)[i + 1].is_string()) {
++        return (*list)[i + 1].GetString();
++      }
++    }
++  }
++  return std::string();
++}
++
++std::string SpaceIcon(const base::DictValue& space) {
++  const base::DictValue* const info = space.FindDict("customInfo");
++  const base::DictValue* const icon = info ? info->FindDict("iconType") : nullptr;
++  if (!icon) {
++    return std::string();
++  }
++  // emoji_v2 is the whole emoji, joiners included; `emoji` is one code point.
++  if (const std::string* const emoji = icon->FindString("emoji_v2")) {
++    return *emoji;
++  }
++  std::string utf8;
++  const std::optional<int> code_point = icon->FindInt("emoji");
++  if (code_point && base::IsValidCharacter(*code_point)) {
++    base::WriteUnicodeCharacter(*code_point, &utf8);
++  }
++  return utf8;
++}
++
++}  // namespace
++
++std::optional<ArcImportPlan> ParseArcSidebarJson(std::string_view json) {
++  const std::optional<base::DictValue> root =
++      base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  const base::DictValue* const container = root ? MainContainer(*root) : nullptr;
++  if (!container) {
++    return std::nullopt;
++  }
++  const ItemIndex items = IndexById(container->FindList("items"));
++  Walker walker(items);
++  ArcImportPlan plan;
++
++  // [profile key, container id, ...]: only the ids matter.
++  if (const base::ListValue* const favorites =
++          container->FindList("topAppsContainerIDs")) {
++    for (const base::Value& element : *favorites) {
++      if (element.is_string()) {
++        for (ArcTab& tab : walker.Tabs(element.GetString())) {
++          plan.favorites.push_back(std::move(tab));
++        }
++      }
++    }
++  }
++
++  if (const base::ListValue* const spaces = container->FindList("spaces")) {
++    for (const base::Value& element : *spaces) {
++      const base::DictValue* const space = element.GetIfDict();
++      if (!space) {
++        continue;
++      }
++      ArcWorkspace workspace;
++      workspace.arc_space_id = StringOr(*space, "id", "");
++      workspace.title = StringOr(*space, "title", "Space");
++      workspace.icon = SpaceIcon(*space);
++      workspace.pinned =
++          walker.Units(RootContainer(*space, "pinned"), /*anchored=*/true);
++      workspace.today =
++          walker.Units(RootContainer(*space, "unpinned"), /*anchored=*/false);
++      plan.workspaces.push_back(std::move(workspace));
++    }
++  }
++
++  plan.skipped = walker.skipped();
++  return plan;
++}
++
++base::Time FromArcSeconds(double seconds) {
++  return base::Time::FromSecondsSinceUnixEpoch(seconds +
++                                               kArcEpochOffsetSeconds);
++}
++
++ArcImportPlan KeepCreatedAfter(ArcImportPlan plan, base::Time last_import) {
++  if (last_import.is_null()) {
++    return plan;
++  }
++  // A tab with no createdAt has a null time and so counts as old.
++  const auto is_old = [last_import](const ArcTab& tab) {
++    return tab.created <= last_import;
++  };
++  std::erase_if(plan.favorites, is_old);
++  for (ArcWorkspace& workspace : plan.workspaces) {
++    for (std::vector<ArcUnit>* units : {&workspace.pinned, &workspace.today}) {
++      for (ArcUnit& unit : *units) {
++        for (ArcItem& item : unit.items) {
++          std::erase_if(item.tabs, is_old);
++        }
++        std::erase_if(unit.items,
++                      [](const ArcItem& item) { return item.tabs.empty(); });
++      }
++      std::erase_if(*units,
++                    [](const ArcUnit& unit) { return unit.items.empty(); });
++    }
++  }
++  return plan;
++}
++
++}  // namespace workspaces::arc_import
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.h
+@@ -0,0 +1,103 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_ARC_IMPORT_PLAN_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_ARC_IMPORT_PLAN_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/time/time.h"
++
++// Arc's StorableSidebar.json turned into plain values: what "Import from
++// Arc..." will create, in the order it will create it (design 5, E14 spec).
++//
++// No Browser, no TabStripModel, no GURL: //base only, so all of it is tested in
++// workspaces_unittests (design 3.10). The file is someone else's undocumented
++// format, read from outside the profile, so nothing here trusts it: a missing
++// key skips the item, a cycle or an absurd depth is refused, and a file that
++// does not look like a sidebar at all is std::nullopt rather than an empty plan.
++namespace workspaces::arc_import {
++
++struct ArcTab {
++  std::string arc_id;
++  // Arc's savedURL. Only http(s) survives the parse (anchors are http(s) only,
++  // LOCAL.md 31); everything else is counted in ArcImportPlan::skipped.
++  std::string url;
++  // The page's own title as Arc saved it.
++  std::string title;
++  // The name typed in Arc, and ONLY where it differs from `title`: 3,175 of
++  // the owner's 3,181 "renamed" tabs carry a copy of the page title, and a
++  // custom title would stop those ever showing the real one (LOCAL.md 37).
++  std::string custom_title;
++  // From a space's pinned container: becomes an anchored tab.
++  bool anchored = false;
++  // timeLastActiveAt, else createdAt -- 40% of Today tabs have no
++  // timeLastActiveAt. Seeds auto-archive's countdown.
++  base::Time last_active;
++  // createdAt, which every Arc item has. What a re-import filters on.
++  base::Time created;
++
++  bool operator==(const ArcTab&) const = default;
++};
++
++// One thing the strip moves as a whole below group level: a tab, or a split
++// view's two tabs in Arc's order.
++struct ArcItem {
++  std::vector<ArcTab> tabs;
++
++  bool operator==(const ArcItem&) const = default;
++};
++
++// A run of consecutive items. With a title it is one Arc folder and becomes one
++// collapsed tab group; without, the items are loose tabs.
++struct ArcUnit {
++  // "A > B" for folder B inside folder A: tab groups cannot nest.
++  std::string group_title;
++  std::vector<ArcItem> items;
++
++  bool operator==(const ArcUnit&) const = default;
++};
++
++struct ArcWorkspace {
++  std::string arc_space_id;
++  std::string title;
++  // Arc's emoji as UTF-8, or empty.
++  std::string icon;
++  // The space's pinned tabs (anchored), then its Today tabs.
++  std::vector<ArcUnit> pinned;
++  std::vector<ArcUnit> today;
++
++  bool operator==(const ArcWorkspace&) const = default;
++};
++
++struct ArcImportPlan {
++  // Arc's favorites, shared by every space: become Chrome-pinned tabs.
++  std::vector<ArcTab> favorites;
++  std::vector<ArcWorkspace> workspaces;
++  // Tabs left out: no URL, not http(s), or reached through a cycle.
++  int skipped = 0;
++
++  bool operator==(const ArcImportPlan&) const = default;
++};
++
++// std::nullopt when `json` is not JSON or holds no main sidebar. Little Arc
++// windows, which the file lists beside the main sidebar and sometimes before
++// it, are ignored.
++std::optional<ArcImportPlan> ParseArcSidebarJson(std::string_view json);
++
++// Arc stamps seconds since 2001-01-01 UTC.
++base::Time FromArcSeconds(double seconds);
++
++// `plan` without the tabs created at or before `last_import`, for a re-run:
++// a tab closed or archived here since then stays gone. A null time keeps
++// everything. A split left with one tab stays as a plain tab; emptied items
++// and units are dropped, workspaces are kept.
++ArcImportPlan KeepCreatedAfter(ArcImportPlan plan, base::Time last_import);
++
++}  // namespace workspaces::arc_import
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_ARC_IMPORT_PLAN_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan_unittest.cc
+@@ -0,0 +1,354 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/arc_import_plan.h"
++
++#include <iostream>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/environment.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace workspaces::arc_import {
++namespace {
++
++// The pieces of Arc's file, as JSON text. `children` is a JSON array of ids.
++std::string Tab(std::string_view id,
++                std::string_view url,
++                std::string_view saved_title,
++                int created,
++                std::string_view more_item = "",
++                std::string_view more_tab = "") {
++  return base::StrCat({R"({"id":")", id, R"(","createdAt":)",
++                       base::NumberToString(created), more_item,
++                       R"(,"data":{"tab":{"savedURL":")", url,
++                       R"(","savedTitle":")", saved_title, "\"", more_tab,
++                       "}}}"});
++}
++
++std::string Parent(std::string_view id,
++                   std::string_view kind,
++                   std::string_view children,
++                   std::string_view title = "") {
++  return base::StrCat({R"({"id":")", id, R"(","title":")", title,
++                       R"(","childrenIds":)", children, R"(,"data":{")", kind,
++                       R"(":{}}})"});
++}
++
++std::string Space(std::string_view id,
++                  std::string_view title,
++                  std::string_view container_ids,
++                  std::string_view more = "") {
++  return base::StrCat({R"({"id":")", id, R"(","title":")", title, "\",",
++                       container_ids, more, "}"});
++}
++
++// `before_global` is where a Little Arc pair goes when it comes first.
++std::string Sidebar(std::string_view items,
++                    std::string_view spaces,
++                    std::string_view favorites = "[]",
++                    std::string_view before_global = "") {
++  return base::StrCat({R"({"sidebar":{"containers":[)", before_global,
++                       R"({"global":{}},{"items":[)", items, R"(],"spaces":[)",
++                       spaces, R"(],"topAppsContainerIDs":)", favorites,
++                       "}]}}"});
++}
++
++// "A[t2] A > B[t3 t5+t6]": units by title, items by id, a split joined by +.
++std::string Shape(const std::vector<ArcUnit>& units) {
++  std::string out;
++  for (const ArcUnit& unit : units) {
++    base::StrAppend(&out, {out.empty() ? "" : " ", unit.group_title, "["});
++    for (size_t i = 0; i < unit.items.size(); ++i) {
++      out += i ? " " : "";
++      for (size_t j = 0; j < unit.items[i].tabs.size(); ++j) {
++        base::StrAppend(&out, {j ? "+" : "", unit.items[i].tabs[j].arc_id});
++      }
++    }
++    out += "]";
++  }
++  return out;
++}
++
++constexpr char kOneSpace[] =
++    R"("containerIDs":["unpinned","u","pinned","p"])";
++
++TEST(ArcImportPlanTest, WalksSpacesFoldersSplitsAndFavorites) {
++  // Arc's real lists alternate an id string and the dict; kept here once.
++  const std::string items = base::StrCat(
++      {R"("fav",)", Parent("fav", "itemContainer", R"(["f1"])"), ",",
++       Tab("f1", "https://fav.example/", "Fav", 100), ",",
++       // Root: a loose tab, folder A, a loose tab, a split. Arc's order stays.
++       Parent("p", "itemContainer", R"(["t1","A","t4","sp"])"), ",",
++       Tab("t1", "https://one.example/", "One", 10), ",",
++       // A lists its subfolder BEFORE its own tab: the tab is hoisted.
++       Parent("A", "list", R"(["B","t2"])", "A"), ",",
++       Parent("B", "list", R"(["t3","spB"])", "B"), ",",
++       Tab("t2", "https://two.example/", "Two", 10), ",",
++       Tab("t3", "https://three.example/", "Three", 10), ",",
++       Parent("spB", "splitView", R"(["t5","t6"])"), ",",
++       Tab("t5", "https://five.example/", "Five", 10), ",",
++       Tab("t6", "https://six.example/", "Six", 10), ",",
++       Tab("t4", "https://four.example/", "Four", 10), ",",
++       // One half is not a web page: the split arrives as a plain tab.
++       Parent("sp", "splitView", R"(["t7","t8"])"), ",",
++       Tab("t7", "https://seven.example/", "Seven", 10), ",",
++       Tab("t8", "chrome://settings/", "Settings", 10), ",",
++       Parent("u", "itemContainer", R"(["u1"])"), ",",
++       Tab("u1", "https://today.example/", "Today", 10), ",",
++       Parent("p2", "itemContainer", "[]"), ",",
++       Parent("u2", "itemContainer", R"(["v1"])"), ",",
++       Tab("v1", "HTTP://upper.example/", "Upper", 10)});
++  const std::string spaces = base::StrCat(
++      {R"("s1",)",
++       Space("s1", "First", kOneSpace,
++             R"(,"customInfo":{"iconType":{"emoji":1,"emoji_v2":"\ud83d\ude80"}})"),
++       ",",
++       // The newer key only, and a bare code point for the icon.
++       Space("s2", "",
++             R"("newContainerIDs":[{"unpinned":{}},"u2",{"pinned":{}},"p2"])",
++             R"(,"customInfo":{"iconType":{"emoji":128640}})")});
++  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(
++      Sidebar(items, spaces, R"([{"default":true},"fav"])"));
++
++  ASSERT_TRUE(plan);
++  ASSERT_EQ(plan->favorites.size(), 1u);
++  EXPECT_EQ(plan->favorites[0].arc_id, "f1");
++  EXPECT_FALSE(plan->favorites[0].anchored);
++
++  ASSERT_EQ(plan->workspaces.size(), 2u);
++  const ArcWorkspace& first = plan->workspaces[0];
++  EXPECT_EQ(first.arc_space_id, "s1");
++  EXPECT_EQ(first.title, "First");
++  EXPECT_EQ(first.icon, "\xF0\x9F\x9A\x80");
++  EXPECT_EQ(Shape(first.pinned), "[t1] A[t2] A > B[t3 t5+t6] [t4 t7]");
++  EXPECT_EQ(Shape(first.today), "[u1]");
++  EXPECT_TRUE(first.pinned[0].items[0].tabs[0].anchored);
++  EXPECT_FALSE(first.today[0].items[0].tabs[0].anchored);
++
++  const ArcWorkspace& second = plan->workspaces[1];
++  EXPECT_EQ(second.title, "Space");
++  EXPECT_EQ(second.icon, "\xF0\x9F\x9A\x80");
++  EXPECT_EQ(Shape(second.pinned), "");
++  EXPECT_EQ(Shape(second.today), "[v1]");
++
++  EXPECT_EQ(plan->skipped, 1);  // t8
++}
++
++TEST(ArcImportPlanTest, ALittleArcWindowListedFirstIsNotTheSidebar) {
++  // 2 of Arc's own 24 snapshots look like this, and "the first container with
++  // spaces" would import the mini window (LOCAL.md 37).
++  const std::string little = base::StrCat(
++      {R"({"littleBrowser":{"_0":"x"}},{"items":[)",
++       Parent("lp", "itemContainer", R"(["l1"])"), ",",
++       Tab("l1", "https://little.example/", "Little", 10), R"(],"spaces":[)",
++       Space("ls", "Little", R"("containerIDs":["pinned","lp"])"), "]},"});
++  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++      base::StrCat({Parent("p", "itemContainer", R"(["t1"])"), ",",
++                    Tab("t1", "https://one.example/", "One", 10)}),
++      Space("s1", "Real", kOneSpace), "[]", little));
++
++  ASSERT_TRUE(plan);
++  ASSERT_EQ(plan->workspaces.size(), 1u);
++  EXPECT_EQ(plan->workspaces[0].title, "Real");
++  EXPECT_EQ(Shape(plan->workspaces[0].pinned), "[t1]");
++}
++
++TEST(ArcImportPlanTest, OnlyWebPagesAreImported) {
++  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++      base::StrCat(
++          {Parent("p", "itemContainer", R"(["a","b","c","d","e"])"), ",",
++           Tab("a", "https://ok.example/", "Ok", 10), ",",
++           Tab("b", "", "Empty", 10), ",",
++           Tab("c", "arc://boost", "Arc", 10), ",",
++           Tab("d", "file:///C:/x.html", "File", 10), ",",
++           // No savedURL key at all: 5 of the owner's pinned tabs.
++           R"({"id":"e","createdAt":10,"data":{"tab":{"savedTitle":"None"}}})"}),
++      Space("s1", "S", kOneSpace)));
++
++  ASSERT_TRUE(plan);
++  EXPECT_EQ(Shape(plan->workspaces[0].pinned), "[a]");
++  EXPECT_EQ(plan->skipped, 4);
++}
++
++TEST(ArcImportPlanTest, ANameIsCustomOnlyWhenItDiffersFromThePageTitle) {
++  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++      base::StrCat({Parent("p", "itemContainer", R"(["a","b","c"])"), ",",
++                    Tab("a", "https://a.example/", "Page", 10,
++                        R"(,"title":"Page")"),
++                    ",",
++                    Tab("b", "https://b.example/", "Page", 10,
++                        R"(,"title":"Mine")"),
++                    ",",
++                    Tab("c", "https://c.example/", "Page", 10,
++                        R"(,"title":null)")}),
++      Space("s1", "S", kOneSpace)));
++
++  ASSERT_TRUE(plan);
++  const std::vector<ArcItem>& items = plan->workspaces[0].pinned[0].items;
++  ASSERT_EQ(items.size(), 3u);
++  EXPECT_EQ(items[0].tabs[0].custom_title, "");
++  EXPECT_EQ(items[0].tabs[0].title, "Page");
++  EXPECT_EQ(items[1].tabs[0].custom_title, "Mine");
++  EXPECT_EQ(items[2].tabs[0].custom_title, "");
++}
++
++TEST(ArcImportPlanTest, LastActiveFallsBackToCreated) {
++  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++      base::StrCat({Parent("u", "itemContainer", R"(["a","b"])"), ",",
++                    Tab("a", "https://a.example/", "A", 100, "",
++                        R"(,"timeLastActiveAt":250.5)"),
++                    ",", Tab("b", "https://b.example/", "B", 100)}),
++      Space("s1", "S", kOneSpace)));
++
++  ASSERT_TRUE(plan);
++  const std::vector<ArcItem>& items = plan->workspaces[0].today[0].items;
++  EXPECT_EQ(items[0].tabs[0].created, FromArcSeconds(100));
++  EXPECT_EQ(items[0].tabs[0].last_active, FromArcSeconds(250.5));
++  // 40% of the owner's Today tabs have no timeLastActiveAt (LOCAL.md 37).
++  EXPECT_EQ(items[1].tabs[0].last_active, FromArcSeconds(100));
++}
++
++TEST(ArcImportPlanTest, ArcSecondsCountFrom2001) {
++  EXPECT_EQ(FromArcSeconds(0),
++            base::Time::FromSecondsSinceUnixEpoch(978307200));
++  EXPECT_EQ(FromArcSeconds(86400) - FromArcSeconds(0), base::Days(1));
++}
++
++TEST(ArcImportPlanTest, ACycleEndsAndIsCounted) {
++  // A's child is B and B's child is A. Without the visited set this recurses
++  // until the stack is gone; the file comes from outside the profile.
++  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++      base::StrCat({Parent("p", "itemContainer", R"(["A"])"), ",",
++                    Parent("A", "list", R"(["B","t1"])", "A"), ",",
++                    Parent("B", "list", R"(["A","t2"])", "B"), ",",
++                    Tab("t1", "https://one.example/", "One", 10), ",",
++                    Tab("t2", "https://two.example/", "Two", 10)}),
++      Space("s1", "S", kOneSpace)));
++
++  ASSERT_TRUE(plan);
++  EXPECT_EQ(Shape(plan->workspaces[0].pinned), "A[t1] A > B[t2]");
++  EXPECT_EQ(plan->skipped, 1);
++}
++
++TEST(ArcImportPlanTest, AFolderChainDeeperThanTheCapIsCutOff) {
++  // 70 nested folders with one tab at the bottom: refused, not followed.
++  std::string items = Parent("p", "itemContainer", R"(["f0"])");
++  for (int i = 0; i < 70; ++i) {
++    const std::string child = i < 69 ? base::StrCat({"f", base::NumberToString(i + 1)})
++                                     : std::string("deep");
++    base::StrAppend(&items,
++                    {",", Parent(base::StrCat({"f", base::NumberToString(i)}),
++                                 "list", base::StrCat({"[\"", child, "\"]"}),
++                                 "F")});
++  }
++  base::StrAppend(&items,
++                  {",", Tab("deep", "https://deep.example/", "Deep", 10)});
++  const std::optional<ArcImportPlan> plan =
++      ParseArcSidebarJson(Sidebar(items, Space("s1", "S", kOneSpace)));
++
++  ASSERT_TRUE(plan);
++  EXPECT_EQ(Shape(plan->workspaces[0].pinned), "");
++  EXPECT_EQ(plan->skipped, 1);
++}
++
++TEST(ArcImportPlanTest, NotASidebarIsNoPlanRatherThanAnEmptyOne) {
++  EXPECT_FALSE(ParseArcSidebarJson(""));
++  EXPECT_FALSE(ParseArcSidebarJson("{\"sidebar\":"));
++  EXPECT_FALSE(ParseArcSidebarJson("[1,2,3]"));
++  EXPECT_FALSE(ParseArcSidebarJson(R"({"sidebar":{"containers":[]}})"));
++  // Only a Little Arc window, no {"global":{}} pair.
++  EXPECT_FALSE(ParseArcSidebarJson(
++      R"({"sidebar":{"containers":[{"littleBrowser":{}},{"items":[],"spaces":[]}]}})"));
++  // A sidebar with nothing in it IS a plan: Arc installed, never used.
++  const std::optional<ArcImportPlan> empty = ParseArcSidebarJson(Sidebar("", ""));
++  ASSERT_TRUE(empty);
++  EXPECT_EQ(*empty, ArcImportPlan());
++}
++
++TEST(ArcImportPlanTest, AReimportKeepsOnlyWhatArcGainedSince) {
++  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++      base::StrCat({Parent("fav", "itemContainer", R"(["f1","f2"])"), ",",
++                    Tab("f1", "https://f1.example/", "F1", 10), ",",
++                    Tab("f2", "https://f2.example/", "F2", 500), ",",
++                    Parent("p", "itemContainer", R"(["A","sp","t3"])"), ",",
++                    Parent("A", "list", R"(["t1"])", "A"), ",",
++                    Tab("t1", "https://one.example/", "One", 10), ",",
++                    Parent("sp", "splitView", R"(["t4","t5"])"), ",",
++                    Tab("t4", "https://four.example/", "Four", 10), ",",
++                    Tab("t5", "https://five.example/", "Five", 500), ",",
++                    Tab("t3", "https://three.example/", "Three", 100)}),
++      Space("s1", "S", kOneSpace), R"([{"default":true},"fav"])"));
++  ASSERT_TRUE(plan);
++  ASSERT_EQ(Shape(plan->workspaces[0].pinned), "A[t1] [t4+t5 t3]");
++
++  // First import: nothing to compare against, everything stays.
++  EXPECT_EQ(KeepCreatedAfter(*plan, base::Time()), *plan);
++
++  // Imported at second 100: `t3` was created AT that second and is old.
++  const ArcImportPlan later = KeepCreatedAfter(*plan, FromArcSeconds(100));
++  ASSERT_EQ(later.favorites.size(), 1u);
++  EXPECT_EQ(later.favorites[0].arc_id, "f2");
++  ASSERT_EQ(later.workspaces.size(), 1u);  // kept even when it empties
++  // Folder A is gone with its only tab; the split is down to its new half.
++  EXPECT_EQ(Shape(later.workspaces[0].pinned), "[t5]");
++
++  const ArcImportPlan nothing = KeepCreatedAfter(*plan, FromArcSeconds(9999));
++  EXPECT_TRUE(nothing.favorites.empty());
++  EXPECT_EQ(Shape(nothing.workspaces[0].pinned), "");
++}
++
++// Not a test of the code above but of my reading of Arc's format: every
++// fixture in this file is a belief, and the real file is the only thing that
++// can contradict one. Skipped unless HELIUM_ARC_SIDEBAR names a file; prints
++// counts only, never a URL, a title or a name.
++TEST(ArcImportPlanTest, CountsFromARealSidebarWhenPointedAtOne) {
++  std::optional<std::string> path =
++      base::Environment::Create()->GetVar("HELIUM_ARC_SIDEBAR");
++  if (!path) {
++    GTEST_SKIP() << "set HELIUM_ARC_SIDEBAR to a StorableSidebar.json";
++  }
++  std::string json;
++  ASSERT_TRUE(base::ReadFileToString(base::FilePath::FromUTF8Unsafe(*path),
++                                     &json));
++  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(json);
++  ASSERT_TRUE(plan);
++
++  std::cout << "ARC favorites=" << plan->favorites.size()
++            << " workspaces=" << plan->workspaces.size()
++            << " skipped=" << plan->skipped << "\n";
++  int index = 0;
++  for (const ArcWorkspace& workspace : plan->workspaces) {
++    int tabs[2] = {0, 0}, groups = 0, splits = 0, renamed = 0;
++    const std::vector<ArcUnit>* const halves[2] = {&workspace.pinned,
++                                                   &workspace.today};
++    for (int half = 0; half < 2; ++half) {
++      for (const ArcUnit& unit : *halves[half]) {
++        groups += unit.group_title.empty() ? 0 : 1;
++        for (const ArcItem& item : unit.items) {
++          splits += item.tabs.size() == 2 ? 1 : 0;
++          tabs[half] += static_cast<int>(item.tabs.size());
++          for (const ArcTab& tab : item.tabs) {
++            renamed += tab.custom_title.empty() ? 0 : 1;
++          }
++        }
++      }
++    }
++    std::cout << "ARC space " << ++index << ": pinned=" << tabs[0]
++              << " today=" << tabs[1] << " groups=" << groups
++              << " splits=" << splits << " renamed=" << renamed
++              << " icon_bytes=" << workspace.icon.size() << "\n";
++  }
++}
++
++}  // namespace
++}  // namespace workspaces::arc_import

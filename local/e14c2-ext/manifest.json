@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "E14c.2 reopen-window test fixture",
+  "version": "2",
+  "description": "Test only (LOCAL.md 42, 119): a closed window whose saved group is open again in another window, then reopened by id, the path History > Recently closed takes.",
+  "permissions": ["tabs", "tabGroups", "sessions", "storage"],
+  "background": { "service_worker": "background.js" }
+}

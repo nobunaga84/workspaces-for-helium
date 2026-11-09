@@ -1,0 +1,158 @@
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -449,9 +449,9 @@ sessions::LiveTab* BrowserLiveTabContext
+       }
+     } else {
+       // Open the group in this browser if it is closed.
+-      group_id = tab_groups::SavedTabGroupUtils::OpenSavedTabGroup(
+-          browser, saved_group_id.value(),
+-          tab_groups::OpeningSource::kOpenedFromTabRestore);
++      // Helium Workspaces (LOCAL.md 66): into the workspace it was closed from.
++      group_id = workspaces::OpenRestoredSavedGroup(
++          browser, saved_group_id.value(), tab.extra_data);
+     }
+ 
+     if (is_restoring_group_or_window) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -802,6 +802,11 @@ int WorkspaceService::MoveTabsToWorkspac
+   return static_cast<int>(moving.size());
+ }
+ 
++base::AutoReset<std::string> WorkspaceService::StampInsertedTabsFor(
++    std::string guid) {
++  return base::AutoReset<std::string>(&stamp_inserted_for_, std::move(guid));
++}
++
+ base::CallbackListSubscription
+ WorkspaceService::RegisterWorkspaceListChangedCallback(
+     base::RepeatingClosure callback) {
+@@ -1624,8 +1629,9 @@ void WorkspaceService::StampInsertedTab(
+   // (workspace_session_data.h), and rule 1 of ResolveGuidForInsertedTab is
+   // what leaves it alone. This is also where that tag is re-persisted against
+   // the restored tab's new session id.
+-  const std::string guid =
+-      ResolveGuidForInsertedTab(GuidOf(tab), active_guid_);
++  const std::string guid = ResolveGuidForInsertedTab(
++      GuidOf(tab),
++      stamp_inserted_for_.empty() ? active_guid_ : stamp_inserted_for_);
+   SetTag(tab->GetContents(), guid);
+ 
+   // active_guid_ is in the line because without it this log cannot answer the
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -11,6 +11,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/auto_reset.h"
+ #include "base/callback_list.h"
+ #include "base/functional/callback_forward.h"
+ #include "base/functional/function_ref.h"
+@@ -257,6 +258,14 @@ class WorkspaceService : public TabStrip
+   int MoveTabsToWorkspace(const std::vector<tabs::TabInterface*>& tabs,
+                           std::string_view guid);
+ 
++  // While the returned object lives, a tab inserted into this window without a
++  // tag of its own is stamped `guid` instead of the workspace on screen. For a
++  // saved group reopened from Recently Closed: Chromium rebuilds it from its
++  // saved-group model, which keeps no workspace (LOCAL.md 66). Keep it to the
++  // one call that inserts the tabs: it points into this service.
++  [[nodiscard]] base::AutoReset<std::string> StampInsertedTabsFor(
++      std::string guid);
++
+   // How many tabs MoveSelectedTabsToWorkspace() would actually move, so a menu
+   // item can say so. Excludes pinned tabs for the same reason the move does,
+   // which is the point of sharing one collector: a label that promised to move
+@@ -700,6 +709,10 @@ class WorkspaceService : public TabStrip
+ 
+   std::string active_guid_;
+ 
++  // What StampInsertedTab() stamps an untagged tab with while a
++  // StampInsertedTabsFor() lives; empty: the workspace on screen.
++  std::string stamp_inserted_for_;
++
+   // The guids that exist, cached because IsTabVisible() consults them once per
+   // tab per layout pass and re-parsing the pref dict that often is not free.
+   //
+--- a/chrome/browser/ui/workspace_restore_hooks.cc
++++ b/chrome/browser/ui/workspace_restore_hooks.cc
+@@ -4,11 +4,15 @@
+ 
+ #include "chrome/browser/ui/workspace_restore_hooks.h"
+ 
++#include "base/auto_reset.h"
+ #include "base/logging.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "components/saved_tab_groups/public/types.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "url/gurl.h"
+ 
+@@ -44,4 +48,29 @@ bool IsSplitAlreadyRestored(const TabStr
+   return true;
+ }
+ 
++std::optional<tab_groups::TabGroupId> OpenRestoredSavedGroup(
++    BrowserWindowInterface* browser,
++    const base::Uuid& saved_group_id,
++    const std::map<std::string, std::string>& extra_data) {
++  // OpenSavedTabGroup() inserts every tab before it returns, so the stamp
++  // lives exactly as long as that call.
++  std::optional<base::AutoReset<std::string>> stamp;
++  WorkspaceService* const workspace_service = WorkspaceService::From(browser);
++  const auto closed_in = extra_data.find(kWorkspaceExtraDataKey);
++  if (workspace_service && closed_in != extra_data.end() &&
++      !closed_in->second.empty()) {
++    stamp.emplace(workspace_service->StampInsertedTabsFor(closed_in->second));
++  }
++  const std::optional<tab_groups::TabGroupId> group_id =
++      tab_groups::SavedTabGroupUtils::OpenSavedTabGroup(
++          browser, saved_group_id,
++          tab_groups::OpeningSource::kOpenedFromTabRestore);
++  if (stamp && group_id) {
++    LOG(INFO) << "[workspaces] restore: saved group reopened into "
++                 "workspace '"
++              << closed_in->second << "'";
++  }
++  return group_id;
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/workspace_restore_hooks.h
++++ b/chrome/browser/ui/workspace_restore_hooks.h
+@@ -5,7 +5,13 @@
+ #ifndef CHROME_BROWSER_UI_WORKSPACE_RESTORE_HOOKS_H_
+ #define CHROME_BROWSER_UI_WORKSPACE_RESTORE_HOOKS_H_
+ 
++#include <map>
++#include <optional>
++#include <string>
++
++#include "base/uuid.h"
+ #include "components/sessions/core/tab_restore_types.h"
++#include "components/tab_groups/tab_group_id.h"
+ 
+ class BrowserWindowInterface;
+ class TabStripModel;
+@@ -34,6 +40,16 @@ bool IsSplitAlreadyRestored(const TabStr
+                             int leading_index,
+                             int trailing_index);
+ 
++// AddRestoredTab, for a saved group that is closed: Chromium's
++// OpenSavedTabGroup, with the rebuilt tabs stamped with the workspace the
++// closed tab was in (LOCAL.md 66). The group is rebuilt from its saved model,
++// which keeps no workspace, so they would take the one on screen. Not behind
++// IsEnabled(), as stamping is not (LOCAL.md 12).
++std::optional<tab_groups::TabGroupId> OpenRestoredSavedGroup(
++    BrowserWindowInterface* browser,
++    const base::Uuid& saved_group_id,
++    const std::map<std::string, std::string>& extra_data);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_WORKSPACE_RESTORE_HOOKS_H_

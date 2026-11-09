@@ -1,0 +1,66 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -108,8 +108,23 @@ void WorkspaceService::SetActiveWorkspac
+     return;
+   }
+ 
++  // Resolved, not taken at face value, and THIS IS THE ONE DOOR THAT MAKES
++  // active_guid_ ALWAYS NAME A WORKSPACE THAT EXISTS.
++  //
++  // Without it the window can be driven into a deleted workspace, and the
++  // symptom is a strip with nothing in it: every tab resolves through the
++  // orphan rule to the default workspace, the active guid is the dead one, and
++  // so no tab matches. Watched happening on 2026-09-12 -- reopening a tab of a
++  // just-deleted workspace with Ctrl+Shift+T restores it with its old tag, the
++  // E7b auto-switch followed that tag, and the window went somewhere that no
++  // longer existed (LOCAL.md 18).
++  //
++  // The auto-switch is where it came in, but the fix belongs here rather than
++  // at that call site: every path that sets the active workspace has the same
++  // hole, and a rule enforced at one of four call sites is a rule waiting for
++  // the fifth.
+   const std::string_view effective_guid =
+-      guid.empty() ? kDefaultWorkspaceGuid : guid;
++      ResolveTabGuid(guid, known_guids_);
+   if (std::string_view(active_guid_) == effective_guid) {
+     return;
+   }
+@@ -264,6 +279,23 @@ WorkspaceService::RegisterWorkspaceListC
+ void WorkspaceService::OnWorkspaceListChanged() {
+   known_guids_ = prefs::GetWorkspaceGuids(prefs_);
+ 
++  // The window this service belongs to may have been showing the workspace
++  // that just disappeared -- and the window that deleted it is not necessarily
++  // this one. DeleteWorkspace() moves ITS OWN window to a neighbour before
++  // writing; every other window on the profile finds out here, and would
++  // otherwise sit on a dead guid with an empty strip.
++  if (ResolveTabGuid(active_guid_, known_guids_) != active_guid_) {
++    SetActiveWorkspace(kDefaultWorkspaceGuid);
++
++    // The active tab is very likely one of the ones that just became invisible.
++    // Posted rather than called: this runs from a pref observer, which can be
++    // reached from inside a TabStripModel notification by a future caller, and
++    // activating a tab there would trip the re-entrancy CHECK (design 2.2).
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&WorkspaceService::EnsureActiveTabVisible,
++                                  weak_factory_.GetWeakPtr()));
++  }
++
+   workspace_list_changed_callbacks_.Notify();
+ 
+   // The list changing changes what the strip should draw, not just what the
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -92,7 +92,11 @@ class WorkspaceService : public TabStrip
+   // a storm of relayouts.
+   //
+   // An empty `guid` means the default workspace, matching
+-  // IsVisibleInWorkspace.
++  // IsVisibleInWorkspace, and so does a guid naming a workspace that does not
++  // exist -- the same orphan rule the visibility predicate uses. That makes
++  // active_guid() an invariant worth relying on: it always names a workspace
++  // in the list, so no path can leave this window showing a workspace nothing
++  // can match.
+   //
+   // This changes only our own bookkeeping -- it calls nothing on
+   // TabStripModel -- so the re-entrancy rule above is not in play, and it is

@@ -1,0 +1,341 @@
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -219,6 +219,10 @@ std::map<std::string, std::string> Brows
+   // session file is rebuilt from that map, and must never carry it.
+   extra_data[workspaces::kArchiveIdExtraDataKey] =
+       workspaces::ArchiveIdForTab(tab_strip_model_->GetWebContentsAt(index));
++  // And, for a tab of a saved group, its id in the saved-group model (E18.2).
++  // Same reopen-only rule.
++  workspaces::PopulateSavedTabExtraData(
++      &profile_.get(), tab_strip_model_->GetTabAtIndex(index), &extra_data);
+ 
+   return extra_data;
+ }
+@@ -452,8 +456,18 @@ sessions::LiveTab* BrowserLiveTabContext
+       // Helium Workspaces (LOCAL.md 66): into the workspace it was closed from.
+       group_id = workspaces::OpenRestoredSavedGroup(
+           browser, saved_group_id.value(), tab.extra_data);
++      // Helium Workspaces (E18.2, LOCAL.md 68): the rebuilt tabs take their
++      // closed tabs' data, and a reopened group pulls the window to it.
++      workspaces::OnRestoredSavedGroupOpened(browser, group_id,
++                                             is_restoring_group_or_window,
++                                             original_session_type);
+     }
+ 
++    // Helium Workspaces (E18.2): this closed tab's anchor and name onto its
++    // rebuilt tab.
++    workspaces::ApplyRestoredTabData(browser, tab, group_id,
++                                     is_restoring_group_or_window);
++
+     if (is_restoring_group_or_window) {
+       // Open the saved tab group as-is if the tab is being restored from a
+       // group or window context. This is to enforce that SavedTabGroups are
+--- a/chrome/browser/ui/tab_ui_helper.cc
++++ b/chrome/browser/ui/tab_ui_helper.cc
+@@ -129,6 +129,17 @@ base::CallbackListSubscription TabUIHelp
+ }
+ 
+ std::u16string TabUIHelper::GetTitle() const {
++  // Helium Workspaces (E11): a title the user typed wins over the page's own.
++  // One hook here rather than one per consumer -- tab_data.cc, tab search and
++  // the hover card all read this function. First, before a deferred saved-
++  // group tab's stored title: a reopened group's tabs stay deferred until
++  // clicked, and their names come back with them (E18.2, LOCAL.md 68).
++  if (const workspaces::WorkspaceTabData* const workspace_data =
++          workspaces::WorkspaceTabData::FromWebContents(web_contents());
++      workspace_data && !workspace_data->custom_title().empty()) {
++    return base::UTF8ToUTF16(workspace_data->custom_title());
++  }
++
+   if (auto* tab_features = tab().GetTabFeatures()) {
+     const tab_groups::SavedTabGroupWebContentsListener* wc_listener =
+         tab_features->saved_tab_group_web_contents_listener();
+@@ -140,15 +151,6 @@ std::u16string TabUIHelper::GetTitle() c
+     }
+   }
+ 
+-  // Helium Workspaces (E11): a title the user typed wins over the page's own.
+-  // One hook here rather than one per consumer -- tab_data.cc, tab search and
+-  // the hover card all read this function.
+-  if (const workspaces::WorkspaceTabData* const workspace_data =
+-          workspaces::WorkspaceTabData::FromWebContents(web_contents());
+-      workspace_data && !workspace_data->custom_title().empty()) {
+-    return base::UTF8ToUTF16(workspace_data->custom_title());
+-  }
+-
+   const std::u16string& contents_title = web_contents()->GetTitle();
+   if (!contents_title.empty()) {
+     return contents_title;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -58,6 +58,7 @@
+ #include "content/public/common/url_constants.h"
+ #include "third_party/blink/public/mojom/frame/sudden_termination_disabler_type.mojom.h"
+ #include "ui/base/page_transition_types.h"
++#include "ui/gfx/range/range.h"
+ #include "url/gurl.h"
+ 
+ namespace workspaces {
+@@ -807,6 +808,59 @@ base::AutoReset<std::string> WorkspaceSe
+   return base::AutoReset<std::string>(&stamp_inserted_for_, std::move(guid));
+ }
+ 
++void WorkspaceService::ExpectClosedTabData(tab_groups::TabGroupId group) {
++  if (!tab_strip_->group_model() ||
++      !tab_strip_->group_model()->ContainsTabGroup(group)) {
++    return;
++  }
++  const gfx::Range range =
++      tab_strip_->group_model()->GetTabGroup(group)->ListTabs();
++  for (size_t i = range.start(); i < range.end(); ++i) {
++    if (tabs::TabInterface* const tab =
++            tab_strip_->GetTabAtIndex(static_cast<int>(i))) {
++      rebuilt_tabs_.insert(tab->GetHandle().raw_value());
++    }
++  }
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(
++                     [](base::WeakPtr<WorkspaceService> service) {
++                       if (service) {
++                         service->rebuilt_tabs_.clear();
++                       }
++                     },
++                     weak_factory_.GetWeakPtr()));
++}
++
++void WorkspaceService::ApplyClosedTabData(
++    tabs::TabInterface* tab,
++    const std::map<std::string, std::string>& extra_data) {
++  if (!tab || !tab->GetContents() ||
++      !rebuilt_tabs_.erase(tab->GetHandle().raw_value())) {
++    return;
++  }
++  std::map<std::string, std::string> carried;
++  for (const char* key : kCarriedOnReopenKeys) {
++    const auto it = extra_data.find(key);
++    if (it != extra_data.end() && !it->second.empty()) {
++      carried.insert(*it);
++    }
++  }
++  if (carried.empty()) {
++    return;
++  }
++  // As a restart restores them (RestoreWorkspaceFromExtraData, which also logs
++  // "restored custom title"), then saved and drawn as SetAnchored() and
++  // SetCustomTitle() do: the tab is already in the strip.
++  content::WebContents* const contents = tab->GetContents();
++  RestoreWorkspaceFromExtraData(contents, carried);
++  PersistTag(contents);
++  contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TITLE);
++  workspace_changed_callbacks_.Notify();
++  LOG(INFO) << "[workspaces] restore: a rebuilt tab took its closed tab's"
++            << (carried.contains(kAnchorUrlExtraDataKey) ? " anchor" : "")
++            << (carried.contains(kCustomTitleExtraDataKey) ? " name" : "");
++}
++
+ base::CallbackListSubscription
+ WorkspaceService::RegisterWorkspaceListChangedCallback(
+     base::RepeatingClosure callback) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -7,6 +7,7 @@
+ 
+ #include <map>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -266,6 +267,17 @@ class WorkspaceService : public TabStrip
+   [[nodiscard]] base::AutoReset<std::string> StampInsertedTabsFor(
+       std::string guid);
+ 
++  // The tabs of `group` were just rebuilt from the saved-group model (E18.2,
++  // LOCAL.md 68): remembered until the restore's task ends, so that only they
++  // -- never a group that was already open -- take a closed tab's data.
++  void ExpectClosedTabData(tab_groups::TabGroupId group);
++
++  // Gives `tab`, if it is one of those rebuilt tabs, its closed tab's anchor
++  // and custom title from `extra_data` -- not the workspace (the group has one,
++  // patch 58) and not the pinned item (a group never holds one).
++  void ApplyClosedTabData(tabs::TabInterface* tab,
++                          const std::map<std::string, std::string>& extra_data);
++
+   // How many tabs MoveSelectedTabsToWorkspace() would actually move, so a menu
+   // item can say so. Excludes pinned tabs for the same reason the move does,
+   // which is the point of sharing one collector: a label that promised to move
+@@ -713,6 +725,10 @@ class WorkspaceService : public TabStrip
+   // StampInsertedTabsFor() lives; empty: the workspace on screen.
+   std::string stamp_inserted_for_;
+ 
++  // ExpectClosedTabData()'s tabs (TabHandle raw values), cleared by a task
++  // posted when they are remembered: a restore runs in one task.
++  std::set<int32_t> rebuilt_tabs_;
++
+   // The guids that exist, cached because IsTabVisible() consults them once per
+   // tab per layout pass and re-parsing the pref dict that often is not free.
+   //
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
+@@ -75,6 +75,18 @@ inline constexpr char kPinItemExtraDataK
+ // would take a close back out of the archive.
+ inline constexpr char kArchiveIdExtraDataKey[] = "helium.archive_id";
+ 
++// A closed grouped tab's saved-tab id in Chromium's saved-group model (E18.2,
++// LOCAL.md 68). Same carrier and the same "reopen path only" rule as the
++// archive id: Chromium rebuilds a reopened saved group from that model, and
++// this id is how each rebuilt tab finds its closed tab's anchor and name.
++inline constexpr char kSavedTabExtraDataKey[] = "helium.saved_tab";
++
++// What a rebuilt tab takes back from its closed tab, by that id (E18.2): the
++// anchor and the name -- not the workspace (the group has one, patch 58) and
++// not the pinned item (a group never holds one).
++inline constexpr const char* kCarriedOnReopenKeys[] = {
++    kAnchorUrlExtraDataKey, kCustomTitleExtraDataKey};
++
+ // The workspace `contents` is tagged for, or empty for a tab that has never
+ // been stamped, a pinned tab (pinning clears the tag), or a null argument.
+ // Empty means the implicit default workspace, never "no workspace".
+--- a/chrome/browser/ui/workspace_restore_hooks.cc
++++ b/chrome/browser/ui/workspace_restore_hooks.cc
+@@ -4,14 +4,19 @@
+ 
+ #include "chrome/browser/ui/workspace_restore_hooks.h"
+ 
++#include <algorithm>
++
+ #include "base/auto_reset.h"
+ #include "base/logging.h"
++#include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "components/saved_tab_groups/public/saved_tab_group.h"
++#include "components/saved_tab_groups/public/tab_group_sync_service.h"
+ #include "components/saved_tab_groups/public/types.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "url/gurl.h"
+@@ -73,4 +78,68 @@ std::optional<tab_groups::TabGroupId> Op
+   return group_id;
+ }
+ 
++void PopulateSavedTabExtraData(Profile* profile,
++                               tabs::TabInterface* tab,
++                               std::map<std::string, std::string>* extra_data) {
++  // ponytail: one SavedTabGroup copy per closed grouped tab (GetGroup returns
++  // a copy), O(n^2) for a big group's close; cache per close if one slows.
++  tab_groups::TabGroupSyncService* const sync =
++      tab && tab->GetGroup()
++          ? tab_groups::TabGroupSyncServiceFactory::GetForProfile(profile)
++          : nullptr;
++  const std::optional<tab_groups::SavedTabGroup> saved_group =
++      sync ? sync->GetGroup(*tab->GetGroup()) : std::nullopt;
++  if (const tab_groups::SavedTabGroupTab* const saved_tab =
++          saved_group ? saved_group->GetTab(tab->GetHandle().raw_value())
++                      : nullptr) {
++    (*extra_data)[kSavedTabExtraDataKey] =
++        saved_tab->saved_tab_guid().AsLowercaseString();
++  }
++}
++
++void OnRestoredSavedGroupOpened(
++    BrowserWindowInterface* browser,
++    std::optional<tab_groups::TabGroupId> group_id,
++    bool is_restoring_group_or_window,
++    sessions::tab_restore::Type original_session_type) {
++  WorkspaceService* const workspace_service = WorkspaceService::From(browser);
++  if (!workspace_service || !group_id || !is_restoring_group_or_window) {
++    return;
++  }
++  workspace_service->ExpectClosedTabData(*group_id);
++  if (original_session_type == sessions::tab_restore::Type::GROUP &&
++      workspace_service->IsEnabled()) {
++    tab_groups::SavedTabGroupUtils::FocusFirstTabOrWindowInOpenGroup(
++        *group_id);
++  }
++}
++
++void ApplyRestoredTabData(BrowserWindowInterface* browser,
++                          const sessions::tab_restore::Tab& tab,
++                          std::optional<tab_groups::TabGroupId> group_id,
++                          bool is_restoring_group_or_window) {
++  const auto carries = [&tab](const char* key) {
++    const auto it = tab.extra_data.find(key);
++    return it != tab.extra_data.end() && !it->second.empty();
++  };
++  const auto saved_tab = tab.extra_data.find(kSavedTabExtraDataKey);
++  WorkspaceService* const workspace_service = WorkspaceService::From(browser);
++  if (!workspace_service || !is_restoring_group_or_window || !group_id ||
++      saved_tab == tab.extra_data.end() ||
++      !std::ranges::any_of(kCarriedOnReopenKeys, carries)) {
++    return;
++  }
++  const std::optional<tab_groups::SavedTabGroup> group =
++      tab_groups::TabGroupSyncServiceFactory::GetForProfile(
++          browser->GetProfile())
++          ->GetGroup(tab.saved_group_id.value());
++  const tab_groups::SavedTabGroupTab* const rebuilt =
++      group ? group->GetTab(base::Uuid::ParseLowercase(saved_tab->second))
++            : nullptr;
++  if (rebuilt && rebuilt->local_tab_id()) {
++    workspace_service->ApplyClosedTabData(
++        tabs::TabHandle(*rebuilt->local_tab_id()).Get(), tab.extra_data);
++  }
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/workspace_restore_hooks.h
++++ b/chrome/browser/ui/workspace_restore_hooks.h
+@@ -14,8 +14,13 @@
+ #include "components/tab_groups/tab_group_id.h"
+ 
+ class BrowserWindowInterface;
++class Profile;
+ class TabStripModel;
+ 
++namespace tabs {
++class TabInterface;
++}
++
+ // Helium Workspaces: what BrowserLiveTabContext's restore hooks do. Each hook
+ // there is one call, so a rebase that rewrites the code around it moves a
+ // line, never a block that still compiles in the wrong place (review #23).
+@@ -50,6 +55,35 @@ std::optional<tab_groups::TabGroupId> Op
+     const base::Uuid& saved_group_id,
+     const std::map<std::string, std::string>& extra_data);
+ 
++// GetExtraDataForTab: a saved group's tab's id in the saved-group model
++// (E18.2). The group's reopen rebuilds the tab from that model, and this id
++// is how the rebuilt tab finds this tab's anchor and name. The reopen path
++// only, as the archive id.
++void PopulateSavedTabExtraData(Profile* profile,
++                               tabs::TabInterface* tab,
++                               std::map<std::string, std::string>* extra_data);
++
++// AddRestoredTab, right after OpenRestoredSavedGroup (E18.2, LOCAL.md 68): the
++// rebuilt tabs take their closed tabs' data, in this call and the group's
++// later ones (ApplyRestoredTabData). And a reopened GROUP pulls the window to
++// it, as Chromium does for a group of 2+ tabs from its 2nd tab's call -- a
++// group of ONE tab has no 2nd call. With Workspaces off, stock.
++void OnRestoredSavedGroupOpened(
++    BrowserWindowInterface* browser,
++    std::optional<tab_groups::TabGroupId> group_id,
++    bool is_restoring_group_or_window,
++    sessions::tab_restore::Type original_session_type);
++
++// AddRestoredTab, for every tab of a saved group: this closed tab's anchor and
++// name onto its rebuilt tab, found by the saved-tab id its close recorded.
++// Only tabs this restore rebuilt take them; a group that was open already
++// keeps what it has. Asked only of a tab that HAS an anchor or a name: the
++// lookup copies the saved group.
++void ApplyRestoredTabData(BrowserWindowInterface* browser,
++                          const sessions::tab_restore::Tab& tab,
++                          std::optional<tab_groups::TabGroupId> group_id,
++                          bool is_restoring_group_or_window);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_WORKSPACE_RESTORE_HOOKS_H_

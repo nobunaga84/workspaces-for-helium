@@ -1,0 +1,965 @@
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -46,6 +46,7 @@
+ #include "chrome/browser/ui/views/tabs/horizontal/horizontal_tab_closing_helper.h"
+ #include "chrome/browser/ui/views/tabs/tab/tab_context_menu_controller.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_collection_types.h"
+@@ -647,6 +648,14 @@ TabStripCollectionController::CreateUnpi
+ TabDragTarget* TabStripCollectionController::GetWorkspaceDragTarget(
+     const gfx::Point& point_in_screen,
+     const gfx::Rect& draggable_bounds) {
++  // The bar decides first (C4): it reaches outside the bounds.
++  if (WorkspaceRailView* const rail =
++          browser_view_ ? WorkspaceRailView::FindIn(browser_view_) : nullptr) {
++    if (TabDragTarget* const bar = rail->GetTabDragTarget(
++            point_in_screen, draggable_bounds.bottom())) {
++      return bar;
++    }
++  }
+   if (!draggable_bounds.Contains(point_in_screen) ||
+       GetDragHandler().IsDraggingPinnedTabs() ||
+       GetDragHandler().IsDraggingGroups()) {
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
+@@ -152,9 +152,12 @@ class TabStripCollectionController : pub
+   // and the section hides itself while it is off.
+   std::unique_ptr<views::View> CreateUnpinnedHeader();
+   // The fork's drop targets beside the list, asked first by the tab strip's
+-  // GetTabDragTarget with its draggable bounds: the pinned section (E15d),
+-  // when the dragged tabs are inside the bounds, over it, and could be pinned
+-  // there -- not favorites, not a group. Null otherwise.
++  // GetTabDragTarget with its draggable bounds: the bar of workspaces below
++  // the list (C4), which decides -- it claims its own rect, raised to the
++  // bounds' bottom edge, so no point between the two tears the tabs off --
++  // then the pinned section (E15d), when the dragged tabs are inside the
++  // bounds, over it, and could be pinned there: not favorites, not a group.
++  // Null otherwise.
+   TabDragTarget* GetWorkspaceDragTarget(const gfx::Point& point_in_screen,
+                                         const gfx::Rect& draggable_bounds);
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -127,7 +127,6 @@
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/controls/separator.h"
+ #include "ui/views/focus/focus_manager.h"
+-#include "ui/views/interaction/element_tracker_views.h"
+ #include "ui/views/layout/box_layout.h"
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/painter.h"
+@@ -3148,6 +3147,11 @@ void WorkspacePinnedSectionView::ShowDel
+ 
+ void WorkspacePinnedSectionView::MoveRow(const std::string& id,
+                                          const std::string& guid) {
++  // Already there: Move would only put it last (C4, the one guard for the
++  // menu and a drop on the bar).
++  if (guid == drawn_guid_) {
++    return;
++  }
+   workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
+   if (!service || !store_ ||
+@@ -3677,9 +3681,13 @@ void WorkspacePinnedSectionView::OnRowDr
+     }
+   } else if (target.list_index) {
+     UnpinItem(id, *target.list_index, target.list_group);
++  } else if (!target.workspace.empty()) {
++    // C4: as the menu's Move to workspace -- last there, its pages with it.
++    MoveRow(id, target.workspace);
+   }
+   // C8: a folder the drag opened closes again unless the drop went into it;
+-  // nothing is kept for a drop in the list, a cancel or no place at all.
++  // nothing is kept for a drop in the list or on the bar, a cancel or no
++  // place at all.
+   CloseHoverOpened(store_ ? KeptFolders(store_->tree(), target.to,
+                                         target.where)
+                           : std::vector<std::string>());
+@@ -3690,22 +3698,36 @@ void WorkspacePinnedSectionView::UpdateD
+   if (!indicator || (drag_id_.empty() && !dragging_tabs_)) {
+     return;
+   }
++  const DropTarget target =
++      dragging_tabs_ ? TabTargetAt(drag_point_) : TargetAt(drag_point_);
++  // C4: the row holds the mouse, so the bar never sees it: it is told here
++  // which chip to light, or none. A tab drag lights its chip through the
++  // bar's own TabDragTarget.
++  WorkspaceRailView* const rail =
++      drag_id_.empty() ? nullptr : WorkspaceRailView::FindIn(this);
++  if (rail) {
++    rail->SetDropHover(target.workspace);
++  }
+   // Held near the top or bottom edge, the list scrolls, as for a dragged tab.
+   // Asked again after every scroll step too: that is where it stops at the
+-  // end (TabDragScrollHandler stops only when told the position again).
++  // end (TabDragScrollHandler stops only when told the position again). Held
++  // over the bar it stops, or the probe, below the list, would scroll it to
++  // the end (C4).
+   if (views::ScrollView* const scroll_view = GetScrollView()) {
+-    const int y =
+-        views::View::ConvertPointFromScreen(scroll_view, drag_point_).y();
+-    // The probe a dragged tab would be: a Today tab's height (E18).
+-    const int height =
+-        collapsed_ ? GetLayoutConstant(LayoutConstant::kVerticalTabHeight)
+-                   : workspaces::prefs::TabRowHeight();
+-    drag_scroll_.OnDraggedTabPositionUpdated(
+-        *scroll_view,
+-        gfx::Rect(0, y - height / 2, scroll_view->width(), height));
++    if (rail && rail->GetBoundsInScreen().Contains(drag_point_)) {
++      drag_scroll_.StopScrolling(*scroll_view);
++    } else {
++      const int y =
++          views::View::ConvertPointFromScreen(scroll_view, drag_point_).y();
++      // The probe a dragged tab would be: a Today tab's height (E18).
++      const int height =
++          collapsed_ ? GetLayoutConstant(LayoutConstant::kVerticalTabHeight)
++                     : workspaces::prefs::TabRowHeight();
++      drag_scroll_.OnDraggedTabPositionUpdated(
++          *scroll_view,
++          gfx::Rect(0, y - height / 2, scroll_view->width(), height));
++    }
+   }
+-  const DropTarget target =
+-      dragging_tabs_ ? TabTargetAt(drag_point_) : TargetAt(drag_point_);
+   // C8: what a held drag would open -- a closed folder it would go into (the
+   // peek row under one included, RowTargetAt), not too big to bury the place
+   // (B6); or, for tabs, the header of a folded card (D13).
+@@ -3765,6 +3787,13 @@ void WorkspacePinnedSectionView::EndDrag
+   if (drag_id_.empty() && !dragging_tabs_) {
+     return;
+   }
++  // C4: the chip a row was held over goes dark -- a drop, a cancel, a drag
++  // ResumeDrag could not carry on.
++  if (!drag_id_.empty()) {
++    if (WorkspaceRailView* const rail = WorkspaceRailView::FindIn(this)) {
++      rail->SetDropHover({});
++    }
++  }
+   drag_id_.clear();
+   dragging_tabs_ = false;
+   drag_scrolled_subscription_ = {};
+@@ -3862,10 +3891,21 @@ void WorkspacePinnedSectionView::CloseHo
+ 
+ WorkspacePinnedSectionView::DropTarget WorkspacePinnedSectionView::TargetAt(
+     const gfx::Point& point_in_screen) {
++  if (drag_id_.empty()) {
++    return DropTarget();
++  }
++  // C4: over another workspace's chip on the bar, the row goes there.
++  if (WorkspaceRailView* const rail = WorkspaceRailView::FindIn(this)) {
++    if (std::string guid = rail->DropTargetAt(point_in_screen); !guid.empty()) {
++      DropTarget target;
++      target.workspace = std::move(guid);
++      return target;
++    }
++  }
+   // Only where the list is on screen: not over the favorites above it, the
+-  // rail below it, or the page.
++  // rest of the rail below it, or the page.
+   views::ScrollView* const scroll_view = GetScrollView();
+-  if (drag_id_.empty() || !list_ || !scroll_view ||
++  if (!list_ || !scroll_view ||
+       !scroll_view->GetLocalBounds().Contains(
+           views::View::ConvertPointFromScreen(scroll_view, point_in_screen))) {
+     return DropTarget();
+@@ -4210,13 +4250,8 @@ void WorkspacePinnedSectionView::ShowCon
+     ui::mojom::MenuSourceType source_type) {
+   if (source == header_) {
+     // The workspace's own menu, as its chip on the bar has it (E17b): one
+-    // menu, run by the bar, which knows the list. Found by the id it sets on
+-    // itself; none in a window without the bar.
+-    if (WorkspaceRailView* const rail =
+-            views::ElementTrackerViews::GetInstance()
+-                ->GetFirstMatchingViewAs<WorkspaceRailView>(
+-                    kWorkspaceRailElementId,
+-                    views::ElementTrackerViews::GetContextForView(this))) {
++    // menu, run by the bar, which knows the list.
++    if (WorkspaceRailView* const rail = WorkspaceRailView::FindIn(this)) {
+       rail->ShowWorkspaceMenuFor(drawn_guid_, source, point, source_type);
+     }
+     return;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -323,7 +323,9 @@ class WorkspacePinnedSectionView
+   void DeleteRow(const std::string& id);
+   void ShowDeleteFolderConfirm(const std::string& id, int items);
+   // C3: row `id` -- a folder with all it holds -- goes last in workspace
+-  // `guid`, and its open pages, in every window, follow it there.
++  // `guid`, and its open pages, in every window, follow it there. Never to
++  // the workspace on screen, where it is already: the menu greys it, and a
++  // row dropped on its chip on the bar (C4) comes here too.
+   void MoveRow(const std::string& id, const std::string& guid);
+   // C17's folder actions. Open all asks first above kOpenAllAskAbove pages,
+   // then opens the folder's closed pages in posted slices (OpenAllSlice).
+@@ -351,6 +353,9 @@ class WorkspacePinnedSectionView
+     // In the tab list: the item becomes a Today tab at this model index.
+     std::optional<int> list_index;
+     std::optional<tab_groups::TabGroupId> list_group;
++    // C4: over another workspace's chip on the bar, a row's drag only: the
++    // row moves there (MoveRow). The chip lights; nothing else is drawn.
++    std::string workspace;
+     // What shows where it would go, in the scroll view's contents: a line
+     // between rows or tabs, or a frame round the folder it would go into
+     // (Where::kInto). Empty: nowhere, and a drop there does nothing.
+@@ -362,7 +367,8 @@ class WorkspacePinnedSectionView
+                  const gfx::Point& point_in_screen);
+   // Draws where a drop at the last point would go, and scrolls the list while
+   // it is held near an edge; also run when the list scrolls under a still
+-  // pointer, which is how the scrolling stops at the end (E15d review).
++  // pointer, which is how the scrolling stops at the end (E15d review). A row
++  // held over a chip on the bar lights it, and the list holds still (C4).
+   void UpdateDrag();
+   // Follows the list's scrolling until EndDrag().
+   void BeginDrag();
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -7,20 +7,25 @@
+ #include <stddef.h>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <iterator>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <type_traits>
+ #include <utility>
+ #include <vector>
+ 
++#include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/i18n/number_formatting.h"
+ #include "base/logging.h"
++#include "base/no_destructor.h"
++#include "base/pickle.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+@@ -30,6 +35,7 @@
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+@@ -47,6 +53,9 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
++#include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+ #include "chrome/browser/ui/views/tabs/vertical/top_container_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_edit_bubble_view.h"
+@@ -60,6 +69,11 @@
+ #include "components/vector_icons/vector_icons.h"
+ #include "content/public/browser/web_contents.h"
+ #include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/clipboard/clipboard_format_type.h"
++#include "ui/base/dragdrop/drag_drop_types.h"
++#include "ui/base/dragdrop/drop_target_event.h"
++#include "ui/base/dragdrop/mojom/drag_drop_types.mojom.h"
++#include "ui/base/dragdrop/os_exchange_data.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/menu_source_utils.h"
+@@ -69,9 +83,12 @@
+ #include "ui/base/models/image_model.h"
+ #include "ui/color/color_id.h"
+ #include "ui/color/color_provider.h"
++#include "ui/compositor/layer.h"
++#include "ui/compositor/layer_tree_owner.h"
+ #include "ui/compositor/paint_recorder.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/color_utils.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/gfx/text_constants.h"
+ #include "ui/gfx/text_elider.h"
+@@ -86,6 +103,7 @@
+ #include "ui/views/controls/label.h"
+ #include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/controls/scroll_view.h"
++#include "ui/views/interaction/element_tracker_views.h"
+ #include "ui/views/layout/flex_layout_types.h"
+ #include "ui/views/layout/layout_types.h"
+ #include "ui/views/paint_info.h"
+@@ -148,6 +166,11 @@ constexpr SkAlpha kCurrentFillAlphaLight
+ constexpr int kBadgeDiscSize = 14;
+ constexpr int kBadgeIconSize = 12;
+ 
++// C4: a drop's marks, as thick as the pinned section's -- the ring a chip
++// draws while a drop on it would move there, and the line between two chips
++// where a dragged chip would go.
++constexpr int kDropLineThickness = 2;
++
+ // The arrows' chevrons (E17a), smaller than the 20 px icons of Helium's own
+ // buttons because the arrows are narrower.
+ constexpr int kArrowIconSize = 14;
+@@ -176,6 +199,17 @@ ui::ImageModel MenuIcon(const gfx::Vecto
+                                         kMenuIconSize);
+ }
+ 
++// A chip's drag carries this format alone (C4), as a toolbar button's carries
++// its own (wish 6c): only a bar takes it. It holds the chip's workspace and
++// its profile's path -- every profile's Home is "default", and another
++// profile's window, or another copy of the browser, takes a drop too.
++const ui::ClipboardFormatType& ChipDragFormat() {
++  static const base::NoDestructor<ui::ClipboardFormatType> format(
++      ui::ClipboardFormatType::CustomPlatformType(
++          "chromium/x-helium-workspace-chip"));
++  return *format;
++}
++
+ // Close all / Delete ask first above this many tabs: Recently Closed keeps
+ // only this many entries (TabRestoreServiceHelper::kMaxEntries), and these
+ // close one tab per entry, so beyond it Ctrl+Shift+T cannot bring them back
+@@ -522,6 +556,17 @@ class WorkspaceChip : public WorkspaceRa
+     UpdateColors();
+   }
+ 
++  // C4: lit while a drop here would move the dragged tabs or pinned row to
++  // this workspace -- a ring PaintChildren draws, which nothing else on the
++  // chip uses: the fill is the current workspace's, the ink drop the hover's.
++  void SetDropTarget(bool drop_target) {
++    if (drop_target_ == drop_target) {
++      return;
++    }
++    drop_target_ = drop_target;
++    SchedulePaint();
++  }
++
+   // The workspace's name, which is also the tooltip MakeRailButton gave the
+   // chip; SetBadge puts it back (C14).
+   void set_name(std::u16string name) { name_ = std::move(name); }
+@@ -599,11 +644,33 @@ class WorkspaceChip : public WorkspaceRa
+   void PaintChildren(const views::PaintInfo& info) override {
+     WorkspaceRailButton::PaintChildren(info);
+     const ui::ColorProvider* const provider = GetColorProvider();
+-    if (!badge_ || !provider) {
++    if ((!badge_ && !drop_target_) || !provider) {
+       return;
+     }
+     ui::PaintRecorder recorder(info.context(), size());
+     gfx::Canvas* const canvas = recorder.canvas();
++    const bool active_frame =
++        GetWidget() && GetWidget()->ShouldPaintAsActive();
++    // C4: the drop's ring, under the badge, in the workspace's own colour at
++    // full strength -- the keyboard focus ring is drawn in the same place in
++    // the drop colour, and a chip may keep focus through a row's drag. Its
++    // outer edge follows the chip's corner, as a rounded border's does.
++    if (drop_target_) {
++      cc::PaintFlags ring;
++      ring.setAntiAlias(true);
++      ring.setStyle(cc::PaintFlags::kStroke_Style);
++      ring.setStrokeWidth(kDropLineThickness);
++      ring.setColor(
++          WorkspaceRailView::WorkspaceColor(*provider, color_, active_frame));
++      gfx::RectF bounds(GetLocalBounds());
++      bounds.Inset(kDropLineThickness / 2.0f);
++      canvas->DrawRoundRect(
++          bounds, WorkspaceRailView::kChipRadius - kDropLineThickness / 2.0f,
++          ring);
++    }
++    if (!badge_) {
++      return;
++    }
+     const gfx::Rect disc(width() - kBadgeDiscSize, height() - kBadgeDiscSize,
+                          kBadgeDiscSize, kBadgeDiscSize);
+     // kColorToolbar: Helium paints the strip's FrameTheme background with it
+@@ -617,9 +684,8 @@ class WorkspaceChip : public WorkspaceRa
+     const gfx::ImageSkia icon =
+         ui::ImageModel::FromVectorIcon(
+             tabs::GetAlertIcon(*badge_),
+-            tabs::GetAlertIndicatorColor(
+-                *badge_, /*is_tab_active=*/false,
+-                GetWidget() && GetWidget()->ShouldPaintAsActive()),
++            tabs::GetAlertIndicatorColor(*badge_, /*is_tab_active=*/false,
++                                         active_frame),
+             kBadgeIconSize)
+             .Rasterize(provider);
+     const int inset = (kBadgeDiscSize - kBadgeIconSize) / 2;
+@@ -631,6 +697,7 @@ class WorkspaceChip : public WorkspaceRa
+   raw_ptr<const gfx::VectorIcon> icon_ = nullptr;
+   bool tint_text_ = false;
+   bool current_ = false;
++  bool drop_target_ = false;
+   std::u16string name_;
+   std::optional<tabs::TabAlert> badge_;
+   std::u16string badge_line_;
+@@ -760,7 +827,11 @@ WorkspaceRailView::WorkspaceRailView(
+   }
+ }
+ 
+-WorkspaceRailView::~WorkspaceRailView() = default;
++WorkspaceRailView::~WorkspaceRailView() {
++  // First, while all of this is still here: a tab drag holding this bar as
++  // its target lets go of it (C4).
++  will_destroy_callbacks_.Notify();
++}
+ 
+ void WorkspaceRailView::AddedToWidget() {
+   views::FlexLayoutView::AddedToWidget();
+@@ -877,10 +948,20 @@ void WorkspaceRailView::Rebuild() {
+     button->set_name(name);
+     button->SetLook(colors[i], icon, /*tint_text=*/entries[i].icon.empty());
+     button->set_context_menu_controller(this);
++    // C4: dragged along the bar to reorder, once there is an order to change.
++    if (entries.size() > 1) {
++      button->set_drag_controller(this);
++    }
++    // A drag held over a chip keeps it lit through a list change (C4).
++    button->SetDropTarget(entries[i].guid == drop_hover_guid_);
+ 
+     guids_.push_back(entries[i].guid);
+     buttons_.push_back(scroll_contents_->AddChildView(std::move(button)));
+   }
++  // Its workspace gone, no chip is lit.
++  if (!std::ranges::contains(guids_, drop_hover_guid_)) {
++    SetDropHover({});
++  }
+ 
+   UpdateHighlight();
+   // New chips start bare; badged here, not a task later (C14).
+@@ -1177,6 +1258,357 @@ void WorkspaceRailView::ShowArrowsOnOver
+   forward_button_->SetVisible(show);
+ }
+ 
++// static
++WorkspaceRailView* WorkspaceRailView::FindIn(views::View* view) {
++  return views::ElementTrackerViews::GetInstance()
++      ->GetFirstMatchingViewAs<WorkspaceRailView>(
++          kWorkspaceRailElementId,
++          views::ElementTrackerViews::GetContextForView(view));
++}
++
++// ponytail: no chip slides into view during any of the three drags (D17): a
++// chip scrolled out of the row is no target until the user slides it in. Add
++// a TabDragScrollHandler over the scroller if workspaces outgrow the bar.
++TabDragTarget* WorkspaceRailView::GetTabDragTarget(
++    const gfx::Point& point_in_screen,
++    int list_bottom) {
++  // Only a drag this window holds -- Attach hands its context the drag's
++  // controller, as the pinned section tells. One from another window, if
++  // attached here, would switch this window to its workspace mid-drag (D3).
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || !service->IsEnabled() || !IsDrawn() ||
++      !DragContext()->GetDragController()) {
++    return nullptr;
++  }
++  // Up to the list's edge: in zen mode the list's bounds end 8 DIP above the
++  // bar, and a drag crossing a point nobody claims tears the tab off.
++  gfx::Rect zone = GetBoundsInScreen();
++  zone.SetVerticalBounds(std::min(zone.y(), list_bottom), zone.bottom());
++  return zone.Contains(point_in_screen) ? this : nullptr;
++}
++
++std::string WorkspaceRailView::DropTargetAt(
++    const gfx::Point& point_in_screen) const {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || !IsDrawn()) {
++    return std::string();
++  }
++  // In the chips' row, the layer's scroll offset included; never a chip
++  // scrolled out of view or under an arrow.
++  const gfx::Point point =
++      views::View::ConvertPointFromScreen(scroll_contents_, point_in_screen);
++  if (!scroll_view_->GetVisibleRect().Contains(point)) {
++    return std::string();
++  }
++  for (size_t i = 0; i < buttons_.size(); ++i) {
++    // With its margin, so the chips' slots meet; a chip made by a Rebuild
++    // has no bounds until the next layout.
++    gfx::Rect slot = buttons_[i]->bounds();
++    if (slot.IsEmpty()) {
++      continue;
++    }
++    slot.Outset(kChipMargin);
++    if (slot.Contains(point)) {
++      // The workspace on screen already holds what is dragged.
++      return guids_[i] == service->active_guid() ? std::string() : guids_[i];
++    }
++  }
++  return std::string();
++}
++
++void WorkspaceRailView::SetDropHover(const std::string& guid) {
++  if (guid == drop_hover_guid_) {
++    return;
++  }
++  drop_hover_guid_ = guid;
++  for (size_t i = 0; i < buttons_.size(); ++i) {
++    buttons_[i]->SetDropTarget(guids_[i] == guid);
++  }
++  // On each change only, so "a drag held over a chip lights it" can be read
++  // from the log.
++  LOG(INFO) << "[workspaces] rail drop: over "
++            << (guid.empty() ? std::string("none")
++                             : base::StrCat({"'", guid, "'"}));
++}
++
++TabDragContext* WorkspaceRailView::DragContext() {
++  return BrowserView::GetBrowserViewForBrowser(browser_)
++      ->tab_strip_view()
++      ->GetDragContext();
++}
++
++TabDragContext* WorkspaceRailView::OnTabDragUpdated(
++    TabDragTarget::DragController& controller,
++    const gfx::Point& point_in_screen) {
++  // A chip lights only for a drag that would move something (D5): favorites
++  // are every workspace's, and a group header's datum carries no tab.
++  const bool movable = std::ranges::any_of(
++      controller.GetSessionData().tab_drag_data_,
++      [](const TabDragData& data) { return data.contents && !data.pinned; });
++  SetDropHover(movable ? DropTargetAt(point_in_screen) : std::string());
++  // Never null, which would tear the tabs off: over the rest of the bar the
++  // drop is the list's, where the drag left the tabs (D4).
++  return DragContext();
++}
++
++void WorkspaceRailView::OnTabDragExited(const gfx::Point& point_in_screen) {
++  SetDropHover({});
++}
++
++void WorkspaceRailView::OnTabDragEnded() {
++  SetDropHover({});
++}
++
++bool WorkspaceRailView::CanDropTab() {
++  return !drop_hover_guid_.empty();
++}
++
++void WorkspaceRailView::HandleTabDrop(
++    TabDragTarget::DragController& controller) {
++  // Handles, copied now: the drag's data is cleared when it ends.
++  std::vector<tabs::TabHandle> dragged;
++  for (const TabDragData& data : controller.GetSessionData().tab_drag_data_) {
++    if (tabs::TabInterface* const tab =
++            data.contents
++                ? tabs::TabInterface::MaybeGetFromContents(data.contents)
++                : nullptr) {
++      dragged.push_back(tab->GetHandle());
++    }
++  }
++  const std::string guid = drop_hover_guid_;
++  LOG(INFO) << "[workspaces] rail drop: " << dragged.size() << " tab(s) -> '"
++            << guid << "'";
++  SetDropHover({});
++  // Posted (D6), never run here. A drop can arrive from inside a dragged
++  // tab's removal, where any model call CHECK-crashes; and a group dragged by
++  // its header has its tab selected again once this returns, which after the
++  // move would switch the window to it. The tabs are drawn in their list
++  // slots meanwhile.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<WorkspaceRailView> self,
++             const std::vector<tabs::TabHandle>& dragged,
++             const std::string& guid) {
++            workspaces::WorkspaceService* const service =
++                self ? workspaces::WorkspaceService::From(self->browser_)
++                     : nullptr;
++            if (!service) {
++              return;
++            }
++            // Those still in this window: one may have closed, or gone to
++            // another window, since the drop.
++            TabStripModel* const model = self->browser_->GetTabStripModel();
++            std::vector<tabs::TabInterface*> tabs;
++            for (const tabs::TabHandle& handle : dragged) {
++              tabs::TabInterface* const tab = handle.Get();
++              if (tab && model->GetIndexOfTab(tab) != TabStripModel::kNoTab) {
++                tabs.push_back(tab);
++              }
++            }
++            // The menu's own move: to the top of that workspace's Today.
++            service->MoveTabsToWorkspace(tabs, guid);
++          },
++          weak_factory_.GetWeakPtr(), std::move(dragged), guid));
++}
++
++base::CallbackListSubscription WorkspaceRailView::RegisterWillDestroyCallback(
++    base::OnceClosure callback) {
++  return will_destroy_callbacks_.Add(std::move(callback));
++}
++
++void WorkspaceRailView::WriteDragDataForView(views::View* sender,
++                                             const gfx::Point& press_pt,
++                                             ui::OSExchangeData* data) {
++  // The guid, never the chip: a list change in any window deletes the chips
++  // in the middle of the drag (Rebuild).
++  for (size_t i = 0; i < buttons_.size(); ++i) {
++    if (buttons_[i] == sender) {
++      base::Pickle pickle;
++      pickle.WriteString(guids_[i]);
++      pickle.WriteString(browser_->GetProfile()->GetPath().AsUTF8Unsafe());
++      data->SetPickledData(ChipDragFormat(), pickle);
++      return;
++    }
++  }
++}
++
++int WorkspaceRailView::GetDragOperationsForView(views::View* sender,
++                                                const gfx::Point& p) {
++  return ui::DragDropTypes::DRAG_MOVE;
++}
++
++bool WorkspaceRailView::CanStartDragForView(views::View* sender,
++                                            const gfx::Point& press_pt,
++                                            const gfx::Point& p) {
++  // Along the bar only, and a real move: a touch long-press, which does not
++  // move, opens the chip's menu.
++  const int along_x = std::abs(p.x() - press_pt.x());
++  const int along_y = std::abs(p.y() - press_pt.y());
++  return GetOrientation() == views::LayoutOrientation::kHorizontal
++             ? along_x > along_y
++             : along_y > along_x;
++}
++
++bool WorkspaceRailView::GetDropFormats(
++    int* formats,
++    std::set<ui::ClipboardFormatType>* format_types) {
++  format_types->insert(ChipDragFormat());
++  return true;
++}
++
++bool WorkspaceRailView::CanDrop(const ui::OSExchangeData& data) {
++  return data.HasCustomFormat(ChipDragFormat());
++}
++
++int WorkspaceRailView::OnDragUpdated(const ui::DropTargetEvent& event) {
++  if (!DraggedChip(event.data())) {
++    SetReorderGap(-1);
++    return ui::DragDropTypes::DRAG_NONE;
++  }
++  // The gap: the chips whose middle is before the pointer, along the bar,
++  // with the pointer held to the chips in view -- over an arrow, the gap at
++  // that end of what is shown.
++  const gfx::Rect visible = scroll_view_->GetVisibleRect();
++  const gfx::Point point = views::View::ConvertPointToTarget(
++      this, scroll_contents_, event.location());
++  const bool row = GetOrientation() == views::LayoutOrientation::kHorizontal;
++  const int along =
++      row ? std::max(visible.x(), std::min(point.x(), visible.right() - 1))
++          : std::max(visible.y(), std::min(point.y(), visible.bottom() - 1));
++  int gap = 0;
++  for (const WorkspaceChip* chip : buttons_) {
++    // A chip a Rebuild just made has no place until the next layout.
++    if (chip->bounds().IsEmpty()) {
++      continue;
++    }
++    const gfx::Point middle = chip->bounds().CenterPoint();
++    if ((row ? middle.x() : middle.y()) < along) {
++      ++gap;
++    }
++  }
++  SetReorderGap(gap);
++  // A move even beside the chip's own place: the drop logs that it stayed.
++  return ui::DragDropTypes::DRAG_MOVE;
++}
++
++void WorkspaceRailView::OnDragExited() {
++  // Off the bar, Escape, or a drop elsewhere.
++  SetReorderGap(-1);
++}
++
++views::View::DropCallback WorkspaceRailView::GetDropCallback(
++    const ui::DropTargetEvent& event) {
++  // Views sends no OnDragExited after a drop it takes: the line goes here.
++  const int gap = reorder_gap_;
++  SetReorderGap(-1);
++  const std::optional<size_t> from = DraggedChip(event.data());
++  // A gap from before a list change in another window may be past the end.
++  if (!from || gap < 0 || gap > static_cast<int>(guids_.size())) {
++    return base::NullCallback();
++  }
++  const std::string guid = guids_[*from];
++  // The list without the chip: every gap after its own place is one less.
++  const int index = static_cast<int>(*from);
++  const int offset = (gap > index ? gap - 1 : gap) - index;
++  if (offset == 0) {
++    LOG(INFO) << "[workspaces] rail reorder: '" << guid
++              << "' dropped where it was";
++    return base::NullCallback();
++  }
++  LOG(INFO) << "[workspaces] rail reorder: '" << guid << "' gap " << gap
++            << " -> offset " << offset;
++  // Posted: MoveWorkspace rebuilds every bar at once, this one's chips too,
++  // while the drag's loop is still on the dragged chip's stack (View::DoDrag).
++  return base::BindOnce(
++      [](base::WeakPtr<WorkspaceRailView> self, const std::string& guid,
++         int offset, const ui::DropTargetEvent&,
++         ui::mojom::DragOperation& output_drag_op,
++         std::unique_ptr<ui::LayerTreeOwner>) {
++        output_drag_op = ui::mojom::DragOperation::kMove;
++        base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++            FROM_HERE,
++            base::BindOnce(
++                [](base::WeakPtr<WorkspaceRailView> self,
++                   const std::string& guid, int offset) {
++                  if (workspaces::WorkspaceService* const service =
++                          self ? workspaces::WorkspaceService::From(
++                                     self->browser_)
++                               : nullptr) {
++                    service->MoveWorkspace(guid, offset);
++                  }
++                },
++                self, guid, offset));
++      },
++      weak_factory_.GetWeakPtr(), guid, offset);
++}
++
++std::optional<size_t> WorkspaceRailView::DraggedChip(
++    const ui::OSExchangeData& data) const {
++  const std::optional<base::Pickle> pickle =
++      data.GetPickledData(ChipDragFormat());
++  if (!pickle) {
++    return std::nullopt;
++  }
++  base::PickleIterator iterator(*pickle);
++  std::string guid;
++  std::string profile_path;
++  if (!iterator.ReadString(&guid) || !iterator.ReadString(&profile_path) ||
++      profile_path != browser_->GetProfile()->GetPath().AsUTF8Unsafe()) {
++    return std::nullopt;
++  }
++  const auto it = std::ranges::find(guids_, guid);
++  if (it == guids_.end()) {
++    return std::nullopt;
++  }
++  return static_cast<size_t>(it - guids_.begin());
++}
++
++void WorkspaceRailView::SetReorderGap(int gap) {
++  reorder_gap_ = gap;
++  if (gap < 0) {
++    if (views::View* const line = reorder_line_.view()) {
++      line->SetVisible(false);
++    }
++    return;
++  }
++  if (!reorder_line_.view()) {
++    auto line = std::make_unique<views::View>();
++    // Placed by hand between the chips, never laid out, never hit; a layer
++    // of its own, over the chips' layers. The pinned section's drop colour.
++    line->SetProperty(views::kViewIgnoredByLayoutKey, true);
++    line->SetCanProcessEventsWithinSubtree(false);
++    line->SetPaintToLayer();
++    line->layer()->SetFillsBoundsOpaquely(false);
++    line->SetBackground(
++        views::CreateSolidBackground(ui::kColorFocusableBorderFocused));
++    reorder_line_.SetView(scroll_contents_->AddChildView(std::move(line)));
++  }
++  views::View* const line = reorder_line_.view();
++  // In the middle of the 4 px between two chips; at either end, flush with
++  // the row's edge.
++  const bool row = GetOrientation() == views::LayoutOrientation::kHorizontal;
++  const size_t count = buttons_.size();
++  const size_t at_gap = static_cast<size_t>(gap);
++  const int middle =
++      at_gap < count
++          ? (row ? buttons_[at_gap]->x() : buttons_[at_gap]->y()) - kChipMargin
++          : (row ? buttons_.back()->bounds().right()
++                 : buttons_.back()->bounds().bottom()) +
++                kChipMargin;
++  const int length =
++      row ? scroll_contents_->width() : scroll_contents_->height();
++  const int start = std::max(0, std::min(middle - kDropLineThickness / 2,
++                                         length - kDropLineThickness));
++  line->SetBoundsRect(
++      row ? gfx::Rect(start, 0, kDropLineThickness, scroll_contents_->height())
++          : gfx::Rect(0, start, scroll_contents_->width(),
++                      kDropLineThickness));
++  line->SetVisible(true);
++}
++
+ void WorkspaceRailView::OnNewWorkspacePressed() {
+   ShowNameBubble(
+       this, IDS_HELIUM_WORKSPACE_NEW, IDS_HELIUM_WORKSPACE_NAME_LABEL,
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -6,6 +6,8 @@
+ #define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_RAIL_VIEW_H_
+ 
+ #include <memory>
++#include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -15,13 +17,16 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "chrome/browser/ui/views/tabs/dragging/tab_drag_target.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/point.h"
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/views/context_menu_controller.h"
++#include "ui/views/drag_controller.h"
+ #include "ui/views/layout/flex_layout_view.h"
+ #include "ui/views/view_tracker.h"
+ 
+@@ -39,8 +44,11 @@ enum class VerticalTabStripCollapseState
+ }  // namespace tabs
+ 
+ namespace ui {
++class ClipboardFormatType;
+ class ColorProvider;
++class DropTargetEvent;
+ class Event;
++class OSExchangeData;
+ }  // namespace ui
+ 
+ namespace workspaces::prefs {
+@@ -81,8 +89,10 @@ DECLARE_ELEMENT_IDENTIFIER_VALUE(kWorksp
+ // chips, "+" -- with no arrows.
+ //
+ // Switching shipped at E9a; adding, renaming and deleting arrive here at E9b.
+-// Reordering does not: it is the one edit that needs a drag interaction rather
+-// than a menu item, and it is E9c's.
++// Reordering came as the menu's Move left / right; since C4 a chip is also
++// dragged along the bar, and a Today tab or a pinned row dropped on a chip
++// moves to that workspace, as Arc drags between Spaces; the window stays
++// where it is.
+ //
+ // DESIGN 5 SAYS TO HIDE THE RAIL WHEN THERE IS ONLY ONE WORKSPACE, AND E9A DID.
+ // E9b stops, because "hide it" and "the + that creates the second workspace
+@@ -102,7 +112,9 @@ DECLARE_ELEMENT_IDENTIFIER_VALUE(kWorksp
+ class WorkspaceRailView : public views::FlexLayoutView,
+                           public views::ContextMenuController,
+                           public ui::SimpleMenuModel::Delegate,
+-                          public TabStripModelObserver {
++                          public TabStripModelObserver,
++                          public TabDragTarget,
++                          public views::DragController {
+   METADATA_HEADER(WorkspaceRailView, views::FlexLayoutView)
+ 
+  public:
+@@ -135,6 +147,59 @@ class WorkspaceRailView : public views::
+   // vertical.
+   void AddedToWidget() override;
+ 
++  // views::View, the drop end of a chip's drag (C4): a chip of this profile
++  // dropped in a gap between two chips moves its workspace there. A chip of
++  // another window's bar drops here too; the list is the profile's.
++  bool GetDropFormats(int* formats,
++                      std::set<ui::ClipboardFormatType>* format_types) override;
++  bool CanDrop(const ui::OSExchangeData& data) override;
++  int OnDragUpdated(const ui::DropTargetEvent& event) override;
++  void OnDragExited() override;
++  DropCallback GetDropCallback(const ui::DropTargetEvent& event) override;
++
++  // views::DragController, the drag end (C4): set on each chip by Rebuild()
++  // while there are two workspaces or more to order.
++  void WriteDragDataForView(views::View* sender,
++                            const gfx::Point& press_pt,
++                            ui::OSExchangeData* data) override;
++  int GetDragOperationsForView(views::View* sender,
++                               const gfx::Point& p) override;
++  bool CanStartDragForView(views::View* sender,
++                           const gfx::Point& press_pt,
++                           const gfx::Point& p) override;
++
++  // This bar as the target of a Today tab's drag at the point (C4): while
++  // Workspaces is on, the bar is drawn and this window holds the drag; over
++  // the bar, its top raised to `list_bottom`, the bottom of the list's own
++  // bounds (both in screen coordinates), so no pixel between the two is
++  // left unclaimed. Null otherwise.
++  TabDragTarget* GetTabDragTarget(const gfx::Point& point_in_screen,
++                                  int list_bottom);
++
++  // The workspace a drop at the point (in screen coordinates) would move to:
++  // the chip drawn there, inside the scroller's visible part -- empty over
++  // anything else, for the workspace on screen and while the bar is not
++  // drawn. The pinned section asks it for a row's drag, which holds the mouse
++  // so the bar never sees it (C4).
++  std::string DropTargetAt(const gfx::Point& point_in_screen) const;
++
++  // Lights the chip of workspace `guid` as the drop's target, and no other;
++  // an empty `guid` lights none. Kept by guid, so a list change keeps it.
++  void SetDropHover(const std::string& guid);
++
++  // TabDragTarget (C4): a Today tab dropped on a chip moves to its
++  // workspace; anywhere else on the bar the drop is the list's, in place.
++  // Never null from OnTabDragUpdated, which would tear the tabs off.
++  void OnTabDragEntered() override {}
++  TabDragContext* OnTabDragUpdated(TabDragTarget::DragController& controller,
++                                   const gfx::Point& point_in_screen) override;
++  void OnTabDragExited(const gfx::Point& point_in_screen) override;
++  void OnTabDragEnded() override;
++  bool CanDropTab() override;
++  void HandleTabDrop(TabDragTarget::DragController& controller) override;
++  base::CallbackListSubscription RegisterWillDestroyCallback(
++      base::OnceClosure callback) override;
++
+   // views::ContextMenuController:
+   void ShowContextMenuForViewImpl(
+       View* source,
+@@ -193,6 +258,12 @@ class WorkspaceRailView : public views::
+       const workspaces::prefs::WorkspaceEntry& entry,
+       size_t index);
+ 
++  // The bar of `view`'s window, found by the id it sets on itself -- no
++  // pointer kept between two views made and destroyed apart; null in a
++  // window without it. The pinned section and the tab strip's drag ask it
++  // (C4).
++  static WorkspaceRailView* FindIn(views::View* view);
++
+   // The Chromium icon for a preset symbol (prefs::kWorkspaceSymbols), or null
+   // for "" and for anything that is not a preset. The editor's grid and the
+   // pinned header draw the same icons (E17a-b).
+@@ -280,6 +351,17 @@ class WorkspaceRailView : public views::
+   // Says what "Import from Arc..." did, or that Arc's data was not found.
+   void OnArcImportDone(const WorkspaceArcImporter::Result& result);
+ 
++  // This window's tab drag context, which holds a Today tab's drag (C4).
++  TabDragContext* DragContext();
++
++  // C4: the index in `guids_` of the chip `data` carries, or nullopt when it
++  // carries none, one of another profile or one whose workspace is gone.
++  std::optional<size_t> DraggedChip(const ui::OSExchangeData& data) const;
++
++  // C4: `gap` (0 to the number of chips) is where a dragged chip would drop,
++  // marked by a line between two chips; -1 hides the line.
++  void SetReorderGap(int gap);
++
+   const raw_ptr<BrowserWindowInterface> browser_;
+ 
+   // Parallel to `buttons_`: the guid each button switches to. Held separately
+@@ -329,6 +411,19 @@ class WorkspaceRailView : public views::
+   base::flat_set<tabs::TabHandle> alerting_;
+   bool badges_scheduled_ = false;
+ 
++  // C4: the workspace whose chip is lit as a drop's target, empty for none.
++  // A guid, never a chip: Rebuild() deletes the chips, and lights the new one.
++  std::string drop_hover_guid_;
++
++  // C4: where a dragged chip would drop (SetReorderGap), -1 while none is
++  // over the bar. The line is a child of `scroll_contents_`, made when first
++  // needed; Rebuild() deletes it with the chips, and the tracker lets go.
++  int reorder_gap_ = -1;
++  views::ViewTracker reorder_line_;
++
++  // C4: a tab drag holding this bar as its target lets go of it.
++  base::OnceClosureList will_destroy_callbacks_;
++
+   base::CallbackListSubscription workspace_changed_subscription_;
+   // C14: a switch or a tag change moves tabs on and off screen. Its own
+   // binding, not UpdateHighlight's, which also runs after every layout.

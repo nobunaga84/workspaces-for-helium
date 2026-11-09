@@ -1,0 +1,29 @@
+--- a/chrome/install_static/chromium_install_modes.h
++++ b/chrome/install_static/chromium_install_modes.h
+@@ -99,8 +99,10 @@ inline constexpr auto kInstallModes = st
+             L"",  // Empty default channel name since no update integration.
+         .channel_strategy = ChannelStrategy::UNSUPPORTED,
+         .supports_system_level = true,  // Supports system-level installs.
+-        .supports_set_as_default_browser =
+-            true,  // Supports in-product set as default browser UX.
++        // Helium Workspaces: no in-product button (LOCAL.md 124). It would
++        // register "Helium" for this exe; Windows Settings > Default apps
++        // offers the installer's own "Helium Workspaces" entry instead.
++        .supports_set_as_default_browser = false,
+         .app_icon_resource_index =
+             icon_resources::kApplicationIndex,  // App icon resource index.
+         .app_icon_resource_id = IDR_MAINFRAME,  // App icon resource id.
+--- a/chrome/install_static/user_data_dir.cc
++++ b/chrome/install_static/user_data_dir.cc
+@@ -97,7 +97,10 @@ bool GetDefaultUserDataDirectory(const I
+   result->swap(user_data_dir);
+   if ((*result)[result->length() - 1] != L'\\')
+     result->push_back(L'\\');
+-  AppendChromeInstallSubDirectory(mode, true /* include_suffix */, result);
++  // Helium Workspaces: its own folder, never official Helium's "imput\Helium"
++  // (LOCAL.md 124). chrome_paths_win.cc's copy, which only compares, keeps
++  // official Helium's, so the taskbar ids and pins stay as they are.
++  result->append(L"Helium Workspaces");
+   result->push_back(L'\\');
+   result->append(L"User Data");
+   return true;

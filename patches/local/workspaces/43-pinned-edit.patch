@@ -1,0 +1,984 @@
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -450,6 +450,9 @@ void TabMenuModel::Build(int index) {
+           tab_strip_->delegate()->GetBrowserWindowInterface())) {
+     AddItemWithStringId(TabStripModel::CommandRenameTab,
+                         IDS_HELIUM_WORKSPACE_RENAME_TAB);
++    // E15d: Arc's "Pin tab", the menu's half of pinning; the drag is the other.
++    AddItemWithStringId(TabStripModel::CommandPinToWorkspace,
++                        IDS_HELIUM_WORKSPACE_PIN_TAB);
+   }
+ 
+   // Helium Workspaces: the anchor submenu (design 5, E10 spec), right beside
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2761,6 +2761,9 @@ bool TabStripModel::IsContextMenuCommand
+       // switches, so a rebase cannot carry them into the wrong one (review #4).
+       return true;
+ 
++    case CommandPinToWorkspace:
++      return workspaces::CanPinToWorkspace(*this, context_index);
++
+     case CommandNewTabToRight:
+     case CommandCloseTab:
+       return true;
+@@ -2912,6 +2915,7 @@ void TabStripModel::ExecuteContextMenuCo
+     case CommandMoveToWorkspace:
+     case CommandAnchorTab:
+     case CommandRenameTab:
++    case CommandPinToWorkspace:
+       break;
+ 
+     case CommandNewTabToRight: {
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
+@@ -12,6 +12,9 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/prefs/pref_service.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "url/gurl.h"
+ 
+ namespace workspaces {
+ 
+@@ -47,4 +50,15 @@ bool NewTabAtTopOfList(const TabStripMod
+   return true;
+ }
+ 
++bool CanPinToWorkspace(const TabStripModel& model, int index) {
++  if (!model.ContainsIndex(index)) {
++    return false;
++  }
++  const tabs::TabInterface* const tab = model.GetTabAtIndex(index);
++  return !tab->IsPinned() && !tab->GetGroup() && !tab->IsSplit() &&
++         model.GetWebContentsAt(index)
++             ->GetLastCommittedURL()
++             .SchemeIsHTTPOrHTTPS();
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
+@@ -38,6 +38,14 @@ base::RepeatingCallback<std::vector<tabs
+ // active one" is on: AddTab's own rules place it then.
+ bool NewTabAtTopOfList(const TabStripModel& model, int* index);
+ 
++// IsContextMenuCommandEnabled, for "Pin to workspace" (E15d): a web page that
++// is one tab of the list -- not a favorite, not in a group or a split, as a
++// pinned page's tab never is (E15c). Judged on the clicked tab, `index`; the
++// rest of a selection that is not is skipped when pinning
++// (WorkspacePinnedSectionView::PinTabs). False for an index no longer in the
++// model, a tab that left under the open menu (review #35).
++bool CanPinToWorkspace(const TabStripModel& model, int index);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -193,6 +193,61 @@ bool EraseNode(std::vector<PinNode>& nod
+   return false;
+ }
+ 
++// The list holding the row `id`, at `nodes` or below, and its place in it;
++// null when no row has that id.
++std::vector<PinNode>* ListOf(std::vector<PinNode>& nodes,
++                             std::string_view id,
++                             size_t& index) {
++  for (size_t i = 0; i < nodes.size(); ++i) {
++    if (nodes[i].id == id) {
++      index = i;
++      return &nodes;
++    }
++    if (std::vector<PinNode>* const list =
++            ListOf(nodes[i].children, id, index)) {
++      return list;
++    }
++  }
++  return nullptr;
++}
++
++// Puts `row` `where` the row `to` is, or last in workspace `guid`'s top level
++// when `to` is empty. False when there is no such place.
++bool Place(PinTree& tree,
++           std::string_view guid,
++           PinNode row,
++           std::string_view to,
++           Where where) {
++  if (to.empty()) {
++    if (guid.empty()) {
++      return false;
++    }
++    tree[std::string(guid)].push_back(std::move(row));
++    return true;
++  }
++  for (auto& [owner, roots] : tree) {
++    size_t index = 0;
++    std::vector<PinNode>* const list = ListOf(roots, to, index);
++    if (!list) {
++      continue;
++    }
++    if (where == Where::kInto) {
++      // First inside, as Arc adds to a folder (E15d: 1,694 of 1,724 pairs of
++      // neighbours in the owner's folders have the newer one above).
++      PinNode& folder = (*list)[index];
++      if (folder.type != PinNode::Type::kFolder) {
++        return false;
++      }
++      folder.children.insert(folder.children.begin(), std::move(row));
++    } else {
++      list->insert(list->begin() + index + (where == Where::kAfter ? 1 : 0),
++                   std::move(row));
++    }
++    return true;
++  }
++  return false;
++}
++
+ }  // namespace
+ 
+ void CountRows(const std::vector<PinNode>& rows, int& items, int& folders) {
+@@ -326,22 +381,70 @@ bool PinStore::SetRoots(std::string_view
+   if (!loaded_ || read_only_ || guid.empty()) {
+     return false;
+   }
+-  // The tree as it would be: `roots` plus every other workspace's rows.
+-  std::set<std::string, std::less<>> ids;
+-  bool savable = AddSavable(roots, ids);
+-  for (const auto& [owner, rows] : tree_) {
+-    savable = savable && (owner == guid || AddSavable(rows, ids));
++  PinTree tree = tree_;
++  tree.insert_or_assign(std::string(guid), std::move(roots));
++  return Commit(std::move(tree));
++}
++
++bool PinStore::Insert(std::string_view guid,
++                      PinNode row,
++                      std::string_view to,
++                      Where where) {
++  if (!loaded_ || read_only_) {
++    return false;
++  }
++  PinTree tree = tree_;
++  return Place(tree, guid, std::move(row), to, where) &&
++         Commit(std::move(tree));
++}
++
++bool PinStore::Move(std::string_view id,
++                    std::string_view guid,
++                    std::string_view to,
++                    Where where) {
++  const PinNode* const moving = Find(id);
++  // Never into itself: a folder dropped on its own row or inside itself.
++  if (!loaded_ || read_only_ || !moving || id == to ||
++      FindNode(moving->children, to)) {
++    return false;
+   }
+-  if (!savable) {
++  PinTree tree = tree_;
++  PinNode row = *moving;
++  for (auto& [owner, roots] : tree) {
++    if (EraseNode(roots, id)) {
++      break;
++    }
++  }
++  return Place(tree, guid, std::move(row), to, where) &&
++         Commit(std::move(tree));
++}
++
++bool PinStore::Rename(std::string_view id, std::string name) {
++  if (!loaded_ || read_only_) {
+     return false;
+   }
+-  if (roots.empty()) {
+-    if (auto it = tree_.find(guid); it != tree_.end()) {
+-      tree_.erase(it);
++  for (auto& [guid, roots] : tree_) {
++    if (PinNode* node = FindNode(roots, id)) {
++      (node->type == PinNode::Type::kFolder ? node->title
++                                            : node->custom_title) =
++          std::move(name);
++      Changed();
++      return true;
++    }
++  }
++  return false;
++}
++
++bool PinStore::Commit(PinTree tree) {
++  // An empty workspace is not stored, as the load does not keep one.
++  std::erase_if(tree, [](const auto& entry) { return entry.second.empty(); });
++  std::set<std::string, std::less<>> ids;
++  for (const auto& [guid, roots] : tree) {
++    if (!AddSavable(roots, ids)) {
++      return false;
+     }
+-  } else {
+-    tree_.insert_or_assign(std::string(guid), std::move(roots));
+   }
++  tree_ = std::move(tree);
+   Changed();
+   return true;
+ }
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -64,6 +64,12 @@ struct PinNode {
+ // Workspace guid -> that workspace's top-level rows, in order.
+ using PinTree = std::map<std::string, std::vector<PinNode>, std::less<>>;
+ 
++// Where PinStore::Insert and Move put a row (E15d): just before or just after
++// another row, in that row's folder, or first inside a folder. By row and not
++// by index, so a row of a deleted workspace -- drawn among the default
++// workspace's (RootsForWorkspace) -- is a place like any other.
++enum class Where { kBefore, kAfter, kInto };
++
+ // The file's JSON, and back. std::nullopt when `value` is not a pin file this
+ // version can read; the store then keeps the file aside rather than write over
+ // it.
+@@ -149,6 +155,23 @@ class PinStore : public base::SupportsUs
+   // again each time a pinned page is activated. False for a folder.
+   bool SetLastActive(std::string_view id, base::Time time);
+ 
++  // Adds `row` `where` the row `to` is, or last in workspace `guid`'s top
++  // level when `to` is empty (E15d). False, and nothing changes, for SetRoots'
++  // reasons, or when `to` is not there -- or is not a folder, for kInto.
++  bool Insert(std::string_view guid,
++              PinNode row,
++              std::string_view to,
++              Where where);
++  // Moves the row `id`, a folder with all it holds, the same way. Also false
++  // when `to` is the row itself or inside it.
++  bool Move(std::string_view id,
++            std::string_view guid,
++            std::string_view to,
++            Where where);
++  // A folder's name, or an item's own (`custom_title`: empty shows the page's
++  // title again). False for Remove's reasons.
++  bool Rename(std::string_view id, std::string name);
++
+   void AddObserver(Observer* observer);
+   void RemoveObserver(Observer* observer);
+ 
+@@ -159,6 +182,11 @@ class PinStore : public base::SupportsUs
+ 
+   // Schedules the write and tells the observers.
+   void Changed();
++  // Makes `tree` the store's, then Changed(), if the next load would accept
++  // all of it; false, and nothing changes, otherwise. Every change of shape is
++  // made on a copy and kept through here, so none can save a file the next
++  // load sends to .bad.
++  bool Commit(PinTree tree);
+ 
+   // base::ImportantFileWriter::DataSerializer:
+   std::optional<std::string> SerializeData() override;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -73,6 +73,14 @@ size_t RootCount(const PinTree& tree, st
+   return it == tree.end() ? 0 : it->second.size();
+ }
+ 
++std::vector<std::string> RowIds(const std::vector<PinNode>& rows) {
++  std::vector<std::string> ids;
++  for (const PinNode& row : rows) {
++    ids.push_back(row.id);
++  }
++  return ids;
++}
++
+ std::vector<std::string> Ids(const std::vector<const PinNode*>& rows) {
+   std::vector<std::string> ids;
+   for (const PinNode* row : rows) {
+@@ -423,6 +431,108 @@ TEST_F(PinStoreTest, RefusesAnIdTheTreeA
+   EXPECT_TRUE(store->SetRoots("work", {Item("w", "https://w2.example/")}));
+ }
+ 
++using RowList = std::vector<std::string>;
++
++// E15d: a row goes just before or after another at any depth, first inside a
++// folder, or last in a workspace's top level. Each is announced and saved.
++TEST_F(PinStoreTest, InsertPutsARowBesideOrInsideAnother) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", SampleTree().at("default")));
++  CountingObserver observer;
++  store->AddObserver(&observer);
++
++  EXPECT_TRUE(store->Insert("default", Item("x", "https://x.example/"), "",
++                            Where::kAfter));
++  EXPECT_TRUE(store->Insert("default", Item("y", "https://y.example/"), "b",
++                            Where::kBefore));
++  EXPECT_TRUE(store->Insert("default", Item("z", "https://z.example/"), "c",
++                            Where::kAfter));
++  EXPECT_TRUE(
++      store->Insert("default", Folder("g", "New", {}), "f2", Where::kInto));
++  EXPECT_TRUE(store->Insert("work", Item("w", "https://w.example/"), "",
++                            Where::kAfter));
++  // No such row, an item is no folder, an id the tree has, no place at all.
++  EXPECT_FALSE(store->Insert("default", Item("q", "https://q.example/"),
++                             "nope", Where::kBefore));
++  EXPECT_FALSE(store->Insert("default", Item("q", "https://q.example/"), "a",
++                             Where::kInto));
++  EXPECT_FALSE(store->Insert("default", Item("a", "https://q.example/"), "",
++                             Where::kAfter));
++  EXPECT_FALSE(
++      store->Insert("", Item("q", "https://q.example/"), "", Where::kAfter));
++  EXPECT_EQ(observer.calls, 5);
++  store->RemoveObserver(&observer);
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->tree().contains("default"));
++  EXPECT_EQ(RowIds(again->tree().at("default")), (RowList{"a", "f1", "x"}));
++  ASSERT_TRUE(again->Find("f1") && again->Find("f2") && again->Find("f3"));
++  EXPECT_EQ(RowIds(again->Find("f1")->children), (RowList{"y", "b", "f2"}));
++  EXPECT_EQ(RowIds(again->Find("f2")->children), (RowList{"g", "f3"}));
++  EXPECT_EQ(RowIds(again->Find("f3")->children), (RowList{"c", "z"}));
++  EXPECT_EQ(RootCount(again->tree(), "work"), 1u);
++}
++
++// E15d: a row moves anywhere a row can be inserted -- a folder with everything
++// in it -- and never into itself. A refused move leaves the row where it was.
++TEST_F(PinStoreTest, MoveTakesAFolderWithItsRowsAndNeverIntoItself) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", SampleTree().at("default")));
++  CountingObserver observer;
++  store->AddObserver(&observer);
++
++  // Down past a later row, and back up before it.
++  EXPECT_TRUE(store->Move("a", "default", "f1", Where::kAfter));
++  EXPECT_TRUE(store->Move("a", "default", "f1", Where::kBefore));
++  // Out of three folders to the end of the top level.
++  EXPECT_TRUE(store->Move("c", "default", "", Where::kAfter));
++  // A folder, with the one inside it, to the front.
++  EXPECT_TRUE(store->Move("f2", "default", "a", Where::kBefore));
++  EXPECT_TRUE(store->Move("b", "default", "f3", Where::kInto));
++  EXPECT_FALSE(store->Move("f2", "default", "f3", Where::kInto));
++  EXPECT_FALSE(store->Move("f2", "default", "f2", Where::kInto));
++  EXPECT_FALSE(store->Move("a", "default", "c", Where::kInto));
++  EXPECT_FALSE(store->Move("nope", "default", "a", Where::kBefore));
++  EXPECT_FALSE(store->Move("a", "default", "nope", Where::kBefore));
++  EXPECT_TRUE(store->Find("a"));
++  EXPECT_EQ(observer.calls, 5);
++  store->RemoveObserver(&observer);
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->tree().contains("default"));
++  EXPECT_EQ(RowIds(again->tree().at("default")),
++            (RowList{"f2", "a", "f1", "c"}));
++  ASSERT_TRUE(again->Find("f1") && again->Find("f2") && again->Find("f3"));
++  EXPECT_EQ(RowIds(again->Find("f1")->children), RowList{});
++  EXPECT_EQ(RowIds(again->Find("f2")->children), (RowList{"f3"}));
++  EXPECT_EQ(RowIds(again->Find("f3")->children), (RowList{"b"}));
++}
++
++// E15d: a folder's name, or an item's own; an empty one shows the item's page
++// title again.
++TEST_F(PinStoreTest, RenameNamesAFolderOrAnItem) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", SampleTree().at("default")));
++  EXPECT_TRUE(store->Rename("f1", "Renamed folder"));
++  EXPECT_TRUE(store->Rename("b", "My B"));
++  EXPECT_TRUE(store->Rename("c", ""));
++  EXPECT_FALSE(store->Rename("nope", "X"));
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->Find("f1") && again->Find("b") && again->Find("c"));
++  EXPECT_EQ(again->Find("f1")->title, "Renamed folder");
++  EXPECT_EQ(again->Find("b")->custom_title, "My B");
++  EXPECT_EQ(again->Find("b")->title, "");
++  EXPECT_EQ(again->Find("c")->custom_title, "");
++  EXPECT_EQ(again->Find("c")->title, "C page");
++}
++
+ TEST_F(PinStoreTest, ASecondBrokenFileDoesNotReplaceTheFirst) {
+   ASSERT_TRUE(base::WriteFile(file(), "first"));
+   LoadedStore();
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -546,6 +546,23 @@ void TabStripCollectionController::Execu
+     ShowRenameTabDialog(tab);
+     return;
+   }
++  // E15d: the clicked tab, or the selection it is part of, as the menu's
++  // other commands take it; PinTabs skips what cannot be pinned.
++  if (command_id == TabStripModel::CommandPinToWorkspace) {
++    // Not this window's any more: dragged to another while the menu was open
++    // (E15d review; IsTabSelected CHECKs the index).
++    const int index = model_->GetIndexOfTab(tab);
++    if (!browser_view_ || index == TabStripModel::kNoTab) {
++      return;
++    }
++    std::vector<tabs::TabInterface*> tabs = {tab};
++    if (model_->IsTabSelected(index)) {
++      const auto& selected = model_->selection_model().selected_tabs();
++      tabs.assign(selected.begin(), selected.end());
++    }
++    WorkspacePinnedSectionView::PinTabs(browser_view_->browser(), tabs);
++    return;
++  }
+   model_->ExecuteContextMenuCommand(model_->GetIndexOfTab(tab), command_id);
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -15,11 +15,13 @@
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/strings/strcat.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/cancelable_task_tracker.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/timer/elapsed_timer.h"
++#include "base/uuid.h"
+ #include "chrome/browser/favicon/favicon_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_tabrestore.h"
+@@ -35,6 +37,7 @@
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/tabs/new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/favicon/core/favicon_service.h"
+@@ -80,6 +83,7 @@
+ namespace {
+ 
+ using workspaces::pins::PinNode;
++using workspaces::pins::Where;
+ 
+ // Per nesting level, and on each side of a row.
+ constexpr int kIndent = 16;
+@@ -93,6 +97,14 @@ constexpr float kActiveRowRadius = 6;
+ constexpr int kCommandUnpin = 1;
+ constexpr int kCommandDelete = 2;
+ constexpr int kCommandDeleteFolder = 3;
++constexpr int kCommandRename = 4;
++constexpr int kCommandNewFolder = 5;
++
++// A new row's id: unique like the imported rows' (Arc's own ids), and never
++// shown.
++std::string NewRowId() {
++  return base::Uuid::GenerateRandomV4().AsLowercaseString();
++}
+ 
+ std::u16string RowText(const PinNode& node) {
+   const std::string& text = !node.custom_title.empty() ? node.custom_title
+@@ -521,6 +533,8 @@ void WorkspacePinnedSectionView::Schedul
+ 
+ void WorkspacePinnedSectionView::Rebuild() {
+   rebuild_scheduled_ = false;
++  // Taken now, so a folder that is not drawn this time is not renamed later.
++  const std::string rename_id = std::exchange(rename_after_rebuild_, {});
+   // Whatever the rows turn out to be -- none included -- the tabs are judged
+   // again after them: a restart can bring pages whose item is gone, and the
+   // store's load is what arrives here (UpdateRowStates, ReadLinks).
+@@ -583,17 +597,24 @@ void WorkspacePinnedSectionView::Rebuild
+   }
+   ApplyStates(*list, ReadLinks());
+   list_ = AddChildViewAt(std::move(list), 0);
+-  if (!focused_id.empty()) {
+-    for (views::View* const child : list_->children()) {
+-      if (views::AsViewClass<PinRow>(child)->id() == focused_id) {
+-        child->RequestFocus();
+-        break;
+-      }
+-    }
+-  }
+   LOG(INFO) << "[workspaces] pins: drew " << rows << " row(s) of '"
+             << drawn_guid_ << "' in " << timer.Elapsed().InMilliseconds()
+             << " ms";
++  if (focused_id.empty() && rename_id.empty()) {
++    return;
++  }
++  // The new rows are not laid out yet -- every one at 0,0 -- and focusing one
++  // or opening the name box on one scrolls it into view: the list jumped to
++  // its very top (E15d review). Laid out first, and only in these two cases.
++  if (views::Widget* const widget = GetWidget()) {
++    widget->LayoutRootViewIfNecessary();
++  }
++  if (views::View* const row = RowFor(focused_id)) {
++    row->RequestFocus();
++  }
++  if (!rename_id.empty()) {
++    ShowRenameBubble(rename_id);
++  }
+ }
+ 
+ void WorkspacePinnedSectionView::UpdateRowStates() {
+@@ -634,6 +655,13 @@ void WorkspacePinnedSectionView::UpdateR
+   const std::string active_id =
+       links.active ? workspaces::PinItemForTab(links.active->GetContents())
+                    : std::string();
++  // Pinning the tab on screen makes it the active item without a switch: the
++  // list stays where it is then (the owner, E15d), and scrolls only when a
++  // different tab is shown.
++  const tabs::TabHandle active_tab =
++      links.active ? links.active->GetHandle() : tabs::TabHandle();
++  const bool switched = active_tab != active_tab_;
++  active_tab_ = active_tab;
+   if (active_id == active_id_) {
+     return;
+   }
+@@ -642,13 +670,8 @@ void WorkspacePinnedSectionView::UpdateR
+     return;
+   }
+   store_->SetLastActive(active_id, base::Time::Now());
+-  if (list_) {
+-    for (views::View* const child : list_->children()) {
+-      if (views::AsViewClass<PinRow>(child)->id() == active_id) {
+-        child->ScrollViewToVisible();
+-        break;
+-      }
+-    }
++  if (views::View* const row = RowFor(active_id); row && switched) {
++    row->ScrollViewToVisible();
+   }
+ }
+ 
+@@ -779,7 +802,7 @@ void WorkspacePinnedSectionView::OnItemP
+       return;
+     }
+   }
+-  OpenItem(*item, /*linked=*/true);
++  OpenItem(*item);
+ }
+ 
+ void WorkspacePinnedSectionView::OnItemClosePressed(const std::string& id) {
+@@ -802,7 +825,7 @@ void WorkspacePinnedSectionView::OnItemR
+   }
+ }
+ 
+-void WorkspacePinnedSectionView::OpenItem(const PinNode& item, bool linked) {
++void WorkspacePinnedSectionView::OpenItem(const PinNode& item) {
+   const GURL url(item.url);
+   if (!url.is_valid()) {
+     LOG(WARNING) << "[workspaces] pins: item '" << item.id
+@@ -819,26 +842,19 @@ void WorkspacePinnedSectionView::OpenIte
+   navigation.set_virtual_url(url);
+   navigation.set_title(base::UTF8ToUTF16(item.title));
+   std::map<std::string, std::string> extra_data;
+-  if (linked) {
+-    extra_data[workspaces::kPinItemExtraDataKey] = item.id;
+-    // The anchor is what makes a typed address open a new tab (E10b) and
+-    // what the back arrow returns to.
+-    extra_data[workspaces::kAnchorUrlExtraDataKey] = item.url;
+-  }
++  extra_data[workspaces::kPinItemExtraDataKey] = item.id;
++  // The anchor is what makes a typed address open a new tab (E10b) and what
++  // the back arrow returns to.
++  extra_data[workspaces::kAnchorUrlExtraDataKey] = item.url;
+   if (!item.custom_title.empty()) {
+     extra_data[workspaces::kCustomTitleExtraDataKey] = item.custom_title;
+   }
++  // Appended: the session service re-records every tab after an insert point
++  // (E14c), and where a hidden tab sits does not matter. Unpin moves it from
++  // here, still linked, so the list does not scroll to it (E15d).
+   TabStripModel* const model = browser_->GetTabStripModel();
+-  // A linked page is appended: the session service re-records every tab after
+-  // an insert point (E14c), and where a hidden tab sits does not matter. A
+-  // Today tab (Unpin) opens at the top of the list, as new tabs do (E15c.1).
+-  const workspaces::WorkspaceService* const service =
+-      workspaces::WorkspaceService::From(browser_);
+-  const int top =
+-      linked || !service ? -1 : service->TopOfListIndex(/*opener=*/nullptr);
+   chrome::AddRestoredTab(
+-      browser_, base::span_from_ref(navigation),
+-      top >= 0 ? top : model->count(),
++      browser_, base::span_from_ref(navigation), model->count(),
+       /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
+       /*group=*/std::nullopt, /*select=*/true, /*pin=*/false,
+       base::TimeTicks::Now(), base::Time::Now(),
+@@ -846,8 +862,7 @@ void WorkspacePinnedSectionView::OpenIte
+       extra_data, /*from_session_restore=*/false,
+       /*is_active_browser=*/std::nullopt,
+       chrome::RestoredTabLoadPolicy::kLoadIfVisible);
+-  LOG(INFO) << "[workspaces] pins: opened item '" << item.id << "'"
+-            << (linked ? "" : " as a Today tab");
++  LOG(INFO) << "[workspaces] pins: opened item '" << item.id << "'";
+ }
+ 
+ void WorkspacePinnedSectionView::UnpinItem(const std::string& id) {
+@@ -856,24 +871,38 @@ void WorkspacePinnedSectionView::UnpinIt
+     return;
+   }
+   // The page first, the row after, so that nothing is lost in between: an open
+-  // page stays where it is and joins the list, a sleeping item opens here.
+-  bool had_page = false;
++  // page joins the list at its top, where new tabs open (E15c.1; the owner's
++  // choice, E15d). A sleeping item is opened first, STILL LINKED, and then
++  // goes the way an open page goes: an unlinked tab opened active made the
++  // list scroll to it (E15d review).
++  const auto has_page = [&id](BrowserWindowInterface* window) {
++    return LinkedTab(window->GetTabStripModel(), id) != nullptr;
++  };
++  if (std::ranges::none_of(WindowsOf(browser_->GetProfile()), has_page)) {
++    const PinNode item = *found;
++    OpenItem(item);
++  }
+   for (BrowserWindowInterface* const window :
+        WindowsOf(browser_->GetProfile())) {
+     workspaces::WorkspaceService* const service =
+         workspaces::WorkspaceService::From(window);
+-    if (tabs::TabInterface* const tab =
+-            LinkedTab(window->GetTabStripModel(), id);
+-        tab && service) {
++    TabStripModel* const model = window->GetTabStripModel();
++    if (tabs::TabInterface* const tab = LinkedTab(model, id); tab && service) {
++      // Moved while still linked, THEN unlinked: the list scrolls to an active
++      // tab that moves, but not to a pinned page's (TabStripView::OnTabChanged,
++      // E15c), so it stays where it is (the owner, E15d). A page's tab never
++      // sits in a group, and the top of the list is the first tab of a unit,
++      // so the move joins no group (GetGroupToAssign looks at the neighbours).
++      const int from = model->GetIndexOfTab(tab);
++      const int top = service->TopOfListIndex(/*opener=*/nullptr);
++      if (top >= 0 && top != from) {
++        model->MoveWebContentsAt(from, from < top ? top - 1 : top,
++                                 /*select_after_move=*/false);
++      }
+       service->SetPinItem(tab, std::string());
+       service->SetAnchored(tab, false);
+-      had_page = true;
+     }
+   }
+-  if (!had_page) {
+-    const PinNode item = *found;
+-    OpenItem(item, /*linked=*/false);
+-  }
+   store_->Remove(id);
+   LOG(INFO) << "[workspaces] pins: unpinned item '" << id << "'";
+ }
+@@ -937,6 +966,132 @@ void WorkspacePinnedSectionView::ShowDel
+       ->Show();
+ }
+ 
++views::View* WorkspacePinnedSectionView::RowFor(std::string_view id) const {
++  if (!list_) {
++    return nullptr;
++  }
++  for (views::View* const child : list_->children()) {
++    if (views::AsViewClass<PinRow>(child)->id() == id) {
++      return child;
++    }
++  }
++  return nullptr;
++}
++
++void WorkspacePinnedSectionView::ShowRenameBubble(const std::string& id) {
++  const PinNode* const row = store_ ? store_->Find(id) : nullptr;
++  views::View* const anchor = RowFor(id);
++  if (!row || !anchor) {
++    return;
++  }
++  anchor->ScrollViewToVisible();
++  WorkspaceRailView::ShowNameBubble(
++      anchor, IDS_BOOKMARKS_RENAME, IDS_HELIUM_WORKSPACE_NAME_LABEL,
++      RowText(*row),
++      base::BindOnce(&WorkspacePinnedSectionView::RenameRow,
++                     weak_factory_.GetWeakPtr(), id));
++}
++
++void WorkspacePinnedSectionView::RenameRow(const std::string& id,
++                                           const std::u16string& text) {
++  const PinNode* const row = store_ ? store_->Find(id) : nullptr;
++  if (!row) {
++    return;
++  }
++  std::u16string trimmed;
++  base::TrimWhitespace(text, base::TRIM_ALL, &trimmed);
++  std::string name = base::UTF16ToUTF8(trimmed);
++  const bool folder = row->type == PinNode::Type::kFolder;
++  // A folder keeps a name. An item named as its page is an item with no name
++  // of its own, and shows its page's title from then on.
++  if (folder && name.empty()) {
++    return;
++  }
++  if (!folder && name == row->title) {
++    name.clear();
++  }
++  if (!store_->Rename(id, name)) {
++    return;
++  }
++  LOG(INFO) << "[workspaces] pins: renamed '" << id << "'";
++  if (folder) {
++    return;
++  }
++  // An open page carries its item's name as its own title (OpenItem): in the
++  // window's title and in tab search.
++  for (BrowserWindowInterface* const window :
++       WindowsOf(browser_->GetProfile())) {
++    workspaces::WorkspaceService* const service =
++        workspaces::WorkspaceService::From(window);
++    if (tabs::TabInterface* const tab =
++            LinkedTab(window->GetTabStripModel(), id);
++        tab && service) {
++      service->SetCustomTitle(tab, name);
++    }
++  }
++}
++
++// static
++void WorkspacePinnedSectionView::PinTabs(
++    BrowserWindowInterface* browser,
++    std::vector<tabs::TabInterface*> tabs) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  if (!service || !service->IsEnabled()) {
++    return;
++  }
++  Profile* const profile = browser->GetProfile();
++  workspaces::pins::PinStore* const store =
++      workspaces::pins::PinStore::GetOrCreate(profile, profile->GetPath());
++  // In the list's order, each after the one before it: a selection is not
++  // kept in that order.
++  TabStripModel* const model = browser->GetTabStripModel();
++  std::ranges::sort(tabs, {}, [model](tabs::TabInterface* tab) {
++    return model->GetIndexOfTab(tab);
++  });
++  // After the last row DRAWN: the section shows a deleted workspace's rows
++  // after its own, and the end of its own list would be above them (E15d
++  // review).
++  std::string after;
++  if (const std::vector<const PinNode*> roots =
++          workspaces::pins::RootsForWorkspace(store->tree(),
++                                              service->active_guid(),
++                                              service->known_guids());
++      !roots.empty()) {
++    after = roots.back()->id;
++  }
++  for (tabs::TabInterface* const tab : tabs) {
++    content::WebContents* const contents = tab->GetContents();
++    // What the menu asked of the clicked tab, asked of each; and not a tab
++    // this window hides, which a shift-click range can hold (E13).
++    if (!contents || tab->IsPinned() || tab->GetGroup() || tab->IsSplit() ||
++        !service->IsTabOnScreen(tab) || service->IsPinItemTab(tab) ||
++        !workspaces::WorkspaceTabData::IsAnchorableUrl(
++            contents->GetLastCommittedURL())) {
++      continue;
++    }
++    PinNode item;
++    item.id = NewRowId();
++    item.url = contents->GetLastCommittedURL().spec();
++    item.title = base::UTF16ToUTF8(contents->GetTitle());
++    item.custom_title = workspaces::CustomTitleForTab(contents);
++    const std::string id = item.id;
++    // The row first: a link to an item the store does not hold is dropped by
++    // the next state pass (ReadLinks).
++    if (!store->Insert(service->active_guid(), std::move(item), after,
++                       Where::kAfter)) {
++      LOG(WARNING) << "[workspaces] pins: could not pin a tab; the pins file "
++                      "is not loaded yet, or is read-only";
++      return;
++    }
++    service->SetPinItem(tab, id);
++    // Anchored at the page it shows, as an opened item is at its address.
++    service->SetAnchored(tab, true);
++    after = id;
++    LOG(INFO) << "[workspaces] pins: pinned a tab as item '" << id << "'";
++  }
++}
++
+ void WorkspacePinnedSectionView::ShowContextMenuForViewImpl(
+     views::View* source,
+     const gfx::Point& point,
+@@ -951,12 +1106,20 @@ void WorkspacePinnedSectionView::ShowCon
+   } else if (const auto* const row = views::AsViewClass<PinRow>(source)) {
+     context_menu_id_ = row->id();
+     context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++    if (!row->folder()) {
++      context_menu_model_->AddItemWithStringId(kCommandUnpin,
++                                               IDS_HELIUM_PINNED_ITEM_UNPIN);
++    }
++    // Chromium's plain "Rename" (the bookmark menu's); the rail's says
++    // "Rename workspace" (the owner's check of E15d.1).
++    context_menu_model_->AddItemWithStringId(kCommandRename,
++                                             IDS_BOOKMARKS_RENAME);
++    context_menu_model_->AddItemWithStringId(kCommandNewFolder,
++                                             IDS_HELIUM_PINNED_NEW_FOLDER);
+     if (row->folder()) {
+       context_menu_model_->AddItemWithStringId(kCommandDeleteFolder,
+                                                IDS_HELIUM_PINNED_FOLDER_DELETE);
+     } else {
+-      context_menu_model_->AddItemWithStringId(kCommandUnpin,
+-                                               IDS_HELIUM_PINNED_ITEM_UNPIN);
+       context_menu_model_->AddItemWithStringId(kCommandDelete,
+                                                IDS_HELIUM_PINNED_ITEM_DELETE);
+     }
+@@ -981,6 +1144,24 @@ void WorkspacePinnedSectionView::Execute
+     case kCommandDelete:
+       DeleteRow(id);
+       break;
++    case kCommandRename:
++      ShowRenameBubble(id);
++      break;
++    case kCommandNewFolder: {
++      // Just below the row, at its level (the owner's choice, E15d), and
++      // named at once: the name box opens on its row once it is drawn.
++      PinNode folder;
++      folder.type = PinNode::Type::kFolder;
++      folder.id = NewRowId();
++      folder.title = l10n_util::GetStringUTF8(IDS_HELIUM_PINNED_NEW_FOLDER);
++      const std::string new_id = folder.id;
++      if (store_ &&
++          store_->Insert(drawn_guid_, std::move(folder), id, Where::kAfter)) {
++        rename_after_rebuild_ = new_id;
++        LOG(INFO) << "[workspaces] pins: new folder '" << new_id << "'";
++      }
++      break;
++    }
+     case kCommandDeleteFolder: {
+       // Asks only when there is something to lose: an empty folder just goes.
+       const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -9,6 +9,8 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <string_view>
++#include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+@@ -16,6 +18,7 @@
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/views/context_menu_controller.h"
+@@ -45,7 +48,7 @@ class MenuRunner;
+ // face -- sleeping, open (an X to close the page) or active (highlighted), with
+ // an arrow back to the item's address while the page is somewhere else.
+ // Closing the page keeps the item. Right-click: Unpin or Delete an item,
+-// Delete a folder.
++// Delete a folder, Rename either, or a New folder below it (E15d).
+ //
+ // Below the rows, their line and then "+ New Tab", at the top of the list as
+ // in Arc (E15c.1); the line only while there are rows. Right-click on it:
+@@ -104,6 +107,14 @@ class WorkspacePinnedSectionView
+   // ui::SimpleMenuModel::Delegate:
+   void ExecuteCommand(int command_id, int event_flags) override;
+ 
++  // The tab menu's "Pin to workspace" (E15d): each of `tabs` that is a web
++  // page drawn in the list becomes an item at the end of the workspace's
++  // pinned section, in the list's order, and stays open as that item's page.
++  // Static: the menu is run by TabStripCollectionController, which does not
++  // hold the section it made.
++  static void PinTabs(BrowserWindowInterface* browser,
++                      std::vector<tabs::TabInterface*> tabs);
++
+  private:
+   // The pages of this window that belong to items, by item id, and the tab
+   // that is active. Reading them also drops every link that no longer holds
+@@ -151,14 +162,20 @@ class WorkspacePinnedSectionView
+   void OnItemPressed(const std::string& id);
+   void OnItemClosePressed(const std::string& id);
+   void OnItemResetPressed(const std::string& id);
+-  // Opens `item` as a tab of this window, active; linked to the item and
+-  // anchored at its address when `linked`, a plain Today tab otherwise.
+-  void OpenItem(const workspaces::pins::PinNode& item, bool linked);
+-  // The item becomes a Today tab: its page if it has one, opened otherwise.
++  // Opens `item` as a tab of this window, active, linked to the item and
++  // anchored at its address.
++  void OpenItem(const workspaces::pins::PinNode& item);
++  // The item becomes a Today tab at the top of the list: its page if it has
++  // one, opened first otherwise.
+   void UnpinItem(const std::string& id);
+   // Removes an item, or a folder with all it holds, closing their pages.
+   void DeleteRow(const std::string& id);
+   void ShowDeleteFolderConfirm(const std::string& id, int items);
++  // The row drawn for `id`, or null.
++  views::View* RowFor(std::string_view id) const;
++  // Asks for a new name in the rail's bubble, anchored to the row (E15d).
++  void ShowRenameBubble(const std::string& id);
++  void RenameRow(const std::string& id, const std::u16string& text);
+ 
+   void OnCollapseChanged(tabs::VerticalTabStripCollapseState state);
+   // Whether the window paints as active: the rows dim with the tabs when not.
+@@ -186,6 +203,9 @@ class WorkspacePinnedSectionView
+   // The item whose page was last seen active: its row is scrolled into view
+   // and its last-used time stamped once per activation, not per tab change.
+   std::string active_id_;
++  // The tab that was active at the last state pass: a row is scrolled into
++  // view only when a DIFFERENT tab became active (E15d).
++  tabs::TabHandle active_tab_;
+   // How many item pages this window had at the last state pass, for the log.
+   size_t open_count_ = 0;
+   // CalculatePreferredSize()'s answer until the next rebuild or theme change.
+@@ -193,6 +213,10 @@ class WorkspacePinnedSectionView
+   bool rebuild_scheduled_ = false;
+   bool row_states_scheduled_ = false;
+ 
++  // A folder just made by New folder: its name is asked for once its row is
++  // drawn, by the next Rebuild().
++  std::string rename_after_rebuild_;
++
+   // The row menu, and the row it was opened on.
+   std::string context_menu_id_;
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -859,6 +859,7 @@ void WorkspaceRailView::OnArcImportDone(
+       ->Show();
+ }
+ 
++// static
+ void WorkspaceRailView::ShowNameBubble(
+     views::View* anchor,
+     int title_string_id,
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -114,6 +114,16 @@ class WorkspaceRailView : public views::
+   void ExecuteCommand(int command_id, int event_flags) override;
+   bool IsCommandIdEnabled(int command_id) const override;
+ 
++  // Opens the one-textfield bubble both create and rename use, anchored to
++  // `anchor`. `on_accept` is run with whatever was typed, and not run at all if
++  // the bubble is dismissed. The pinned section's Rename uses it too (E15d).
++  static void ShowNameBubble(
++      views::View* anchor,
++      int title_string_id,
++      int label_string_id,
++      const std::u16string& initial_text,
++      base::OnceCallback<void(const std::u16string&)> on_accept);
++
+  private:
+   // Throws the buttons away and makes them again from the current list.
+   void Rebuild();
+@@ -142,15 +152,6 @@ class WorkspaceRailView : public views::
+   // Says what "Import from Arc..." did, or that Arc's data was not found.
+   void OnArcImportDone(const WorkspaceArcImporter::Result& result);
+ 
+-  // Opens the one-textfield bubble both create and rename use, anchored to
+-  // `anchor`. `on_accept` is run with whatever was typed, and not run at all if
+-  // the bubble is dismissed.
+-  void ShowNameBubble(views::View* anchor,
+-                      int title_string_id,
+-                      int label_string_id,
+-                      const std::u16string& initial_text,
+-                      base::OnceCallback<void(const std::u16string&)> on_accept);
+-
+   const raw_ptr<BrowserWindowInterface> browser_;
+ 
+   // Parallel to `buttons_`: the guid each button switches to. Held separately
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -51,6 +51,9 @@ enum TabContextMenuCommand {
+   // E11: a plain item, executed by BrowserTabStripController before the
+   // model sees it -- the dialog needs the window, which the model has not.
+   CommandRenameTab,
++  // E15d: run by TabStripCollectionController, as CommandRenameTab is --
++  // the pinned section, and its file, are views-side.
++  CommandPinToWorkspace,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 

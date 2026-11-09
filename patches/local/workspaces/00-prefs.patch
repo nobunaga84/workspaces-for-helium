@@ -1,0 +1,202 @@
+--- a/chrome/browser/prefs/BUILD.gn
++++ b/chrome/browser/prefs/BUILD.gn
+@@ -125,6 +125,7 @@ source_set("impl") {
+     "//chrome/browser/ui/side_search",
+     "//chrome/browser/ui/startup",
+     "//chrome/browser/ui/startup:startup_tab",
++    "//chrome/browser/ui/tabs/workspaces:prefs",
+     "//chrome/browser/ui/toolbar",
+     "//chrome/browser/ui/toolbar/chrome_labs",
+     "//chrome/browser/ui/webui/accessibility",
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -96,6 +96,7 @@
+ #include "chrome/browser/ui/safety_hub/safety_hub_prefs.h"
+ #include "chrome/browser/ui/tabs/organizer/organizer_prefs.h"
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/toolbar/chrome_labs/chrome_labs_prefs.h"
+ #include "chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.h"
+ #include "chrome/browser/ui/toolbar/toolbar_pref_names.h"
+@@ -1941,6 +1942,7 @@ void RegisterProfilePrefs(user_prefs::Pr
+   visited_url_ranking::GroupSuggestionsServiceImpl::RegisterProfilePrefs(
+       registry);
+   wallet::prefs::RegisterProfilePrefs(registry);
++  workspaces::prefs::RegisterProfilePrefs(registry);
+   omnibox::RegisterProfilePrefs(registry);
+ #if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+   omnibox_everywhere::prefs::RegisterProfilePrefs(registry);
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -0,0 +1,64 @@
++# Copyright 2026 The Helium Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import("//testing/test.gni")
++
++# Pref declarations for Workspaces, deliberately split into their own leaf
++# target rather than living in the main workspaces target that arrives in E5.
++#
++# //chrome/browser/prefs:impl has to depend on this in order to register the
++# prefs at startup. The full workspaces target will itself depend on
++# //chrome/browser/ui/tabs:tab_strip, which reaches //chrome/browser/prefs. If
++# the pref declarations lived in that target, those two edges would close a
++# dependency cycle, and GN fails outright on a cycle rather than warning.
++#
++# Keeping this target a leaf -- no //chrome dependencies at all -- makes the
++# cycle impossible to form no matter what the workspaces target later grows. See
++# helium-workspaces-design.md 3.1.
++source_set("prefs") {
++  sources = [
++    "workspace_prefs.cc",
++    "workspace_prefs.h",
++  ]
++
++  deps = [ "//components/prefs" ]
++}
++
++source_set("unit_tests") {
++  testonly = true
++
++  sources = [ "workspace_prefs_unittest.cc" ]
++
++  deps = [
++    ":prefs",
++    "//components/prefs",
++    "//components/prefs:test_support",
++    "//testing/gtest",
++  ]
++}
++
++# A standalone test binary owned by this fork, deliberately NOT a source_set
++# folded into //chrome/test:unit_tests.
++#
++# That binary does not link here at all: the fork patches production APIs and
++# never updates Chromium's test doubles, and Helium CI builds no tests, so
++# several of them still call pre-patch signatures. //chrome/test:test_support
++# hard-depends on the broken ones, so nothing that links it can be built.
++# LOCAL.md 8 has the diagnosis.
++#
++# This target depends on none of that -- //base, //components/prefs and gtest
++# only -- so it is immune to that rot and stays cheap to run. The constraint it
++# imposes is a good one: logic reachable from here has to be expressible over
++# plain inputs rather than a live Profile or TabStripModel, which is the shape
++# the workspace decision logic should have anyway (design 3.10).
++#
++#   resume-build.ps1 -Targets workspaces_unittests
++#   out/Default/workspaces_unittests.exe
++test("workspaces_unittests") {
++  deps = [
++    ":unit_tests",
++    "//base/test:run_all_unittests",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++
++#include "components/prefs/pref_registry_simple.h"
++
++namespace workspaces::prefs {
++
++void RegisterProfilePrefs(PrefRegistrySimple* registry) {
++  // Defaults on: this is a private fork built to run Workspaces, so there is
++  // nobody to opt in. The settings-page toggle lands in Stage 5 with the rest
++  // of the settings integration (helium-workspaces-design.md 3.4).
++  registry->RegisterBooleanPref(kHeliumWorkspacesEnabled, true);
++}
++
++}  // namespace workspaces::prefs
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
++
++class PrefRegistrySimple;
++
++namespace workspaces::prefs {
++
++// Whether Workspaces is active for this profile.
++//
++// Local-only by construction: this is registered on a PrefRegistrySimple and is
++// never added to the sync allowlist. Helium's vault syncs PREFERENCES only for
++// allow-listed prefs, and SESSIONS sync carries no per-tab extra_data -- so a
++// synced workspace list would arrive with tagless tabs, which is worse than not
++// syncing at all. See helium-workspaces-design.md 2.4.
++inline constexpr char kHeliumWorkspacesEnabled[] = "helium.workspaces.enabled";
++
++void RegisterProfilePrefs(PrefRegistrySimple* registry);
++
++}  // namespace workspaces::prefs
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++
++#include "components/prefs/pref_service.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++// These tests deliberately use TestingPrefServiceSimple rather than
++// TestingProfile: that keeps this binary off //chrome/test:test_support, which
++// does not link in this fork (LOCAL.md 8). Keep it that way -- anything needing
++// a full Profile belongs in a different target.
++
++namespace workspaces::prefs {
++namespace {
++
++TEST(WorkspacePrefsTest, RegistersEnabledPref) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  EXPECT_TRUE(pref_service.FindPreference(kHeliumWorkspacesEnabled));
++}
++
++TEST(WorkspacePrefsTest, EnabledDefaultsToTrue) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  const PrefService::Preference* pref =
++      pref_service.FindPreference(kHeliumWorkspacesEnabled);
++  ASSERT_TRUE(pref);
++  EXPECT_TRUE(pref->IsDefaultValue());
++  EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesEnabled));
++}
++
++TEST(WorkspacePrefsTest, EnabledIsWritable) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  pref_service.SetBoolean(kHeliumWorkspacesEnabled, false);
++
++  EXPECT_FALSE(pref_service.GetBoolean(kHeliumWorkspacesEnabled));
++  EXPECT_FALSE(
++      pref_service.FindPreference(kHeliumWorkspacesEnabled)->IsDefaultValue());
++}
++
++// The pref name is written into every user profile the moment it is set, so it
++// is effectively permanent. Pin it.
++TEST(WorkspacePrefsTest, PrefNameIsStable) {
++  EXPECT_STREQ("helium.workspaces.enabled", kHeliumWorkspacesEnabled);
++}
++
++}  // namespace
++}  // namespace workspaces::prefs

@@ -1,0 +1,420 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -141,8 +141,9 @@
+ // never has to reopen it. 34110-34999 is entirely free -- Helium's own ids
+ // stop at 34091 and the upstream block above ends at 34108.
+ //
+-// Only NEXT and PREV are wired today. The others are named so that the
+-// range is visibly spoken for, and 34126-34139 is left spare.
++// NEXT, PREV, NEW, MOVE_UP and MOVE_DOWN are wired today. The others are
++// named so that the range is visibly spoken for, and 34128-34139 is left
++// spare.
+ #define IDC_HELIUM_WORKSPACE_NEXT     34110
+ #define IDC_HELIUM_WORKSPACE_PREV     34111
+ #define IDC_HELIUM_WORKSPACE_1        34112
+@@ -159,6 +160,8 @@
+ #define IDC_HELIUM_WORKSPACE_RENAME   34123
+ #define IDC_HELIUM_WORKSPACE_MOVE_TAB_TO 34124
+ #define IDC_HELIUM_WORKSPACE_TOGGLE_RAIL 34125
++#define IDC_HELIUM_WORKSPACE_MOVE_UP 34126
++#define IDC_HELIUM_WORKSPACE_MOVE_DOWN 34127
+ 
+ // Page-related commands
+ #define IDC_BOOKMARK_THIS_TAB           35000
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -261,9 +261,20 @@ const AcceleratorMapping kAcceleratorMap
+     // S because W is taken (IDC_CLOSE_TAB_GROUP) and so is N
+     // (IDC_NEW_SPLIT_TAB, appended conditionally further down this file, which
+     // is why it does not show up in the map above). S for Space, Arc's name
+-    // for the same thing. Shift+Alt+Up and Shift+Alt+Down are deliberately
+-    // left free: reordering wants them next.
++    // for the same thing.
+     {ui::VKEY_S, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_NEW},
++    // The keys E9e part 1 reserved for reordering, now taken. VKEY_UP and
++    // VKEY_DOWN appear nowhere else in this file -- checked across all four
++    // maps and the conditional appends below, which is the check E9e part 1
++    // records having nearly skipped for VKEY_N.
++    //
++    // No RTL swap here, unlike PREV/NEXT above. Left and right mirror in an
++    // RTL layout and up and down do not, so "up" means one place earlier in
++    // the list whichever way the strip runs.
++    {ui::VKEY_UP, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
++     IDC_HELIUM_WORKSPACE_MOVE_UP},
++    {ui::VKEY_DOWN, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
++     IDC_HELIUM_WORKSPACE_MOVE_DOWN},
+     {ui::VKEY_HOME, ui::EF_ALT_DOWN, IDC_HOME},
+     {ui::VKEY_E, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+     {ui::VKEY_F, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -149,6 +149,44 @@ std::vector<WorkspaceEntry> RemoveWorksp
+   return entries;
+ }
+ 
++std::vector<WorkspaceEntry> MoveWorkspace(std::vector<WorkspaceEntry> entries,
++                                          std::string_view guid,
++                                          int offset) {
++  if (offset == 0) {
++    return entries;
++  }
++
++  int from = -1;
++  for (size_t i = 0; i < entries.size(); ++i) {
++    if (entries[i].guid == guid) {
++      from = static_cast<int>(i);
++      break;
++    }
++  }
++  if (from < 0) {
++    return entries;
++  }
++
++  const int target = from + offset;
++  if (target < 0 || target >= static_cast<int>(entries.size())) {
++    return entries;
++  }
++
++  // Lift it out and put it back, rather than a swap. A swap is only correct
++  // for an offset of one; for anything larger it would jump the entry over the
++  // ones in between and leave those in the wrong order relative to each other.
++  //
++  // `target` is an index into the list BEFORE the erase, and inserting at it
++  // afterwards is still right in both directions: moving later, the erase
++  // shifts everything after `from` down by one, which is exactly the shift the
++  // entry needs to land past them; moving earlier, nothing before `from`
++  // moves at all.
++  WorkspaceEntry moved = std::move(entries[from]);
++  entries.erase(entries.begin() + from);
++  entries.insert(entries.begin() + target, std::move(moved));
++  return entries;
++}
++
+ base::DictValue SerializeWorkspaces(
+     const std::vector<WorkspaceEntry>& entries) {
+   base::ListValue list;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -129,6 +129,33 @@ std::vector<WorkspaceEntry> RenameWorksp
+ std::vector<WorkspaceEntry> RemoveWorkspace(std::vector<WorkspaceEntry> entries,
+                                             std::string_view guid);
+ 
++// Moves `guid` `offset` places along the list, and returns the edited list.
++// Negative is earlier, positive is later. E9e part 2, and the same shape as the
++// three above: takes the list by value, returns the edited one, and a refused
++// edit returns what it was given.
++//
++// THE ORDER IS THE ONLY THING THIS LIST CARRIES BESIDES THE ENTRIES. It is the
++// order the rail draws its buttons in and the order Shift+Alt+arrow cycles
++// through, which is what makes reordering worth a command at all -- and it is
++// also why AddWorkspace appends rather than inserting.
++//
++// REFUSES AN OUT-OF-RANGE TARGET RATHER THAN CLAMPING OR WRAPPING. Wrapping is
++// right for switching -- RelativeWorkspaceGuid wraps, because that is how you
++// get from the last workspace back to the first -- and wrong for moving, where
++// it would teleport a rail button from one end to the other on a keypress the
++// user expected to do nothing. Clamping would be a write that reports success
++// and changes nothing, which is the shape RemoveWorkspace is documented above
++// for refusing.
++//
++// Nothing here special-cases the default workspace. It can be moved off the
++// front and stays there: ParseWorkspaces() prepends it only when it is ABSENT,
++// so a stored list that contains it keeps its position. That is load-bearing
++// enough to be pinned by a round-trip test rather than left as a reading of
++// the parser.
++std::vector<WorkspaceEntry> MoveWorkspace(std::vector<WorkspaceEntry> entries,
++                                          std::string_view guid,
++                                          int offset);
++
+ // The stored form of `entries`, carrying this build's schema version. The
+ // inverse of ParseWorkspaces(), and round-trips with it.
+ base::DictValue SerializeWorkspaces(
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -432,6 +432,110 @@ TEST(WorkspaceWriteTest, RemoveOfAnUnkno
+   EXPECT_EQ(2u, RemoveWorkspace(TwoWorkspaces(), "gone").size());
+ }
+ 
++// --- Reorder (E9e part 2) ---------------------------------------------------
++
++// Three, because two cannot tell a move apart from a swap, and cannot show
++// whether the entries a move steps over keep their own order.
++std::vector<WorkspaceEntry> ThreeWorkspaces() {
++  return {WorkspaceEntry{std::string(kDefaultWorkspaceGuid), "Home"},
++          WorkspaceEntry{"work", "Work"},
++          WorkspaceEntry{"study", "Study"}};
++}
++
++TEST(WorkspaceWriteTest, MoveUpTakesThePlaceOfTheOneBefore) {
++  const std::vector<WorkspaceEntry> after =
++      MoveWorkspace(ThreeWorkspaces(), "study", -1);
++
++  EXPECT_EQ((std::vector<std::string>{std::string(kDefaultWorkspaceGuid),
++                                      "study", "work"}),
++            GuidsOf(after));
++}
++
++TEST(WorkspaceWriteTest, MoveDownTakesThePlaceOfTheOneAfter) {
++  const std::vector<WorkspaceEntry> after =
++      MoveWorkspace(ThreeWorkspaces(), "work", 1);
++
++  EXPECT_EQ((std::vector<std::string>{std::string(kDefaultWorkspaceGuid),
++                                      "study", "work"}),
++            GuidsOf(after));
++}
++
++TEST(WorkspaceWriteTest, MoveCarriesTheTitle) {
++  const std::vector<WorkspaceEntry> after =
++      MoveWorkspace(ThreeWorkspaces(), "study", -1);
++
++  EXPECT_EQ("Study", after[1].title);
++  EXPECT_EQ("Work", after[2].title);
++}
++
++// REFUSED, NOT CLAMPED AND NOT WRAPPED. Switching wraps -- that is how the last
++// workspace reaches the first -- and moving must not, or Shift+Alt+Up on the
++// first workspace would teleport its button to the far end of the rail.
++TEST(WorkspaceWriteTest, MoveRefusesPastTheStart) {
++  EXPECT_EQ(GuidsOf(ThreeWorkspaces()),
++            GuidsOf(MoveWorkspace(ThreeWorkspaces(), kDefaultWorkspaceGuid,
++                                  -1)));
++}
++
++TEST(WorkspaceWriteTest, MoveRefusesPastTheEnd) {
++  EXPECT_EQ(GuidsOf(ThreeWorkspaces()),
++            GuidsOf(MoveWorkspace(ThreeWorkspaces(), "study", 1)));
++}
++
++TEST(WorkspaceWriteTest, MoveOfAnUnknownGuidChangesNothing) {
++  EXPECT_EQ(GuidsOf(ThreeWorkspaces()),
++            GuidsOf(MoveWorkspace(ThreeWorkspaces(), "gone", 1)));
++}
++
++TEST(WorkspaceWriteTest, MoveByZeroChangesNothing) {
++  EXPECT_EQ(GuidsOf(ThreeWorkspaces()),
++            GuidsOf(MoveWorkspace(ThreeWorkspaces(), "work", 0)));
++}
++
++// Why the implementation lifts the entry out and reinserts it rather than
++// swapping: a swap is only correct for a single step. Nothing calls this with
++// a larger offset today -- both callers pass 1 or -1 -- and that is exactly
++// why it is worth pinning, because the drag interaction that comes later is
++// the one that will.
++TEST(WorkspaceWriteTest, MoveByMoreThanOneKeepsTheOthersInOrder) {
++  const std::vector<WorkspaceEntry> after =
++      MoveWorkspace(ThreeWorkspaces(), kDefaultWorkspaceGuid, 2);
++
++  EXPECT_EQ((std::vector<std::string>{"work", "study",
++                                      std::string(kDefaultWorkspaceGuid)}),
++            GuidsOf(after));
++}
++
++// The default workspace is the one entry with a rule attached to its position,
++// and the rule is about ABSENCE, not about index 0: ParseWorkspaces() prepends
++// it only when the stored list does not contain it. So it can be moved, unlike
++// being removed.
++TEST(WorkspaceWriteTest, MoveWorksOnTheDefaultWorkspace) {
++  const std::vector<WorkspaceEntry> after =
++      MoveWorkspace(ThreeWorkspaces(), kDefaultWorkspaceGuid, 1);
++
++  EXPECT_EQ((std::vector<std::string>{"work",
++                                      std::string(kDefaultWorkspaceGuid),
++                                      "study"}),
++            GuidsOf(after));
++}
++
++// And the half that would actually bite: moved off the front, written, read
++// back -- and still there, rather than silently prepended again on the next
++// read. Without this the menu item would appear to work and the order would
++// snap back at the next restart, which is the worst way to find out.
++TEST(WorkspaceWriteTest, MovingTheDefaultWorkspaceOffTheFrontSurvivesAReRead) {
++  const std::vector<WorkspaceEntry> moved =
++      MoveWorkspace(ThreeWorkspaces(), kDefaultWorkspaceGuid, 2);
++
++  const std::vector<WorkspaceEntry> round_tripped =
++      ParseWorkspaces(SerializeWorkspaces(moved));
++
++  EXPECT_EQ((std::vector<std::string>{"work", "study",
++                                      std::string(kDefaultWorkspaceGuid)}),
++            GuidsOf(round_tripped));
++}
++
+ // Serialise and parse are inverses. This is what lets every edit be "read the
+ // list, edit the list, write the list" with no separate merge path.
+ TEST(WorkspaceWriteTest, SerializeRoundTripsThroughParse) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -227,6 +227,35 @@ void WorkspaceService::RenameWorkspace(s
+       prefs_, prefs::RenameWorkspace(GetWorkspaces(), guid, title));
+ }
+ 
++void WorkspaceService::MoveWorkspace(std::string_view guid, int offset) {
++  // Guarded here for the same reason CreateWorkspace() is: one of the two
++  // callers is a keyboard command, which can fire while the feature is off and
++  // nothing is on screen to show what it did.
++  if (!IsEnabled()) {
++    return;
++  }
++
++  const std::vector<std::string> before = known_guids_;
++
++  prefs::WriteWorkspaces(prefs_,
++                         prefs::MoveWorkspace(GetWorkspaces(), guid, offset));
++
++  // A refused move -- either end of the list, or a guid naming nothing --
++  // writes the list back unchanged, and JsonPrefStore drops a write whose value
++  // is equal to the stored one, so nothing downstream sees it. The guard here
++  // is not about the pref: it is about the log line, which is how this chunk
++  // gets verified, and "moved" printed for a keypress that did nothing is the
++  // kind of small lie nobody ever debugs (LOCAL.md 19).
++  //
++  // known_guids_ is the comparison because the write above refreshes it
++  // SYNCHRONOUSLY -- PrefChangeRegistrar notifies on the SetDict call, not on a
++  // later task, which is the same fact CreateWorkspace() relies on to switch
++  // into a workspace it has only just added.
++  if (known_guids_ != before) {
++    LOG(INFO) << "[workspaces] moved workspace '" << guid << "' by " << offset;
++  }
++}
++
+ void WorkspaceService::DeleteWorkspace(std::string_view guid) {
+   if (guid.empty() || guid == kDefaultWorkspaceGuid) {
+     return;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -138,6 +138,17 @@ class WorkspaceService : public TabStrip
+   // workspace acquires the title E7c deliberately did not give it.
+   void RenameWorkspace(std::string_view guid, const std::string& title);
+ 
++  // Moves a workspace `offset` places along the list -- negative is earlier,
++  // positive is later -- changing the order the rail draws and the order
++  // Shift+Alt+arrow cycles through. Does nothing at the ends of the list
++  // (workspace_prefs.h explains why it refuses rather than wrapping).
++  //
++  // Unlike the other three write-path methods this one is safe to call from
++  // anywhere: it moves no tab, activates nothing and closes nothing. All it
++  // does is write the pref, and every window's rail redraws itself off the
++  // pref observer E9b installed.
++  void MoveWorkspace(std::string_view guid, int offset);
++
+   // Deletes a workspace and closes the tabs that belonged to it.
+   //
+   // Refuses the default workspace, because ParseWorkspaces() would put it back
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -43,6 +43,8 @@ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kW
+ constexpr int kMenuCommandRename = 1;
+ constexpr int kMenuCommandDelete = 2;
+ constexpr int kMenuCommandMoveTabsHere = 3;
++constexpr int kMenuCommandMoveUp = 4;
++constexpr int kMenuCommandMoveDown = 5;
+ 
+ // What a workspace's button says.
+ //
+@@ -328,6 +330,23 @@ void WorkspaceRailView::ShowContextMenuF
+ 
+   context_menu_model_->AddItemWithStringId(kMenuCommandRename,
+                                            IDS_HELIUM_WORKSPACE_RENAME);
++
++  // "Up" and "down" mean earlier and later in the list, which is left and
++  // right while the strip is expanded and the rail is drawn as a row, and
++  // literally up and down once the strip collapses and it becomes a column.
++  // Naming them for the list rather than the pixels is what keeps them
++  // matching Shift+Alt+Up / Shift+Alt+Down, which cannot change with the
++  // strip's width.
++  context_menu_model_->AddItemWithStringId(kMenuCommandMoveUp,
++                                           IDS_HELIUM_WORKSPACE_MOVE_UP);
++  context_menu_model_->AddItemWithStringId(kMenuCommandMoveDown,
++                                           IDS_HELIUM_WORKSPACE_MOVE_DOWN);
++
++  // Delete is separated now that there are three items above it. It closes
++  // every tab in the workspace, and it had been sitting directly under Rename
++  // when Rename was the only neighbour; putting two more one-word items
++  // against it makes a mis-click both likelier and more expensive.
++  context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   context_menu_model_->AddItemWithStringId(kMenuCommandDelete,
+                                            IDS_HELIUM_WORKSPACE_DELETE);
+ 
+@@ -357,6 +376,24 @@ bool WorkspaceRailView::IsCommandIdEnabl
+     return service && service->active_guid() != context_menu_guid_ &&
+            service->SelectedMovableTabCount() > 0;
+   }
++
++  // Greyed at the ends of the list, because MoveWorkspace() refuses an
++  // out-of-range target rather than wrapping -- an enabled item that does
++  // nothing is worse than a disabled one, the same rule as Move tabs here.
++  //
++  // Answered from `guids_` rather than by asking the service for the list
++  // again: `guids_` IS what this rail is currently drawing, rebuilt from the
++  // service on every list change, so it cannot disagree with what the user is
++  // looking at while the menu is open.
++  if (command_id == kMenuCommandMoveUp || command_id == kMenuCommandMoveDown) {
++    for (size_t i = 0; i < guids_.size(); ++i) {
++      if (guids_[i] != context_menu_guid_) {
++        continue;
++      }
++      return command_id == kMenuCommandMoveUp ? i > 0 : i + 1 < guids_.size();
++    }
++    return false;
++  }
+   return true;
+ }
+ 
+@@ -400,6 +437,12 @@ void WorkspaceRailView::ExecuteCommand(i
+     case kMenuCommandMoveTabsHere:
+       service->MoveSelectedTabsToWorkspace(guid);
+       break;
++    case kMenuCommandMoveUp:
++      service->MoveWorkspace(guid, -1);
++      break;
++    case kMenuCommandMoveDown:
++      service->MoveWorkspace(guid, 1);
++      break;
+     case kMenuCommandDelete:
+       // No confirmation step, and design 5 asks for one. Deliberate for now and
+       // recorded in LOCAL.md 18: every tab it closes goes to Recently Closed
+--- a/chrome/browser/ui/workspace_command_hooks.cc
++++ b/chrome/browser/ui/workspace_command_hooks.cc
+@@ -52,6 +52,31 @@ bool ExecuteWorkspaceCommand(BrowserWind
+         service->CreateWorkspace(std::string());
+       }
+       break;
++    case IDC_HELIUM_WORKSPACE_MOVE_UP:
++    case IDC_HELIUM_WORKSPACE_MOVE_DOWN:
++      // Moves the workspace this window is SHOWING. A key press has no
++      // right-clicked button to act on, and the active workspace is the only
++      // subject the user can be said to have chosen; the rail's menu items
++      // act on whichever one was right-clicked instead.
++      //
++      // At the ends of the list this does nothing -- MoveWorkspace() refuses
++      // an out-of-range target rather than wrapping. Wrapping is right for
++      // switching, where it is how you get from the last workspace back to
++      // the first, and wrong for moving, where it would teleport a button
++      // from one end of the rail to the other.
++      if (WorkspaceService* service = WorkspaceService::From(browser)) {
++        // A COPY, not active_guid() straight through. That returns a
++        // reference to the service's own member, MoveWorkspace() would hold a
++        // string_view of it across a pref write, and the pref observer that
++        // write runs synchronously is allowed to assign to that member. It
++        // does not on this path -- reordering removes no workspace, so the
++        // resolve branch in OnWorkspaceListChanged never fires -- but that is
++        // a fact about a different function, and the temporary costs nothing.
++        service->MoveWorkspace(
++            std::string(service->active_guid()),
++            id == IDC_HELIUM_WORKSPACE_MOVE_UP ? -1 : 1);
++      }
++      break;
+     default:
+       return false;
+   }
+@@ -78,6 +103,10 @@ WorkspaceShortcutLabel(int id) {
+       return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_PREVIOUS};
+     case IDC_HELIUM_WORKSPACE_NEW:
+       return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_NEW};
++    case IDC_HELIUM_WORKSPACE_MOVE_UP:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_MOVE_UP};
++    case IDC_HELIUM_WORKSPACE_MOVE_DOWN:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_MOVE_DOWN};
+     default:
+       return std::nullopt;
+   }

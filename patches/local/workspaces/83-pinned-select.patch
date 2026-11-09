@@ -1,0 +1,963 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -309,6 +309,60 @@ int CountPages(const std::vector<PinNode
+   return items;
+ }
+ 
++std::vector<std::string> SelectRange(const std::vector<std::string>& drawn,
++                                     std::string_view anchor,
++                                     std::string_view clicked) {
++  const auto to = std::ranges::find(drawn, clicked);
++  if (to == drawn.end()) {
++    return {};
++  }
++  // No anchor, or one no longer drawn: the click alone.
++  auto from = std::ranges::find(drawn, anchor);
++  if (anchor.empty() || from == drawn.end()) {
++    from = to;
++  }
++  // Top to bottom, whichever of the two was clicked first; both ends in.
++  return std::vector<std::string>(std::min(from, to),
++                                  std::max(from, to) + 1);
++}
++
++namespace {
++
++// Adds to `inside` each row of `rows` -- and below -- that is in `wanted` while
++// an ancestor of it is too.
++void MarkInside(const std::vector<PinNode>& rows,
++                const std::set<std::string_view>& wanted,
++                bool under_wanted,
++                std::set<std::string_view>& inside) {
++  for (const PinNode& row : rows) {
++    const bool is_wanted = wanted.contains(row.id);
++    if (is_wanted && under_wanted) {
++      inside.insert(row.id);
++    }
++    MarkInside(row.children, wanted, under_wanted || is_wanted, inside);
++  }
++}
++
++}  // namespace
++
++std::vector<std::string> WithoutInside(const PinTree& tree,
++                                       const std::vector<std::string>& ids) {
++  // One walk of the tree, not one per pair: a Shift+click over an open folder
++  // can select a thousand rows.
++  const std::set<std::string_view> wanted(ids.begin(), ids.end());
++  std::set<std::string_view> inside;
++  for (const auto& [guid, roots] : tree) {
++    MarkInside(roots, wanted, false, inside);
++  }
++  std::vector<std::string> kept;
++  for (const std::string& id : ids) {
++    if (!inside.contains(id) && !std::ranges::contains(kept, id)) {
++      kept.push_back(id);
++    }
++  }
++  return kept;
++}
++
+ base::DictValue PinTreeToValue(const PinTree& tree) {
+   base::DictValue workspaces;
+   for (const auto& [guid, roots] : tree) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -94,6 +94,22 @@ void CountRows(const std::vector<PinNode
+ // wants the pages alone (E18).
+ int CountPages(const std::vector<PinNode>& rows);
+ 
++// C29, the Shift+click: the ids from `anchor` to `clicked` in `drawn` -- the
++// ids of the rows on screen, top to bottom -- both ends included, in drawn
++// order, whichever of the two comes first. With no `anchor` (nothing was
++// clicked before), or one that is not drawn any more, just `clicked`; with a
++// `clicked` that is not drawn, nothing.
++std::vector<std::string> SelectRange(const std::vector<std::string>& drawn,
++                                     std::string_view anchor,
++                                     std::string_view clicked);
++
++// C29: `ids` without a repeat and without any row that sits inside another
++// one of them in `tree` -- a selected folder already carries what it holds, so
++// moving or deleting both would do the child twice. Order kept; an id the tree
++// does not hold stays (the caller finds it gone).
++std::vector<std::string> WithoutInside(const PinTree& tree,
++                                       const std::vector<std::string>& ids);
++
+ // The rows to draw for workspace `guid`, own rows first. Rows kept under a
+ // workspace that no longer exists show under the default workspace, as its
+ // tabs do (ResolveTabGuid, design 2.4): nothing is lost when a workspace is
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -985,5 +985,35 @@ TEST_F(PinStoreTest, OneStorePerProfileA
+   EXPECT_EQ(RootCount(LoadedStore()->tree(), "default"), 1u);
+ }
+ 
++// C29: the Shift+click's range, both ends in, in drawn order.
++TEST(WorkspacePinsTest, SelectRangeIsTheDrawnRowsBetweenTheTwoClicks) {
++  const std::vector<std::string> drawn = {"a", "f1", "b", "f2", "c"};
++  EXPECT_EQ(SelectRange(drawn, "f1", "f2"), (RowList{"f1", "b", "f2"}));
++  // Upwards from the anchor: the same rows, still top to bottom.
++  EXPECT_EQ(SelectRange(drawn, "f2", "f1"), (RowList{"f1", "b", "f2"}));
++  EXPECT_EQ(SelectRange(drawn, "a", "a"), (RowList{"a"}));
++  EXPECT_EQ(SelectRange(drawn, "a", "c"), drawn);
++  // Nothing clicked before, or the anchor is no longer drawn: the row alone.
++  EXPECT_EQ(SelectRange(drawn, "", "b"), (RowList{"b"}));
++  EXPECT_EQ(SelectRange(drawn, "gone", "b"), (RowList{"b"}));
++  // A click on a row that is not drawn selects nothing.
++  EXPECT_TRUE(SelectRange(drawn, "a", "gone").empty());
++}
++
++// C29: a folder carries what it holds, so a row inside a selected folder is
++// not a second thing to move or delete.
++TEST(WorkspacePinsTest, WithoutInsideDropsRowsInsideAnotherSelectedRow) {
++  const PinTree tree = SampleTree();
++  // c sits in f3 in f2 in f1: three folders deep.
++  EXPECT_EQ(WithoutInside(tree, {"a", "f1", "c", "b"}), (RowList{"a", "f1"}));
++  EXPECT_EQ(WithoutInside(tree, {"c", "f3"}), (RowList{"f3"}));
++  // Rows that only share a folder both stay, in the order given.
++  EXPECT_EQ(WithoutInside(tree, {"f2", "b", "a"}), (RowList{"f2", "b", "a"}));
++  // Across workspaces; a repeat once; an unknown id is left for the caller.
++  EXPECT_EQ(WithoutInside(tree, {"d", "a", "d", "nope"}),
++            (RowList{"d", "a", "nope"}));
++  EXPECT_TRUE(WithoutInside(tree, {}).empty());
++}
++
+ }  // namespace
+ }  // namespace workspaces::pins
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <cstdlib>
+ #include <memory>
++#include <ranges>
+ #include <set>
+ #include <string>
+ #include <utility>
+@@ -580,6 +581,24 @@ void CollectItems(const PinNode& row, st
+   }
+ }
+ 
++// The ids of every item under the rows `rows`, any depth, in the order given
++// (C29: what a selection's Close closes, and whether any of it is open),
++// copied: a change to the store replaces the tree they point into.
++std::vector<std::string> ItemIdsOfRows(const workspaces::pins::PinStore& store,
++                                       const std::vector<std::string>& rows) {
++  std::vector<std::string> ids;
++  for (const std::string& id : rows) {
++    if (const PinNode* const row = store.Find(id)) {
++      std::vector<const PinNode*> items;
++      CollectItems(*row, items);
++      for (const PinNode* const item : items) {
++        ids.push_back(item->id);
++      }
++    }
++  }
++  return ids;
++}
++
+ // The item `id` in any workspace of `tree`, and in `key` the tree's key for
+ // the workspace whose rows hold it -- a deleted workspace's too (C1: the quick
+ // search box finds items outside the section on screen). Null for a folder or
+@@ -1335,6 +1354,23 @@ class PinRow : public views::LabelButton
+   bool open() const { return open_; }
+   bool peek() const { return peek_; }
+   void MarkPeek() { peek_ = true; }
++  // C29: part of the section's selection. It shows in the row's fill
++  // (UpdateColors) and a screen reader hears it.
++  void SetSelected(bool selected) {
++    if (selected == selected_) {
++      return;
++    }
++    selected_ = selected;
++    GetViewAccessibility().SetIsSelected(selected);
++    UpdateColors();
++  }
++  // Esc lets go of a selection: `wanted` says there is one, `clear` lets go of
++  // it and says whether it did.
++  void SetEscapeCallbacks(base::RepeatingCallback<bool()> wanted,
++                          base::RepeatingCallback<bool()> clear) {
++    escape_wanted_ = std::move(wanted);
++    on_escape_ = std::move(clear);
++  }
+   // C8: takes over the drag of the row a rebuild replaced; its release is a
+   // drop. False for a row that is never dragged -- a peek row, a collapsed
+   // one: their drag callback is null (M2).
+@@ -1535,6 +1571,11 @@ class PinRow : public views::LabelButton
+           NotifyClick(event);
+         }
+         return true;
++      case ui::VKEY_ESCAPE:
++        if (!on_escape_.is_null() && on_escape_.Run()) {
++          return true;
++        }
++        [[fallthrough]];
+       default:
+         pressed_page_ = 0;
+         return views::LabelButton::OnKeyPressed(event);
+@@ -1545,9 +1586,13 @@ class PinRow : public views::LabelButton
+   // a folder moved the focus instead of opening or closing it (the owner's
+   // check of E15b). Up and Down stay the pane's, which carry on into the tabs.
+   bool SkipDefaultKeyEventProcessing(const ui::KeyEvent& event) override {
++    // Esc is the browser's Stop accelerator, run before the row sees the key:
++    // with a selection (C29) it is the row's.
+     return (folder_ && !icon_only_ &&
+             (event.key_code() == ui::VKEY_LEFT ||
+              event.key_code() == ui::VKEY_RIGHT)) ||
++           (event.key_code() == ui::VKEY_ESCAPE && !escape_wanted_.is_null() &&
++            escape_wanted_.Run()) ||
+            views::LabelButton::SkipDefaultKeyEventProcessing(event);
+   }
+ 
+@@ -1594,8 +1639,9 @@ class PinRow : public views::LabelButton
+     // After the x's own (a view's children hear first): it sets its colours.
+     UpdateCloseImages();
+     // The ring round the page in front is painted in colours (C35.1); only
+-    // that row has one -- a list of 1,313 rows is attached at once.
+-    if (RowState() == ItemState::kActive) {
++    // that row has one -- a list of 1,313 rows is attached at once. A selected
++    // row (C29) is painted in colours too.
++    if (RowState() == ItemState::kActive || selected_) {
+       UpdateColors();
+     }
+   }
+@@ -1774,18 +1820,28 @@ class PinRow : public views::LabelButton
+     // border: the border holds the row's insets. Colours, not ids: resolved
+     // again on a theme change (OnThemeChanged).
+     const ui::ColorProvider* const provider = GetColorProvider();
+-    if (!active) {
++    // C29: a selected row is filled with its workspace's colour at a low
++    // alpha, as the header's symbol and the chip are; the page in front keeps
++    // its ring, over that fill.
++    if (!active && !selected_) {
+       SetBackground(nullptr);
+     } else if (!provider) {
+       SetBackground(
+           views::CreateRoundedRectBackground(background, kActiveRowRadius));
+     } else {
+-      SetBackground(views::CreateBackgroundFromPainter(
+-          views::Painter::CreateRoundRectWith1PxBorderPainter(
+-              provider->GetColor(background),
+-              WorkspaceRailView::WorkspaceColor(*provider, color_,
+-                                                frame_active_),
+-              kActiveRowRadius)));
++      const SkColor workspace = WorkspaceRailView::WorkspaceColor(
++          *provider, color_, frame_active_);
++      if (!active) {
++        SetBackground(WorkspaceRailView::CurrentFill(*provider, workspace));
++      } else {
++        SkColor fill = provider->GetColor(background);
++        if (selected_) {
++          fill = color_utils::AlphaBlend(workspace, fill, SkAlpha{0x50});
++        }
++        SetBackground(views::CreateBackgroundFromPainter(
++            views::Painter::CreateRoundRectWith1PxBorderPainter(
++                fill, workspace, kActiveRowRadius)));
++      }
+     }
+   }
+ 
+@@ -1806,6 +1862,9 @@ class PinRow : public views::LabelButton
+   int hovered_page_ = -1;
+   bool dragging_ = false;
+   bool peek_ = false;
++  bool selected_ = false;
++  base::RepeatingCallback<bool()> escape_wanted_;
++  base::RepeatingCallback<bool()> on_escape_;
+   // A folder's, except collapsed; and its number of pages (E18).
+   raw_ptr<views::ImageView> chevron_ = nullptr;
+   raw_ptr<views::Label> count_ = nullptr;
+@@ -2262,7 +2321,7 @@ void WorkspacePinnedSectionView::Rebuild
+     RemoveChildViewT(old_list);
+   }
+   card_line_->SetVisible(false);
+-  drawn_guid_.clear();
++  const std::string previous_guid = std::exchange(drawn_guid_, {});
+   peek_id_.clear();
+   preferred_height_.reset();
+ 
+@@ -2305,9 +2364,15 @@ void WorkspacePinnedSectionView::Rebuild
+   }
+   SetVisible(shown);
+   if (!shown) {
++    ClearSelection();
+     return;
+   }
+   drawn_guid_ = service->active_guid();
++  // C29: a selection belongs to the workspace it was made in, and to the open
++  // strip.
++  if (drawn_guid_ != previous_guid || collapsed_) {
++    ClearSelection();
++  }
+   // The header, from the list: a rename, a colour or a symbol arrives here
+   // through the list-changed callback. The colours are the whole list's
+   // (a default depends on what the others hold).
+@@ -2592,10 +2657,11 @@ size_t WorkspacePinnedSectionView::AddRo
+   // The id only, never the row: the store is read again when it is clicked,
+   // since another window may have changed it since this row was made.
+   const bool folder = row.type == PinNode::Type::kFolder;
++  // C29: a press with Ctrl or Shift selects the row; any other press does what
++  // it always did. Not in the collapsed column, nor on a peek row.
+   views::Button::PressedCallback callback = base::BindRepeating(
+-      folder ? &WorkspacePinnedSectionView::OnFolderPressed
+-             : &WorkspacePinnedSectionView::OnItemPressed,
+-      base::Unretained(this), row.id);
++      &WorkspacePinnedSectionView::OnRowPressed, base::Unretained(this), row.id,
++      folder, /*selectable=*/!collapsed_ && !peek_at);
+   const bool lists_pages = folder && collapsed_;
+   if (lists_pages) {
+     // One icon with nothing drawn under it: its press lists its pages.
+@@ -2625,6 +2691,14 @@ size_t WorkspacePinnedSectionView::AddRo
+           ? DragCallback()
+           : base::BindRepeating(&WorkspacePinnedSectionView::OnRowDrag,
+                                 base::Unretained(this), row.id));
++  if (!collapsed_ && !peek_at) {
++    pin_row->SetEscapeCallbacks(
++        base::BindRepeating(&WorkspacePinnedSectionView::HasSelection,
++                            base::Unretained(this)),
++        base::BindRepeating(&WorkspacePinnedSectionView::ClearSelectionForEscape,
++                            base::Unretained(this)));
++    pin_row->SetSelected(selected_.contains(row.id));
++  }
+   if (lists_pages) {
+     // A menu button, as the bar's "+" is: clicking the icon again to close
+     // its menu would otherwise reopen it -- Windows replays that click to the
+@@ -2811,6 +2885,272 @@ void WorkspacePinnedSectionView::ShowFol
+       ui::GetMenuSourceTypeForEvent(event));
+ }
+ 
++void WorkspacePinnedSectionView::OnRowPressed(const std::string& id,
++                                              bool folder,
++                                              bool selectable,
++                                              const ui::Event& event) {
++  const bool control = event.IsControlDown();
++  const bool shift = event.IsShiftDown();
++  // Left and Right open and close a folder (PinRow::OnKeyPressed), whatever
++  // modifier is held, and leave the selection alone.
++  const ui::KeyEvent* const key =
++      event.IsKeyEvent() ? event.AsKeyEvent() : nullptr;
++  const bool arrow = key && (key->key_code() == ui::VKEY_LEFT ||
++                             key->key_code() == ui::VKEY_RIGHT);
++  if (selectable && !arrow && (control || shift)) {
++    if (shift) {
++      // The rows from the first click to this one; Ctrl as well adds them to
++      // what is selected, else they are all that is.
++      const std::vector<std::string> drawn = DrawnIds();
++      if (!std::ranges::contains(drawn, select_anchor_)) {
++        select_anchor_ = id;
++      }
++      if (!control) {
++        selected_.clear();
++      }
++      for (std::string& row :
++           workspaces::pins::SelectRange(drawn, select_anchor_, id)) {
++        selected_.insert(std::move(row));
++      }
++    } else {
++      if (selected_.erase(id) == 0) {
++        selected_.insert(id);
++      }
++      select_anchor_ = id;
++    }
++    ApplySelection();
++    // A mouse press gives a button no focus, and Esc (letting go of the
++    // selection) goes to the row that has it.
++    if (views::View* const row = RowFor(id)) {
++      row->RequestFocus();
++    }
++    LOG(INFO) << "[workspaces] pins: selected " << SelectedInOrder().size()
++              << " row(s)";
++    return;
++  }
++  // Any other press lets go of a selection, then does what it always did.
++  if (!arrow) {
++    ClearSelection();
++  }
++  if (folder) {
++    OnFolderPressed(id);
++  } else {
++    OnItemPressed(id);
++  }
++}
++
++std::vector<std::string> WorkspacePinnedSectionView::DrawnIds() const {
++  std::vector<std::string> ids;
++  if (list_) {
++    for (const views::View* const child : list_->children()) {
++      const auto* const row = views::AsViewClass<PinRow>(child);
++      if (!row->peek()) {
++        ids.push_back(row->id());
++      }
++    }
++  }
++  return ids;
++}
++
++std::vector<std::string> WorkspacePinnedSectionView::SelectedInOrder() const {
++  std::vector<std::string> ids;
++  for (std::string& id : DrawnIds()) {
++    if (selected_.contains(id)) {
++      ids.push_back(std::move(id));
++    }
++  }
++  return store_ ? workspaces::pins::WithoutInside(store_->tree(), ids) : ids;
++}
++
++void WorkspacePinnedSectionView::ApplySelection() {
++  if (!list_) {
++    return;
++  }
++  for (views::View* const child : list_->children()) {
++    auto* const row = views::AsViewClass<PinRow>(child);
++    if (!row->peek()) {
++      row->SetSelected(selected_.contains(row->id()));
++    }
++  }
++}
++
++void WorkspacePinnedSectionView::ClearSelection() {
++  if (selected_.empty() && select_anchor_.empty()) {
++    return;
++  }
++  selected_.clear();
++  select_anchor_.clear();
++  ApplySelection();
++  LOG(INFO) << "[workspaces] pins: selection cleared";
++}
++
++bool WorkspacePinnedSectionView::HasSelection() const {
++  return !selected_.empty();
++}
++
++bool WorkspacePinnedSectionView::ClearSelectionForEscape() {
++  if (selected_.empty()) {
++    return false;
++  }
++  ClearSelection();
++  return true;
++}
++
++bool WorkspacePinnedSectionView::BuildSelectionMenu(const std::string& id,
++                                                    bool peek) {
++  context_menu_selection_.clear();
++  if (peek || selected_.empty()) {
++    return false;
++  }
++  // A right-click on a row that is not selected ends the selection, then is an
++  // ordinary one.
++  if (!selected_.contains(id)) {
++    ClearSelection();
++    return false;
++  }
++  std::vector<std::string> ids = SelectedInOrder();
++  if (ids.size() < 2 || !store_) {
++    return false;
++  }
++  const bool any_item = std::ranges::any_of(ids, [this](const std::string& id) {
++    const PinNode* const row = store_->Find(id);
++    return row && row->type != PinNode::Type::kFolder;
++  });
++  const bool any_open = std::ranges::any_of(
++      ItemIdsOfRows(*store_, ids), [this](const std::string& page) {
++        return LinkedTab(browser_->GetTabStripModel(), page) != nullptr;
++      });
++  context_menu_selection_ = std::move(ids);
++  context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  // What the whole selection can do. Rename, New folder, Colour and a folder's
++  // own actions stay one row's (the owner's D2).
++  if (any_open) {
++    context_menu_model_->AddItemWithStringId(kCommandClose, IDS_APP_CLOSE);
++  }
++  if (any_item) {
++    context_menu_model_->AddItemWithStringId(kCommandUnpin,
++                                             IDS_HELIUM_PINNED_ITEM_UNPIN);
++  }
++  AddMoveToWorkspaceMenu();
++  context_menu_model_->AddItemWithStringId(kCommandDelete,
++                                           IDS_HELIUM_PINNED_ITEM_DELETE);
++  LOG(INFO) << "[workspaces] pins: menu for " << context_menu_selection_.size()
++            << " selected row(s)";
++  return true;
++}
++
++void WorkspacePinnedSectionView::AddMoveToWorkspaceMenu() {
++  // C3: to any other workspace, as a Today tab's menu has it (D2); built like
++  // the Colour submenu, after the menu that points at it.
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (const std::vector<workspaces::prefs::WorkspaceEntry> entries =
++          service ? service->GetWorkspaces()
++                  : std::vector<workspaces::prefs::WorkspaceEntry>();
++      entries.size() > 1) {
++    workspace_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++    menu_workspace_guids_.clear();
++    for (const workspaces::prefs::WorkspaceEntry& entry : entries) {
++      const int command = kCommandFirstWorkspace +
++                          static_cast<int>(menu_workspace_guids_.size());
++      if (command > kCommandLastWorkspace) {
++        break;
++      }
++      workspace_menu_model_->AddItem(command,
++                                     WorkspaceRailView::DisplayName(entry));
++      menu_workspace_guids_.push_back(entry.guid);
++    }
++    context_menu_model_->AddSubMenuWithStringId(
++        kCommandMoveToWorkspace, IDS_HELIUM_PINNED_MOVE_TO_WORKSPACE,
++        workspace_menu_model_.get());
++  }
++}
++
++void WorkspacePinnedSectionView::ExecuteSelectionCommand(int command_id) {
++  // Taken now: the rows are drawn again as the commands change the store.
++  const std::vector<std::string> ids =
++      std::exchange(context_menu_selection_, {});
++  if (!store_) {
++    return;
++  }
++  if (command_id >= kCommandFirstWorkspace &&
++      command_id <= kCommandLastWorkspace) {
++    const size_t index =
++        static_cast<size_t>(command_id - kCommandFirstWorkspace);
++    if (index < menu_workspace_guids_.size()) {
++      // In the order drawn: each goes last, so they land in that order.
++      for (const std::string& id : ids) {
++        MoveRow(id, menu_workspace_guids_[index]);
++      }
++      LOG(INFO) << "[workspaces] pins: moved " << ids.size()
++                << " selected row(s) to workspace '"
++                << menu_workspace_guids_[index] << "'";
++      ClearSelection();
++    }
++    return;
++  }
++  switch (command_id) {
++    case kCommandClose:
++      for (const std::string& page : ItemIdsOfRows(*store_, ids)) {
++        OnItemClosePressed(page);
++      }
++      LOG(INFO) << "[workspaces] pins: closed the open pages of " << ids.size()
++                << " selected row(s)";
++      break;
++    case kCommandUnpin:
++      // Each goes to the top of Today, so the last first: the top row ends on
++      // top. A folder is not unpinned.
++      for (const std::string& id : std::views::reverse(ids)) {
++        UnpinItem(id, -1, std::nullopt, /*select=*/false);
++      }
++      LOG(INFO) << "[workspaces] pins: unpinned " << ids.size()
++                << " selected row(s)";
++      ClearSelection();
++      break;
++    case kCommandDelete:
++      ShowDeleteSelectionConfirm(ids);
++      break;
++    default:
++      break;
++  }
++}
++
++void WorkspacePinnedSectionView::ShowDeleteSelectionConfirm(
++    const std::vector<std::string>& ids) {
++  LOG(INFO) << "[workspaces] confirm asked: delete " << ids.size()
++            << " selected row(s)";
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(l10n_util::GetPluralStringFUTF16(
++              IDS_HELIUM_PINNED_SELECTION_CONFIRM_DELETE,
++              static_cast<int>(ids.size())))
++          .AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(
++              IDS_HELIUM_PINNED_SELECTION_CONFIRM_BODY)))
++          .AddOkButton(
++              base::BindOnce(&WorkspacePinnedSectionView::DeleteSelection,
++                             weak_factory_.GetWeakPtr(), ids),
++              ui::DialogModel::Button::Params().SetLabel(
++                  l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_ITEM_DELETE)))
++          .AddCancelButton(base::BindOnce(
++              [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), this, views::BubbleBorder::TOP_LEFT);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
++void WorkspacePinnedSectionView::DeleteSelection(
++    const std::vector<std::string>& ids) {
++  for (const std::string& id : ids) {
++    DeleteRow(id);
++  }
++  LOG(INFO) << "[workspaces] pins: deleted " << ids.size()
++            << " selected row(s)";
++  ClearSelection();
++}
++
+ void WorkspacePinnedSectionView::OnItemPressed(const std::string& id) {
+   // A split's row is one button for its two pages: the page pressed is shown,
+   // the other beside it (E19).
+@@ -2985,7 +3325,8 @@ bool WorkspacePinnedSectionView::ShowSpl
+ void WorkspacePinnedSectionView::UnpinItem(
+     const std::string& id,
+     int index,
+-    std::optional<tab_groups::TabGroupId> group) {
++    std::optional<tab_groups::TabGroupId> group,
++    bool select) {
+   const PinNode* const found = store_ ? store_->Find(id) : nullptr;
+   if (!found || found->type == PinNode::Type::kFolder) {
+     return;
+@@ -3036,7 +3377,7 @@ void WorkspacePinnedSectionView::UnpinIt
+     }
+     if (!page) {
+       const PinNode item = *found;
+-      OpenItem(browser_, item);
++      OpenItem(browser_, item, /*guid=*/{}, select);
+     } else if (index >= 0) {
+       here->InsertDetachedTabAt(
+           here->count(),
+@@ -3663,6 +4004,19 @@ void WorkspacePinnedSectionView::OnRowDr
+   if (step == DragStep::kMove) {
+     if (drag_id_.empty()) {
+       drag_id_ = id;
++      // C29: a selected row drags the whole selection; any other row drags
++      // alone and ends it.
++      drag_group_.clear();
++      if (selected_.contains(id)) {
++        std::vector<std::string> group = SelectedInOrder();
++        if (group.size() >= 2 && std::ranges::contains(group, id)) {
++          drag_group_ = std::move(group);
++          LOG(INFO) << "[workspaces] pins: dragging " << drag_group_.size()
++                    << " selected row(s)";
++        }
++      } else {
++        ClearSelection();
++      }
+       BeginDrag();
+     }
+     drag_point_ = point_in_screen;
+@@ -3673,18 +4027,10 @@ void WorkspacePinnedSectionView::OnRowDr
+   const DropTarget target = step == DragStep::kDrop && drag_id_ == id
+                                 ? TargetAt(point_in_screen)
+                                 : DropTarget();
++  const std::vector<std::string> ids =
++      drag_group_.empty() ? std::vector<std::string>{id} : drag_group_;
+   EndDrag();
+-  if (!target.to.empty()) {
+-    if (store_ && store_->Move(id, drawn_guid_, target.to, target.where)) {
+-      LOG(INFO) << "[workspaces] pins: moved '" << id << "' "
+-                << WhereName(target.where) << " '" << target.to << "'";
+-    }
+-  } else if (target.list_index) {
+-    UnpinItem(id, *target.list_index, target.list_group);
+-  } else if (!target.workspace.empty()) {
+-    // C4: as the menu's Move to workspace -- last there, its pages with it.
+-    MoveRow(id, target.workspace);
+-  }
++  DropRows(ids, target);
+   // C8: a folder the drag opened closes again unless the drop went into it;
+   // nothing is kept for a drop in the list or on the bar, a cancel or no
+   // place at all.
+@@ -3693,6 +4039,59 @@ void WorkspacePinnedSectionView::OnRowDr
+                           : std::vector<std::string>());
+ }
+ 
++bool WorkspacePinnedSectionView::InDragGroup(std::string_view id) const {
++  return !drag_id_.empty() &&
++         (id == drag_id_ || std::ranges::contains(drag_group_, id));
++}
++
++void WorkspacePinnedSectionView::DropRows(const std::vector<std::string>& ids,
++                                          const DropTarget& target) {
++  if (!store_) {
++    return;
++  }
++  if (!target.to.empty()) {
++    // The group keeps its order. Into a folder a row goes in first, so the
++    // last goes first; after a row each goes after the one before it.
++    const bool into = target.where == Where::kInto;
++    const bool after = target.where == Where::kAfter;
++    std::string anchor = target.to;
++    for (size_t k = 0; k < ids.size(); ++k) {
++      const std::string& row = into ? ids[ids.size() - 1 - k] : ids[k];
++      if (store_->Move(row, drawn_guid_, after ? anchor : target.to,
++                       target.where)) {
++        LOG(INFO) << "[workspaces] pins: moved '" << row << "' "
++                  << WhereName(target.where) << " '"
++                  << (after ? anchor : target.to) << "'";
++        if (after) {
++          anchor = row;
++        }
++      }
++    }
++  } else if (target.list_index) {
++    // Each just before the tab the drop was before, so they land in order
++    // however the page tabs they move are placed.
++    TabStripModel* const here = browser_->GetTabStripModel();
++    tabs::TabInterface* const before =
++        *target.list_index < here->count()
++            ? here->GetTabAtIndex(*target.list_index)
++            : nullptr;
++    for (const std::string& id : ids) {
++      UnpinItem(id,
++                ids.size() == 1 ? *target.list_index
++                : before        ? here->GetIndexOfTab(before)
++                                : here->count(),
++                target.list_group, /*select=*/ids.size() == 1);
++    }
++    ClearSelection();
++  } else if (!target.workspace.empty()) {
++    // C4: as the menu's Move to workspace -- last there, its pages with it.
++    for (const std::string& id : ids) {
++      MoveRow(id, target.workspace);
++    }
++    ClearSelection();
++  }
++}
++
+ void WorkspacePinnedSectionView::UpdateDrag() {
+   views::View* const indicator = DropIndicator();
+   if (!indicator || (drag_id_.empty() && !dragging_tabs_)) {
+@@ -3795,6 +4194,7 @@ void WorkspacePinnedSectionView::EndDrag
+     }
+   }
+   drag_id_.clear();
++  drag_group_.clear();
+   dragging_tabs_ = false;
+   drag_scrolled_subscription_ = {};
+   hover_timer_.Stop();
+@@ -3949,28 +4349,25 @@ WorkspacePinnedSectionView::DropTarget W
+   const auto row_at = [&rows](size_t i) {
+     return views::AsViewClass<PinRow>(rows[i].get());
+   };
+-  // The dragged row and, when it is an open folder, the rows drawn inside it:
+-  // nowhere there can it go.
+-  size_t first = rows.size();
++  // The dragged rows (C29: the group's) and, for an open folder, the rows
++  // drawn inside it: nowhere there can they go.
++  std::vector<bool> excluded(rows.size(), false);
+   for (size_t i = 0; i < rows.size(); ++i) {
+-    if (row_at(i)->id() == drag_id_) {
+-      first = i;
+-      break;
++    if (row_at(i)->peek() || !InDragGroup(row_at(i)->id())) {
++      continue;
+     }
+-  }
+-  size_t past = first;
+-  if (first < rows.size()) {
+-    past = first + 1;
+-    while (past < rows.size() &&
+-           row_at(past)->level() > row_at(first)->level()) {
++    size_t past = i + 1;
++    while (past < rows.size() && row_at(past)->level() > row_at(i)->level()) {
+       ++past;
+     }
++    std::fill(excluded.begin() + i, excluded.begin() + past, true);
++    i = past - 1;
+   }
+   size_t r = 0;
+   while (r < rows.size() && rows[r]->bounds().bottom() <= y) {
+     ++r;
+   }
+-  if (r >= first && r < past) {
++  if (r < rows.size() && excluded[r]) {
+     return DropTarget();
+   }
+   // A row dropped on the peek row goes into its folder, the row above it
+@@ -3979,7 +4376,7 @@ WorkspacePinnedSectionView::DropTarget W
+     DropTarget into;
+     into.to = row_at(r - 1)->id();
+     into.where = Where::kInto;
+-    if (into.to == drag_id_) {
++    if (InDragGroup(into.to)) {
+       return DropTarget();
+     }
+     into.indicator = views::View::ConvertRectToTarget(list_, parent(),
+@@ -4037,7 +4434,7 @@ WorkspacePinnedSectionView::DropTarget W
+     in_list = line_at(row->bounds().bottom(), 0);
+   }
+   // Just before or after itself is where it already is.
+-  if (target.to.empty() || target.to == drag_id_) {
++  if (target.to.empty() || InDragGroup(target.to)) {
+     return DropTarget();
+   }
+   target.indicator = views::View::ConvertRectToTarget(list_, parent(), in_list);
+@@ -4047,9 +4444,14 @@ WorkspacePinnedSectionView::DropTarget W
+ WorkspacePinnedSectionView::DropTarget WorkspacePinnedSectionView::ListTargetAt(
+     const gfx::Point& point_in_screen) {
+   // A folder does not become tabs; an item or a split does (E19).
+-  const PinNode* const dragged = store_ ? store_->Find(drag_id_) : nullptr;
+-  if (!dragged || dragged->type == PinNode::Type::kFolder) {
+-    return DropTarget();
++  // C29: a group with a folder in it does not go either.
++  for (const std::string& id : drag_group_.empty()
++                                   ? std::vector<std::string>{drag_id_}
++                                   : drag_group_) {
++    const PinNode* const dragged = store_ ? store_->Find(id) : nullptr;
++    if (!dragged || dragged->type == PinNode::Type::kFolder) {
++      return DropTarget();
++    }
+   }
+   UnpinnedTabContainerView* container = nullptr;
+   for (views::View* const child : parent()->children()) {
+@@ -4263,6 +4665,9 @@ void WorkspacePinnedSectionView::ShowCon
+       return;
+     }
+     context_menu_model_ = std::make_unique<NewTabButtonMenuModel>(browser_);
++  } else if (const auto* const selected = views::AsViewClass<PinRow>(source);
++             selected && BuildSelectionMenu(selected->id(), selected->peek())) {
++    // C29: the menu of several selected rows, built.
+   } else if (const auto* const row = views::AsViewClass<PinRow>(source)) {
+     context_menu_id_ = row->id();
+     // A split's row is both its pages (E19): Rename names the one the menu was
+@@ -4301,30 +4706,7 @@ void WorkspacePinnedSectionView::ShowCon
+     // "Rename workspace" (the owner's check of E15d.1).
+     context_menu_model_->AddItemWithStringId(kCommandRename,
+                                              IDS_BOOKMARKS_RENAME);
+-    // C3: to any other workspace, as a Today tab's menu has it (D2); built
+-    // like the Colour submenu, after the menu that points at it.
+-    const workspaces::WorkspaceService* const service =
+-        workspaces::WorkspaceService::From(browser_);
+-    if (const std::vector<workspaces::prefs::WorkspaceEntry> entries =
+-            service ? service->GetWorkspaces()
+-                    : std::vector<workspaces::prefs::WorkspaceEntry>();
+-        entries.size() > 1) {
+-      workspace_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+-      menu_workspace_guids_.clear();
+-      for (const workspaces::prefs::WorkspaceEntry& entry : entries) {
+-        const int command = kCommandFirstWorkspace +
+-                            static_cast<int>(menu_workspace_guids_.size());
+-        if (command > kCommandLastWorkspace) {
+-          break;
+-        }
+-        workspace_menu_model_->AddItem(command,
+-                                       WorkspaceRailView::DisplayName(entry));
+-        menu_workspace_guids_.push_back(entry.guid);
+-      }
+-      context_menu_model_->AddSubMenuWithStringId(
+-          kCommandMoveToWorkspace, IDS_HELIUM_PINNED_MOVE_TO_WORKSPACE,
+-          workspace_menu_model_.get());
+-    }
++    AddMoveToWorkspaceMenu();
+     // Not on a peek row (C12): its place is inside the closed folder, where a
+     // new folder would land unseen (design review).
+     if (!row->peek()) {
+@@ -4413,6 +4795,11 @@ void WorkspacePinnedSectionView::Execute
+     }
+     return;
+   }
++  if (!context_menu_selection_.empty()) {
++    // C29: the menu of several selected rows.
++    ExecuteSelectionCommand(command_id);
++    return;
++  }
+   const std::string id = context_menu_id_;
+   if (const int picked = command_id - kCommandFirstColor;
+       picked >= 0 && picked < workspaces::prefs::kWorkspaceColorCount) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -8,6 +8,7 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -279,6 +280,37 @@ class WorkspacePinnedSectionView
+   // The fold pref changed, here or in another window: a rebuild only when
+   // the card this window draws is folded or unfolded by it (review).
+   void OnFoldPrefChanged();
++  // A row's press (C29): with Ctrl it toggles the row in the selection, with
++  // Shift it selects the rows from the first click to this one (Ctrl and Shift
++  // add them); any other press lets go of the selection and does what the row
++  // always did -- opens the item, or toggles the folder. `selectable` is false
++  // in the collapsed column and on a peek row, which only do the latter.
++  void OnRowPressed(const std::string& id,
++                    bool folder,
++                    bool selectable,
++                    const ui::Event& event);
++  // The drawn rows' ids, top to bottom, peek row left out.
++  std::vector<std::string> DrawnIds() const;
++  // The selected rows that are drawn, top to bottom, without any inside
++  // another selected folder: what a command is done to.
++  std::vector<std::string> SelectedInOrder() const;
++  // Marks each drawn row selected or not from `selected_`; a rebuild marks the
++  // rows it makes itself (AddRow).
++  void ApplySelection();
++  void ClearSelection();
++  // Esc on a row (C29): whether there is a selection to let go of, and
++  // letting go of it.
++  bool HasSelection() const;
++  bool ClearSelectionForEscape();
++  // The menu of several selected rows, when the row right-clicked is one of at
++  // least two; a right-click on a row that is not selected ends the selection
++  // and builds nothing. Fills context_menu_selection_ and context_menu_model_.
++  bool BuildSelectionMenu(const std::string& id, bool peek);
++  // Move to workspace (C3) into context_menu_model_: every workspace.
++  void AddMoveToWorkspaceMenu();
++  void ExecuteSelectionCommand(int command_id);
++  void ShowDeleteSelectionConfirm(const std::vector<std::string>& ids);
++  void DeleteSelection(const std::vector<std::string>& ids);
+   void OnFolderPressed(const std::string& id);
+   // Collapsed, a folder's press: a menu of every page under it, by title,
+   // each opened as its row would be (E17b).
+@@ -316,9 +348,12 @@ class WorkspacePinnedSectionView
+   // otherwise. At model index `index` of this window, in `group` if given,
+   // when it was dropped there (E15d) -- a page open in another window comes
+   // here; else at the top of the list.
++  // A page it has to open is opened active, unless `select` is false (C29: the
++  // rows of a selection, which would otherwise each load and be shown in turn).
+   void UnpinItem(const std::string& id,
+                  int index = -1,
+-                 std::optional<tab_groups::TabGroupId> group = std::nullopt);
++                 std::optional<tab_groups::TabGroupId> group = std::nullopt,
++                 bool select = true);
+   // Removes an item, or a folder with all it holds, closing their pages.
+   void DeleteRow(const std::string& id);
+   void ShowDeleteFolderConfirm(const std::string& id, int items);
+@@ -361,10 +396,19 @@ class WorkspacePinnedSectionView
+     // (Where::kInto). Empty: nowhere, and a drop there does nothing.
+     gfx::Rect indicator;
+   };
+-  // A row reports its drag here, the id bound when the row was made.
++  // A row reports its drag here, the id bound when the row was made. On a
++  // selected row of a selection of two or more, the drag is the whole
++  // selection's (C29): drag_group_.
+   void OnRowDrag(const std::string& id,
+                  DragStep step,
+                  const gfx::Point& point_in_screen);
++  // C29: the rows dragged -- the group, else the one -- dropped at `target`,
++  // in the order drawn: before a row one after another, after it in a chain,
++  // into a folder last first (a row goes in at the top); as Today tabs one
++  // before the next, on a chip each moved there.
++  void DropRows(const std::vector<std::string>& ids, const DropTarget& target);
++  // Whether row `id` is one of the rows being dragged.
++  bool InDragGroup(std::string_view id) const;
+   // Draws where a drop at the last point would go, and scrolls the list while
+   // it is held near an edge; also run when the list scrolls under a still
+   // pointer, which is how the scrolling stops at the end (E15d review). A row
+@@ -478,6 +522,9 @@ class WorkspacePinnedSectionView
+   // The row being dragged (empty: none) and the last point it was dragged
+   // to, in screen coordinates.
+   std::string drag_id_;
++  // C29: with drag_id_ in a selection of two or more rows, the selection in
++  // the order drawn -- all of them are dragged. Empty: one row.
++  std::vector<std::string> drag_group_;
+   // Tabs that can be pinned are being dragged over the rows (E15d).
+   bool dragging_tabs_ = false;
+   gfx::Point drag_point_;
+@@ -517,6 +564,14 @@ class WorkspacePinnedSectionView
+   // view (E18 review); it lets go of it on its own if that view goes first.
+   std::unique_ptr<WheelGlide> favorites_glide_;
+ 
++  // C29: the selected rows' ids -- a row's own id; a split is one row -- and
++  // where a Shift+click starts its range. Per window, in the section: a rebuild
++  // draws the rows again, so the ids are kept here, not in the rows.
++  std::set<std::string, std::less<>> selected_;
++  std::string select_anchor_;
++  // The selection the open menu is for (empty: a one-row menu).
++  std::vector<std::string> context_menu_selection_;
++
+   // The row menu, and the row it was opened on. A folder's menu holds the
+   // Colour submenu, declared first so it outlives the menu that points at it
+   // (E17b). A collapsed folder's menu of pages runs on the same model and

@@ -1,0 +1,377 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ 
+ #include <string>
++#include <string_view>
+ 
+ #include "base/logging.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -36,6 +37,21 @@ WorkspaceService* WorkspaceService::From
+   return browser ? Get(browser->GetUnownedUserDataHost()) : nullptr;
+ }
+ 
++bool WorkspaceService::IsTabVisible(const tabs::TabInterface* tab) const {
++  if (!tab) {
++    return true;
++  }
++  content::WebContents* contents = tab->GetContents();
++  if (!contents) {
++    return true;
++  }
++  const WorkspaceTabData* tab_data =
++      WorkspaceTabData::FromWebContents(contents);
++  return IsVisibleInWorkspace(
++      tab_data ? std::string_view(tab_data->guid()) : std::string_view(),
++      active_guid_);
++}
++
+ void WorkspaceService::OnTabStripModelChanged(
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -14,6 +14,10 @@
+ class BrowserWindowInterface;
+ class TabStripModel;
+ 
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
+ namespace workspaces {
+ 
+ // One per browser window. Owns which workspace that window is showing, and
+@@ -50,6 +54,18 @@ class WorkspaceService : public TabStrip
+   // ever written to a pref (design 2.4).
+   const std::string& active_guid() const { return active_guid_; }
+ 
++  // Whether `tab` is drawn in this window, for the rendering predicate.
++  //
++  // Fails open: a null tab, a tab with no WebContents, or a tab that has never
++  // been stamped all return true. Getting this wrong in the other direction
++  // makes tabs disappear with no way for the user to get them back, so when
++  // this cannot answer, it shows the tab.
++  //
++  // Called from layout, so it must stay cheap and must not be cached by the
++  // caller -- switching kHeliumLayout destroys and rebuilds the whole view
++  // tree, and the answer changes whenever the active workspace does.
++  bool IsTabVisible(const tabs::TabInterface* tab) const;
++
+  private:
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -24,4 +24,13 @@ std::string ResolveGuidForInsertedTab(st
+   return std::string(kDefaultWorkspaceGuid);
+ }
+ 
++bool IsVisibleInWorkspace(std::string_view tab_guid,
++                          std::string_view active_guid) {
++  const std::string_view effective_tab =
++      tab_guid.empty() ? kDefaultWorkspaceGuid : tab_guid;
++  const std::string_view effective_active =
++      active_guid.empty() ? kDefaultWorkspaceGuid : active_guid;
++  return effective_tab == effective_active;
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -43,6 +43,20 @@ std::string ResolveGuidForInsertedTab(st
+                                       std::string_view opener_guid,
+                                       std::string_view active_guid);
+ 
++// Whether a tab is drawn, given the workspace it belongs to and the workspace
++// its window is currently showing (design 2.7).
++//
++// An empty guid means the implicit default workspace, not "no workspace", on
++// both sides. So an unstamped tab is visible exactly when the default workspace
++// is active, which is what makes enabling the feature on a profile with 200
++// open tabs behave sanely instead of hiding all of them.
++//
++// "Not visible" always means the TabView is present but invisible, never
++// absent: index -> tab -> handle -> view still resolves, so Ctrl+N, drag math,
++// context menus and accessibility keep working on hidden tabs.
++bool IsVisibleInWorkspace(std::string_view tab_guid,
++                          std::string_view active_guid);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -43,5 +43,45 @@ TEST(WorkspaceStampingTest, PrecedenceIs
+   EXPECT_EQ("c", ResolveGuidForInsertedTab("", "", "c"));
+ }
+ 
++TEST(WorkspaceVisibilityTest, TabInActiveWorkspaceIsVisible) {
++  EXPECT_TRUE(IsVisibleInWorkspace("work", "work"));
++}
++
++TEST(WorkspaceVisibilityTest, TabInAnotherWorkspaceIsHidden) {
++  EXPECT_FALSE(IsVisibleInWorkspace("work", "personal"));
++}
++
++// The case that decides whether turning the feature on for the first time is
++// pleasant or catastrophic: every existing tab is unstamped, and they must all
++// stay visible while the default workspace is active rather than vanishing.
++TEST(WorkspaceVisibilityTest, UnstampedTabBelongsToDefaultWorkspace) {
++  EXPECT_TRUE(IsVisibleInWorkspace("", kDefaultWorkspaceGuid));
++  EXPECT_FALSE(IsVisibleInWorkspace("", "personal"));
++}
++
++// Symmetry: an empty active guid means the default workspace too, so a service
++// that has not been told otherwise shows exactly the unstamped tabs.
++TEST(WorkspaceVisibilityTest, EmptyActiveGuidMeansDefaultWorkspace) {
++  EXPECT_TRUE(IsVisibleInWorkspace("", ""));
++  EXPECT_TRUE(IsVisibleInWorkspace(kDefaultWorkspaceGuid, ""));
++  EXPECT_FALSE(IsVisibleInWorkspace("work", ""));
++}
++
++// A freshly inserted tab is always visible in the window that received it:
++// whatever ResolveGuidForInsertedTab returns must satisfy IsVisibleInWorkspace
++// against that window's active guid. If these two ever disagree, opening a tab
++// would make it disappear immediately.
++TEST(WorkspaceStampingTest, NewlyStampedTabIsVisibleInItsWindow) {
++  const std::string_view actives[] = {std::string_view(""),
++                                      std::string_view("work"),
++                                      kDefaultWorkspaceGuid};
++  for (std::string_view active : actives) {
++    const std::string stamped = ResolveGuidForInsertedTab("", "", active);
++    EXPECT_TRUE(IsVisibleInWorkspace(stamped, active))
++        << "stamped '" << stamped << "' but hidden in active '" << active
++        << "'";
++  }
++}
++
+ }  // namespace
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -88,6 +88,13 @@ source_set("impl") {
+     "vertical_tab_style_views.h",
+   ]
+ 
++  # Helium Workspaces: the bodies of its hooks in these views (the hook
++  # shrink, part 4).
++  sources += [
++    "workspace_view_hooks.cc",
++    "workspace_view_hooks.h",
++  ]
++
+   deps = [
+     "//base:i18n",
+     "//cc/paint",
+@@ -117,6 +124,7 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs:utils",
+     "//chrome/browser/ui/tabs/organizer:impl",
+     "//chrome/browser/ui/tabs/saved_tab_groups",
++    "//chrome/browser/ui/tabs/workspaces",
+     "//chrome/browser/ui/user_education",
+     "//chrome/browser/ui/views:layout_provider",
+     "//chrome/browser/ui/views/frame",
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -564,6 +565,16 @@ void TabStripCollectionController::OnTab
+   expand_on_hover_lock_.reset();
+ }
+ 
++bool TabStripCollectionController::IsTabVisibleForWorkspace(
++    const tabs::TabInterface* tab) const {
++  if (!browser_view_) {
++    return true;
++  }
++  const workspaces::WorkspaceService* service =
++      workspaces::WorkspaceService::From(browser_view_->browser());
++  return !service || service->IsTabVisible(tab);
++}
++
+ void TabStripCollectionController::TabGroupFocusChanged(
+     std::optional<tab_groups::TabGroupId> new_focused_group_id,
+     std::optional<tab_groups::TabGroupId> old_focused_group_id) {
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
+@@ -125,6 +125,13 @@ class TabStripCollectionController : pub
+   // changed.
+   void TabKeyboardFocusChangedTo(const tabs::TabInterface* tab);
+ 
++  // Whether `tab` should be drawn, given the Workspace this window is showing.
++  //
++  // Fails open in the same way GetFocusedGroup() returns nullopt: with no
++  // browser view or no WorkspaceService, everything is visible and the strip
++  // renders exactly as stock Helium does.
++  bool IsTabVisibleForWorkspace(const tabs::TabInterface* tab) const;
++
+   void TabGroupFocusChanged(
+       std::optional<tab_groups::TabGroupId> new_focused_group_id,
+       std::optional<tab_groups::TabGroupId> old_focused_group_id);
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_layout_utils.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
++#include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
+ #include "chrome/browser/ui/views/tabs/horizontal/horizontal_tab_closing_helper.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_group.h"
+@@ -242,7 +243,11 @@ views::ProposedLayout UnpinnedTabContain
+   const int horizontal_padding =
+       GetLayoutConstant(LayoutConstant::kVerticalTabStripHorizontalPadding);
+ 
+-  for (auto* child : children) {
++  // Indexed rather than range-for, matching CalculateHorizontalLayout above:
++  // the workspace predicate needs the child's position to reach its collection
++  // node, and GetDirectChildren() returns views in collection-node order.
++  for (size_t child_index = 0; child_index < children.size(); ++child_index) {
++    views::View* child = children[child_index];
+     int x =
+         views::AsViewClass<TabGroupView>(child) &&
+                 collapse_state != tabs::VerticalTabStripCollapseState::kExpanded
+@@ -270,6 +275,11 @@ views::ProposedLayout UnpinnedTabContain
+     bool should_show_child =
+         IsChildVisibleInContainer(tab_container_view, focused_group_id, child);
+ 
++    // Helium Workspaces: and only a child of the window's workspace.
++    should_show_child = should_show_child &&
++                        workspaces::IsChildDrawnForWorkspace(
++                            tab_container_view->collection_node_, child_index);
++
+     if (!should_show_child) {
+       layouts.child_layouts.emplace_back(
+           child, false,
+@@ -352,17 +362,25 @@ gfx::Size UnpinnedTabContainerViewLayout
+   std::optional<tab_groups::TabGroupId> focused_group_id =
+       GetFocusedGroupId(tab_container_view);
+ 
++  // Must apply the same predicates as CalculateVerticalLayout. A child hidden
++  // there but counted here gives the strip a minimum size for tabs it is not
++  // drawing.
++  const auto children =
++      tab_container_view->collection_node_->GetDirectChildren();
++
+   int num_children = 0;
+-  for (const auto* child :
+-       tab_container_view->collection_node_->GetDirectChildren()) {
++  for (size_t child_index = 0; child_index < children.size(); ++child_index) {
+     bool should_show = true;
+     if (focused_group_id.has_value()) {
+       std::optional<tab_groups::TabGroupId> group_id =
+-          GetGroupIdForChild(child);
++          GetGroupIdForChild(children[child_index]);
+       if (group_id != focused_group_id.value()) {
+         should_show = false;
+       }
+     }
++    should_show = should_show &&
++                  workspaces::IsChildDrawnForWorkspace(
++                      tab_container_view->collection_node_, child_index);
+     if (should_show) {
+       num_children++;
+     }
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
++
++#include <variant>
++
++#include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
++#include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
++
++namespace workspaces {
++
++namespace {
++
++// The first tab at or below `node`, or null if it contains none.
++//
++// Used to give a whole collection a workspace: a group or split is drawn when
++// its first tab is (design 2.7). Deliberately recursive rather than a switch on
++// node type -- the direct children of an unpinned container are TAB, GROUP and
++// SPLIT, and the layout's focused-group code hides anything it fails to
++// classify, so a switch that forgot SPLIT would make every ungrouped split view
++// silently vanish. Recursion cannot forget a case.
++const tabs::TabInterface* FirstDescendantTab(const TabCollectionNode* node) {
++  if (!node) {
++    return nullptr;
++  }
++  if (node->type() == TabCollectionNode::Type::TAB) {
++    const tabs::ConstChildPtr node_data = node->GetNodeData();
++    // M153 made the variant hold raw_ptr<const TabInterface> rather than a
++    // bare pointer, and tab_collection_node.cc reads it the same way.
++    const tabs::ConstDanglingUntriagedTabInterface* tab =
++        std::get_if<tabs::ConstDanglingUntriagedTabInterface>(&node_data);
++    return tab ? tab->get() : nullptr;
++  }
++  for (const auto& child : node->children()) {
++    if (const tabs::TabInterface* tab = FirstDescendantTab(child.get())) {
++      return tab;
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++bool IsChildDrawnForWorkspace(const TabCollectionNode* parent,
++                              size_t child_index) {
++  if (!parent || !parent->GetController()) {
++    return true;
++  }
++  const TabCollectionNode::NodeChildren& nodes = parent->children();
++  if (child_index >= nodes.size()) {
++    return true;
++  }
++  const tabs::TabInterface* tab = FirstDescendantTab(nodes[child_index].get());
++  return !tab || parent->GetController()->IsTabVisibleForWorkspace(tab);
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.h
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_WORKSPACE_VIEW_HOOKS_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_WORKSPACE_VIEW_HOOKS_H_
++
++#include <stddef.h>
++
++class TabCollectionNode;
++
++// Helium Workspaces: the bodies of the fork's hooks in the vertical tab
++// strip's views (views/tabs/common). Each is asked in one line, so a rebase
++// that rewrites Chromium's layout code moves a line, never a block (the hook
++// shrink, part 4). Built in those views' own target, so these reach what they
++// reach.
++namespace workspaces {
++
++// UnpinnedTabContainerViewLayout's vertical layout and minimum size: whether
++// the direct child at `child_index` of `parent` -- the container's collection
++// node, whose children GetDirectChildren() returns in the same order -- is
++// drawn, given the workspace its window shows. A group or split is drawn when
++// its first tab is (design 2.7). Fails open like GetFocusedGroupId: with no
++// node, no controller, or a collection holding no tabs, the child is shown.
++bool IsChildDrawnForWorkspace(const TabCollectionNode* parent,
++                              size_t child_index);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_WORKSPACE_VIEW_HOOKS_H_

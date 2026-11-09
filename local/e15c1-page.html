@@ -1,0 +1,19 @@
+<!doctype html>
+<!-- check-e15c1-auto.ps1's pinned page. The title names the page by its #hash, so each tab can be told
+     apart in the list. Opened as a pinned page (no #hash), it opens '#one' when first shown and '#two' when
+     shown again: a link from a pinned page without a click -- an MSAA press on a link opens nothing, and
+     the test allows popups in its copy. Twice per profile: localStorage keeps the count across restarts. -->
+<title>E15c1</title>
+<script>
+document.title = 'E15c1 ' + (location.hash.slice(1) || 'links');
+if (!location.hash) {
+  const open = () => {
+    const n = +(localStorage.getItem('e15c1') || 0);
+    if (document.visibilityState !== 'visible' || n >= 2) return;
+    localStorage.setItem('e15c1', n + 1);
+    window.open('e15c1-page.html#' + ['one', 'two'][n]);
+  };
+  addEventListener('load', open);
+  document.addEventListener('visibilitychange', open);
+}
+</script>

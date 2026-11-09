@@ -1,0 +1,473 @@
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -455,6 +455,19 @@ bool BrowserTabStripModelDelegate::Reset
+   return true;
+ }
+ 
++int BrowserTabStripModelDelegate::IndexForNewTab(bool from_link) const {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  return service ? service->IndexForNewTab(from_link) : -1;
++}
++
++bool BrowserTabStripModelDelegate::IsTabAtTopOfList(
++    const tabs::TabInterface* tab) const {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  return service && service->IsTabAtTopOfList(tab);
++}
++
+ void BrowserTabStripModelDelegate::NewSplitTab(
+     std::vector<int> indices,
+     split_tabs::SplitTabLayout layout,
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.h
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.h
+@@ -89,6 +89,8 @@ class BrowserTabStripModelDelegate : pub
+   bool IsTabAnchored(const tabs::TabInterface* tab) const override;
+   bool ResetAnchoredTabInsteadOfClosing(tabs::TabInterface* tab,
+                                         const char* via) override;
++  int IndexForNewTab(bool from_link) const override;
++  bool IsTabAtTopOfList(const tabs::TabInterface* tab) const override;
+   void NewSplitTab(std::vector<int> indices,
+                    split_tabs::SplitTabLayout layout,
+                    split_tabs::SplitTabCreatedSource source) override;
+--- a/chrome/browser/ui/tabs/tab_list_bridge.cc
++++ b/chrome/browser/ui/tabs/tab_list_bridge.cc
+@@ -164,6 +164,12 @@ tabs::TabInterface* TabListBridge::OpenT
+   // It's a bit of a code smell to reach in and grab the delegate from
+   // TabStripModel, but it avoids introducing new dependencies here.
+   TabStripModelDelegate* delegate = tab_strip_->delegate();
++  // Helium Workspaces: a tab with no index opens at the top of the list, not
++  // the end (E15c.1). Asked first, so the tab returned below is the one opened
++  // (kNoTab is -1, which is also the answer "the end, as stock").
++  if (index == TabStripModel::kNoTab) {
++    index = delegate->IndexForNewTab(/*from_link=*/false);
++  }
+   delegate->AddTabAt(url, index, foreground);
+   int index_to_retrieve =
+       index == tab_list::kNoTabIndex ? tab_strip_->count() - 1 : index;
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -1786,6 +1786,8 @@ void TabStripModel::AddTab(std::unique_p
+   // to inherit the parent's opener attribute, so that if this tab is then
+   // closed we'll jump back to the parent tab.
+   bool inherit_opener = (add_types & ADD_INHERIT_OPENER) == ADD_INHERIT_OPENER;
++  // Helium Workspaces: where a new tab opens instead of the end (E15c.1).
++  bool top_of_list = false;
+ 
+   if (ui::PageTransitionTypeIncludingQualifiersIs(transition,
+                                                   ui::PAGE_TRANSITION_LINK) &&
+@@ -1795,7 +1797,13 @@ void TabStripModel::AddTab(std::unique_p
+     // drag-and-drops a link to the tab strip), callers aren't really handling
+     // link clicks, they just want to score the navigation like a link click in
+     // the history backend, so we don't inherit the opener in this case.
+-    index = DetermineInsertionIndex(transition, add_types & ADD_ACTIVE);
++    //
++    // Helium Workspaces: a link from a page drawn as a pinned row goes to the
++    // top of the list, as in Arc (E15c.1); -1 for every other link.
++    index = delegate()->IndexForNewTab(/*from_link=*/true);
++    if (index < 0) {
++      index = DetermineInsertionIndex(transition, add_types & ADD_ACTIVE);
++    }
+     inherit_opener = true;
+ 
+     // The current active index is our opener. If the tab we are adding is not
+@@ -1804,6 +1812,9 @@ void TabStripModel::AddTab(std::unique_p
+       group = GetTabGroupForTab(active_index());
+     }
+   } else {
++    // Helium Workspaces: at the top of the list, as in Arc (E15c.1), unless
++    // Helium's "new tab next to the active one" is on.
++    top_of_list = workspaces::NewTabAtTopOfList(*this, &index);
+     // For all other types, respect what was passed to us, normalizing -1s and
+     // values that are too large.
+     if (index < 0 || index > count()) {
+@@ -1855,9 +1866,10 @@ void TabStripModel::AddTab(std::unique_p
+     index = GetIndexRangeOfSplit(split_id.value()).GetMax();
+   }
+ 
++  // Helium Workspaces: or at the top of the list, where ours open (E15c.1).
+   if (ui::PageTransitionTypeIncludingQualifiersIs(transition,
+                                                   ui::PAGE_TRANSITION_TYPED) &&
+-      index == count()) {
++      (index == count() || top_of_list)) {
+     // Also, any tab opened at the end of the TabStrip with a "TYPED"
+     // transition inherit opener as well. This covers the cases where the user
+     // creates a New Tab (e.g. Ctrl+T, or clicks the New Tab button), or types
+@@ -4105,9 +4117,13 @@ std::vector<tabs::TabInterface*> TabStri
+ 
+ bool TabStripModel::IsNewTabAtEndOfTabStrip(WebContents* contents) const {
+   const GURL& url = contents->GetLastCommittedURL();
++  // Helium Workspaces: or at the top of the list, where new tabs open
++  // (E15c.1): typing into one must not forget where the user came from.
+   return url.SchemeIs(content::kChromeUIScheme) &&
+          url.host() == chrome::kChromeUINewTabHost &&
+-         contents == GetTabAtIndex(count() - 1)->GetContents() &&
++         (contents == GetTabAtIndex(count() - 1)->GetContents() ||
++          delegate()->IsTabAtTopOfList(
++              tabs::TabInterface::MaybeGetFromContents(contents))) &&
+          contents->GetController().GetEntryCount() == 1;
+ }
+ 
+--- a/chrome/browser/ui/tabs/tab_strip_model_delegate.h
++++ b/chrome/browser/ui/tabs/tab_strip_model_delegate.h
+@@ -250,6 +250,17 @@ class TabStripModelDelegate {
+     return false;
+   }
+ 
++  // Where a tab added with no index of its own goes -- a new tab, or with
++  // `from_link` a tab opened from a link on the active tab -- or -1 to leave it
++  // to TabStripModel's own rule. Same delegate route, and a default that keeps
++  // stock behaviour, as the three above. Fork addition (E15c.1).
++  virtual int IndexForNewTab(bool from_link) const { return -1; }
++  // Whether `tab` sits where IndexForNewTab puts a new tab -- the question
++  // alone, for the rules that expect a new tab at the end. Fork (E15c.1).
++  virtual bool IsTabAtTopOfList(const tabs::TabInterface* tab) const {
++    return false;
++  }
++
+   // Creates a split view with the active tab and the tabs at `indices`. If
+   // `indices` is empty, a new tab navigated to the split tab empty state page
+   // will be used for the split view instead.
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
+@@ -7,7 +7,11 @@
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
+ 
+ namespace workspaces {
+ 
+@@ -29,4 +33,18 @@ base::RepeatingCallback<std::vector<tabs
+       base::Unretained(delegate), std::move(get_tabs));
+ }
+ 
++bool NewTabAtTopOfList(const TabStripModel& model, int* index) {
++  if ((*index >= 0 && *index <= model.count()) ||
++      (model.count() >= 1 &&
++       model.profile()->GetPrefs()->GetBoolean(prefs::kNewTabNextToActive))) {
++    return false;
++  }
++  const int top = model.delegate()->IndexForNewTab(/*from_link=*/false);
++  if (top < 0) {
++    return false;
++  }
++  *index = top;
++  return true;
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/functional/callback.h"
+ 
++class TabStripModel;
+ class TabStripModelDelegate;
+ 
+ namespace tabs {
+@@ -31,6 +32,12 @@ base::RepeatingCallback<std::vector<tabs
+     const TabStripModelDelegate* delegate,
+     base::RepeatingCallback<std::vector<tabs::TabInterface*>()> get_tabs);
+ 
++// AddTab, for a tab that is not a link's: true when it opens at the top of
++// the list, as in Arc (E15c.1), with `index` set there. False, and `index`
++// untouched, when the caller gave an index or Helium's "new tab next to the
++// active one" is on: AddTab's own rules place it then.
++bool NewTabAtTopOfList(const TabStripModel& model, int* index);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -17,6 +17,7 @@
+ #include "base/logging.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
+ #include "base/uuid.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+@@ -1417,6 +1418,65 @@ bool WorkspaceService::IsDrawnAsPinnedRo
+   return IsPinItemTab(tab) && !(vertical && vertical->IsCollapsed());
+ }
+ 
++int WorkspaceService::TopOfListIndex(const tabs::TabInterface* opener) const {
++  if (!IsEnabled()) {
++    return -1;
++  }
++  // The first tab the list draws. Model index 0 would not do: other
++  // workspaces' tabs and open pinned pages share the model.
++  int index = tab_strip_->IndexOfFirstNonPinnedTab();
++  for (; index < tab_strip_->count(); ++index) {
++    const tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(index);
++    if (IsTabVisible(tab) && !IsDrawnAsPinnedRow(tab)) {
++      break;
++    }
++  }
++  if (index == tab_strip_->count()) {
++    return -1;
++  }
++  // After the pinned page's earlier links, in the order they were opened.
++  while (opener && index < tab_strip_->count() &&
++         tab_strip_->GetOpenerOfTabAt(index) == opener) {
++    ++index;
++  }
++  return index;
++}
++
++bool WorkspaceService::IsTabAtTopOfList(const tabs::TabInterface* tab) const {
++  const int top = TopOfListIndex(/*opener=*/nullptr);
++  return top >= 0 && tab_strip_->GetTabAtIndex(top) == tab;
++}
++
++int WorkspaceService::IndexForNewTab(bool from_link) const {
++  const tabs::TabInterface* const opener =
++      from_link ? tab_strip_->GetActiveTab() : nullptr;
++  if (from_link && !IsDrawnAsPinnedRow(opener)) {
++    return -1;
++  }
++  const int index = TopOfListIndex(opener);
++  if (index < 0) {
++    return -1;
++  }
++  // Measured on testprofile (LOCAL.md 47), logged when the window is free
++  // again: the time follows how many tabs the list DRAWS, not how many follow
++  // in the model -- Home, index 2 of 444 with 1 drawn, 59-100 ms; Canary,
++  // 321 drawn, 100-135 ms -- so the session's rewrite of every tab
++  // after the insert point (3 commands each) is not what costs.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](int index, bool link, base::TimeTicks start) {
++            LOG(INFO) << "[workspaces] new tab at index " << index
++                      << (link ? " (a link from a pinned page)"
++                               : " (the top of the list)")
++                      << ": the window was busy "
++                      << (base::TimeTicks::Now() - start).InMilliseconds()
++                      << " ms";
++          },
++          index, opener != nullptr, base::TimeTicks::Now()));
++  return index;
++}
++
+ int WorkspaceService::ListTabNear(int index, int delta) const {
+   std::vector<bool> selectable;
+   selectable.reserve(static_cast<size_t>(tab_strip_->count()));
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -382,6 +382,22 @@ class WorkspaceService : public TabStrip
+   // guard and the commands that follow the list ask.
+   bool IsDrawnAsPinnedRow(const tabs::TabInterface* tab) const;
+ 
++  // Where a tab added with no index goes, as Arc places it (E15c.1, read from
++  // the owner's own Arc sidebar file): a new tab at the top of the list; a
++  // link from a page drawn as a pinned row at the top too, after the tabs that
++  // page opened already. -1 leaves it to Chromium: Workspaces off, an empty
++  // list, or a link from a tab of the list -- below that tab, which is
++  // Chromium's own rule and Arc's. For a tab about to be added: it logs how
++  // long the add kept the window busy.
++  int IndexForNewTab(bool from_link) const;
++  // The question alone, nothing logged: the model index of the first tab the
++  // list draws -- or, given `opener`, of the first after the run of tabs it
++  // opened there -- or -1 while Workspaces is off or the list is empty.
++  int TopOfListIndex(const tabs::TabInterface* opener) const;
++  // Whether `tab` is the first tab the list draws: where a new tab opens, so
++  // Chromium's "a new tab at the END" rules ask this too (E15c.1 review #1).
++  bool IsTabAtTopOfList(const tabs::TabInterface* tab) const;
++
+   // Links `tab` to the pinned item `id`, or unlinks it with an empty id: the
+   // tab leaves or joins the list. Persisted through the same session write as
+   // the tag.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ #include "base/containers/span.h"
++#include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/strings/strcat.h"
+@@ -31,6 +32,9 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
++#include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/views/tabs/new_tab_button.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/favicon/core/favicon_service.h"
+@@ -290,6 +294,9 @@ class PinRow : public views::LabelButton
+                                             : std::next(it) != rows.end()) {
+           (event.key_code() == ui::VKEY_UP ? *std::prev(it) : *std::next(it))
+               ->RequestFocus();
++        } else if (event.key_code() == ui::VKEY_DOWN && GetFocusManager()) {
++          // From the last row on to "+ New Tab", just below (E15c.1).
++          GetFocusManager()->AdvanceFocus(/*reverse=*/false);
+         }
+         return true;
+       }
+@@ -389,6 +396,14 @@ WorkspacePinnedSectionView::WorkspacePin
+                        views::BoxLayout::Orientation::kVertical))
+       ->set_inside_border_insets(gfx::Insets::TLBR(0, 0, 4, 0));
+   SetVisible(false);
++  // Below the rows: their line, then "+ New Tab" at the top of the list, as
++  // in Arc (E15c.1). Helium's own button: the same action as Ctrl+T, and the
++  // bottom one is hidden while Workspaces is on (the rail, E13). Made once and
++  // off the widget; a rebuild replaces only the rows above them.
++  separator_ = AddChildView(std::make_unique<views::Separator>());
++  new_tab_button_ =
++      AddChildView(std::make_unique<VerticalNewTabButton>(browser_));
++  new_tab_button_->set_context_menu_controller(this);
+ }
+ 
+ WorkspacePinnedSectionView::~WorkspacePinnedSectionView() = default;
+@@ -522,25 +537,34 @@ void WorkspacePinnedSectionView::Rebuild
+       }
+     }
+   }
+-  // Cleared BEFORE the views go: `list_` would dangle across the delete.
++  // Cleared BEFORE the view goes: `list_` would dangle across the delete.
++  views::View* const old_list = list_;
+   list_ = nullptr;
++  if (old_list) {
++    RemoveChildViewT(old_list);
++  }
+   drawn_guid_.clear();
+   preferred_height_.reset();
+-  RemoveAllChildViews();
+ 
+   workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
++  // Shown with no rows as well: "+ New Tab" is the list's (E15c.1).
++  const bool shown = service && service->IsEnabled() &&
++                     !(state_controller_ && state_controller_->IsCollapsed());
+   std::vector<const PinNode*> roots;
+-  if (service && service->IsEnabled() && store_ && store_->loaded() &&
+-      !(state_controller_ && state_controller_->IsCollapsed())) {
++  if (shown && store_ && store_->loaded()) {
+     roots = workspaces::pins::RootsForWorkspace(
+         store_->tree(), service->active_guid(), service->known_guids());
+   }
+-  SetVisible(!roots.empty());
+-  if (roots.empty()) {
++  SetVisible(shown);
++  separator_->SetVisible(!roots.empty());
++  if (!shown) {
+     return;
+   }
+   drawn_guid_ = service->active_guid();
++  if (roots.empty()) {
++    return;
++  }
+ 
+   // Built OFF the widget, then attached as one child. Every child added to or
+   // removed from a view in the widget makes views walk the whole layer subtree
+@@ -558,8 +582,7 @@ void WorkspacePinnedSectionView::Rebuild
+     rows += AddRow(*list, *root, /*level=*/0, frame_active);
+   }
+   ApplyStates(*list, ReadLinks());
+-  list_ = AddChildView(std::move(list));
+-  AddChildView(std::make_unique<views::Separator>());
++  list_ = AddChildViewAt(std::move(list), 0);
+   if (!focused_id.empty()) {
+     for (views::View* const child : list_->children()) {
+       if (views::AsViewClass<PinRow>(child)->id() == focused_id) {
+@@ -806,10 +829,16 @@ void WorkspacePinnedSectionView::OpenIte
+     extra_data[workspaces::kCustomTitleExtraDataKey] = item.custom_title;
+   }
+   TabStripModel* const model = browser_->GetTabStripModel();
+-  // Appended: the session service re-records every tab after an insert point
+-  // (E14c), and where a hidden tab sits in the list does not matter.
++  // A linked page is appended: the session service re-records every tab after
++  // an insert point (E14c), and where a hidden tab sits does not matter. A
++  // Today tab (Unpin) opens at the top of the list, as new tabs do (E15c.1).
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  const int top =
++      linked || !service ? -1 : service->TopOfListIndex(/*opener=*/nullptr);
+   chrome::AddRestoredTab(
+-      browser_, base::span_from_ref(navigation), model->count(),
++      browser_, base::span_from_ref(navigation),
++      top >= 0 ? top : model->count(),
+       /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
+       /*group=*/std::nullopt, /*select=*/true, /*pin=*/false,
+       base::TimeTicks::Now(), base::Time::Now(),
+@@ -912,20 +941,27 @@ void WorkspacePinnedSectionView::ShowCon
+     views::View* source,
+     const gfx::Point& point,
+     ui::mojom::MenuSourceType source_type) {
+-  const auto* const row = views::AsViewClass<PinRow>(source);
+-  if (!row) {
+-    return;
+-  }
+-  context_menu_id_ = row->id();
+-  context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+-  if (row->folder()) {
+-    context_menu_model_->AddItemWithStringId(kCommandDeleteFolder,
+-                                             IDS_HELIUM_PINNED_FOLDER_DELETE);
++  if (source == new_tab_button_) {
++    // Helium's New Tab menu, as the bottom button has it -- that one is hidden
++    // while Workspaces is on (E15c.1 review #8).
++    if (!base::FeatureList::IsEnabled(features::kNewTabButtonContextMenu)) {
++      return;
++    }
++    context_menu_model_ = std::make_unique<NewTabButtonMenuModel>(browser_);
++  } else if (const auto* const row = views::AsViewClass<PinRow>(source)) {
++    context_menu_id_ = row->id();
++    context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++    if (row->folder()) {
++      context_menu_model_->AddItemWithStringId(kCommandDeleteFolder,
++                                               IDS_HELIUM_PINNED_FOLDER_DELETE);
++    } else {
++      context_menu_model_->AddItemWithStringId(kCommandUnpin,
++                                               IDS_HELIUM_PINNED_ITEM_UNPIN);
++      context_menu_model_->AddItemWithStringId(kCommandDelete,
++                                               IDS_HELIUM_PINNED_ITEM_DELETE);
++    }
+   } else {
+-    context_menu_model_->AddItemWithStringId(kCommandUnpin,
+-                                             IDS_HELIUM_PINNED_ITEM_UNPIN);
+-    context_menu_model_->AddItemWithStringId(kCommandDelete,
+-                                             IDS_HELIUM_PINNED_ITEM_DELETE);
++    return;
+   }
+   context_menu_runner_ = std::make_unique<views::MenuRunner>(
+       context_menu_model_.get(),
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -47,10 +47,13 @@ class MenuRunner;
+ // Closing the page keeps the item. Right-click: Unpin or Delete an item,
+ // Delete a folder.
+ //
++// Below the rows, their line and then "+ New Tab", at the top of the list as
++// in Arc (E15c.1); the line only while there are rows. Right-click on it:
++// Helium's New Tab menu.
++//
+ // Made by TabStripCollectionController for every vertical strip of a regular
+ // profile, and mounted by the one hunk in TabStripView::AddScrollViewContents.
+-// It hides itself while Workspaces is off, while the strip is collapsed, and
+-// while the workspace has no pinned rows.
++// It hides itself while Workspaces is off and while the strip is collapsed.
+ class WorkspacePinnedSectionView
+     : public views::View,
+       public workspaces::pins::PinStore::Observer,
+@@ -175,6 +178,9 @@ class WorkspacePinnedSectionView
+   base::CallbackListSubscription paint_as_active_subscription_;
+   // The rows' container, made by each Rebuild(); every child is a row.
+   raw_ptr<views::View> list_ = nullptr;
++  // The line under the rows, and "+ New Tab" after it.
++  raw_ptr<views::View> separator_ = nullptr;
++  raw_ptr<views::View> new_tab_button_ = nullptr;
+   // The workspace the rows are of; empty while the section is hidden.
+   std::string drawn_guid_;
+   // The item whose page was last seen active: its row is scrolled into view

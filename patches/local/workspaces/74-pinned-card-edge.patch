@@ -1,0 +1,155 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -123,6 +123,7 @@
+ #include "ui/views/controls/label.h"
+ #include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/controls/scroll_view.h"
++#include "ui/views/controls/separator.h"
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/interaction/element_tracker_views.h"
+ #include "ui/views/layout/box_layout.h"
+@@ -204,12 +205,20 @@ constexpr int kChevronSize = 12;
+ constexpr int kChevronSpace = kIndent;
+ 
+ // The card (E17b, design 5 "E17 spec" 3): the text colour at a whisper,
+-// a little more on a dark strip, where the same alpha reads fainter; 8 px in
+-// from the strip's sides and 4 px above and below the rows.
+-constexpr SkAlpha kCardAlphaDark = 0x0B;
++// more on a dark strip, where the same alpha reads fainter -- at 0x0B the
++// pinned pages and Today read as one list (C35, the owner); 8 px in from the
++// strip's sides and 4 px above and below the rows, its edge included.
++constexpr SkAlpha kCardAlphaDark = 0x14;
+ constexpr SkAlpha kCardAlphaLight = 0x09;
+ constexpr int kCardMargin = 8;
+ constexpr int kCardPadding = 4;
++// C35: an edge round the card and a line under it, both in the colour of
++// the strip's own line over the bar (ui::kColorSeparator). The edge is the
++// card's border, so the rows sit inside it and the page in front never
++// covers it. The line's band: this much above the line and below it.
++constexpr int kCardEdge = 1;
++constexpr int kCardLineAbove = 6;
++constexpr int kCardLineBelow = 5;
+ 
+ // "+ New Tab" (E18): Helium's own insets, which compact keeps
+ // (vertical_new_tab_button.cc); taller than compact, its icon starts where
+@@ -1194,12 +1203,15 @@ class PinRow : public views::LabelButton
+       }
+       SetTooltipText(folder_ ? RowText(node) : base::JoinString(lines, u"\n"));
+     }
++    // Inside the card's edge (C35), so less by its width: the icons and
++    // titles stay in line with the Today tabs' (E18).
+     SetBorder(views::CreateEmptyBorder(
+         icon_only_ ? gfx::Insets()
+                    : gfx::Insets::TLBR(0,
+-                                       kRowInset + level * kIndent +
++                                       kRowInset - kCardEdge +
++                                           level * kIndent +
+                                            (folder_ ? kChevronSpace : 0),
+-                                       0, kRowInset)));
++                                       0, kRowInset - kCardEdge)));
+     // As tall as a Today tab (E18, the Tab style); the collapsed column stays
+     // compact, as the tabs there do.
+     SetMinSize(gfx::Size(
+@@ -1890,8 +1902,8 @@ WorkspacePinnedSectionView::WorkspacePin
+   SetVisible(false);
+   // The workspace's header first (E17b), then -- once Rebuild() makes it --
+   // the card of rows, then "+ New Tab" at the top of the list, as in Arc
+-  // (E15c.1). The card's edge parts it from the list; the line that did
+-  // before E17b is gone. Helium's own button: the same action as Ctrl+T, and
++  // (E15c.1). The card's edge and the line under it (C35) part it from the
++  // list. Helium's own button: the same action as Ctrl+T, and
+   // the bottom one is hidden while Workspaces is on (the rail, E13). Made once
+   // and off the widget; a rebuild replaces only the card.
+   // Unretained: the header is a child, deleted with this view.
+@@ -1899,6 +1911,10 @@ WorkspacePinnedSectionView::WorkspacePin
+       base::BindRepeating(&WorkspacePinnedSectionView::OnHeaderPressed,
+                           base::Unretained(this))));
+   header_->set_context_menu_controller(this);
++  // Rebuild() puts each card in front of the line and shows the line with it.
++  card_line_ = AddChildView(std::make_unique<views::Separator>());
++  card_line_->SetOrientation(views::Separator::Orientation::kHorizontal);
++  card_line_->SetVisible(false);
+   new_tab_button_ =
+       AddChildView(std::make_unique<VerticalNewTabButton>(browser_));
+   new_tab_button_->set_context_menu_controller(this);
+@@ -1995,7 +2011,7 @@ WorkspacePinnedSectionView::CardBackgrou
+   return views::CreateRoundedRectBackground(
+       SkColorSetA(text, color_utils::IsDark(text) ? kCardAlphaLight
+                                                   : kCardAlphaDark),
+-      kActiveRowRadius);
++      kActiveRowRadius, kCardEdge);
+ }
+ 
+ gfx::Size WorkspacePinnedSectionView::CalculatePreferredSize(
+@@ -2164,6 +2180,7 @@ void WorkspacePinnedSectionView::Rebuild
+   if (old_list) {
+     RemoveChildViewT(old_list);
+   }
++  card_line_->SetVisible(false);
+   drawn_guid_.clear();
+   peek_id_.clear();
+   preferred_height_.reset();
+@@ -2250,7 +2267,10 @@ void WorkspacePinnedSectionView::Rebuild
+       views::BoxLayout::Orientation::kVertical));
+   list->SetProperty(views::kMarginsKey,
+                     gfx::Insets::VH(0, collapsed_ ? 0 : kCardMargin));
+-  list->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(kCardPadding, 0)));
++  list->SetBorder(views::CreatePaddedBorder(
++      views::CreateRoundedRectBorder(kCardEdge, kActiveRowRadius,
++                                     ui::kColorSeparator),
++      gfx::Insets::VH(kCardPadding - kCardEdge, 0)));
+   list->SetBackground(CardBackground());
+   const bool frame_active = IsFrameActive();
+   // After drawn_guid_ is set (above): ReadLinks may unlink a tab, which tells
+@@ -2281,7 +2301,12 @@ void WorkspacePinnedSectionView::Rebuild
+     return;
+   }
+   ApplyStates(*list, links);
+-  // After the header.
++  // After the header, and its line after it, as wide as the card (C35).
++  const int line_margin = collapsed_ ? 0 : kCardMargin;
++  card_line_->SetProperty(views::kMarginsKey,
++                          gfx::Insets::TLBR(kCardLineAbove, line_margin,
++                                            kCardLineBelow, line_margin));
++  card_line_->SetVisible(true);
+   list_ = AddChildViewAt(std::move(list), 1);
+   LOG(INFO) << "[workspaces] pins: drew " << rows << " row(s) of '"
+             << drawn_guid_ << "' in " << timer.Elapsed().InMilliseconds()
+@@ -3972,9 +3997,14 @@ bool WorkspacePinnedSectionView::InZone(
+   // Never in the collapsed column (E17b), whose "+ New Tab" is hidden. An
+   // empty section takes a tab too, its header the zone (C24) -- only while the
+   // pins file can take it: loading or read-only, a drop would pin nothing.
++  // It ends at the line under the card (C35), the edge it had at "+ New Tab"
++  // before the line's band came between them.
++  const int end = card_line_->GetVisible()
++                      ? card_line_->bounds().CenterPoint().y()
++                      : new_tab_button_->y();
+   return (list_ || (store_ && store_->loaded() && !store_->read_only())) &&
+          !collapsed_ && IsDrawn() && GetVisibleBounds().Contains(point) &&
+-         point.y() < new_tab_button_->y();
++         point.y() < end;
+ }
+ 
+ TabDragContext* WorkspacePinnedSectionView::DragContext() {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -50,6 +50,7 @@ namespace views {
+ class Background;
+ class MenuRunner;
+ class ScrollView;
++class Separator;
+ }  // namespace views
+ 
+ // The pinned section of the workspace this window shows (design 5, E15 spec):
+@@ -419,7 +420,10 @@ class WorkspacePinnedSectionView
+   // The rows' container and their card, made by each Rebuild() after the
+   // header; every child is a row.
+   raw_ptr<views::View> list_ = nullptr;
+-  // Below the card.
++  // The line under the card (C35), made once between the header and "+ New
++  // Tab"; shown exactly while there is a card.
++  raw_ptr<views::Separator> card_line_ = nullptr;
++  // Below the card and its line.
+   raw_ptr<VerticalNewTabButton> new_tab_button_ = nullptr;
+   // The workspace the rows are of; empty while the section is hidden.
+   std::string drawn_guid_;

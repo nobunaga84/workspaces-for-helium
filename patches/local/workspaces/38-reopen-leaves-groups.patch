@@ -1,0 +1,148 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -553,7 +553,18 @@ if (!is_android) {
+ 
+   source_set("browser_live_tab_context_impl") {
+     sources = [ "browser_live_tab_context.cc" ]
+-    public_deps = [ ":browser_live_tab_context" ]
++
++    # Helium Workspaces: the bodies of its restore hooks (review #23). They reach
++    # the workspaces model and saved tab groups, so they keep the catch-all public
++    # dep this target had until 157 (see browser_public_dependencies in chrome/browser).
++    sources += [
++      "workspace_restore_hooks.cc",
++      "workspace_restore_hooks.h",
++    ]
++    public_deps = [
++      ":browser_live_tab_context",
++      "//chrome/browser:browser_public_dependencies",
++    ]
+     deps = [
+       ":browser_commands",
+       ":browser_init_state",
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -38,6 +38,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/window_metadata/window_metadata_controller.h"
++#include "chrome/browser/ui/workspace_restore_hooks.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+ #include "components/saved_tab_groups/public/features.h"
+ #include "components/saved_tab_groups/public/saved_tab_group.h"
+@@ -430,7 +431,10 @@ sessions::LiveTab* BrowserLiveTabContext
+       }
+ 
+       // Move the group into `browser` if it is open in a different browser.
+-      if (source_browser != browser) {
++      // Helium Workspaces (LOCAL.md 42): unless a window's reopen leaves it.
++      if (source_browser != browser &&
++          !workspaces::LeaveRestoredGroupInPlace(browser,
++                                                 original_session_type)) {
+         chrome::MoveGroupToExistingWindow(source_browser, browser,
+                                           group_id.value());
+       }
+@@ -513,6 +517,11 @@ void BrowserLiveTabContext::ReconstructS
+ 
+   if (leading_index != TabStripModel::kNoTab &&
+       trailing_index != TabStripModel::kNoTab) {
++    // Helium Workspaces (LOCAL.md 42): a split half is never split again.
++    if (workspaces::IsSplitAlreadyRestored(*tab_strip_model_, leading_index,
++                                           trailing_index)) {
++      return;
++    }
+     tab_strip_model_->RestoreSplit(split_id, {leading_index, trailing_index},
+                                    visual_data);
+   }
+--- /dev/null
++++ b/chrome/browser/ui/workspace_restore_hooks.cc
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/workspace_restore_hooks.h"
++
++#include "base/logging.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "components/tabs/public/tab_interface.h"
++#include "url/gurl.h"
++
++namespace workspaces {
++
++bool LeaveRestoredGroupInPlace(
++    BrowserWindowInterface* browser,
++    sessions::tab_restore::Type original_session_type) {
++  const WorkspaceService* const workspace_service =
++      WorkspaceService::From(browser);
++  if (original_session_type != sessions::tab_restore::Type::WINDOW ||
++      !workspace_service || !workspace_service->IsEnabled()) {
++    return false;
++  }
++  LOG(INFO) << "[workspaces] restore: saved group already open in "
++               "another window, left there";
++  TabStripModel* const model = browser->GetTabStripModel();
++  if (model->empty()) {
++    model->delegate()->AddTabAt(GURL(), -1, true);
++  }
++  return true;
++}
++
++bool IsSplitAlreadyRestored(const TabStripModel& model,
++                            int leading_index,
++                            int trailing_index) {
++  if (!model.GetTabAtIndex(leading_index)->IsSplit() &&
++      !model.GetTabAtIndex(trailing_index)->IsSplit()) {
++    return false;
++  }
++  LOG(INFO) << "[workspaces] restore: split at " << leading_index << " and "
++            << trailing_index << " already in place, not rebuilt";
++  return true;
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/workspace_restore_hooks.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WORKSPACE_RESTORE_HOOKS_H_
++#define CHROME_BROWSER_UI_WORKSPACE_RESTORE_HOOKS_H_
++
++#include "components/sessions/core/tab_restore_types.h"
++
++class BrowserWindowInterface;
++class TabStripModel;
++
++// Helium Workspaces: what BrowserLiveTabContext's restore hooks do. Each hook
++// there is one call, so a rebase that rewrites the code around it moves a
++// line, never a block that still compiles in the wrong place (review #23).
++// Built in that file's own target, so these reach what it reaches.
++namespace workspaces {
++
++// AddRestoredTab, for a saved group open in another window: true when the
++// group stays where it is instead of moving into `browser` (LOCAL.md 42) --
++// a whole WINDOW's reopen, with Workspaces on. Moving all 22 of them out of
++// the window they were open in is what made one Ctrl+Shift+T freeze for three
++// minutes and CHECK on a split. A window that would stay empty gets a New Tab
++// page, as "Close group" does.
++bool LeaveRestoredGroupInPlace(
++    BrowserWindowInterface* browser,
++    sessions::tab_restore::Type original_session_type);
++
++// ReconstructSplit: true when either tab is already a split half (LOCAL.md
++// 42). It arrived with a saved group moved here from the window it was open
++// in, split and all (the stock move, which runs with Workspaces off), and
++// splitting it again CHECKs in AddToSplitImpl.
++bool IsSplitAlreadyRestored(const TabStripModel& model,
++                            int leading_index,
++                            int trailing_index);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_WORKSPACE_RESTORE_HOOKS_H_

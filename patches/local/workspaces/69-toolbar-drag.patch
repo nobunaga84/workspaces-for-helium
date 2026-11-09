@@ -1,0 +1,864 @@
+--- a/chrome/browser/ui/tabs/workspaces/toolbar_order.cc
++++ b/chrome/browser/ui/tabs/workspaces/toolbar_order.cc
+@@ -66,6 +66,31 @@ std::vector<std::string> Arrange(const s
+   return Resolve(saved, DefaultOrder(pinned, others));
+ }
+ 
++std::vector<std::string> Complete(const std::vector<std::string>& saved,
++                                  const std::vector<std::string>& pinned) {
++  std::vector<std::string> others;
++  std::ranges::copy_if(saved, std::back_inserter(others),
++                       [](const std::string& n) { return !IsOwnButton(n); });
++  return Arrange(saved, pinned, others);
++}
++
++std::vector<std::string> Dropped(const std::vector<std::string>& saved,
++                                 const std::vector<std::string>& pinned,
++                                 const std::string& name,
++                                 const std::string& after,
++                                 const std::string& before) {
++  std::vector<std::string> order = Complete(saved, pinned);
++  const auto at = std::ranges::find(order, name);
++  if (at != order.end() &&
++      (after.empty() || std::ranges::find(order, after) < at) &&
++      at < std::ranges::find(order, before)) {
++    return order;
++  }
++  std::erase(order, name);
++  order.insert(std::ranges::find(order, before), name);
++  return order;
++}
++
+ std::vector<std::string> FromList(const base::ListValue& list) {
+   std::vector<std::string> names;
+   for (const base::Value& name : list) {
+--- a/chrome/browser/ui/tabs/workspaces/toolbar_order.h
++++ b/chrome/browser/ui/tabs/workspaces/toolbar_order.h
+@@ -63,6 +63,23 @@ std::vector<std::string> Arrange(const s
+                                  const std::vector<std::string>& pinned,
+                                  const std::vector<std::string>& others);
+ 
++// Everything `saved` and the pinned buttons name, in Arrange's order: what the
++// toolbar draws plus the buttons it does not show today (Home switched off, a
++// Chrome button saved but not pinned), each keeping its place.
++std::vector<std::string> Complete(const std::vector<std::string>& saved,
++                                  const std::vector<std::string>& pinned);
++
++// The list to save after `name` was dragged in the toolbar itself and dropped
++// between the buttons drawn at `after` and `before` (empty: the toolbar's
++// start or end) -- wish 6c: Complete() with that one move, so Settings'
++// Toolbar list loses no row. Dropped where it already was, nothing moves --
++// not even the buttons the toolbar does not show around it.
++std::vector<std::string> Dropped(const std::vector<std::string>& saved,
++                                 const std::vector<std::string>& pinned,
++                                 const std::string& name,
++                                 const std::string& after,
++                                 const std::string& before);
++
+ // The names in the saved pref's list; anything that is not a string is skipped.
+ std::vector<std::string> FromList(const base::ListValue& list);
+ 
+--- a/chrome/browser/ui/tabs/workspaces/toolbar_order_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/toolbar_order_unittest.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/toolbar_order.h"
+ 
++#include <algorithm>
+ #include <string>
+ #include <vector>
+ 
+@@ -98,6 +99,44 @@ TEST(ToolbarOrderTest, FromListSkipsNonS
+   EXPECT_EQ(FromList(list), (Names{kBack, kAddressBar}));
+ }
+ 
++TEST(ToolbarOrderTest, DroppedWithNothingSavedMovesOneButton) {
++  // Reload dragged right of the address bar, onto New tab's left half.
++  EXPECT_EQ(Dropped({}, {"kActionShowDownloads"}, kReload, kAddressBar, kNewTab),
++            (Names{kCollapse, kBack, kForward, kHome, kSplit, kAddressBar,
++                   kReload, kNewTab, kExtensions, "kActionShowDownloads",
++                   kMedia, kAvatar, kMenu}));
++}
++
++TEST(ToolbarOrderTest, DroppedKeepsWhatTheToolbarDoesNotShow) {
++  // Print is saved but not pinned (a list row whose switch is off): it stays
++  // after Downloads while the menu goes first; nothing named is lost.
++  const Names saved = {kBack, kAddressBar, "kActionShowDownloads",
++                       "kActionPrint", kMenu};
++  EXPECT_EQ(Dropped(saved, {"kActionShowDownloads"}, kMenu, kCollapse, kBack),
++            (Names{kCollapse, kMenu, kBack, kForward, kReload, kHome, kSplit,
++                   kAddressBar, kNewTab, kExtensions, "kActionShowDownloads",
++                   "kActionPrint", kMedia, kAvatar}));
++}
++
++TEST(ToolbarOrderTest, DroppedLastAndNewlyPinned) {
++  // Dev tools is pinned but not saved yet: it is in the list it returns. A
++  // drop past every button (no `before`) puts the dragged one last.
++  const Names out =
++      Dropped({kAddressBar, kBack, kMenu}, {"kActionDevTools"}, kBack, kMenu, "");
++  EXPECT_EQ(out.back(), kBack);
++  EXPECT_TRUE(std::ranges::contains(out, "kActionDevTools"));
++  EXPECT_TRUE(IsValid(out));
++}
++
++TEST(ToolbarOrderTest, DroppedWhereItWasMovesNothing) {
++  // Reload let go between Forward and Split, where it is drawn: Home, hidden
++  // between Reload and Split, stays after Reload -- nothing to save.
++  EXPECT_EQ(Dropped({}, {}, kReload, kForward, kSplit), Complete({}, {}));
++  // The same at the toolbar's ends.
++  EXPECT_EQ(Dropped({}, {}, kCollapse, "", kBack), Complete({}, {}));
++  EXPECT_EQ(Dropped({}, {}, kMenu, kAvatar, ""), Complete({}, {}));
++}
++
+ TEST(ToolbarOrderTest, OwnButtons) {
+   EXPECT_TRUE(IsOwnButton(kAddressBar));
+   EXPECT_TRUE(IsOwnButton(kExtensions));
+--- a/chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.cc
++++ b/chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.cc
+@@ -862,9 +862,10 @@ PinnedActionToolbarButton* PinnedToolbar
+     button->ClearProperty(views::kFlexBehaviorKey);
+     button->set_drag_controller(this);
+   } else {
+-    // No drag controller in the host: dragging a hosted button is off (6c),
+-    // and this box may be freed before it when the toolbar is torn down. Full
+-    // opacity: this box's fade-out may have left it at 0; the host never fades.
++    // Not this box's drag controller in the host -- the host gives it its own
++    // (wish 6c) -- as this box may be freed before it when the toolbar is torn
++    // down. Full opacity: this box's fade-out may have left it at 0; the host
++    // never fades.
+     button->set_drag_controller(nullptr);
+     if (button->layer()) {
+       button->layer()->SetOpacity(1.0f);
+@@ -890,7 +891,8 @@ void PinnedToolbarActionsContainer::Move
+ 
+ // Wish 6b: a hosted button's removal, posted by RemovePinnedActionButtonFor.
+ // Home first, so upstream's RemoveButton -- which removes it from this box --
+-// is right for it.
++// is right for it, and it drags with this box's controller again: the
++// toolbar's may be freed before a deferred delete runs (wish 6c).
+ void PinnedToolbarActionsContainer::RemoveHostedButton(
+     PinnedActionToolbarButton* button) {
+   MoveButtonTo(button, this);
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -2596,6 +2596,23 @@ views::View* ToolbarView::GetViewForDrop
+   return this;
+ }
+ 
++bool ToolbarView::CanDrop(const ui::OSExchangeData& data) {
++  return workspaces::CanDropOnToolbar(this, data);
++}
++
++int ToolbarView::OnDragUpdated(const ui::DropTargetEvent& event) {
++  return workspaces::OnToolbarDragUpdated(this, event);
++}
++
++void ToolbarView::OnDragExited() {
++  workspaces::OnToolbarDragExited(this);
++}
++
++views::View::DropCallback ToolbarView::GetDropCallback(
++    const ui::DropTargetEvent& event) {
++  return workspaces::GetToolbarDropCallback(this);
++}
++
+ void ToolbarView::OnChromeLabsPrefChanged() {
+   actions::ActionItem* chrome_labs_action =
+       pinned_toolbar_actions_container_->GetActionItemFor(
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -386,6 +386,13 @@ class ToolbarView : public views::Access
+       gfx::Point loc_in_local_coords) override;
+   views::View* GetViewForDrop() override;
+ 
++  // views::View (Helium Workspaces, wish 6c): a toolbar button dragged in the
++  // toolbar itself is dropped here (workspace_toolbar_order.h).
++  bool CanDrop(const ui::OSExchangeData& data) override;
++  int OnDragUpdated(const ui::DropTargetEvent& event) override;
++  void OnDragExited() override;
++  DropCallback GetDropCallback(const ui::DropTargetEvent& event) override;
++
+   // views::MouseWatcherListener:
+   void MouseMovedOutOfHost() override;
+ 
+--- a/chrome/browser/ui/views/toolbar/workspace_toolbar_order.cc
++++ b/chrome/browser/ui/views/toolbar/workspace_toolbar_order.cc
+@@ -5,7 +5,7 @@
+ #include "chrome/browser/ui/views/toolbar/workspace_toolbar_order.h"
+ 
+ #include <algorithm>
+-#include <iterator>
++#include <cstdlib>
+ #include <map>
+ #include <memory>
+ #include <optional>
+@@ -14,6 +14,15 @@
+ #include <vector>
+ 
+ #include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/i18n/rtl.h"
++#include "base/logging.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/pickle.h"
++#include "base/scoped_observation.h"
++#include "base/values.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -21,52 +30,40 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model.h"
+ #include "chrome/browser/ui/toolbar/toolbar_pref_names.h"
++#include "chrome/browser/ui/views/extensions/extensions_toolbar_button.h"
++#include "chrome/browser/ui/views/extensions/extensions_toolbar_desktop.h"
+ #include "chrome/browser/ui/views/toolbar/pinned_action_toolbar_button.h"
+ #include "chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_button.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/actions/actions.h"
+ #include "ui/base/class_property.h"
++#include "ui/base/clipboard/clipboard_format_type.h"
++#include "ui/base/dragdrop/drag_drop_types.h"
++#include "ui/base/dragdrop/drop_target_event.h"
++#include "ui/base/dragdrop/mojom/drag_drop_types.mojom.h"
++#include "ui/base/dragdrop/os_exchange_data.h"
+ #include "ui/base/interaction/element_identifier.h"
++#include "ui/compositor/layer_tree_owner.h"
++#include "ui/events/event.h"
++#include "ui/events/event_handler.h"
++#include "ui/events/event_target.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/button/button_controller.h"
++#include "ui/views/drag_controller.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/view_observer.h"
+ #include "ui/views/view_utils.h"
+-
+-namespace workspaces {
+-
+-// Lays the toolbar out again when the saved order or the pinned buttons'
+-// order changes -- in this window and, through the profile's prefs, in every
+-// other. Owned by the toolbar as a class property, so it cannot outlive it.
+-class ToolbarOrderWatcher {
+- public:
+-  ToolbarOrderWatcher(ToolbarView* toolbar, PrefService* prefs) {
+-    registrar_.Init(prefs);
+-    // UpdateToolbarLayout, not ApplyToolbarOrder: Helium's own Collapse move
+-    // runs first there, so the saved order always has the last word.
+-    const base::RepeatingClosure relayout = base::BindRepeating(
+-        &ToolbarView::UpdateToolbarLayout, base::Unretained(toolbar));
+-    registrar_.Add(prefs::kHeliumWorkspacesToolbarOrder, relayout);
+-    registrar_.Add(::prefs::kPinnedActions, relayout);
+-  }
+-
+- private:
+-  PrefChangeRegistrar registrar_;
+-};
+-
+-}  // namespace workspaces
+-
+-DEFINE_UI_CLASS_PROPERTY_TYPE(workspaces::ToolbarOrderWatcher*)
++#include "ui/views/widget/widget.h"
+ 
+ namespace workspaces {
+ 
+ namespace {
+ 
+-DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(ToolbarOrderWatcher,
+-                                   kToolbarOrderWatcherKey)
+-
+ // The toolbar's children the saved order names, by the element identifier each
+-// already carries. The pinned box is named apart: it stands for its first
+-// pinned button.
++// already carries.
+ std::optional<std::string> OwnButtonName(ui::ElementIdentifier id) {
+   const std::pair<ui::ElementIdentifier, const char*> kNamed[] = {
+       {kToolbarVerticalTabsCollapseButtonElementId, toolbar_order::kCollapse},
+@@ -90,6 +87,17 @@ std::optional<std::string> OwnButtonName
+   return std::nullopt;
+ }
+ 
++// A toolbar child's name in the saved order, if it has one. A pinned button the
++// box lent us is named by its action (wish 6b); the box itself, holding only
++// popped-out buttons, has none.
++std::optional<std::string> ChildName(views::View* child) {
++  if (auto* pinned_button =
++          views::AsViewClass<PinnedActionToolbarButton>(child)) {
++    return actions::ActionIdMap::ActionIdToString(pinned_button->GetActionId());
++  }
++  return OwnButtonName(child->GetProperty(views::kElementIdentifierKey));
++}
++
+ // The first view in `list` carrying `id`, or list.end().
+ template <typename List>
+ auto FindById(const List& list, ui::ElementIdentifier id) {
+@@ -98,39 +106,12 @@ auto FindById(const List& list, ui::Elem
+   });
+ }
+ 
+-}  // namespace
+-
+-void ApplyToolbarOrder(ToolbarView* toolbar) {
+-  BrowserWindowInterface* const browser = toolbar->browser();
+-  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
+-    return;
+-  }
+-  Profile* const profile = browser->GetProfile();
+-  // The regular profile's prefs, also for an incognito window: the order is
+-  // saved there, and its changes reach this window's watcher directly.
+-  PrefService* const pref_service = profile->GetOriginalProfile()->GetPrefs();
+-  const bool first_layout = !toolbar->GetProperty(kToolbarOrderWatcherKey);
+-  if (first_layout) {
+-    toolbar->SetProperty(
+-        kToolbarOrderWatcherKey,
+-        std::make_unique<ToolbarOrderWatcher>(toolbar, pref_service));
+-    // Wish 6b: the pinned box lends its buttons to the toolbar, which places
+-    // each one on its own; a pin or unpin lays the toolbar out again.
+-    const auto box_view = FindById(toolbar->children(),
+-                                   kPinnedToolbarActionsContainerElementId);
+-    if (auto* box = box_view == toolbar->children().end()
+-                        ? nullptr
+-                        : views::AsViewClass<PinnedToolbarActionsContainer>(
+-                              box_view->get())) {
+-      box->SetButtonHost(
+-          toolbar, base::BindRepeating(&ToolbarView::UpdateToolbarLayout,
+-                                       base::Unretained(toolbar)));
+-    }
+-  }
+-
+-  const std::vector<std::string> saved = toolbar_order::FromList(
++std::vector<std::string> SavedOrder(PrefService* pref_service) {
++  return toolbar_order::FromList(
+       pref_service->GetList(prefs::kHeliumWorkspacesToolbarOrder));
++}
+ 
++std::vector<std::string> PinnedNames(Profile* profile) {
+   std::vector<std::string> pinned;
+   for (const actions::ActionId id :
+        PinnedToolbarActionsModel::Get(profile)->PinnedActionIds()) {
+@@ -139,20 +120,53 @@ void ApplyToolbarOrder(ToolbarView* tool
+       pinned.push_back(*name);
+     }
+   }
+-  std::vector<std::string> order =
+-      saved.empty() ? toolbar_order::DefaultOrder(pinned, /*others=*/{})
+-                    : toolbar_order::Arrange(saved, pinned, /*others=*/{});
+-  // Helium's UpdateToolbarLayout has just put Collapse first, or right after
+-  // the menu when vertical tabs are on the right -- next to the sidebar it
+-  // folds. Unnamed, it rides behind the menu there; with nothing saved, first
+-  // is where it already is.
+-  if (saved.empty() ||
+-      FindById(toolbar->children(),
+-               kToolbarVerticalTabsCollapseButtonElementId) >
+-          FindById(toolbar->children(), kToolbarAppMenuButtonElementId)) {
+-    std::erase(order, toolbar_order::kCollapse);
++  return pinned;
++}
++
++// A toolbar button's drag carries this format alone, which no view in the
++// toolbar but the toolbar takes -- the omnibox wants text, the extensions and
++// pinned boxes their own format -- so every drop of it reaches the toolbar.
++const ui::ClipboardFormatType& DragFormat() {
++  static const base::NoDestructor<ui::ClipboardFormatType> format(
++      ui::ClipboardFormatType::CustomPlatformType(
++          "chromium/x-helium-toolbar-button"));
++  return *format;
++}
++
++// The names of the toolbar's children in the order they stand now. Taken on
++// the first layout, before Place moves anything, it is Helium's own order:
++// what "nothing saved" means (review #9: no hand-kept copy of
++// ToolbarView::Init's order to drift). A button the toolbar makes later goes
++// after its usual neighbour (toolbar_order::Resolve). Collapse is left out:
++// Helium moves it with the sidebar's side, so Resolve puts it first, as it
++// always did when nothing was saved.
++std::vector<std::string> NamedOrder(ToolbarView* toolbar) {
++  std::vector<std::string> names;
++  for (views::View* child : toolbar->children()) {
++    if (std::optional<std::string> name = ChildName(child);
++        name && *name != toolbar_order::kCollapse) {
++      names.push_back(*std::move(name));
++    }
+   }
++  return names;
++}
+ 
++// Puts the toolbar's children in `saved`'s order -- empty: `helium_order`
++// (NamedOrder). `collapse_by_sidebar`: Helium put Collapse after the menu,
++// next to the sidebar it folds (vertical tabs on the right); it stays there.
++void Place(ToolbarView* toolbar,
++           const std::vector<std::string>& saved,
++           const std::vector<std::string>& helium_order,
++           bool collapse_by_sidebar) {
++  const std::vector<std::string> pinned =
++      PinnedNames(toolbar->browser()->GetProfile());
++  std::vector<std::string> order = toolbar_order::Arrange(
++      saved.empty() ? helium_order : saved, pinned, /*others=*/{});
++  // Unnamed, Collapse rides behind the menu by the sidebar; with nothing
++  // saved, first is where Helium already put it.
++  if (saved.empty() || collapse_by_sidebar) {
++    std::erase(order, toolbar_order::kCollapse);
++  }
+ 
+   // Each named child, with the unnamed ones that follow it today (battery
+   // saver, glic, the compact tab strip after the address bar, ...): they keep
+@@ -163,19 +177,12 @@ void ApplyToolbarOrder(ToolbarView* tool
+   views::View* overflow = nullptr;
+   std::string previous;
+   for (views::View* child : toolbar->children()) {
+-    const ui::ElementIdentifier id =
+-        child->GetProperty(views::kElementIdentifierKey);
+-    if (id == kToolbarOverflowButtonElementId) {
++    if (child->GetProperty(views::kElementIdentifierKey) ==
++        kToolbarOverflowButtonElementId) {
+       overflow = child;
+       continue;
+     }
+-    // A pinned button the box lent us is named by its action (wish 6b); the
+-    // box itself, holding only popped-out buttons, rides like any unnamed one.
+-    auto* pinned_button = views::AsViewClass<PinnedActionToolbarButton>(child);
+-    std::optional<std::string> name =
+-        pinned_button
+-            ? actions::ActionIdMap::ActionIdToString(pinned_button->GetActionId())
+-            : OwnButtonName(id);
++    std::optional<std::string> name = ChildName(child);
+     if (name && !runs.contains(*name) && std::ranges::contains(order, *name)) {
+       runs[*name].push_back(child);
+       previous = *name;
+@@ -207,19 +214,6 @@ void ApplyToolbarOrder(ToolbarView* tool
+   if (wanted.size() != toolbar->children().size()) {
+     return;
+   }
+-  // DefaultOrder copies ToolbarView::Init by hand: if a rebase changes Init,
+-  // the first layout of a toolbar with nothing saved would move buttons --
+-  // other than the pinned ones the box just lent us (appended last).
+-  const auto not_lent = [](views::View* view) {
+-    return !views::IsViewClass<PinnedActionToolbarButton>(view);
+-  };
+-  std::vector<views::View*> before;
+-  std::ranges::copy_if(toolbar->children(), std::back_inserter(before),
+-                       not_lent);
+-  std::vector<views::View*> after;
+-  std::ranges::copy_if(wanted, std::back_inserter(after), not_lent);
+-  DCHECK(!first_layout || !saved.empty() || before == after)
+-      << "toolbar_order::DefaultOrder no longer matches ToolbarView::Init";
+   for (size_t i = 0; i < wanted.size(); ++i) {
+     if (toolbar->children()[i] != wanted[i]) {
+       toolbar->ReorderChildView(wanted[i], i);
+@@ -227,4 +221,364 @@ void ApplyToolbarOrder(ToolbarView* tool
+   }
+ }
+ 
++}  // namespace
++
++// Keeps the toolbar in the saved order and lets the user drag its buttons in
++// the toolbar itself (wish 6c). Lays the toolbar out again when the saved
++// order or the pinned buttons' order changes -- in this window and, through
++// the profile's prefs, in every other. Owned by the toolbar as a class
++// property: freed after the toolbar's children, which point at it as their
++// drag controller.
++class ToolbarOrderController : public views::DragController,
++                               public ui::EventHandler,
++                               public views::ViewObserver {
++ public:
++  ToolbarOrderController(ToolbarView* toolbar, PrefService* prefs)
++      : toolbar_(toolbar), prefs_(prefs), helium_order_(NamedOrder(toolbar)) {
++    registrar_.Init(prefs);
++    // UpdateToolbarLayout, not ApplyToolbarOrder: Helium's own Collapse move
++    // runs first there, so the saved order always has the last word.
++    const base::RepeatingClosure relayout = base::BindRepeating(
++        &ToolbarView::UpdateToolbarLayout, base::Unretained(toolbar));
++    registrar_.Add(prefs::kHeliumWorkspacesToolbarOrder, relayout);
++    registrar_.Add(::prefs::kPinnedActions, relayout);
++    event_observation_.Observe(toolbar);
++    view_observation_.Observe(toolbar);
++  }
++
++  void set_collapse_by_sidebar(bool by_sidebar) {
++    collapse_by_sidebar_ = by_sidebar;
++  }
++
++  // Puts the toolbar in the saved order -- or, while a drag is over it, in the
++  // order its drop would save, through any other relayout too.
++  void Lay() {
++    Place(toolbar_, preview_.empty() ? SavedOrder(prefs_) : preview_,
++          helium_order_, collapse_by_sidebar_);
++  }
++
++  // Every button the order names drags with this controller -- the
++  // extensions by their puzzle piece; the address bar is not dragged.
++  void Adopt() {
++    for (views::View* child : toolbar_->children()) {
++      const std::optional<std::string> name = ChildName(child);
++      if (!name || *name == toolbar_order::kAddressBar) {
++        continue;
++      }
++      views::View* source = child;
++      if (auto* extensions =
++              views::AsViewClass<ExtensionsToolbarDesktop>(child)) {
++        source = extensions->GetExtensionsButton();
++      }
++      if (!source || source->drag_controller() == this) {
++        continue;
++      }
++      source->set_drag_controller(this);
++      // A button acts on release, so a press can still become a drag:
++      // Profiles and Media acted on press; the menu, puzzle and split buttons
++      // switch by themselves once they can be dragged (MenuButtonController).
++      if (auto* button = views::AsViewClass<views::Button>(source)) {
++        button->button_controller()->set_notify_action(
++            views::ButtonController::NotifyAction::kOnRelease);
++      }
++    }
++  }
++
++  // views::DragController:
++  void WriteDragDataForView(views::View* sender,
++                            const gfx::Point& press_pt,
++                            ui::OSExchangeData* data) override {
++    data->SetPickledData(DragFormat(), base::Pickle());
++  }
++  int GetDragOperationsForView(views::View* sender,
++                               const gfx::Point& p) override {
++    return UnitName(Unit(sender)) ? ui::DragDropTypes::DRAG_MOVE
++                                  : ui::DragDropTypes::DRAG_NONE;
++  }
++  bool CanStartDragForView(views::View* sender,
++                           const gfx::Point& press_pt,
++                           const gfx::Point& p) override {
++    // Sideways only: dragging down opens Back's, Forward's, Reload's and
++    // Home's menu, and a touch long-press (no move at all) the context menu.
++    return std::abs(p.x() - press_pt.x()) > std::abs(p.y() - press_pt.y());
++  }
++  void OnWillStartDragForView(views::View* dragged_view) override {
++    // Else a long press's menu opens in the middle of the drag (the drag's
++    // loop runs tasks) or right after the drop (it eats the release).
++    if (auto* button = views::AsViewClass<ToolbarButton>(dragged_view)) {
++      button->ClearPendingMenu();
++    }
++    preview_.clear();
++    LOG(INFO) << "[workspaces] toolbar drag: "
++              << UnitName(Unit(dragged_view)).value_or("(none)");
++  }
++
++  // ui::EventHandler: views starts no drag from a disabled view -- Forward
++  // with nowhere to go, Back on a new tab -- so the toolbar starts it, as
++  // View::ProcessMouseDragged would.
++  void OnMouseEvent(ui::MouseEvent* event) override {
++    auto* const view = static_cast<views::View*>(event->target());
++    const bool ours = !view->GetEnabled() && view->drag_controller() == this;
++    if (event->type() == ui::EventType::kMousePressed) {
++      disabled_press_ = ours && event->IsOnlyLeftMouseButton()
++                            ? std::make_optional(event->location())
++                            : std::nullopt;
++      // Taken here: a disabled button does not take it, and the press -- and
++      // with it the moves that follow -- would go on to the toolbar.
++      if (disabled_press_) {
++        event->SetHandled();
++      }
++      return;
++    }
++    if (!ours || event->type() != ui::EventType::kMouseDragged ||
++        !disabled_press_ ||
++        !views::View::ExceededDragThreshold(event->location() -
++                                            *disabled_press_) ||
++        !CanStartDragForView(view, *disabled_press_, event->location()) ||
++        !GetDragOperationsForView(view, *disabled_press_) ||
++        view->GetWidget()->dragged_view()) {
++      return;
++    }
++    auto data = std::make_unique<ui::OSExchangeData>();
++    WriteDragDataForView(view, *disabled_press_, data.get());
++    disabled_press_.reset();
++    gfx::Point location = event->location();
++    views::View::ConvertPointToWidget(view, &location);
++    event->StopPropagation();
++    // Blocks until the drop; this window may be gone after it.
++    view->GetWidget()->RunDragDropLoop(view, std::move(data), location,
++                                       ui::DragDropTypes::DRAG_MOVE,
++                                       ui::mojom::DragEventSource::kMouse);
++  }
++
++  // views::ViewObserver:
++  void OnViewHierarchyWillBeDeleted(views::View*) override {
++    registrar_.RemoveAll();
++    event_observation_.Reset();
++    view_observation_.Reset();
++  }
++
++  // The toolbar as the drop target of its own buttons (ToolbarView's
++  // forwarders).
++  bool CanDrop(const ui::OSExchangeData& data) {
++    return data.HasCustomFormat(DragFormat()) &&
++           UnitName(Unit(DraggedView()));
++  }
++
++  int OnDragUpdated(const ui::DropTargetEvent& event) {
++    views::View* const dragged = Unit(DraggedView());
++    const std::optional<std::string> name = UnitName(dragged);
++    if (!name) {
++      return ui::DragDropTypes::DRAG_NONE;
++    }
++    // Between the other buttons drawn either side of the pointer, each
++    // passed at its middle -- the address bar too.
++    std::string after;
++    std::string before;
++    for (views::View* child : toolbar_->children()) {
++      const std::optional<std::string> anchor =
++          child == dragged || !child->GetVisible() ? std::nullopt
++                                                   : UnitName(child);
++      if (!anchor) {
++        continue;
++      }
++      if ((child->GetMirroredBounds().CenterPoint().x() > event.x()) !=
++          base::i18n::IsRTL()) {
++        before = *anchor;
++        break;
++      }
++      after = *anchor;
++    }
++    // The preview: the button itself moves there while the drag goes on.
++    std::vector<std::string> preview = toolbar_order::Dropped(
++        Order(), PinnedNames(toolbar_->browser()->GetProfile()),
++        *name, after, before);
++    if (preview != preview_) {
++      preview_ = std::move(preview);
++      Lay();
++    }
++    return ui::DragDropTypes::DRAG_MOVE;
++  }
++
++  void OnDragExited() {
++    // Out of the toolbar, or Escape: the saved order again.
++    if (!preview_.empty()) {
++      preview_.clear();
++      toolbar_->UpdateToolbarLayout();
++    }
++  }
++
++  views::View::DropCallback GetDropCallback() {
++    if (preview_.empty()) {
++      return base::NullCallback();
++    }
++    return base::BindOnce(&ToolbarOrderController::Save,
++                          weak_factory_.GetWeakPtr(),
++                          std::exchange(preview_, {}));
++  }
++
++ private:
++  // The saved order, or Helium's own while nothing is saved (as Place).
++  std::vector<std::string> Order() const {
++    std::vector<std::string> saved = SavedOrder(prefs_);
++    return saved.empty() ? helium_order_ : saved;
++  }
++
++  // The toolbar child `view` is part of: itself, or the extensions box for
++  // its puzzle piece. Null outside the toolbar.
++  views::View* Unit(views::View* view) const {
++    while (view && view->parent() != toolbar_) {
++      view = view->parent();
++    }
++    return view;
++  }
++
++  // The name `unit` is dragged and dropped by, if it is placed on its own --
++  // not Collapse by the sidebar, where Helium keeps it.
++  std::optional<std::string> UnitName(views::View* unit) const {
++    std::optional<std::string> name = unit ? ChildName(unit) : std::nullopt;
++    if (name == toolbar_order::kCollapse && collapse_by_sidebar_) {
++      return std::nullopt;
++    }
++    return name;
++  }
++
++  // The view being dragged from this window, if any.
++  views::View* DraggedView() const {
++    views::Widget* const widget = toolbar_->GetWidget();
++    return widget ? widget->dragged_view() : nullptr;
++  }
++
++  // As CustomizeToolbarHandler::SetToolbarOrder: the list, then the pinned
++  // box's own order, so the two read the same. Settings' Toolbar list and
++  // every window redraw from the prefs.
++  void Save(std::vector<std::string> order,
++            const ui::DropTargetEvent& event,
++            ui::mojom::DragOperation& output_drag_op,
++            std::unique_ptr<ui::LayerTreeOwner> drag_image_layer_owner) {
++    output_drag_op = ui::mojom::DragOperation::kMove;
++    Profile* const profile = toolbar_->browser()->GetProfile();
++    if (order == toolbar_order::Complete(Order(), PinnedNames(profile))) {
++      LOG(INFO) << "[workspaces] toolbar drag: dropped where it was";
++      toolbar_->UpdateToolbarLayout();
++      return;
++    }
++    LOG(INFO) << "[workspaces] toolbar drag: dropped, order saved";
++    base::ListValue list;
++    for (const std::string& name : order) {
++      list.Append(name);
++    }
++    prefs_->SetList(prefs::kHeliumWorkspacesToolbarOrder, std::move(list));
++    PinnedToolbarActionsModel* const model =
++        PinnedToolbarActionsModel::Get(profile);
++    int index = 0;
++    for (const std::string& name : order) {
++      const std::optional<actions::ActionId> id =
++          actions::ActionIdMap::StringToActionId(name);
++      if (id && model->Contains(*id)) {
++        model->MovePinnedAction(*id, index++);
++      }
++    }
++  }
++
++  const raw_ptr<ToolbarView> toolbar_;
++  const raw_ptr<PrefService> prefs_;
++  // NamedOrder on the first layout, when this is made.
++  const std::vector<std::string> helium_order_;
++  PrefChangeRegistrar registrar_;
++  bool collapse_by_sidebar_ = false;
++  // Where a disabled button was pressed, until its drag starts.
++  std::optional<gfx::Point> disabled_press_;
++  // What a drop now would save; empty while no drag is over the toolbar.
++  std::vector<std::string> preview_;
++  base::ScopedObservation<ui::EventTarget, ui::EventHandler>
++      event_observation_{this};
++  base::ScopedObservation<views::View, views::ViewObserver> view_observation_{
++      this};
++  base::WeakPtrFactory<ToolbarOrderController> weak_factory_{this};
++};
++
++}  // namespace workspaces
++
++DEFINE_UI_CLASS_PROPERTY_TYPE(workspaces::ToolbarOrderController*)
++
++namespace workspaces {
++
++namespace {
++
++DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(ToolbarOrderController,
++                                   kToolbarOrderControllerKey)
++
++}  // namespace
++
++void ApplyToolbarOrder(ToolbarView* toolbar) {
++  BrowserWindowInterface* const browser = toolbar->browser();
++  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++    return;
++  }
++  Profile* const profile = browser->GetProfile();
++  // The regular profile's prefs, also for an incognito window: the order is
++  // saved there, and its changes reach this window's controller directly.
++  PrefService* const pref_service = profile->GetOriginalProfile()->GetPrefs();
++  ToolbarOrderController* controller =
++      toolbar->GetProperty(kToolbarOrderControllerKey);
++  const bool first_layout = !controller;
++  if (first_layout) {
++    controller = toolbar->SetProperty(
++        kToolbarOrderControllerKey,
++        std::make_unique<ToolbarOrderController>(toolbar, pref_service));
++    // Wish 6b: the pinned box lends its buttons to the toolbar, which places
++    // each one on its own; a pin or unpin lays the toolbar out again.
++    const auto box_view = FindById(toolbar->children(),
++                                   kPinnedToolbarActionsContainerElementId);
++    if (auto* box = box_view == toolbar->children().end()
++                        ? nullptr
++                        : views::AsViewClass<PinnedToolbarActionsContainer>(
++                              box_view->get())) {
++      box->SetButtonHost(
++          toolbar, base::BindRepeating(&ToolbarView::UpdateToolbarLayout,
++                                       base::Unretained(toolbar)));
++    }
++  }
++  // Helium's UpdateToolbarLayout has just put Collapse first, or right after
++  // the menu when vertical tabs are on the right.
++  controller->set_collapse_by_sidebar(
++      FindById(toolbar->children(),
++               kToolbarVerticalTabsCollapseButtonElementId) >
++      FindById(toolbar->children(), kToolbarAppMenuButtonElementId));
++  controller->Lay();
++  // Off the record the toolbar follows the order but cannot change it, as
++  // with Chrome's own pinning (PinnedToolbarActionsModel::CanUpdate).
++  if (!profile->IsOffTheRecord()) {
++    controller->Adopt();
++  }
++}
++
++bool CanDropOnToolbar(ToolbarView* toolbar, const ui::OSExchangeData& data) {
++  ToolbarOrderController* const controller =
++      toolbar->GetProperty(kToolbarOrderControllerKey);
++  return controller && controller->CanDrop(data);
++}
++
++int OnToolbarDragUpdated(ToolbarView* toolbar,
++                         const ui::DropTargetEvent& event) {
++  ToolbarOrderController* const controller =
++      toolbar->GetProperty(kToolbarOrderControllerKey);
++  return controller ? controller->OnDragUpdated(event)
++                    : ui::DragDropTypes::DRAG_NONE;
++}
++
++void OnToolbarDragExited(ToolbarView* toolbar) {
++  if (ToolbarOrderController* const controller =
++          toolbar->GetProperty(kToolbarOrderControllerKey)) {
++    controller->OnDragExited();
++  }
++}
++
++views::View::DropCallback GetToolbarDropCallback(ToolbarView* toolbar) {
++  ToolbarOrderController* const controller =
++      toolbar->GetProperty(kToolbarOrderControllerKey);
++  return controller ? controller->GetDropCallback() : base::NullCallback();
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/toolbar/workspace_toolbar_order.h
++++ b/chrome/browser/ui/views/toolbar/workspace_toolbar_order.h
+@@ -5,19 +5,37 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TOOLBAR_WORKSPACE_TOOLBAR_ORDER_H_
+ #define CHROME_BROWSER_UI_VIEWS_TOOLBAR_WORKSPACE_TOOLBAR_ORDER_H_
+ 
++#include "ui/views/view.h"
++
+ class ToolbarView;
+ 
++namespace ui {
++class DropTargetEvent;
++class OSExchangeData;
++}  // namespace ui
++
+ namespace workspaces {
+ 
+-// Puts the toolbar's own buttons, the extensions and the pinned Chrome buttons
+-// (as one group) in the user's saved order, either side of the address bar
+-// (wish 6). Called at the end of Helium's own reorder in
+-// ToolbarView::UpdateToolbarLayout, and again by itself whenever the saved order
+-// or the pinned buttons change. Nothing saved means Helium's own order (what
+-// Init built, so nothing moves -- unless a reset just cleared the order); a
+-// window that is not a normal browser window is left alone.
++// Puts the toolbar's own buttons, the extensions and each pinned Chrome button
++// in the user's saved order, either side of the address bar (wish 6), and makes
++// them draggable in the toolbar itself (6c). Called at the end of Helium's own
++// reorder in ToolbarView::UpdateToolbarLayout, and again by itself whenever the
++// saved order or the pinned buttons change. Nothing saved means Helium's own
++// order (what Init built, so nothing moves -- unless a reset just cleared the
++// order); a window that is not a normal browser window is left alone, and an
++// incognito one follows the order but drags nothing.
+ void ApplyToolbarOrder(ToolbarView* toolbar);
+ 
++// Wish 6c: the toolbar as the drop target of its own buttons, dragged in it --
++// ToolbarView's CanDrop, OnDragUpdated, OnDragExited and GetDropCallback. The
++// button moves with the pointer; a drop saves the order as Settings' Toolbar
++// list does, leaving the toolbar or Escape puts it back.
++bool CanDropOnToolbar(ToolbarView* toolbar, const ui::OSExchangeData& data);
++int OnToolbarDragUpdated(ToolbarView* toolbar,
++                         const ui::DropTargetEvent& event);
++void OnToolbarDragExited(ToolbarView* toolbar);
++views::View::DropCallback GetToolbarDropCallback(ToolbarView* toolbar);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TOOLBAR_WORKSPACE_TOOLBAR_ORDER_H_

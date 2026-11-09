@@ -1,0 +1,1614 @@
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -216,6 +216,11 @@ std::map<std::string, std::string> Brows
+   // than in whichever one happens to be on screen (design 2.6).
+   workspaces::PopulateWorkspaceExtraData(
+       tab_strip_model_->GetWebContentsAt(index), &extra_data);
++  // And the id its close is archived under, so Ctrl+Shift+T takes the close
++  // back out of the archive (E14d.1). Here and not in the call above: the
++  // session file is rebuilt from that map, and must never carry it.
++  extra_data[workspaces::kArchiveIdExtraDataKey] =
++      workspaces::ArchiveIdForTab(tab_strip_model_->GetWebContentsAt(index));
+ 
+   return extra_data;
+ }
+@@ -364,6 +369,10 @@ sessions::LiveTab* BrowserLiveTabContext
+     bool select,
+     bool is_restoring_group_or_window,
+     sessions::tab_restore::Type original_session_type) {
++  // Helium Workspaces: a reopened close leaves the archive (E14d.1). First,
++  // because a saved group's tabs return below without a tab of their own --
++  // they reopen from the group's model (review, LOCAL.md 52).
++  workspaces::RemoveReopenedClose(&profile_.get(), tab.extra_data);
+   tab_groups::TabGroupSyncService* tab_group_service =
+       tab_groups::TabGroupSyncServiceFactory::GetForProfile(&profile_.get());
+   CHECK(tab_group_service);
+@@ -500,6 +509,8 @@ sessions::LiveTab* BrowserLiveTabContext
+ 
+ sessions::LiveTab* BrowserLiveTabContext::ReplaceRestoredTab(
+     const sessions::tab_restore::Tab& tab) {
++  // Helium Workspaces: as in AddRestoredTab (E14d.1).
++  workspaces::RemoveReopenedClose(&profile_.get(), tab.extra_data);
+   const sessions::tab_restore::PlatformSpecificTabData* tab_platform_data =
+       tab.platform_data.get();
+   SessionStorageNamespaceHandle* storage_namespace =
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -232,6 +232,20 @@ void BrowserTabStripModelDelegate::MoveG
+ 
+ std::optional<SessionID> BrowserTabStripModelDelegate::CreateHistoricalTab(
+     content::WebContents* contents) {
++  // Helium Workspaces: every close the user makes passes here once, so the
++  // archive records it here, before Chromium's entry (design 5, "E14d spec");
++  // an anchored tab's reset and a detach never do. No service in incognito or
++  // a window without Workspaces. Quitting is asked here: the workspaces target
++  // cannot include browser_shutdown.h (GN cycle). HasShutdownStarted() alone:
++  // IsTryingToQuit() is also an Exit still waiting on "Leave site?", which the
++  // user can cancel, and a tab closed by hand meanwhile is a real close; an
++  // Exit that goes ahead shuts the session service down first, which the
++  // service reads itself (review, LOCAL.md 52).
++  if (workspaces::WorkspaceService* const service =
++          workspaces::WorkspaceService::From(browser_)) {
++    service->ArchiveClosingTab(contents,
++                               browser_shutdown::HasShutdownStarted());
++  }
+   if (!BrowserSupportsHistoricalEntries()) {
+     return std::nullopt;
+   }
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -19,6 +19,23 @@ source_set("arc_import") {
+   deps = [ "//base" ]
+ }
+ 
++# Every tab the user closes, kept per workspace for 60 days in a file of its
++# own (E14d.1, design 5 "E14d spec"). //base only, as ":pins" is, and for the
++# same reason: tested whole in workspaces_unittests, no factory, no upstream
++# file. ":pins" for the file read both stores share (a bad file set aside as
++# .bad, a newer one left alone), which is itself //base-only.
++source_set("archive") {
++  sources = [
++    "workspace_archive.cc",
++    "workspace_archive.h",
++  ]
++
++  deps = [
++    ":pins",
++    "//base",
++  ]
++}
++
+ # Each workspace's pinned section -- folders and items that are data, not tabs
+ # -- and the per-profile file that keeps them (E15a, design 5 "E15 spec").
+ # //base only, the file included: the store attaches to a Profile as
+@@ -107,6 +124,9 @@ source_set("tab_data") {
+   ]
+ 
+   deps = [
++    # ":archive" so a reopened close leaves the archive (E14d.1). //base-only,
++    # so this target stays as free of //chrome as it was.
++    ":archive",
+     "//base",
+     "//content/public/browser",
+ 
+@@ -137,6 +157,7 @@ source_set("workspaces") {
+     # second is already reachable through the public_deps of :tab_strip; it is
+     # listed anyway because this target includes its header directly, and a
+     # public_deps edge in an upstream file is not ours to rely on.
++    ":archive",
+     ":prefs",
+     ":stamping",
+     ":tab_data",
+@@ -147,10 +168,16 @@ source_set("workspaces") {
+     # and tab SessionIDs come from. Both are already reachable through
+     # //chrome/browser/ui/tabs:tab_strip, so neither adds an edge to the graph
+     # -- they are listed because this target includes their headers directly.
++    "//chrome/browser/profiles:profile",
+     "//chrome/browser/sessions",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs:tabs",
++
++    # "//chrome/common" for kChromeUINewTabHost: an untouched New Tab page is
++    # not archived (E14d.1), Chromium's own test of one. Not :url_constants,
++    # which is visible only inside //chrome/common; this re-exports it.
++    "//chrome/common",
+     "//components/prefs",
+     "//components/sessions",
+ 
+@@ -163,6 +190,12 @@ source_set("workspaces") {
+     "//components/tabs:public",
+     "//content/public/browser",
+ 
++    # "//content/public/common" for kChromeUIScheme, and
++    # "//chrome/browser/profiles:profile" (above) for Profile: the archive's door
++    # (E14d.1) names both. Both reachable already; listed because this target
++    # includes their headers directly.
++    "//content/public/common",
++
+     # For blink::mojom::SuddenTerminationDisablerType: whether a page has a
+     # "Leave site?" handler, which anchors and Unload must not discard (E13.5).
+     "//third_party/blink/public/mojom:mojom_core",
+@@ -181,6 +214,7 @@ source_set("unit_tests") {
+ 
+   sources = [
+     "arc_import_plan_unittest.cc",
++    "workspace_archive_unittest.cc",
+     "workspace_pins_unittest.cc",
+     "workspace_prefs_unittest.cc",
+     "workspace_stamping_unittest.cc",
+@@ -190,6 +224,7 @@ source_set("unit_tests") {
+   # most of //chrome into the test binary and undo the reason it exists.
+   deps = [
+     ":arc_import",
++    ":archive",
+     ":pins",
+     ":prefs",
+     ":stamping",
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
+@@ -0,0 +1,359 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
++
++#include <algorithm>
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/json/json_writer.h"
++#include "base/json/values_util.h"
++#include "base/logging.h"
++#include "base/notreached.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
++
++namespace workspaces::archive {
++namespace {
++
++constexpr char kVersionKey[] = "version";
++constexpr char kEntriesKey[] = "entries";
++constexpr char kIdKey[] = "id";
++constexpr char kUrlKey[] = "url";
++constexpr char kTitleKey[] = "title";
++constexpr char kCustomTitleKey[] = "custom_title";
++constexpr char kWorkspaceKey[] = "workspace";
++constexpr char kReasonKey[] = "reason";
++constexpr char kArchivedAtKey[] = "archived_at";
++constexpr char kLastActiveKey[] = "last_active";
++
++// Its address is the store's key among its profile's user data.
++constexpr char kUserDataKey[] = "helium_workspace_archive";
++
++base::DictValue EntryToValue(const ArchiveEntry& entry) {
++  base::DictValue dict;
++  dict.Set(kIdKey, entry.id);
++  dict.Set(kUrlKey, entry.url);
++  dict.Set(kTitleKey, entry.title);
++  if (!entry.custom_title.empty()) {
++    dict.Set(kCustomTitleKey, entry.custom_title);
++  }
++  dict.Set(kWorkspaceKey, entry.workspace);
++  dict.Set(kReasonKey, ReasonName(entry.reason));
++  dict.Set(kArchivedAtKey, base::TimeToValue(entry.archived_at));
++  if (!entry.last_active.is_null()) {
++    dict.Set(kLastActiveKey, base::TimeToValue(entry.last_active));
++  }
++  return dict;
++}
++
++std::optional<ArchiveEntry::Reason> ReasonFromName(std::string_view name) {
++  for (ArchiveEntry::Reason reason :
++       {ArchiveEntry::Reason::kManual, ArchiveEntry::Reason::kWindow,
++        ArchiveEntry::Reason::kAuto}) {
++    if (ReasonName(reason) == name) {
++      return reason;
++    }
++  }
++  return std::nullopt;
++}
++
++// Strict about what a restore needs (the id, the address, a reason and a time
++// this version knows), lenient about the names: this file is only ever written
++// by EntryToValue, so anything else means it is not ours to trust, and the
++// whole file is refused rather than written back without the entry -- the
++// pins store's rule (39).
++std::optional<ArchiveEntry> EntryFromValue(const base::Value& value) {
++  const base::DictValue* dict = value.GetIfDict();
++  if (!dict) {
++    return std::nullopt;
++  }
++  const std::string* id = dict->FindString(kIdKey);
++  const std::string* url = dict->FindString(kUrlKey);
++  const std::string* reason_name = dict->FindString(kReasonKey);
++  const base::Value* archived_at = dict->Find(kArchivedAtKey);
++  if (!id || id->empty() || !url || url->empty() || !reason_name ||
++      !archived_at) {
++    return std::nullopt;
++  }
++  std::optional<ArchiveEntry::Reason> reason = ReasonFromName(*reason_name);
++  std::optional<base::Time> archived = base::ValueToTime(*archived_at);
++  if (!reason || !archived) {
++    return std::nullopt;
++  }
++  ArchiveEntry entry;
++  entry.id = *id;
++  entry.url = *url;
++  entry.reason = *reason;
++  entry.archived_at = *archived;
++  if (const std::string* title = dict->FindString(kTitleKey)) {
++    entry.title = *title;
++  }
++  if (const std::string* custom_title = dict->FindString(kCustomTitleKey)) {
++    entry.custom_title = *custom_title;
++  }
++  if (const std::string* workspace = dict->FindString(kWorkspaceKey)) {
++    entry.workspace = *workspace;
++  }
++  if (const base::Value* last_active = dict->Find(kLastActiveKey)) {
++    std::optional<base::Time> time = base::ValueToTime(*last_active);
++    if (!time) {
++      return std::nullopt;
++    }
++    entry.last_active = *time;
++  }
++  return entry;
++}
++
++bool HasId(const std::vector<ArchiveEntry>& entries, std::string_view id) {
++  return std::ranges::any_of(
++      entries, [id](const ArchiveEntry& entry) { return entry.id == id; });
++}
++
++// Drops every entry older than kKeepFor (design 5: at the load and before a
++// write). True when one went.
++bool Prune(std::vector<ArchiveEntry>& entries) {
++  const base::Time oldest = base::Time::Now() - kKeepFor;
++  return std::erase_if(entries, [oldest](const ArchiveEntry& entry) {
++           return entry.archived_at < oldest;
++         }) > 0;
++}
++
++}  // namespace
++
++std::string_view ReasonName(ArchiveEntry::Reason reason) {
++  switch (reason) {
++    case ArchiveEntry::Reason::kManual:
++      return "manual";
++    case ArchiveEntry::Reason::kWindow:
++      return "window";
++    case ArchiveEntry::Reason::kAuto:
++      return "auto";
++  }
++  NOTREACHED();
++}
++
++base::DictValue ArchiveToValue(const std::vector<ArchiveEntry>& entries) {
++  base::ListValue list;
++  for (const ArchiveEntry& entry : entries) {
++    list.Append(EntryToValue(entry));
++  }
++  base::DictValue file;
++  file.Set(kVersionKey, kArchiveFileVersion);
++  file.Set(kEntriesKey, std::move(list));
++  return file;
++}
++
++std::optional<std::vector<ArchiveEntry>> ArchiveFromValue(
++    const base::DictValue& value) {
++  if (value.FindInt(kVersionKey) != kArchiveFileVersion) {
++    return std::nullopt;
++  }
++  const base::ListValue* list = value.FindList(kEntriesKey);
++  if (!list) {
++    return std::nullopt;
++  }
++  std::vector<ArchiveEntry> entries;
++  entries.reserve(list->size());
++  // A reopen removes an entry by id, so two may never share one.
++  std::set<std::string, std::less<>> ids;
++  for (const base::Value& value_entry : *list) {
++    std::optional<ArchiveEntry> entry = EntryFromValue(value_entry);
++    if (!entry || !ids.insert(entry->id).second) {
++      return std::nullopt;
++    }
++    entries.push_back(std::move(*entry));
++  }
++  return entries;
++}
++
++struct ArchiveStore::LoadResult {
++  pins::FileRead status = pins::FileRead::kMissing;
++  std::vector<ArchiveEntry> entries;
++};
++
++// static
++ArchiveStore* ArchiveStore::GetOrCreate(base::SupportsUserData* host,
++                                        const base::FilePath& profile_dir) {
++  if (auto* store =
++          static_cast<ArchiveStore*>(host->GetUserData(kUserDataKey))) {
++    return store;
++  }
++  auto owned = std::make_unique<ArchiveStore>(
++      profile_dir.Append(kFileName),
++      base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++           base::TaskShutdownBehavior::BLOCK_SHUTDOWN}));
++  ArchiveStore* store = owned.get();
++  host->SetUserData(kUserDataKey, std::move(owned));
++  return store;
++}
++
++ArchiveStore::ArchiveStore(
++    const base::FilePath& file,
++    scoped_refptr<base::SequencedTaskRunner> file_task_runner)
++    : file_task_runner_(std::move(file_task_runner)),
++      writer_(file, file_task_runner_, kSaveDelay) {
++  // The same sequence as the writer's, so the read always runs before any
++  // write -- and no write is scheduled before the read's reply anyway.
++  file_task_runner_->PostTaskAndReplyWithResult(
++      FROM_HERE, base::BindOnce(&ArchiveStore::ReadFile, file),
++      base::BindOnce(&ArchiveStore::OnLoaded, weak_factory_.GetWeakPtr()));
++}
++
++ArchiveStore::~ArchiveStore() {
++  // As the pins store: ImportantFileWriter DCHECKs a pending write in its
++  // destructor, and this saves the last 2.5 s of closes at shutdown.
++  if (writer_.HasPendingWrite()) {
++    writer_.DoScheduledWrite();
++  }
++  // Gone before the read's reply -- the browser quit right after its first
++  // close, which is always held (review, LOCAL.md 52). The file sequence runs
++  // this after the read, and is BLOCK_SHUTDOWN, so it runs; it reads again and
++  // merges as OnLoaded would, without touching `this`.
++  if (!loaded_ && (!entries_.empty() || !removed_before_load_.empty())) {
++    LOG(INFO) << "[workspaces] archive: the store went before its load; "
++              << entries_.size() << " close(s) and "
++              << removed_before_load_.size()
++              << " reopen(s) made before it are merged into the file";
++    file_task_runner_->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](const base::FilePath& file, std::vector<ArchiveEntry> held,
++               const std::set<std::string, std::less<>>& removed) {
++              LoadResult result = ReadFile(file);
++              if (!Merge(file, result, std::move(held), removed)) {
++                return;
++              }
++              std::optional<std::string> json =
++                  base::WriteJson(ArchiveToValue(result.entries));
++              if (!json ||
++                  !base::ImportantFileWriter::WriteFileAtomically(file,
++                                                                  *json)) {
++                LOG(WARNING) << "[workspaces] archive: could not write "
++                             << file;
++              }
++            },
++            writer_.path(), std::move(entries_),
++            std::move(removed_before_load_)));
++  }
++}
++
++bool ArchiveStore::Add(ArchiveEntry entry) {
++  if (read_only_ || entry.id.empty() || entry.url.empty() ||
++      HasId(entries_, entry.id)) {
++    return false;
++  }
++  Prune(entries_);
++  entries_.push_back(std::move(entry));
++  // Before the load the entry is held, and OnLoaded writes it.
++  if (loaded_) {
++    writer_.ScheduleWrite(this);
++  }
++  return true;
++}
++
++bool ArchiveStore::Remove(std::string_view id) {
++  if (read_only_) {
++    return false;
++  }
++  const bool erased = std::erase_if(entries_, [id](const ArchiveEntry& entry) {
++                        return entry.id == id;
++                      }) > 0;
++  if (!loaded_) {
++    removed_before_load_.emplace(id);
++    return true;
++  }
++  if (!erased) {
++    return false;
++  }
++  writer_.ScheduleWrite(this);
++  return true;
++}
++
++// static
++ArchiveStore::LoadResult ArchiveStore::ReadFile(const base::FilePath& file) {
++  LoadResult result;
++  result.status = pins::ReadStoreFile(
++      file, kArchiveFileVersion, [&result](const base::DictValue& dict) {
++        std::optional<std::vector<ArchiveEntry>> entries =
++            ArchiveFromValue(dict);
++        if (entries) {
++          result.entries = std::move(*entries);
++        }
++        return entries.has_value();
++      });
++  return result;
++}
++
++// static
++bool ArchiveStore::Merge(const base::FilePath& file,
++                         LoadResult& result,
++                         std::vector<ArchiveEntry> held,
++                         const std::set<std::string, std::less<>>& removed) {
++  bool changed = !held.empty();
++  switch (result.status) {
++    case pins::FileRead::kMissing:
++      LOG(INFO) << "[workspaces] archive: no file yet at " << file;
++      break;
++    case pins::FileRead::kLoaded: {
++      const size_t in_file = result.entries.size();
++      changed |= std::erase_if(result.entries,
++                               [&removed](const ArchiveEntry& entry) {
++                                 return removed.contains(entry.id);
++                               }) > 0;
++      LOG(INFO) << "[workspaces] archive: loaded " << in_file
++                << " entr(ies) from " << file;
++      break;
++    }
++    case pins::FileRead::kMovedAside:
++      LOG(WARNING) << "[workspaces] archive: " << file
++                   << " is not an archive file; kept as .bad, starting empty";
++      break;
++    case pins::FileRead::kReadOnly:
++      // Nothing may be written over a file that could not be read, and there
++      // is nowhere else to keep the closes made before the load: they go, and
++      // the log says how many.
++      LOG(WARNING) << "[workspaces] archive: " << file
++                   << " could not be read, is from a newer version, or could "
++                      "not be moved aside; it will not be written, and "
++                   << held.size() << " close(s) made before the load are lost";
++      return false;
++  }
++  if (!held.empty()) {
++    LOG(INFO) << "[workspaces] archive: " << held.size()
++              << " close(s) held before the load joined it";
++  }
++  for (ArchiveEntry& entry : held) {
++    if (!HasId(result.entries, entry.id)) {
++      result.entries.push_back(std::move(entry));
++    }
++  }
++  changed |= Prune(result.entries);
++  return changed;
++}
++
++void ArchiveStore::OnLoaded(LoadResult result) {
++  loaded_ = true;
++  read_only_ = result.status == pins::FileRead::kReadOnly;
++  // The closes made before the file was read.
++  const bool changed = Merge(writer_.path(), result,
++                             std::exchange(entries_, {}), removed_before_load_);
++  entries_ = std::move(result.entries);
++  removed_before_load_.clear();
++  if (changed) {
++    writer_.ScheduleWrite(this);
++  }
++}
++
++std::optional<std::string> ArchiveStore::SerializeData() {
++  // Compact, not pretty as the pins file: at Arc's rate the file is ~0.5 MB,
++  // rewritten whole on every close (design 5, E14d spec).
++  return base::WriteJson(ArchiveToValue(entries_));
++}
++
++}  // namespace workspaces::archive
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.h
+@@ -0,0 +1,159 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_ARCHIVE_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_ARCHIVE_H_
++
++#include <functional>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/files/important_file_writer.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
++#include "base/time/time.h"
++#include "base/values.h"
++
++namespace base {
++class SequencedTaskRunner;
++}
++
++// Arc's archive: every tab the user closes, kept per workspace for 60 days in
++// a file of its own, so a close is never the end of a page (design 5, "E14d
++// spec"). E14d.1 records; the screen that finds and restores is E14d.2's.
++//
++// //base only, the file included, like the pins store (39): all of it is
++// tested in workspaces_unittests, and it attaches to its profile as
++// base::SupportsUserData -- no KeyedService, no upstream factory list.
++namespace workspaces::archive {
++
++// One closed tab.
++struct ArchiveEntry {
++  // Why the tab left: closed by the user, with its window while another
++  // window of the profile stayed open, or by the auto-archive (E14d.3).
++  enum class Reason { kManual, kWindow, kAuto };
++
++  // The tab's own id (its helium.archive_id): Ctrl+Shift+T of this close
++  // removes the entry by it, so a page lives in one place, as in Arc.
++  std::string id;
++  // The last committed address -- present on a tab never loaded since a
++  // restore (design 5, E14d spec).
++  std::string url;
++  // The page's title at the close, and the name the user gave the tab (E11),
++  // empty for none.
++  std::string title;
++  std::string custom_title;
++  // The workspace guid the tab was in; kDefaultWorkspaceGuid for an untagged
++  // tab. A deleted workspace's entries show under the default one, as its
++  // tabs do (ResolveTabGuid, design 2.4).
++  std::string workspace;
++  Reason reason = Reason::kManual;
++  base::Time archived_at;
++  // When the page was last shown; null when not known.
++  base::Time last_active;
++
++  bool operator==(const ArchiveEntry&) const = default;
++};
++
++// How long an entry is kept (the owner: Arc's number).
++inline constexpr base::TimeDelta kKeepFor = base::Days(60);
++
++// The file's and the log's word for a reason: "manual", "window", "auto".
++std::string_view ReasonName(ArchiveEntry::Reason reason);
++
++// The file's JSON, and back. std::nullopt when `value` is not an archive this
++// version can read -- an entry with an empty id or url, an unknown reason, a
++// time that does not parse, or an id twice -- and the store then keeps the
++// file aside rather than write over it.
++inline constexpr int kArchiveFileVersion = 1;
++base::DictValue ArchiveToValue(const std::vector<ArchiveEntry>& entries);
++std::optional<std::vector<ArchiveEntry>> ArchiveFromValue(
++    const base::DictValue& value);
++
++// The archive file of one profile, loaded off the UI thread and written
++// through base::ImportantFileWriter, so a crash never leaves half a file. Used
++// on one sequence (the UI thread).
++class ArchiveStore : public base::SupportsUserData::Data,
++                     public base::ImportantFileWriter::DataSerializer {
++ public:
++  static constexpr base::FilePath::CharType kFileName[] =
++      FILE_PATH_LITERAL("Workspace Archive");
++  // The pins store's delay: a crash loses at most this much.
++  static constexpr base::TimeDelta kSaveDelay = base::Milliseconds(2500);
++
++  // The one store of `host` (a Profile), created -- and its load started --
++  // on the first call.
++  static ArchiveStore* GetOrCreate(base::SupportsUserData* host,
++                                   const base::FilePath& profile_dir);
++
++  // Starts loading `file` on `file_task_runner`, which must be BLOCK_SHUTDOWN
++  // so the destructor's last write finishes.
++  ArchiveStore(const base::FilePath& file,
++               scoped_refptr<base::SequencedTaskRunner> file_task_runner);
++  ArchiveStore(const ArchiveStore&) = delete;
++  ArchiveStore& operator=(const ArchiveStore&) = delete;
++  // Writes any change still waiting for kSaveDelay -- and, when the store goes
++  // before the read's reply, merges the closes and reopens made before the
++  // load into the file on the file sequence, after the read (review, LOCAL.md
++  // 52): the browser can quit right after its first close.
++  ~ArchiveStore() override;
++
++  bool loaded() const { return loaded_; }
++  // The file exists but could not be read, or is from a newer version: it is
++  // never written, so nothing in it is lost.
++  bool read_only() const { return read_only_; }
++  // Oldest first, in the order they were kept; none older than kKeepFor at
++  // the load or at the last Add().
++  const std::vector<ArchiveEntry>& entries() const { return entries_; }
++
++  // Keeps `entry`, and drops every entry older than kKeepFor. A close can
++  // come before the file has been read: the entry is then held and joins the
++  // file's entries at the load -- unlike the pins store, which refuses a
++  // change it cannot show yet, the archive must not lose a close. False, and
++  // nothing kept, when read_only() or when `entry` is one ArchiveFromValue()
++  // would refuse, its id already kept included.
++  bool Add(ArchiveEntry entry);
++
++  // Removes the entry with `id` (a reopened close). Before the load the id is
++  // remembered and removed from the file's entries when they arrive. False
++  // when read_only(), and after the load when no entry has `id`.
++  bool Remove(std::string_view id);
++
++ private:
++  struct LoadResult;
++  static LoadResult ReadFile(const base::FilePath& file);
++  // The load's merge, shared by OnLoaded and the destructor: `result`'s
++  // entries lose the `removed` ids, gain the `held` closes whose id they lack,
++  // and are pruned. True when they then differ from the file; false on
++  // kReadOnly, whose entries are empty, the held closes dropped. Logs as the
++  // load does.
++  static bool Merge(const base::FilePath& file,
++                    LoadResult& result,
++                    std::vector<ArchiveEntry> held,
++                    const std::set<std::string, std::less<>>& removed);
++  void OnLoaded(LoadResult result);
++
++  // base::ImportantFileWriter::DataSerializer:
++  std::optional<std::string> SerializeData() override;
++
++  std::vector<ArchiveEntry> entries_;
++  // Remove()'s ids from before the load.
++  std::set<std::string, std::less<>> removed_before_load_;
++  bool loaded_ = false;
++  bool read_only_ = false;
++  // The writer's, kept for the destructor's merge: the writer does not expose
++  // it.
++  scoped_refptr<base::SequencedTaskRunner> file_task_runner_;
++  base::ImportantFileWriter writer_;
++  base::WeakPtrFactory<ArchiveStore> weak_factory_{this};
++};
++
++}  // namespace workspaces::archive
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_ARCHIVE_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
+@@ -0,0 +1,392 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/supports_user_data.h"
++#include "base/task/thread_pool.h"
++#include "base/test/task_environment.h"
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace workspaces::archive {
++namespace {
++
++ArchiveEntry Entry(std::string id,
++                   std::string url,
++                   base::Time archived_at = base::Time::Now()) {
++  ArchiveEntry entry;
++  entry.id = std::move(id);
++  entry.url = std::move(url);
++  entry.archived_at = archived_at;
++  return entry;
++}
++
++std::vector<std::string> Ids(const std::vector<ArchiveEntry>& entries) {
++  std::vector<std::string> ids;
++  for (const ArchiveEntry& entry : entries) {
++    ids.push_back(entry.id);
++  }
++  return ids;
++}
++
++using IdList = std::vector<std::string>;
++
++TEST(WorkspaceArchiveTest, JsonRoundTripKeepsEveryField) {
++  ArchiveEntry full =
++      Entry("a", "https://a.example/",
++            base::Time::FromSecondsSinceUnixEpoch(1'760'000'000));
++  full.title = "A page";
++  full.custom_title = "My A";
++  full.workspace = "work";
++  full.reason = ArchiveEntry::Reason::kWindow;
++  full.last_active = base::Time::FromSecondsSinceUnixEpoch(1'759'000'000);
++  // No name, no last-shown time, no title, no workspace.
++  ArchiveEntry bare =
++      Entry("b", "https://b.example/",
++            base::Time::FromSecondsSinceUnixEpoch(1'760'000'100));
++  bare.reason = ArchiveEntry::Reason::kAuto;
++  const std::vector<ArchiveEntry> entries = {full, Entry("c", "https://c/"),
++                                             bare};
++
++  const base::DictValue value = ArchiveToValue(entries);
++  EXPECT_EQ(ArchiveFromValue(value), entries);
++
++  // What is empty or null is left out of the file, not written as "".
++  const base::ListValue* list = value.FindList("entries");
++  ASSERT_TRUE(list);
++  ASSERT_EQ(list->size(), 3u);
++  const base::DictValue& written = (*list)[2].GetDict();
++  EXPECT_FALSE(written.Find("custom_title"));
++  EXPECT_FALSE(written.Find("last_active"));
++  EXPECT_EQ(*written.FindString("reason"), "auto");
++}
++
++TEST(WorkspaceArchiveTest, ReasonNames) {
++  EXPECT_EQ(ReasonName(ArchiveEntry::Reason::kManual), "manual");
++  EXPECT_EQ(ReasonName(ArchiveEntry::Reason::kWindow), "window");
++  EXPECT_EQ(ReasonName(ArchiveEntry::Reason::kAuto), "auto");
++}
++
++TEST(WorkspaceArchiveTest, RefusesFilesItDidNotWrite) {
++  // The least a file may hold: no title, name, workspace or last time.
++  const std::optional<base::DictValue> smallest = base::JSONReader::ReadDict(
++      R"({"version":1,"entries":[{"id":"a","url":"https://a/","reason":"manual","archived_at":"1"}]})",
++      base::JSON_PARSE_RFC);
++  ASSERT_TRUE(smallest);
++  EXPECT_TRUE(ArchiveFromValue(*smallest).has_value());
++
++  for (std::string_view json : {
++           R"({"entries":[]})",
++           R"({"version":2,"entries":[]})",
++           R"({"version":1})",
++           R"({"version":1,"entries":{}})",
++           R"({"version":1,"entries":["a"]})",
++           R"({"version":1,"entries":[{"url":"https://a/","reason":"manual","archived_at":"1"}]})",
++           R"({"version":1,"entries":[{"id":"","url":"https://a/","reason":"manual","archived_at":"1"}]})",
++           R"({"version":1,"entries":[{"id":"a","reason":"manual","archived_at":"1"}]})",
++           R"({"version":1,"entries":[{"id":"a","url":"","reason":"manual","archived_at":"1"}]})",
++           R"({"version":1,"entries":[{"id":"a","url":"https://a/","archived_at":"1"}]})",
++           R"({"version":1,"entries":[{"id":"a","url":"https://a/","reason":"closed","archived_at":"1"}]})",
++           R"({"version":1,"entries":[{"id":"a","url":"https://a/","reason":"manual"}]})",
++           R"({"version":1,"entries":[{"id":"a","url":"https://a/","reason":"manual","archived_at":"soon"}]})",
++           R"({"version":1,"entries":[{"id":"a","url":"https://a/","reason":"manual","archived_at":"1","last_active":"soon"}]})",
++           R"({"version":1,"entries":[{"id":"a","url":"https://a/","reason":"manual","archived_at":"1"},{"id":"a","url":"https://b/","reason":"auto","archived_at":"2"}]})",
++       }) {
++    SCOPED_TRACE(json);
++    std::optional<base::DictValue> dict =
++        base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++    ASSERT_TRUE(dict);
++    EXPECT_FALSE(ArchiveFromValue(*dict).has_value());
++  }
++}
++
++// Stands in for a Profile: SupportsUserData's destructor is protected.
++class FakeProfile : public base::SupportsUserData {};
++
++class ArchiveStoreTest : public testing::Test {
++ protected:
++  void SetUp() override { ASSERT_TRUE(dir_.CreateUniqueTempDir()); }
++
++  base::FilePath file() const {
++    return dir_.GetPath().Append(ArchiveStore::kFileName);
++  }
++  base::FilePath bad_file() const {
++    return file().AddExtension(FILE_PATH_LITERAL(".bad"));
++  }
++
++  // A store whose load is still on its way.
++  std::unique_ptr<ArchiveStore> NewStore() {
++    return std::make_unique<ArchiveStore>(
++        file(), base::ThreadPool::CreateSequencedTaskRunner(
++                    {base::MayBlock(),
++                     base::TaskShutdownBehavior::BLOCK_SHUTDOWN}));
++  }
++
++  std::unique_ptr<ArchiveStore> LoadedStore() {
++    std::unique_ptr<ArchiveStore> store = NewStore();
++    task_environment_.RunUntilIdle();
++    return store;
++  }
++
++  // Destroys `store` -- its destructor writes what is waiting -- and reads
++  // the file back through a new one.
++  std::vector<ArchiveEntry> Reloaded(std::unique_ptr<ArchiveStore> store) {
++    store.reset();
++    task_environment_.RunUntilIdle();
++    return LoadedStore()->entries();
++  }
++
++  void WriteArchive(const std::vector<ArchiveEntry>& entries) {
++    std::optional<std::string> json = base::WriteJson(ArchiveToValue(entries));
++    ASSERT_TRUE(json);
++    ASSERT_TRUE(base::WriteFile(file(), *json));
++  }
++
++  std::string Contents(const base::FilePath& path) {
++    std::string contents;
++    EXPECT_TRUE(base::ReadFileToString(path, &contents)) << path;
++    return contents;
++  }
++
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  base::ScopedTempDir dir_;
++};
++
++TEST_F(ArchiveStoreTest, NoFileLoadsEmptyAndWritable) {
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  EXPECT_TRUE(store->loaded());
++  EXPECT_FALSE(store->read_only());
++  EXPECT_TRUE(store->entries().empty());
++  task_environment_.FastForwardBy(ArchiveStore::kSaveDelay * 2);
++  EXPECT_FALSE(base::PathExists(file()));
++}
++
++TEST_F(ArchiveStoreTest, AnAddIsWrittenCompactAfterTheDelayAndReadBack) {
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  ArchiveEntry a = Entry("a", "https://a.example/");
++  a.title = "A page";
++  a.workspace = "work";
++  ASSERT_TRUE(store->Add(a));
++  ASSERT_TRUE(store->Add(Entry("b", "https://b.example/")));
++
++  task_environment_.FastForwardBy(ArchiveStore::kSaveDelay / 2);
++  EXPECT_FALSE(base::PathExists(file()));
++  task_environment_.FastForwardBy(ArchiveStore::kSaveDelay);
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(base::PathExists(file()));
++  // One line: the file is rewritten whole on every close.
++  EXPECT_EQ(Contents(file()).find('\n'), std::string::npos);
++
++  const std::vector<ArchiveEntry> expected = store->entries();
++  EXPECT_EQ(Ids(expected), (IdList{"a", "b"}));
++  EXPECT_EQ(Reloaded(std::move(store)), expected);
++}
++
++TEST_F(ArchiveStoreTest, DestroyingTheStoreWritesTheAddStillWaiting) {
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  ASSERT_TRUE(store->Add(Entry("a", "https://a.example/")));
++  // Well inside kSaveDelay: only the destructor can have written it.
++  EXPECT_EQ(Ids(Reloaded(std::move(store))), (IdList{"a"}));
++}
++
++// A close before the file is read is held, never lost, and joins the file's
++// entries at the load -- after them, unless the file already has its id.
++TEST_F(ArchiveStoreTest, AnAddBeforeTheLoadIsHeldAndJoinsTheFile) {
++  WriteArchive({Entry("a", "https://a.example/")});
++  std::unique_ptr<ArchiveStore> store = NewStore();
++  EXPECT_FALSE(store->loaded());
++  EXPECT_TRUE(store->Add(Entry("b", "https://b.example/")));
++  EXPECT_TRUE(store->Add(Entry("a", "https://not-kept.example/")));
++  EXPECT_FALSE(store->Add(Entry("b", "https://b2.example/")));
++  EXPECT_EQ(Ids(store->entries()), (IdList{"b", "a"}));
++
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(store->loaded());
++  ASSERT_EQ(Ids(store->entries()), (IdList{"a", "b"}));
++  EXPECT_EQ(store->entries()[0].url, "https://a.example/");
++
++  // The held entry is written without another change.
++  task_environment_.FastForwardBy(ArchiveStore::kSaveDelay * 2);
++  EXPECT_EQ(Ids(LoadedStore()->entries()), (IdList{"a", "b"}));
++}
++
++// Ctrl+Shift+T of a close before the file is read: its entry must not come
++// back when the file does.
++TEST_F(ArchiveStoreTest, ARemoveBeforeTheLoadRemovesTheFilesEntry) {
++  WriteArchive(
++      {Entry("a", "https://a.example/"), Entry("b", "https://b.example/")});
++  std::unique_ptr<ArchiveStore> store = NewStore();
++  ASSERT_TRUE(store->Add(Entry("c", "https://c.example/")));
++  EXPECT_TRUE(store->Remove("a"));
++  EXPECT_TRUE(store->Remove("c"));
++  EXPECT_TRUE(store->entries().empty());
++
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(Ids(store->entries()), (IdList{"b"}));
++  EXPECT_EQ(Ids(Reloaded(std::move(store))), (IdList{"b"}));
++}
++
++TEST_F(ArchiveStoreTest, ARemoveAfterTheLoadIsSaved) {
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  ASSERT_TRUE(store->Add(Entry("a", "https://a.example/")));
++  ASSERT_TRUE(store->Add(Entry("b", "https://b.example/")));
++  task_environment_.FastForwardBy(ArchiveStore::kSaveDelay * 2);
++
++  EXPECT_TRUE(store->Remove("a"));
++  EXPECT_FALSE(store->Remove("a"));
++  EXPECT_FALSE(store->Remove("nope"));
++  EXPECT_EQ(Ids(Reloaded(std::move(store))), (IdList{"b"}));
++}
++
++TEST_F(ArchiveStoreTest, ABrokenFileIsKeptAsideAndNeverWrittenOver) {
++  ASSERT_TRUE(base::WriteFile(file(), "{not json"));
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  EXPECT_TRUE(store->loaded());
++  EXPECT_FALSE(store->read_only());
++  EXPECT_TRUE(store->entries().empty());
++  EXPECT_FALSE(base::PathExists(file()));
++  EXPECT_EQ(Contents(bad_file()), "{not json");
++
++  ASSERT_TRUE(store->Add(Entry("a", "https://a.example/")));
++  EXPECT_EQ(Ids(Reloaded(std::move(store))), (IdList{"a"}));
++  EXPECT_EQ(Contents(bad_file()), "{not json");
++}
++
++TEST_F(ArchiveStoreTest, ASecondBrokenFileDoesNotReplaceTheFirst) {
++  ASSERT_TRUE(base::WriteFile(file(), "first"));
++  LoadedStore();
++  ASSERT_TRUE(base::WriteFile(file(), "second"));
++  LoadedStore();
++
++  EXPECT_EQ(Contents(bad_file()), "first");
++  EXPECT_EQ(Contents(dir_.GetPath().Append(
++                FILE_PATH_LITERAL("Workspace Archive (1).bad"))),
++            "second");
++}
++
++// Never written, so nothing in it is lost -- and a close made before the load
++// cannot be kept anywhere, so it goes.
++TEST_F(ArchiveStoreTest, AFileFromANewerVersionIsReadOnly) {
++  const std::string newer = R"({"version":2,"entries":[]})";
++  ASSERT_TRUE(base::WriteFile(file(), newer));
++  std::unique_ptr<ArchiveStore> store = NewStore();
++  EXPECT_TRUE(store->Add(Entry("held", "https://held.example/")));
++  task_environment_.RunUntilIdle();
++  EXPECT_TRUE(store->loaded());
++  EXPECT_TRUE(store->read_only());
++  EXPECT_TRUE(store->entries().empty());
++  EXPECT_FALSE(store->Add(Entry("a", "https://a.example/")));
++  EXPECT_FALSE(store->Remove("a"));
++
++  store.reset();
++  task_environment_.FastForwardBy(ArchiveStore::kSaveDelay * 2);
++  EXPECT_EQ(Contents(file()), newer);
++  EXPECT_FALSE(base::PathExists(bad_file()));
++}
++
++// 60 days: what is older goes at the load, and the file is written
++// without it.
++TEST_F(ArchiveStoreTest, TheLoadDropsEntriesOlderThanSixtyDays) {
++  const base::Time now = base::Time::Now();
++  WriteArchive({Entry("old", "https://old.example/", now - base::Days(61)),
++                Entry("new", "https://new.example/", now - base::Days(59))});
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  EXPECT_EQ(Ids(store->entries()), (IdList{"new"}));
++
++  task_environment_.FastForwardBy(ArchiveStore::kSaveDelay * 2);
++  task_environment_.RunUntilIdle();
++  // Read directly: another store's load would prune it again and hide an
++  // unwritten file (review, LOCAL.md 52).
++  std::optional<base::DictValue> written =
++      base::JSONReader::ReadDict(Contents(file()), base::JSON_PARSE_RFC);
++  ASSERT_TRUE(written);
++  std::optional<std::vector<ArchiveEntry>> on_disk = ArchiveFromValue(*written);
++  ASSERT_TRUE(on_disk);
++  EXPECT_EQ(Ids(*on_disk), (IdList{"new"}));
++}
++
++TEST_F(ArchiveStoreTest, AnAddDropsEntriesOlderThanSixtyDays) {
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  ASSERT_TRUE(store->Add(Entry("old", "https://old.example/")));
++  task_environment_.FastForwardBy(base::Days(61));
++  EXPECT_EQ(Ids(store->entries()), (IdList{"old"}));
++  ASSERT_TRUE(store->Add(Entry("new", "https://new.example/")));
++  // Before any reload, whose own prune would hide an Add that stopped pruning.
++  EXPECT_EQ(Ids(store->entries()), (IdList{"new"}));
++  EXPECT_EQ(Ids(Reloaded(std::move(store))), (IdList{"new"}));
++}
++
++// The browser can quit right after its first close, before the file is read:
++// the held close must reach the file anyway (review, LOCAL.md 52).
++TEST_F(ArchiveStoreTest, AnAddBeforeTheLoadSurvivesTheStoreGoingFirst) {
++  WriteArchive({Entry("a", "https://a.example/")});
++  std::unique_ptr<ArchiveStore> store = NewStore();
++  ASSERT_TRUE(store->Add(Entry("b", "https://b.example/")));
++  store.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(Ids(LoadedStore()->entries()), (IdList{"a", "b"}));
++}
++
++TEST_F(ArchiveStoreTest, ARemoveBeforeTheLoadSurvivesTheStoreGoingFirst) {
++  WriteArchive(
++      {Entry("a", "https://a.example/"), Entry("b", "https://b.example/")});
++  std::unique_ptr<ArchiveStore> store = NewStore();
++  ASSERT_TRUE(store->Remove("a"));
++  store.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(Ids(LoadedStore()->entries()), (IdList{"b"}));
++}
++
++TEST_F(ArchiveStoreTest, AReadOnlyFileIsUntouchedWhenTheStoreGoesFirst) {
++  const std::string newer = R"({"version":2,"entries":[]})";
++  ASSERT_TRUE(base::WriteFile(file(), newer));
++  std::unique_ptr<ArchiveStore> store = NewStore();
++  ASSERT_TRUE(store->Add(Entry("held", "https://held.example/")));
++  store.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(Contents(file()), newer);
++  EXPECT_FALSE(base::PathExists(bad_file()));
++}
++
++// Everything Add keeps, the next load must accept: one refused entry would
++// send the whole file to .bad.
++TEST_F(ArchiveStoreTest, RefusesEntriesTheNextLoadWouldRefuse) {
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  ASSERT_TRUE(store->Add(Entry("a", "https://a.example/")));
++  EXPECT_FALSE(store->Add(Entry("", "https://b.example/")));
++  EXPECT_FALSE(store->Add(Entry("b", "")));
++  EXPECT_FALSE(store->Add(Entry("a", "https://a2.example/")));
++  ASSERT_EQ(Ids(store->entries()), (IdList{"a"}));
++  EXPECT_EQ(store->entries()[0].url, "https://a.example/");
++}
++
++TEST_F(ArchiveStoreTest, OneStorePerProfileAndItsDeathSavesTheFile) {
++  auto profile = std::make_unique<FakeProfile>();
++  ArchiveStore* store = ArchiveStore::GetOrCreate(profile.get(), dir_.GetPath());
++  EXPECT_EQ(ArchiveStore::GetOrCreate(profile.get(), dir_.GetPath()), store);
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(store->loaded());
++  ASSERT_TRUE(store->Add(Entry("a", "https://a.example/")));
++
++  // What a browser exit does: the profile, and its user data, are destroyed.
++  profile.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(Ids(LoadedStore()->entries()), (IdList{"a"}));
++}
++
++}  // namespace
++}  // namespace workspaces::archive
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -329,16 +329,37 @@ std::vector<const PinNode*> RootsForWork
+   return rows;
+ }
+ 
++FileRead ReadStoreFile(const base::FilePath& file,
++                       int version,
++                       base::FunctionRef<bool(const base::DictValue&)> parse) {
++  if (!base::PathExists(file)) {
++    return FileRead::kMissing;
++  }
++  std::string contents;
++  if (!base::ReadFileToString(file, &contents)) {
++    return FileRead::kReadOnly;
++  }
++  if (std::optional<base::DictValue> dict =
++          base::JSONReader::ReadDict(contents, base::JSON_PARSE_RFC)) {
++    std::optional<int> file_version = dict->FindInt(kVersionKey);
++    if (file_version && *file_version > version) {
++      return FileRead::kReadOnly;
++    }
++    if (parse(*dict)) {
++      return FileRead::kLoaded;
++    }
++  }
++  // Kept, never written over: the next write starts a new file. A second bad
++  // file gets "<file> (1).bad", never the first one's name. An empty unique
++  // path (100 taken) fails the move, and the store stays read-only.
++  return base::Move(file, base::GetUniquePath(
++                              file.AddExtension(FILE_PATH_LITERAL(".bad"))))
++             ? FileRead::kMovedAside
++             : FileRead::kReadOnly;
++}
++
+ struct PinStore::LoadResult {
+-  enum class Status {
+-    kMissing,
+-    kLoaded,
+-    // Not a pins file this version wrote: renamed to "<file>.bad".
+-    kMovedAside,
+-    // Unreadable, from a newer version, or could not be moved aside.
+-    kReadOnly,
+-  };
+-  Status status = Status::kMissing;
++  FileRead status = FileRead::kMissing;
+   PinTree tree;
+ };
+ 
+@@ -544,35 +565,14 @@ void PinStore::RemoveObserver(Observer*
+ // static
+ PinStore::LoadResult PinStore::ReadFile(const base::FilePath& file) {
+   LoadResult result;
+-  if (!base::PathExists(file)) {
+-    return result;
+-  }
+-  std::string contents;
+-  if (!base::ReadFileToString(file, &contents)) {
+-    result.status = LoadResult::Status::kReadOnly;
+-    return result;
+-  }
+-  if (std::optional<base::DictValue> dict =
+-          base::JSONReader::ReadDict(contents, base::JSON_PARSE_RFC)) {
+-    std::optional<int> version = dict->FindInt(kVersionKey);
+-    if (version && *version > kPinFileVersion) {
+-      result.status = LoadResult::Status::kReadOnly;
+-      return result;
+-    }
+-    if (std::optional<PinTree> tree = PinTreeFromValue(*dict)) {
+-      result.status = LoadResult::Status::kLoaded;
+-      result.tree = std::move(*tree);
+-      return result;
+-    }
+-  }
+-  // Kept, never written over: the next write starts a new file. A second bad
+-  // file gets "<file> (1).bad", never the first one's name. An empty unique
+-  // path (100 taken) fails the move, and the store stays read-only.
+-  result.status =
+-      base::Move(file, base::GetUniquePath(
+-                           file.AddExtension(FILE_PATH_LITERAL(".bad"))))
+-          ? LoadResult::Status::kMovedAside
+-          : LoadResult::Status::kReadOnly;
++  result.status = ReadStoreFile(
++      file, kPinFileVersion, [&result](const base::DictValue& dict) {
++        std::optional<PinTree> tree = PinTreeFromValue(dict);
++        if (tree) {
++          result.tree = std::move(*tree);
++        }
++        return tree.has_value();
++      });
+   return result;
+ }
+ 
+@@ -580,10 +580,10 @@ void PinStore::OnLoaded(LoadResult resul
+   loaded_ = true;
+   tree_ = std::move(result.tree);
+   switch (result.status) {
+-    case LoadResult::Status::kMissing:
++    case FileRead::kMissing:
+       LOG(INFO) << "[workspaces] pins: no file yet at " << writer_.path();
+       break;
+-    case LoadResult::Status::kLoaded: {
++    case FileRead::kLoaded: {
+       int items = 0;
+       int folders = 0;
+       for (const auto& [guid, roots] : tree_) {
+@@ -594,11 +594,11 @@ void PinStore::OnLoaded(LoadResult resul
+                 << tree_.size() << " workspace(s) from " << writer_.path();
+       break;
+     }
+-    case LoadResult::Status::kMovedAside:
++    case FileRead::kMovedAside:
+       LOG(WARNING) << "[workspaces] pins: " << writer_.path()
+                    << " is not a pins file; kept as .bad, starting empty";
+       break;
+-    case LoadResult::Status::kReadOnly:
++    case FileRead::kReadOnly:
+       read_only_ = true;
+       LOG(WARNING) << "[workspaces] pins: " << writer_.path()
+                    << " could not be read, is from a newer version, or could "
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -14,6 +14,7 @@
+ 
+ #include "base/files/file_path.h"
+ #include "base/files/important_file_writer.h"
++#include "base/functional/function_ref.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/observer_list.h"
+@@ -89,6 +90,25 @@ std::vector<const PinNode*> RootsForWork
+     std::string_view guid,
+     const std::vector<std::string>& known_guids);
+ 
++// How a store's file read went. The rules are this store's, shared with the
++// archive's (E14d.1, design 5 "E14d spec"): a file neither can trust is kept,
++// never written over.
++enum class FileRead {
++  kMissing,
++  kLoaded,
++  // Not a file this version wrote: renamed to "<file>.bad".
++  kMovedAside,
++  // Unreadable, from a newer version, or could not be moved aside.
++  kReadOnly,
++};
++
++// Reads `file`, a JSON dict with a "version", on a sequence that may block.
++// kLoaded when `parse` takes the dict; a dict whose version is above `version`
++// is left alone, anything else `parse` refuses is moved aside.
++FileRead ReadStoreFile(const base::FilePath& file,
++                       int version,
++                       base::FunctionRef<bool(const base::DictValue&)> parse);
++
+ // The pins file of one profile, loaded off the UI thread and written through
+ // base::ImportantFileWriter, so a crash never leaves half a file. Used on one
+ // sequence (the UI thread).
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -19,10 +19,12 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/uuid.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/desktop_browser_window_capabilities.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+@@ -30,10 +32,12 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
++#include "chrome/common/webui_url_constants.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/split_tabs/split_tab_id.h"
+@@ -45,6 +49,7 @@
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/referrer.h"
++#include "content/public/common/url_constants.h"
+ #include "third_party/blink/public/mojom/frame/sudden_termination_disabler_type.mojom.h"
+ #include "ui/base/page_transition_types.h"
+ #include "url/gurl.h"
+@@ -98,6 +103,45 @@ std::string InitialWorkspace(BrowserWind
+   return guid;
+ }
+ 
++// Whether `window`'s close has COMMITTED: its UnloadController marked it, and
++// UnloadController::OnWindowClosing runs SessionService::WindowClosing,
++// TabRestoreService::BrowserClosing and CloseAllTabs in one synchronous call
++// (unload_controller.cc:142-190), so from inside that close the strip is
++// closing_all(). Neither half is enough alone: the mark is also a close still
++// waiting on "Leave site?", and closing_all() is also a Close group of the
++// whole strip, never reset once set (tab_strip_model.cc:1410-1424) -- review,
++// LOCAL.md 52. False once the window's capabilities are torn down.
++bool IsCloseCommitted(BrowserWindowInterface* window) {
++  const DesktopBrowserWindowCapabilities* const capabilities =
++      window->capabilities();
++  return capabilities && capabilities->IsAttemptingToCloseBrowser() &&
++         window->GetTabStripModel()->closing_all();
++}
++
++// Whether a window of `window`'s profile other than `window` stays open as the
++// SESSION counts it (SessionService::HasOpenTrackableBrowsers): a normal window
++// or a popup -- the session restores popups, which have no WorkspaceService --
++// whose close has not committed (review, LOCAL.md 52). A committed close has
++// emptied its strip, or holds only tabs waiting on their unload handlers.
++// ponytail: BrowserInitState::omit_from_session_restore (the identity and
++// WebAuthn popups) is not checked: it lives in //chrome/browser/ui, a GN cycle
++// from this target. Such a window counts as staying here but not for the
++// session, so a close beside one archives tabs the session also keeps -- a
++// duplicate, never a loss.
++bool AnotherSessionWindowStays(BrowserWindowInterface* window) {
++  bool stays = false;
++  ProfileBrowserCollection::GetForProfile(window->GetProfile())
++      ->ForEach([&](BrowserWindowInterface* other) {
++        const BrowserWindowInterface::Type type = other->GetType();
++        stays = other != window &&
++                (type == BrowserWindowInterface::TYPE_NORMAL ||
++                 type == BrowserWindowInterface::TYPE_POPUP) &&
++                !other->GetTabStripModel()->empty() && !IsCloseCommitted(other);
++        return !stays;
++      });
++  return stays;
++}
++
+ }  // namespace
+ 
+ DEFINE_USER_DATA(WorkspaceService);
+@@ -146,6 +190,16 @@ WorkspaceService::WorkspaceService(
+         base::BindRepeating(&WorkspaceService::OnLayoutModeChanged,
+                             base::Unretained(this)));
+   }
++
++  // The archive file is read now, at startup, not at the first close, which
++  // the store can only hold until its read replies (review, LOCAL.md 52). The
++  // store also saves a close held before its read when it dies (its
++  // destructor), so this is for the common case, not the only guard. A
++  // profile's later windows find the store already made.
++  if (IsEnabled()) {
++    Profile* const profile = browser_window_->GetProfile();
++    archive::ArchiveStore::GetOrCreate(profile, profile->GetPath());
++  }
+ }
+ 
+ WorkspaceService::~WorkspaceService() {
+@@ -1572,6 +1626,89 @@ bool WorkspaceService::ClosePinItemPage(
+   return true;
+ }
+ 
++void WorkspaceService::ArchiveClosingTab(content::WebContents* contents,
++                                         bool quitting) {
++  // IsEnabled() is false without a window too: the file's fail-open rule.
++  if (!contents || !IsEnabled()) {
++    return;
++  }
++  // A pinned item's page is never archived (Arc; design 5): the item stays in
++  // the section. Here, in the shared door, not only in ClosePinItemPage: a page
++  // with an unload-type handler comes back through CloseContents ->
++  // chrome::CloseWebContents(add_to_history), which adds
++  // CLOSE_CREATE_HISTORICAL_TAB (browser_tabstrip.cc:137-139), and a window
++  // close and the rail's Close all tabs close it with
++  // CLOSE_CREATE_HISTORICAL_TAB (review, LOCAL.md 52).
++  if (!PinItemForTab(contents).empty()) {
++    LOG(INFO) << "[workspaces] not archived: a pinned item's page";
++    return;
++  }
++  // Before the window rule: a quit that skips unload handlers (a silent exit,
++  // log-off) marks no window closing, so every tab would pass as `manual`
++  // (review, LOCAL.md 52).
++  if (quitting) {
++    LOG(INFO) << "[workspaces] not archived: the browser is quitting";
++    return;
++  }
++  archive::ArchiveEntry::Reason reason = archive::ArchiveEntry::Reason::kManual;
++  if (IsCloseCommitted(browser_window_)) {
++    // The session's own rule (SessionService::WindowClosing and
++    // HasOpenTrackableBrowsers): a window's close is committed only while
++    // another window the session tracks stays open. The last window's tabs
++    // come back at the next start (design 5, "Which closes are archived"), and
++    // so does every window's at Exit: the app menu's Exit and a profile's Close
++    // all windows never set IsTryingToQuit, but BrowserCloseManager shuts the
++    // session service down before any window closes, so nothing is committed
++    // (browser_close_manager.cc:190-193; review, LOCAL.md 52).
++    if (!SessionServiceFactory::GetForProfileIfExisting(
++            browser_window_->GetProfile()) ||
++        !AnotherSessionWindowStays(browser_window_)) {
++      LOG(INFO) << "[workspaces] not archived: the session keeps the last "
++                   "window's tabs";
++      return;
++    }
++    reason = archive::ArchiveEntry::Reason::kWindow;
++  }
++
++  const GURL& url = contents->GetLastCommittedURL();
++  if (!url.is_valid()) {
++    LOG(INFO) << "[workspaces] not archived: no address";
++    return;
++  }
++  // Chromium's own test of an untouched New Tab page
++  // (TabStripModel::IsNewTabAtEndOfTabStrip): nothing to go back to.
++  if (url.SchemeIs(content::kChromeUIScheme) &&
++      url.host() == chrome::kChromeUINewTabHost &&
++      contents->GetController().GetEntryCount() == 1) {
++    LOG(INFO) << "[workspaces] not archived: an untouched New Tab page";
++    return;
++  }
++
++  // The last committed address, which a restored tab never loaded since has
++  // too (design 5): a sleeping import is archived at its page.
++  archive::ArchiveEntry entry;
++  entry.id = ArchiveIdForTab(contents);
++  entry.url = url.spec();
++  entry.title = base::UTF16ToUTF8(contents->GetTitle());
++  entry.custom_title = CustomTitleForTab(contents);
++  entry.workspace = WorkspaceGuidForTab(contents);
++  if (entry.workspace.empty()) {
++    entry.workspace = kDefaultWorkspaceGuid;
++  }
++  entry.reason = reason;
++  entry.archived_at = base::Time::Now();
++  entry.last_active = contents->GetLastActiveTime();
++  const std::string workspace = entry.workspace;
++  Profile* const profile = browser_window_->GetProfile();
++  const bool added =
++      archive::ArchiveStore::GetOrCreate(profile, profile->GetPath())
++          ->Add(std::move(entry));
++  // Never the address or the title: a log is pasted when asking for help.
++  LOG(INFO) << "[workspaces] archived a " << archive::ReasonName(reason)
++            << " close in '" << workspace << "'"
++            << (added ? "" : " (refused)");
++}
++
+ bool WorkspaceService::ShouldDivertTypedNavigation(
+     content::WebContents* contents,
+     const GURL& url) const {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -410,6 +410,18 @@ class WorkspaceService : public TabStrip
+   // Never from an observer: closing a tab mutates the model (design 2.2).
+   bool ClosePinItemPage(tabs::TabInterface* tab, const char* via);
+ 
++  // Arc's archive (E14d.1, design 5 "E14d spec"): keeps `contents`, which the
++  // user is closing, or logs why not. The gates, in order: nothing while the
++  // feature is off; never a pinned item's page; nothing while `quitting`; a
++  // committed window close only while the session commits it too -- its
++  // service still up and another window it tracks staying open; never a tab
++  // with no address or an untouched New Tab page (review, LOCAL.md 52).
++  // `quitting` is browser_shutdown::HasShutdownStarted(), which this target
++  // cannot ask (a GN cycle), so the caller passes it. Called from the
++  // delegate's CreateHistoricalTab, INSIDE TabStripModel's close: it reads the
++  // tab and writes the store, never the model (design 2.2).
++  void ArchiveClosingTab(content::WebContents* contents, bool quitting);
++
+  private:
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
+@@ -8,7 +8,10 @@
+ #include <string>
+ 
+ #include "base/logging.h"
++#include "base/uuid.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/gurl.h"
+ 
+@@ -50,6 +53,33 @@ std::string PinItemForTab(content::WebCo
+   return tab_data ? tab_data->pin_item() : std::string();
+ }
+ 
++std::string ArchiveIdForTab(content::WebContents* contents) {
++  if (!contents) {
++    return std::string();
++  }
++  WorkspaceTabData* const tab_data =
++      WorkspaceTabData::GetOrCreateForWebContents(contents);
++  if (tab_data->archive_id().empty()) {
++    tab_data->set_archive_id(
++        base::Uuid::GenerateRandomV4().AsLowercaseString());
++  }
++  return tab_data->archive_id();
++}
++
++void RemoveReopenedClose(content::BrowserContext* context,
++                         const std::map<std::string, std::string>& extra_data) {
++  const auto archive_it = extra_data.find(kArchiveIdExtraDataKey);
++  if (archive_it == extra_data.end() || archive_it->second.empty() ||
++      !context || context->IsOffTheRecord()) {
++    return;
++  }
++  const bool removed =
++      archive::ArchiveStore::GetOrCreate(context, context->GetPath())
++          ->Remove(archive_it->second);
++  LOG(INFO) << "[workspaces] archive: a reopened close "
++            << (removed ? "leaves the archive" : "was not in the archive");
++}
++
+ bool HasDriftedFrom(content::WebContents* contents, const GURL& url) {
+   const std::string anchor = AnchorUrlForTab(contents);
+   return !anchor.empty() && anchor != url.spec();
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
+@@ -9,6 +9,7 @@
+ #include <string>
+ 
+ namespace content {
++class BrowserContext;
+ class WebContents;
+ }
+ 
+@@ -63,6 +64,17 @@ inline constexpr char kCustomTitleExtraD
+ // rules: written empty to clear, absent means "an ordinary tab".
+ inline constexpr char kPinItemExtraDataKey[] = "helium.pin_item";
+ 
++// A closed tab's id in the archive (E14d.1, design 5 "E14d spec"). CHOSEN
++// ONCE, like the keys above: it is written into the Tabs file's Recently
++// Closed entries, which outlive the build that wrote them. The reopen path
++// only -- never the session: it is added at Recently Closed's capture
++// (BrowserLiveTabContext::GetExtraDataForTab), NOT by
++// PopulateWorkspaceExtraData, whose map the session rebuild writes too
++// (SessionService::BuildCommandsForTab). Recently Closed's copy of the last
++// session is built from that file (TabRestoreServiceImpl), and reopening it
++// would take a close back out of the archive.
++inline constexpr char kArchiveIdExtraDataKey[] = "helium.archive_id";
++
+ // The workspace `contents` is tagged for, or empty for a tab that has never
+ // been stamped, a pinned tab (pinning clears the tag), or a null argument.
+ // Empty means the implicit default workspace, never "no workspace".
+@@ -77,6 +89,34 @@ std::string CustomTitleForTab(content::W
+ // The pinned item `contents` is the open page of, or empty for an ordinary tab.
+ std::string PinItemForTab(content::WebContents* contents);
+ 
++// The id `contents`'s close is kept under in the archive and in its Recently
++// Closed entry, or empty for a null argument. Minted the FIRST time it is
++// asked for, not at the door, because the door is not always first: a window
++// close, "Close group" and a split close write their Recently Closed entry
++// before closing the tabs one by one through the door
++// (TabRestoreServiceHelper's BrowserClosing, CreateHistoricalGroup and
++// CreateHistoricalSplit capture every tab's extra data first, through
++// BrowserLiveTabContext::GetExtraDataForTab), while a single tab's close
++// reaches the door first. Whichever asks first makes the
++// id, so the two always agree, and Ctrl+Shift+T of either finds the entry.
++std::string ArchiveIdForTab(content::WebContents* contents);
++
++// Takes a reopened close back out of `context`'s archive, so a page lives in
++// one place, as in Arc (design 5, "E14d spec"). Called first in
++// BrowserLiveTabContext's AddRestoredTab and ReplaceRestoredTab, which every
++// tab of every Recently Closed reopen passes exactly once -- a saved group's
++// tabs included, which reopen from the group's model and never reach
++// chrome::CreateRestoredTab (review, LOCAL.md 52). A session restore passes
++// neither. The id is NOT put on the new tab: its next close is a new close,
++// with an id of its own. Nothing off the record, which has no archive.
++// ponytail: restoring ONE tab of a closed saved group reopens the whole group
++// from its model (Chromium's own behaviour), but only that tab's entry leaves;
++// its siblings' stay until the rest of the group's entry is restored. Pass the
++// Group entry's ids through here if the owner meets it (fix review, LOCAL.md
++// 52).
++void RemoveReopenedClose(content::BrowserContext* context,
++                         const std::map<std::string, std::string>& extra_data);
++
+ // Whether an anchored `contents` would be away from home at `url`. False for a
+ // tab that is not anchored: a tab with no home cannot be away from it.
+ //
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.cc
+@@ -11,10 +11,15 @@
+ namespace workspaces {
+ 
+ WorkspaceTabData::WorkspaceTabData(content::WebContents* web_contents)
+-    : content::WebContentsUserData<WorkspaceTabData>(*web_contents) {}
++    : content::WebContentsUserData<WorkspaceTabData>(*web_contents),
++      content::WebContentsObserver(web_contents) {}
+ 
+ WorkspaceTabData::~WorkspaceTabData() = default;
+ 
++void WorkspaceTabData::BeforeUnloadDialogCancelled() {
++  archive_id_.clear();
++}
++
+ // static
+ bool WorkspaceTabData::IsAnchorableUrl(const GURL& url) {
+   return url.SchemeIsHTTPOrHTTPS();
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -7,6 +7,7 @@
+ 
+ #include <string>
+ 
++#include "content/public/browser/web_contents_observer.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ 
+ class GURL;
+@@ -28,9 +29,10 @@ namespace workspaces {
+ // a tab around: dragging it into another window, moving it between tab strips,
+ // and being restored from a session all carry this object along with the tab.
+ //
+-// Stage 5 adds anchor fields here; keep it a plain data holder with no
+-// behaviour of its own.
+-class WorkspaceTabData : public content::WebContentsUserData<WorkspaceTabData> {
++// Stage 5 adds anchor fields here; keep it a data holder. Its one behaviour
++// is forgetting the archive id when a close is cancelled (E14d.1).
++class WorkspaceTabData : public content::WebContentsUserData<WorkspaceTabData>,
++                         public content::WebContentsObserver {
+  public:
+   WorkspaceTabData(const WorkspaceTabData&) = delete;
+   WorkspaceTabData& operator=(const WorkspaceTabData&) = delete;
+@@ -72,6 +74,20 @@ class WorkspaceTabData : public content:
+   const std::string& pin_item() const { return pin_item_; }
+   void set_pin_item(std::string id) { pin_item_ = std::move(id); }
+ 
++  // This tab's id in the archive (E14d.1, design 5 "E14d spec"), minted by
++  // ArchiveIdForTab() the first time it is asked for; empty until then. Never
++  // written to the session: a restored or reopened tab's next close is a new
++  // close, with an id of its own.
++  const std::string& archive_id() const { return archive_id_; }
++  void set_archive_id(std::string id) { archive_id_ = std::move(id); }
++
++  // content::WebContentsObserver:
++  // "Leave site?" answered Stay: the close is off, but a group or split close
++  // may already have put the id in its Recently Closed entry, whose reopen
++  // would then remove this tab's next close. Its next close mints a new one
++  // (review, LOCAL.md 52).
++  void BeforeUnloadDialogCancelled() override;
++
+  private:
+   friend class content::WebContentsUserData<WorkspaceTabData>;
+ 
+@@ -83,6 +99,7 @@ class WorkspaceTabData : public content:
+   std::string anchor_url_;
+   std::string custom_title_;
+   std::string pin_item_;
++  std::string archive_id_;
+ };
+ 
+ }  // namespace workspaces

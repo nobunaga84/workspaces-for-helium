@@ -1,0 +1,105 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -283,6 +283,23 @@ class WorkspaceService : public TabStrip
+   // tree, and the answer changes whenever the active workspace does.
+   bool IsTabVisible(const tabs::TabInterface* tab) const;
+ 
++  // Whether `tab` is actually on screen right now, which is NOT the same
++  // question as IsTabVisible().
++  //
++  // IsTabVisible() answers about guids. A pinned tab is drawn in every
++  // workspace whatever guid it carries, because it renders from a container
++  // the E6a layout predicate never reaches -- so for a pinned tab the two
++  // answers differ, and it is this one that matches the screen.
++  //
++  // Everything that decides where to put the user has to ask this rather than
++  // IsTabVisible(), or closing a tab in a non-default workspace would move
++  // them off a pinned tab sitting in plain sight at the top of the strip.
++  // BrowserTabStripModelDelegate::IsTabVisibleInActiveWorkspace short-circuits
++  // on pinned for the same reason; this is the second door onto that rule and
++  // it does not inherit it (LOCAL.md 13). Public since E11: tab search asks
++  // it too, so that the list matches the strip by the same rule.
++  bool IsTabOnScreen(tabs::TabInterface* tab) const;
++
+   // Stage 5 anchors (design 5, E10 spec). An anchored tab remembers a home
+   // URL; Ctrl+W puts it to sleep there instead of closing it.
+   //
+@@ -339,22 +356,6 @@ class WorkspaceService : public TabStrip
+                               int index) override;
+   void OnSplitTabChanged(const SplitTabChange& change) override;
+ 
+-  // Whether `tab` is actually on screen right now, which is NOT the same
+-  // question as IsTabVisible().
+-  //
+-  // IsTabVisible() answers about guids. A pinned tab is drawn in every
+-  // workspace whatever guid it carries, because it renders from a container
+-  // the E6a layout predicate never reaches -- so for a pinned tab the two
+-  // answers differ, and it is this one that matches the screen.
+-  //
+-  // Everything that decides where to put the user has to ask this rather than
+-  // IsTabVisible(), or closing a tab in a non-default workspace would move
+-  // them off a pinned tab sitting in plain sight at the top of the strip.
+-  // BrowserTabStripModelDelegate::IsTabVisibleInActiveWorkspace short-circuits
+-  // on pinned for the same reason; this is the second door onto that rule and
+-  // it does not inherit it (LOCAL.md 13).
+-  bool IsTabOnScreen(tabs::TabInterface* tab) const;
+-
+   // The selected tabs that a move would actually touch: everything selected in
+   // this window except pinned tabs.
+   std::vector<tabs::TabInterface*> SelectedMovableTabs() const;
+--- a/chrome/browser/ui/webui/tab_search/BUILD.gn
++++ b/chrome/browser/ui/webui/tab_search/BUILD.gn
+@@ -49,6 +49,7 @@ source_set("tab_search") {
+     "//chrome/browser/ui/navigator",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs/alert:tab_alert",
++    "//chrome/browser/ui/tabs/workspaces",
+     "//chrome/browser/ui/tabs/tab_strip_api",
+     "//chrome/browser/ui/tabs/tab_strip_api/tab_strip_model_impl",
+     "//chrome/browser/ui/webui:favicon_source",
+--- a/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
++++ b/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
+@@ -42,6 +42,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_api/tab_strip_service_feature.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/webui/metrics_reporter/metrics_reporter.h"
+ #include "chrome/browser/ui/webui/tab_search/tab_search.mojom.h"
+@@ -523,6 +524,15 @@ tab_search::mojom::ProfileDataPtr TabSea
+         WalkContainer(get_tabs_result.value(), window.get(), profile_data.get(),
+                       tab_dedup_keys, tab_group_ids);
+ 
++        // Helium Workspaces (E11): one line per listing, so a run log shows
++        // both that tabs were withheld while the feature was on AND that a
++        // listing made with it off withheld none -- silence alone cannot
++        // tell "hid nothing" from "never listed". "of" counts the whole
++        // strip, so a tab still loading is in the difference too.
++        LOG(INFO) << "[workspaces] tab search: listed " << window->tabs.size()
++                  << " of " << browser->GetTabStripModel()->count()
++                  << " tab(s) in a window";
++
+         profile_data->windows.push_back(std::move(window));
+ 
+         return true;
+@@ -550,6 +560,19 @@ void TabSearchPageHandler::WalkContainer
+         container->data->get_tab()->id.ToTabHandle();
+     if (handle) {
+       tabs::TabInterface* const tab_interface = handle->Get();
++      // Helium Workspaces (E11): a tab its own window is hiding -- another
++      // workspace's -- is not listed. Asked of the tab's window, not the
++      // host window, because every window has its own active workspace.
++      // With the feature off IsTabOnScreen is true for every tab, so classic
++      // layout is untouched.
++      workspaces::WorkspaceService* const workspace_service =
++          tab_interface ? workspaces::WorkspaceService::From(
++                              tab_interface->GetBrowserWindowInterface())
++                        : nullptr;
++      if (tab_interface && workspace_service &&
++          !workspace_service->IsTabOnScreen(tab_interface)) {
++        return;  // a tab container has no children to walk
++      }
+       // A Tab can potentially be in a state where it has no committed
+       // entries during loading and thus has no title/URL. Skip any such
+       // pending tabs. These tabs will be added to the list later on once

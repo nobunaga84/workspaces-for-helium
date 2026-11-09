@@ -1,0 +1,56 @@
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -155,6 +155,7 @@ BrowserLiveTabContext::~BrowserLiveTabCo
+ }
+ 
+ void BrowserLiveTabContext::ShowBrowserWindow() {
++  workspaces::EnsureRestoredWindowHasATab(*tab_strip_model_);
+   base_window_->Show();
+ }
+ 
+--- a/chrome/browser/ui/workspace_restore_hooks.cc
++++ b/chrome/browser/ui/workspace_restore_hooks.cc
+@@ -34,13 +34,15 @@ bool LeaveRestoredGroupInPlace(
+   }
+   LOG(INFO) << "[workspaces] restore: saved group already open in "
+                "another window, left there";
+-  TabStripModel* const model = browser->GetTabStripModel();
+-  if (model->empty()) {
+-    model->delegate()->AddTabAt(GURL(), -1, true);
+-  }
+   return true;
+ }
+ 
++void EnsureRestoredWindowHasATab(TabStripModel& model) {
++  if (model.empty()) {
++    model.delegate()->AddTabAt(GURL(), -1, true);
++  }
++}
++
+ bool IsSplitAlreadyRestored(const TabStripModel& model,
+                             int leading_index,
+                             int trailing_index) {
+--- a/chrome/browser/ui/workspace_restore_hooks.h
++++ b/chrome/browser/ui/workspace_restore_hooks.h
+@@ -31,12 +31,19 @@ namespace workspaces {
+ // group stays where it is instead of moving into `browser` (LOCAL.md 42) --
+ // a whole WINDOW's reopen, with Workspaces on. Moving all 22 of them out of
+ // the window they were open in is what made one Ctrl+Shift+T freeze for three
+-// minutes and CHECK on a split. A window that would stay empty gets a New Tab
+-// page, as "Close group" does.
++// minutes and CHECK on a split. A window left empty by it gets a New Tab page
++// at the end of the reopen (EnsureRestoredWindowHasATab).
+ bool LeaveRestoredGroupInPlace(
+     BrowserWindowInterface* browser,
+     sessions::tab_restore::Type original_session_type);
+ 
++// ShowBrowserWindow, the end of a reopen: a window whose every tab was left
++// where it was gets a New Tab page, as "Close group" does. Not earlier:
++// Chromium restores a saved group's first tab first, so a strip empty in the
++// middle of a reopen still waits for the window's own tabs (the polish batch,
++// LOCAL.md 129: a reopened window ended "loose | New Tab | New Tab").
++void EnsureRestoredWindowHasATab(TabStripModel& model);
++
+ // ReconstructSplit: true when either tab is already a split half (LOCAL.md
+ // 42). It arrived with a saved group moved here from the window it was open
+ // in, split and all (the stock move, which runs with Workspaces off), and

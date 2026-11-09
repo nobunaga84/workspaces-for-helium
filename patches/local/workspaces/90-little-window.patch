@@ -1,0 +1,514 @@
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -250,6 +250,9 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+   // perfectly normal-looking switch that silently refuses to save.
+   (*s_allowlist)[::workspaces::prefs::kHeliumWorkspacesEnabled] =
+       settings_api::PrefType::kBoolean;
++  // Helium Workspaces (C6): "Open links from other apps in a small window".
++  (*s_allowlist)[::workspaces::prefs::kHeliumWorkspacesLittleWindow] =
++      settings_api::PrefType::kBoolean;
+ 
+   // Miscellaneous
+   (*s_allowlist)[::embedder_support::kAlternateErrorPagesEnabled] =
+--- a/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
+@@ -33,6 +33,11 @@ export function getHtml(this: SettingsAp
+       label="$i18n{tabStripRightAlign}">
+   </settings-toggle-button>
+   <settings-toggle-button class="hr"
++      pref-key="helium.workspaces.little_window"
++      label="$i18n{littleWindow}"
++      sub-label="$i18n{littleWindowDescription}">
++  </settings-toggle-button>
++  <settings-toggle-button class="hr"
+       ?hidden="${!this.showVerticalSettings_()}"
+       pref-key="helium.workspaces.enabled"
+       label="$i18n{workspaces}"
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -293,6 +293,9 @@ const AcceleratorMapping kAcceleratorMap
+     {ui::VKEY_H, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
+      IDC_HELIUM_WORKSPACE_ARCHIVE},
+     {ui::VKEY_F, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_QUICK_SEARCH},
++    // Helium Workspaces (C6): Arc's "Open in Arc", a pop-up's page into the
++    // main window; a normal window disables the command.
++    {ui::VKEY_O, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_SHOW_AS_TAB},
+     {ui::VKEY_HOME, ui::EF_ALT_DOWN, IDC_HOME},
+     {ui::VKEY_E, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+     {ui::VKEY_F, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -61,6 +61,7 @@
+ #include "chrome/browser/ui/actions/command_action_updater.h"
+ #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_init_state.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_select_file_dialog_controller.h"
+ #include "chrome/browser/ui/browser_window.h"
+@@ -567,7 +568,13 @@ bool BrowserCommandController::IsReserve
+          command_id == IDC_CYCLE_TO_NEXT_TAB ||
+          command_id == IDC_CYCLE_TO_PREV_TAB || command_id == IDC_EXIT ||
+          command_id == IDC_COPY_OR_INSPECT_SHORTCUT || command_id == IDC_DEV_TOOLS ||
+-         command_id == IDC_DEV_TOOLS_TOGGLE || command_id == IDC_TAB_SEARCH;
++         command_id == IDC_DEV_TOOLS_TOGGLE || command_id == IDC_TAB_SEARCH ||
++         // Helium Workspaces (C6): Shift+Alt+O in a little window (a pop-up
++         // left out of session restore), whose page swallowed it before the
++         // window saw it; other pop-ups' pages keep the key.
++         (command_id == IDC_SHOW_AS_TAB &&
++          browser_->GetType() == BrowserWindowInterface::Type::TYPE_POPUP &&
++          BrowserInitState::From(browser_.get())->omit_from_session_restore());
+ }
+ 
+ void BrowserCommandController::TabStateChanged() {
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -129,6 +129,7 @@
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_little_window.h"
+ #include "chrome/browser/ui/waap/initial_webui_window_metrics_manager.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/ui/web_applications/web_app_launch_utils.h"
+@@ -2077,6 +2078,12 @@ bool HasKeyboardFocusedTab(const Browser
+ 
+ void ConvertPopupToTabbedBrowser(BrowserWindowInterface* browser) {
+   base::RecordAction(UserMetricsAction("ShowAsTab"));
++  // Helium Workspaces (C6): into the profile's main window at the top of
++  // Today, as Arc's "Open in Arc" -- not a window of its own. Every pop-up,
++  // the little window too; the rest below is the fallback.
++  if (workspaces::MoveToMainWindow(browser)) {
++    return;
++  }
+   TabStripModel* tab_strip = browser->GetTabStripModel();
+   // If this popup is the last browser object, removing it from the browser-list
+   // will trigger OnShutdownStarting for Window close. Create the new browser
+--- a/chrome/browser/ui/startup/startup_browser_creator.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator.cc
+@@ -155,6 +155,13 @@
+ using content::BrowserThread;
+ using content::ChildProcessSecurityPolicy;
+ 
++namespace workspaces {
++// Helium Workspaces (C6), workspace_little_window.cc. Declared, not included:
++// no //chrome/browser/ui/startup -> views edge (GN cycle); a drift is a link
++// error.
++bool MaybeOpenLittleWindow(Profile* profile, const GURL& url);
++}  // namespace workspaces
++
+ namespace {
+ 
+ // Dumps the current set of the browser process's histograms to |output_file|.
+@@ -1394,6 +1401,24 @@ bool StartupBrowserCreator::ProcessCmdLi
+     return true;
+   }
+ 
++#if BUILDFLAG(IS_WIN)
++  // Helium Workspaces (C6): a link from another app -- Windows hands it over
++  // as "--single-argument <url>" (the installer's ProgID) -- opens in a
++  // little window while the browser runs; a cold start opens it as before.
++  if (process_startup == chrome::startup::IsProcessStartup::kNo &&
++      command_line.HasSingleArgumentSwitch() &&
++      !command_line.HasSwitch(switches::kAppId) &&
++      profile_info.mode == StartupProfileMode::kBrowserWindow) {
++    const StartupTabs tabs = StartupTabProviderImpl().GetCommandLineTabs(
++        command_line, cur_dir, privacy_safe_profile);
++    if (tabs.size() == 1 && !tabs[0].is_untrusted_launch &&
++        workspaces::MaybeOpenLittleWindow(privacy_safe_profile, tabs[0].url)) {
++      ProfileLaunchObserver::AddLaunched(privacy_safe_profile);  // as launched
++      return true;
++    }
++  }
++#endif
++
+   // Launch the browser if the profile is unable to open web apps.
+   if (!CanOpenWebApp(privacy_safe_profile)) {
+     LaunchBrowserForLastProfiles(
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -71,6 +71,9 @@ void RegisterProfilePrefs(PrefRegistrySi
+   // On: as wide as the window allows, as the owner asked (E18, D14).
+   registry->RegisterBooleanPref(kHeliumWorkspacesWideSidebar, true);
+ 
++  // On: links from other apps open in a little window (C6, D16).
++  registry->RegisterBooleanPref(kHeliumWorkspacesLittleWindow, true);
++
+   // Empty: Helium's own toolbar until the user reorders it (wish 6).
+   registry->RegisterListPref(kHeliumWorkspacesToolbarOrder);
+ 
+@@ -471,4 +474,28 @@ int MaxSidebarWidth(bool wide,
+   return wide ? std::max(min_width, window_width - page_min) : helium_max;
+ }
+ 
++LittleWindowRect LittleWindowBounds(int work_x,
++                                    int work_y,
++                                    int work_width,
++                                    int work_height) {
++  // The little window's size (C6, D13): this part of the work area, in
++  // percent, held within this range. No Arc measurement exists in the
++  // fork's data: retune these by eye.
++  constexpr int kWidthPercent = 55;
++  constexpr int kMinWidth = 480;
++  constexpr int kMaxWidth = 1100;
++  constexpr int kHeightPercent = 70;
++  constexpr int kMinHeight = 400;
++  constexpr int kMaxHeight = 900;
++  // The range's minimum yields to a smaller area: never off the screen.
++  const int width = std::min(
++      std::clamp(work_width * kWidthPercent / 100, kMinWidth, kMaxWidth),
++      work_width);
++  const int height = std::min(
++      std::clamp(work_height * kHeightPercent / 100, kMinHeight, kMaxHeight),
++      work_height);
++  return {work_x + (work_width - width) / 2,
++          work_y + (work_height - height) / 2, width, height};
++}
++
+ }  // namespace workspaces::prefs
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -105,6 +105,14 @@ inline constexpr char kHeliumWorkspacesS
+ inline constexpr char kHeliumWorkspacesWideSidebar[] =
+     "helium.workspaces.wide_sidebar";
+ 
++// Whether a link from another app opens in a little window while the browser
++// runs (C6, Arc's Little Arc): the "Open links from other apps in a small
++// window" setting, on by default; off opens it as a tab, as before. Read on
++// each link, so a change needs no observer. A sibling of the prefs above for
++// the reason above, and pinned by the same test.
++inline constexpr char kHeliumWorkspacesLittleWindow[] =
++    "helium.workspaces.little_window";
++
+ // The toolbar's buttons, left to right, either side of the address bar (wish
+ // 6): a list of toolbar_order.h names. Empty -- the default -- leaves Helium's
+ // toolbar exactly as it is. This PC only: a toolbar order is a habit of one
+@@ -349,6 +357,22 @@ int MaxSidebarWidth(bool wide,
+                     int helium_max,
+                     int page_min);
+ 
++// Where the little window opens (C6): a part of the work area -- the screen
++// less the taskbar -- clamped to a range and never larger than the area,
++// centred in it. The part and the range are constants in the .cc, to retune
++// by eye. Pure -- the caller hands in the display's numbers -- so it is
++// tested here; a plain struct, as :prefs does not depend on //ui/gfx.
++struct LittleWindowRect {
++  int x = 0;
++  int y = 0;
++  int width = 0;
++  int height = 0;
++};
++LittleWindowRect LittleWindowBounds(int work_x,
++                                    int work_y,
++                                    int work_width,
++                                    int work_height);
++
+ // C19.1 (Export / Import): the user-set value of every helium.workspaces.*
+ // preference, keyed by the name after that prefix -- the Preferences file's own
+ // `helium.workspaces` subtree, defaults left out.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -132,12 +132,14 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+   const std::string wide_sidebar(kHeliumWorkspacesWideSidebar);
+   const std::string toolbar_order(kHeliumWorkspacesToolbarOrder);
+   const std::string pins_folded(kHeliumWorkspacesPinsFolded);
+-  for (const std::string& later : {imported_at, archive_after, tab_row_height,
+-                                   smooth_scrolling, wide_sidebar,
+-                                   toolbar_order, pins_folded}) {
++  const std::string little_window(kHeliumWorkspacesLittleWindow);
++  for (const std::string& later :
++       {imported_at, archive_after, tab_row_height, smooth_scrolling,
++        wide_sidebar, toolbar_order, pins_folded, little_window}) {
+     for (const std::string& other :
+          {enabled, list, imported_at, archive_after, tab_row_height,
+-          smooth_scrolling, wide_sidebar, toolbar_order, pins_folded}) {
++          smooth_scrolling, wide_sidebar, toolbar_order, pins_folded,
++          little_window}) {
+       if (other == later) {
+         continue;
+       }
+@@ -329,6 +331,61 @@ TEST(WorkspacePrefsTest, MaxSidebarWidth
+   }
+ }
+ 
++// ------------------------------------------------------ little window (C6)
++
++TEST(WorkspacePrefsTest, LittleWindowPrefNameIsStable) {
++  EXPECT_STREQ("helium.workspaces.little_window",
++               kHeliumWorkspacesLittleWindow);
++}
++
++// On is the default: links from other apps open in a little window (D16).
++TEST(WorkspacePrefsTest, LittleWindowDefaultsToOn) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesLittleWindow));
++}
++
++// 55% by 70% of the work area, within 480-1100 by 400-900, never larger
++// than the area, centred in it -- on a second monitor too.
++TEST(WorkspacePrefsTest, LittleWindowBoundsCentresAndClamps) {
++  // A 1920x1080 screen less a 40 px taskbar: the part itself, centred.
++  LittleWindowRect rect = LittleWindowBounds(0, 0, 1920, 1040);
++  EXPECT_EQ(1056, rect.width);
++  EXPECT_EQ(728, rect.height);
++  EXPECT_EQ(432, rect.x);
++  EXPECT_EQ(156, rect.y);
++
++  // A 4K screen: the range's maximum.
++  rect = LittleWindowBounds(0, 0, 3840, 2080);
++  EXPECT_EQ(1100, rect.width);
++  EXPECT_EQ(900, rect.height);
++  EXPECT_EQ(1370, rect.x);
++  EXPECT_EQ(590, rect.y);
++
++  // A small screen: the range's minimum, still inside the area.
++  rect = LittleWindowBounds(0, 0, 800, 600);
++  EXPECT_EQ(480, rect.width);
++  EXPECT_EQ(420, rect.height);
++  EXPECT_EQ(160, rect.x);
++  EXPECT_EQ(90, rect.y);
++
++  // Smaller than the minimum: the whole area, never beyond it.
++  rect = LittleWindowBounds(0, 0, 400, 300);
++  EXPECT_EQ(400, rect.width);
++  EXPECT_EQ(300, rect.height);
++  EXPECT_EQ(0, rect.x);
++  EXPECT_EQ(0, rect.y);
++
++  // A second monitor right of the first, its taskbar on top: offset by its
++  // own origin.
++  rect = LittleWindowBounds(1920, 40, 1920, 1040);
++  EXPECT_EQ(1056, rect.width);
++  EXPECT_EQ(728, rect.height);
++  EXPECT_EQ(1920 + 432, rect.x);
++  EXPECT_EQ(40 + 156, rect.y);
++}
++
+ // ------------------------------------------------------- registered default
+ 
+ TEST(WorkspacePrefsTest, RegistersWorkspacesPref) {
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -18,6 +18,7 @@ source_set("vertical") {
+     "workspace_arc_importer.h",
+     "workspace_archive_view.h",
+     "workspace_link_preview.h",
++    "workspace_little_window.h",
+     "workspace_pinned_section_view.h",
+     "workspace_quick_search_view.h",
+     "workspace_rail_view.h",
+@@ -65,6 +66,7 @@ source_set("impl") {
+     "workspace_arc_importer.cc",
+     "workspace_archive_view.cc",
+     "workspace_link_preview.cc",
++    "workspace_little_window.cc",
+     "workspace_pinned_section_view.cc",
+     "workspace_quick_search_view.cc",
+     "workspace_rail_view.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_little_window.cc
+@@ -0,0 +1,137 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/workspace_little_window.h"
++
++#include <memory>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++// InsertMovedPage, C20's "Open as tab" shared: C6's move needs C20's patch.
++#include "chrome/browser/ui/views/tabs/vertical/workspace_link_preview.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_button.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/base_window.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/display/display.h"
++#include "ui/display/screen.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "url/gurl.h"
++
++namespace workspaces {
++
++bool MaybeOpenLittleWindow(Profile* profile, const GURL& url) {
++  // An .htm file from Explorer comes the same way (one ProgID serves http,
++  // https, .htm and .html), and stays a tab (D12).
++  if (!profile || !profile->IsRegularProfile() ||
++      !url.SchemeIsHTTPOrHTTPS() ||
++      !profile->GetPrefs()->GetBoolean(prefs::kHeliumWorkspacesLittleWindow) ||
++      GetBrowserWindowCreationStatusForProfile(*profile) !=
++          BrowserWindowInterface::CreationStatus::kOk) {
++    return false;
++  }
++
++  const gfx::Rect work =
++      display::Screen::Get()->GetDisplayForNewWindows().work_area();
++  const prefs::LittleWindowRect rect = prefs::LittleWindowBounds(
++      work.x(), work.y(), work.width(), work.height());
++  // No app_name and no user_title: the window keeps the browser's taskbar id,
++  // so it groups with the main window (browser_window_property_manager_win).
++  // A pop-up's bounds are its page's: the frame and the address row come on
++  // top (BrowserView::GetSavedWindowPlacement). The window is given the
++  // rectangle again before it shows (below), so the whole window is it.
++  BrowserWindowCreateParams params(BrowserWindowInterface::TYPE_POPUP,
++                                   *profile, /*from_user_gesture=*/true);
++  const gfx::Rect initial(rect.x, rect.y, rect.width, rect.height);
++  params.initial_bounds = initial;
++  params.initial_origin_specified =
++      BrowserWindowCreateParams::ValueSpecified::kSpecified;
++  // Never restored, and never written: a little window is thrown away.
++  params.omit_from_session_restore = true;
++  BrowserWindowInterface* const popup = CreateBrowserWindow(std::move(params));
++  if (!popup) {
++    return false;
++  }
++
++  // At the right end of the address row: a pop-up's slim toolbar is the
++  // address bar and the pinned actions in a row (ToolbarView::Init, run while
++  // the window was made), and a child added now comes after them.
++  if (BrowserView* const view = BrowserView::GetBrowserViewForBrowser(popup);
++      view && view->toolbar()) {
++    auto button = std::make_unique<ToolbarButton>(base::BindRepeating(
++        [](BrowserWindowInterface* browser) {
++          chrome::ExecuteCommand(browser, IDC_SHOW_AS_TAB);
++        },
++        base::Unretained(popup)));
++    const std::u16string name =
++        l10n_util::GetStringUTF16(IDS_HELIUM_LITTLE_WINDOW_OPEN);
++    button->SetVectorIcon(kOpenInBrowserIcon);
++    button->SetTooltipText(name);
++    button->GetViewAccessibility().SetName(name);
++    view->toolbar()->AddChildView(std::move(button));
++  }
++
++  chrome::AddSelectedTabWithURL(popup, url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++  popup->GetWindow()->SetBounds(initial);
++  popup->GetWindow()->Show();
++  LOG(INFO) << "[workspaces] little window: opened window "
++            << popup->GetSessionID().id() << " at " << rect.x << ","
++            << rect.y << " " << rect.width << "x" << rect.height;
++  return true;
++}
++
++bool MoveToMainWindow(BrowserWindowInterface* popup) {
++  TabStripModel* const from = popup->GetTabStripModel();
++  if (from->empty()) {
++    return false;
++  }
++
++  // The main window first, as Chromium does: the pop-up emptied below must
++  // never be the last window, or its close starts a shutdown.
++  Profile* const profile = popup->GetProfile();
++  BrowserWindowInterface* target =
++      ProfileBrowserCollection::GetForProfile(profile)->FindTabbedBrowser();
++  if (!target) {
++    if (GetBrowserWindowCreationStatusForProfile(*profile) !=
++        BrowserWindowInterface::CreationStatus::kOk) {
++      return false;
++    }
++    target = CreateBrowserWindow(
++        BrowserWindowCreateParams(*profile, /*from_user_gesture=*/true));
++    if (!target) {
++      return false;
++    }
++  }
++
++  // The live page moves -- its history, its state, no reload -- to the top
++  // of Today, as the link preview's "Open as tab"; a little window saved no
++  // history of its own (omit_from_session_restore), InsertMovedPage does.
++  const int index = InsertMovedPage(
++      target, from->DetachWebContentsAtForInsertion(from->active_index()));
++  target->GetWindow()->Show();
++  // The pop-up's strip is empty now: Browser::TabStripEmpty closes it.
++  LOG(INFO) << "[workspaces] little window: moved into window "
++            << target->GetSessionID().id() << " at index " << index;
++  return true;
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_little_window.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_LITTLE_WINDOW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_LITTLE_WINDOW_H_
++
++class BrowserWindowInterface;
++class GURL;
++class Profile;
++
++// The little window (C6, Arc's Little Arc): a link from another app opens in
++// a small window of its own while the browser runs, not as a tab.
++//
++//   ( example.org                          [Open in main window] )
++//   |                                                            |
++//   |                      the linked page                       |
++//   |                                                            |
++//
++// - It is a plain pop-up (TYPE_POPUP): the read-only address row, no tab
++//   strip, never restored by the session, never in Recently Closed or the
++//   Archive. Closing it throws the page away.
++// - "Open in main window" (the button, Shift+Alt+O, the title bar's "Show as
++//   tab") moves the SAME page, no reload, to the top of Today in the main
++//   window. That road serves every pop-up, sign-in pop-ups too.
++// - The setting "Open links from other apps in a small window"
++//   (kHeliumWorkspacesLittleWindow) turns it off.
++//
++// Logs, ids and numbers only, never a title or an address:
++//   "[workspaces] little window: opened window <id> at <x>,<y> <w>x<h>"
++//   "[workspaces] little window: moved into window <id> at index <i>"
++//
++// Forward declarations only: two upstream files call these, one of them
++// (startup_browser_creator.cc) by a declaration of its own.
++namespace workspaces {
++
++// A link handed over by Windows to the running browser: opens `url` in a
++// little window and answers true, or answers false -- not a regular profile,
++// not http(s), the setting off, no window can open -- and the caller opens it
++// as it always did.
++bool MaybeOpenLittleWindow(Profile* profile, const GURL& url);
++
++// "Show as tab" on any pop-up: its page moves into the profile's main window
++// (made first when there is none) at the top of Today, selected, and the
++// emptied pop-up closes. False when there is nothing to move or no window can
++// open; the caller then does what Chromium does.
++bool MoveToMainWindow(BrowserWindowInterface* popup);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_LITTLE_WINDOW_H_
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -615,6 +615,8 @@ void AddAppearanceStrings(content::WebUI
+       {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
+       {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
+       {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
++      {"littleWindow", IDS_SETTINGS_LITTLE_WINDOW},
++      {"littleWindowDescription", IDS_SETTINGS_LITTLE_WINDOW_DESCRIPTION},
+       {"workspaces", IDS_SETTINGS_WORKSPACES},
+       {"workspacesDescription", IDS_SETTINGS_WORKSPACES_DESCRIPTION},
+       {"browserZenMode", IDS_SETTINGS_BROWSER_ZEN_MODE},

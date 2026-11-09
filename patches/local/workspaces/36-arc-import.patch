@@ -1,0 +1,911 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/time/time.h"
+ #include "base/values.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "components/prefs/pref_registry_simple.h"
+@@ -46,6 +47,9 @@ void RegisterProfilePrefs(PrefRegistrySi
+   registry->RegisterBooleanPref(kHeliumWorkspacesEnabled, true);
+ 
+   registry->RegisterDictionaryPref(kHeliumWorkspacesList, DefaultWorkspacesDict());
++
++  // Null until the first import, which therefore takes everything.
++  registry->RegisterTimePref(kHeliumWorkspacesArcImportedAt, base::Time());
+ }
+ 
+ base::DictValue DefaultWorkspacesDict() {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -49,6 +49,12 @@ inline constexpr char kHeliumWorkspacesE
+ // accident even if someone later wants it to be.
+ inline constexpr char kHeliumWorkspacesList[] = "helium.workspaces.list";
+ 
++// When "Import from Arc..." last ran (E14c). A re-run imports only what Arc
++// created after it, so a tab closed here since then stays gone. A sibling of
++// the two above for the reason above, and pinned by the same test.
++inline constexpr char kHeliumWorkspacesArcImportedAt[] =
++    "helium.workspaces.arc_imported_at";
++
+ // Keys inside kHeliumWorkspacesList.
+ inline constexpr char kSchemaVersionKey[] = "schema_version";
+ inline constexpr char kItemsKey[] = "items";
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -119,6 +119,16 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+       << list << " is stored inside " << enabled;
+   EXPECT_FALSE(enabled.starts_with(list + "."))
+       << enabled << " is stored inside " << list;
++
++  // Every later pref too (E14c): a dotted path is a JSON node, so a pref named
++  // inside another would be eaten by the first write of its parent (15).
++  const std::string imported_at(kHeliumWorkspacesArcImportedAt);
++  for (const std::string& other : {enabled, list}) {
++    EXPECT_FALSE(imported_at.starts_with(other + "."))
++        << imported_at << " is stored inside " << other;
++    EXPECT_FALSE(other.starts_with(imported_at + "."))
++        << other << " is stored inside " << imported_at;
++  }
+ }
+ 
+ // ------------------------------------------------------- registered default
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -22,6 +22,7 @@
+ #include "chrome/browser/sessions/session_service_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+@@ -33,6 +34,7 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/split_tabs/split_tab_id.h"
++#include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/invalidate_type.h"
+ #include "content/public/browser/navigation_controller.h"
+@@ -276,6 +278,25 @@ std::string WorkspaceService::CreateWork
+   return guid;
+ }
+ 
++std::string WorkspaceService::EnsureWorkspaceForImport(
++    const std::string& title,
++    const std::string& icon) {
++  const std::vector<prefs::WorkspaceEntry> entries = GetWorkspaces();
++  for (const prefs::WorkspaceEntry& entry : entries) {
++    if (entry.title == title) {
++      return entry.guid;
++    }
++  }
++  std::string guid = base::Uuid::GenerateRandomV4().AsLowercaseString();
++  // One write, so the list observer runs once and the guid is known before
++  // the first tab tagged with it arrives (see CreateWorkspace()).
++  prefs::WriteWorkspaces(
++      prefs_, prefs::SetWorkspaceIcon(prefs::AddWorkspace(entries, guid, title),
++                                      guid, icon));
++  LOG(INFO) << "[workspaces] created workspace '" << guid << "' for an import";
++  return guid;
++}
++
+ void WorkspaceService::RenameWorkspace(std::string_view guid,
+                                        const std::string& title) {
+   prefs::WriteWorkspaces(
+@@ -960,7 +981,7 @@ void WorkspaceService::OnTabStripModelCh
+   // workspace, which is not better and is more code (LOCAL.md 12).
+   if (change.type() == TabStripModelChange::kInserted) {
+     for (const auto& inserted : change.GetInsert()->contents) {
+-      StampInsertedTab(inserted.tab.get());
++      StampInsertedTab(inserted.tab.get(), inserted.index);
+     }
+   }
+ 
+@@ -1075,10 +1096,24 @@ void WorkspaceService::TabGroupedStateCh
+   // The arriving tab is excluded by identity rather than by `index`, so this
+   // does not depend on which index the notification carried -- joining a group
+   // can move the tab.
++  //
++  // ONE other member, asked of the group itself. This used to scan the whole
++  // strip by index, and an index lookup is itself a walk of the collection
++  // tree, so every grouped insert cost n walks: an Arc import of 3,300 grouped
++  // tabs, and every restart after it, paid that per tab (LOCAL.md 37). One
++  // member is enough -- the rule only ever read the first, and every member
++  // already carries the group's guid, because each joined through here.
+   std::vector<std::string> member_guids;
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
+-    tabs::TabInterface* member = tab_strip_->GetTabAtIndex(i);
+-    if (member != tab && tab_strip_->GetTabGroupForTab(i) == new_group) {
++  if (const TabGroup* const group =
++          tab_strip_->group_model() &&
++                  tab_strip_->group_model()->ContainsTabGroup(*new_group)
++              ? tab_strip_->group_model()->GetTabGroup(*new_group)
++              : nullptr) {
++    tabs::TabInterface* member = group->GetFirstTab();
++    if (member == tab) {
++      member = group->GetLastTab();
++    }
++    if (member && member != tab) {
+       member_guids.push_back(GuidOf(member));
+     }
+   }
+@@ -1264,7 +1299,8 @@ void WorkspaceService::PersistTag(conten
+   // dangling at shutdown -- which is exactly what Helium's
+   // VerticalTabStripStateController has to do, because it writes from a
+   // destructor path. Nothing here does: every write is driven by a tab strip
+-  // event, the lookup is a map probe, and tag changes happen at human speed.
++  // event, the lookup is a map probe, and tag changes happen at human speed
++  // -- except during an Arc import (E14c), which is why that only appends.
+   // "IfExisting" rather than "GetForProfile" so that stamping a tab can never
+   // be the thing that brings a SessionService into being.
+   SessionService* session_service =
+@@ -1311,7 +1347,7 @@ void WorkspaceService::ApplyCollectionGu
+          ResolveGuidForCollectionJoin(member_guids, GuidOf(tab)));
+ }
+ 
+-void WorkspaceService::StampInsertedTab(tabs::TabInterface* tab) {
++void WorkspaceService::StampInsertedTab(tabs::TabInterface* tab, int index) {
+   if (!tab || !tab->GetContents()) {
+     return;
+   }
+@@ -1334,8 +1370,10 @@ void WorkspaceService::StampInsertedTab(
+   // question it exists for. "-> workspace 'default'" is the same text whether
+   // the tab joined the workspace on screen or was stamped for a different one,
+   // and telling those apart by eye is what a browser session was spent on.
+-  LOG(INFO) << "[workspaces] tab inserted at index "
+-            << tab_strip_->GetIndexOfTab(tab) << " -> workspace '" << guid
++  // `index` is the notification's own: GetIndexOfTab() walks the strip, and a
++  // walk per insert is a quadratic import (E14c: 130 ms per tab at 3,500).
++  LOG(INFO) << "[workspaces] tab inserted at index " << index
++            << " -> workspace '" << guid
+             << "' (active '" << active_guid_ << "')";
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -140,6 +140,14 @@ class WorkspaceService : public TabStrip
+   // ends in SwitchToWorkspace().
+   std::string CreateWorkspace(const std::string& title);
+ 
++  // The guid of the workspace titled `title`, adding it (with `icon`) when
++  // there is none. For "Import from Arc..." (E14c): unlike CreateWorkspace()
++  // it neither switches nor spawns a tab, so a space can be filled while the
++  // user stays where they are, and running an import twice reuses the
++  // workspace it made the first time. Pref-only: safe from anywhere.
++  std::string EnsureWorkspaceForImport(const std::string& title,
++                                       const std::string& icon);
++
+   // Renames a workspace, including the default one -- which is how the default
+   // workspace acquires the title E7c deliberately did not give it.
+   void RenameWorkspace(std::string_view guid, const std::string& title);
+@@ -437,7 +445,7 @@ class WorkspaceService : public TabStrip
+                            const std::vector<std::string>& member_guids);
+ 
+   // Stamps a newly inserted tab with the workspace it belongs to.
+-  void StampInsertedTab(tabs::TabInterface* tab);
++  void StampInsertedTab(tabs::TabInterface* tab, int index);
+ 
+   // Moves the workspace tag onto a tab's replacement WebContents.
+   //
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+@@ -268,9 +268,6 @@ views::ProposedLayout UnpinnedTabContain
+                               ? (size_bounds.width() - (x + horizontal_padding))
+                               : size_bounds.width(),
+                           child_height_bound);
+-    gfx::Rect bounds = gfx::Rect(child->GetPreferredSize(child_size_bounds));
+-    bounds.set_x(x);
+-
+     auto drag_data = tab_container_view->GetVisualDataForDraggedView(*child);
+     bool should_show_child =
+         IsChildVisibleInContainer(tab_container_view, focused_group_id, child);
+@@ -280,14 +277,25 @@ views::ProposedLayout UnpinnedTabContain
+                         workspaces::IsChildDrawnForWorkspace(
+                             tab_container_view->collection_node_, child_index);
+ 
++    // Decided BEFORE the child is asked for its size: a hidden child's size is
++    // never drawn, and asking is not free -- it runs the tab's own layout. This
++    // pass runs on every added view (TabCollectionAnimatingLayoutManager
++    // recomputes its target synchronously), so on a strip holding thousands of
++    // tabs of other workspaces it was a quarter of a 263 s restart (LOCAL.md 40).
+     if (!should_show_child) {
+       layouts.child_layouts.emplace_back(
+           child, false,
+           gfx::Rect(x, drag_data ? drag_data->offset.y() : height,
+-                    bounds.width(), 0));
++                    size_bounds.width().is_bounded()
++                        ? std::max(0, size_bounds.width().value() - x -
++                                          horizontal_padding)
++                        : 0,
++                    0));
+       continue;
+     }
+ 
++    gfx::Rect bounds = gfx::Rect(child->GetPreferredSize(child_size_bounds));
++    bounds.set_x(x);
+     bounds.set_y(drag_data ? drag_data->offset.y() : height);
+ 
+     if (size_bounds.width().is_bounded()) {
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -15,6 +15,7 @@ source_set("vertical") {
+     "vertical_tab_strip_scroll_bar.h",
+     "vertical_tab_strip_segmented_control.h",
+     "vertical_tab_strip_top_container.h",
++    "workspace_arc_importer.h",
+     "workspace_rail_view.h",
+   ]
+ 
+@@ -47,6 +48,7 @@ source_set("impl") {
+     "vertical_tab_strip_scroll_bar.cc",
+     "vertical_tab_strip_segmented_control.cc",
+     "vertical_tab_strip_top_container.cc",
++    "workspace_arc_importer.cc",
+     "workspace_rail_view.cc",
+   ]
+ 
+@@ -71,7 +73,17 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs/organizer:impl",
+     "//chrome/browser/ui/tabs/saved_tab_groups",
+     "//chrome/browser/ui/tabs/workspaces",
++    "//chrome/browser/ui/tabs/workspaces:arc_import",
+     "//chrome/browser/ui/tabs/workspaces:prefs",
++
++    # For workspace_arc_importer.cc (E14c). Kept together, out of alphabetical
++    # order, so the fork's lines stay one hunk at a rebase.
++    "//components/prefs",
++    "//components/saved_tab_groups/public",
++    "//components/sessions",
++    "//components/split_tabs",
++    "//url",
++
+     "//chrome/browser/ui/user_education",
+     "//chrome/browser/ui/views:layout_provider",
+     "//chrome/browser/ui/views/frame",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
+@@ -0,0 +1,389 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h"
++
++#include <algorithm>
++#include <map>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/environment.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/i18n/number_formatting.h"
++#include "base/logging.h"
++#include "base/path_service.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/timer/elapsed_timer.h"
++#include "build/build_config.h"
++#include "chrome/browser/prefs/session_startup_pref.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
++#include "chrome/browser/ui/browser_ui_controller/browser_ui_controller.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/status_bubble.h"
++#include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/prefs/pref_service.h"
++#include "components/saved_tab_groups/public/tab_group_sync_service.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/split_tabs/split_tab_id.h"
++#include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tab_groups/tab_group_color.h"
++#include "components/tab_groups/tab_group_visual_data.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "url/gurl.h"
++
++namespace {
++
++using workspaces::arc_import::ArcImportPlan;
++using workspaces::arc_import::ArcItem;
++using workspaces::arc_import::ArcTab;
++using workspaces::arc_import::ArcUnit;
++using workspaces::arc_import::ArcWorkspace;
++
++// The owner's file is 8 MB. A cap, because it is read whole into memory and
++// comes from outside the profile.
++constexpr size_t kMaxSidebarBytes = 64 * 1024 * 1024;
++
++// How long one slice may keep the UI thread. Long enough that a slice does
++// real work, short enough that the window keeps painting between slices.
++constexpr base::TimeDelta kSliceBudget = base::Milliseconds(40);
++
++// HELIUM_ARC_SIDEBAR overrides the path: a copy of the file, a smaller one for
++// a rehearsal, or Arc's location on another OS. The same variable points the
++// parser's real-file test at a file (LOCAL.md 39).
++base::FilePath ArcSidebarPath() {
++  if (std::optional<std::string> path =
++          base::Environment::Create()->GetVar("HELIUM_ARC_SIDEBAR")) {
++    return base::FilePath::FromUTF8Unsafe(*path);
++  }
++#if BUILDFLAG(IS_WIN)
++  // The exact name, never a glob: Arc keeps dated StorableSidebar.*.json
++  // backups beside it.
++  base::FilePath local_app_data;
++  if (base::PathService::Get(base::DIR_LOCAL_APP_DATA, &local_app_data)) {
++    return local_app_data.AppendASCII("Packages")
++        .AppendASCII("TheBrowserCompany.Arc_ttt1ap7aakyb4")
++        .AppendASCII("LocalCache")
++        .AppendASCII("Local")
++        .AppendASCII("Arc")
++        .AppendASCII("StorableSidebar.json");
++  }
++#endif
++  return base::FilePath();
++}
++
++// On the thread pool: the read blocks, and the parsed tree (which includes a
++// sync copy of the sidebar nobody uses) lives and dies here. Only the plan
++// crosses back. Arc may be running; the read does not lock the file.
++std::optional<ArcImportPlan> ReadAndParse(const base::FilePath& path) {
++  std::string json;
++  if (path.empty() ||
++      !base::ReadFileToStringWithMaxSize(path, &json, kMaxSidebarBytes)) {
++    return std::nullopt;
++  }
++  return workspaces::arc_import::ParseArcSidebarJson(json);
++}
++
++// One sleeping tab, tagged before it is inserted. ALWAYS appended (a pinned
++// one at the end of the pinned run): the session service re-records every
++// tab after an insert point, so an append is O(1) and anything else is O(n).
++content::WebContents* AddSleepingTab(BrowserWindowInterface* window,
++                                     const ArcTab& tab,
++                                     const std::string& guid,
++                                     std::optional<tab_groups::TabGroupId> group,
++                                     bool pin) {
++  const GURL url(tab.url);
++  if (!url.is_valid()) {
++    return nullptr;
++  }
++  sessions::SerializedNavigationEntry navigation;
++  navigation.set_index(0);
++  navigation.set_virtual_url(url);
++  navigation.set_title(base::UTF8ToUTF16(tab.title));
++
++  std::map<std::string, std::string> extra_data;
++  if (!guid.empty()) {
++    extra_data[workspaces::kWorkspaceExtraDataKey] = guid;
++  }
++  if (tab.anchored) {
++    // The same spec as the entry's URL, or the tab reads as drifted.
++    extra_data[workspaces::kAnchorUrlExtraDataKey] = url.spec();
++  }
++  if (!tab.custom_title.empty()) {
++    extra_data[workspaces::kCustomTitleExtraDataKey] = tab.custom_title;
++  }
++
++  // Only a Today tab carries its age: it is what auto-archive will count
++  // from (E14d). The session service persists it from here on. The ticks
++  // formula is session restore's own.
++  base::Time last_active;
++  base::TimeTicks last_active_ticks;
++  const base::Time now = base::Time::Now();
++  if (!tab.anchored && !pin && !tab.last_active.is_null() &&
++      tab.last_active <= now) {
++    last_active = tab.last_active;
++    last_active_ticks = base::TimeTicks::Now() - (now - last_active);
++  }
++
++  TabStripModel* const model = window->GetTabStripModel();
++  return chrome::AddRestoredTab(
++      window, base::span_from_ref(navigation),
++      pin ? model->IndexOfFirstNonPinnedTab() : model->count(),
++      /*selected_navigation=*/0, /*extension_app_id=*/std::string(), group,
++      /*select=*/false, pin, last_active_ticks, last_active,
++      /*storage_namespace=*/nullptr, sessions::SerializedUserAgentOverride(),
++      extra_data, /*from_session_restore=*/false,
++      /*is_active_browser=*/std::nullopt,
++      chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
++}
++
++}  // namespace
++
++WorkspaceArcImporter::WorkspaceArcImporter(BrowserWindowInterface* browser)
++    : browser_(browser) {}
++
++WorkspaceArcImporter::~WorkspaceArcImporter() = default;
++
++void WorkspaceArcImporter::Start(DoneCallback done) {
++  if (running_) {
++    return;
++  }
++  running_ = true;
++  done_ = std::move(done);
++  result_ = Result();
++  window_ = nullptr;
++  items_.clear();
++  next_item_ = 0;
++  color_ = 0;
++  LOG(INFO) << "[workspaces] arc import: reading";
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++      base::BindOnce(&ReadAndParse, ArcSidebarPath()),
++      base::BindOnce(&WorkspaceArcImporter::OnPlanReady,
++                     weak_factory_.GetWeakPtr(), base::Time::Now()));
++}
++
++void WorkspaceArcImporter::OnPlanReady(base::Time started,
++                                       std::optional<ArcImportPlan> plan) {
++  // A reply to a posted task, so outside every observer: inserting is legal.
++  started_ = started;
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  Profile* const profile = browser_->GetProfile();
++  if (!plan || !service || !service->IsEnabled() || !profile) {
++    LOG(INFO) << "[workspaces] arc import: nothing imported ("
++              << (plan ? "workspaces unavailable" : "no readable Arc sidebar")
++              << ")";
++    Finish();
++    return;
++  }
++  result_.found = true;
++  prefs_ = profile->GetPrefs();
++
++  // A re-run adds only what Arc gained since the last one (owner's choice,
++  // LOCAL.md 39): a tab closed or archived here since then stays gone.
++  const ArcImportPlan todo = workspaces::arc_import::KeepCreatedAfter(
++      *std::move(plan),
++      prefs_->GetTime(workspaces::prefs::kHeliumWorkspacesArcImportedAt));
++  result_.skipped = todo.skipped;
++
++  // The plan, flattened into the order the strip gets it: favorites first,
++  // while the strip is short (a pinned insert is the one insert here that is
++  // not at the very end), then each workspace's pinned units, then its Today
++  // units. A folder's group id is made here and travels with its items, so a
++  // group may straddle slices: a later tab with the same id is inserted into
++  // the group's range, which stays contiguous.
++  for (const ArcTab& tab : todo.favorites) {
++    items_.push_back(Item{{tab}, std::string(), std::nullopt, std::string(),
++                          /*pin=*/true});
++  }
++  for (const ArcWorkspace& workspace : todo.workspaces) {
++    if (workspace.pinned.empty() && workspace.today.empty()) {
++      continue;  // a re-run with nothing new: no empty workspace appears
++    }
++    // Never CreateWorkspace(): it switches, and spawns a loaded tab.
++    const std::string guid =
++        service->EnsureWorkspaceForImport(workspace.title, workspace.icon);
++    ++result_.workspaces;
++    for (const std::vector<ArcUnit>* units :
++         {&workspace.pinned, &workspace.today}) {
++      for (const ArcUnit& unit : *units) {
++        std::optional<tab_groups::TabGroupId> group;
++        if (!unit.group_title.empty()) {
++          group = tab_groups::TabGroupId::GenerateNew();
++        }
++        const size_t first = items_.size();
++        for (const ArcItem& item : unit.items) {
++          items_.push_back(
++              Item{item.tabs, guid, group, std::string(), /*pin=*/false});
++        }
++        if (group && items_.size() > first) {
++          items_.back().group_title_to_apply = unit.group_title;
++        }
++      }
++    }
++  }
++  for (const Item& item : items_) {
++    result_.planned += static_cast<int>(item.tabs.size());
++  }
++  LOG(INFO) << "[workspaces] arc import: start: " << result_.planned
++            << " tab(s) planned";
++
++  // Imported tabs live in the session file and nowhere else. The Windows
++  // default for "On startup" is the New Tab page, which would drop them all
++  // at the next launch (LOCAL.md 37).
++  if (SessionStartupPref::GetStartupPref(profile).type !=
++      SessionStartupPref::LAST) {
++    SessionStartupPref::SetStartupPref(
++        profile, SessionStartupPref(SessionStartupPref::LAST));
++    result_.startup_changed = true;
++  }
++
++  // This window, held weakly: a slice may run after the user closed it.
++  window_ = browser_->GetWeakPtr();
++  ImportSlice();
++}
++
++void WorkspaceArcImporter::ImportSlice() {
++  // Closing the window is how an import is cancelled: whatever arrived went
++  // with it, and the import time is not recorded, so the next run starts over
++  // rather than skipping what was lost.
++  BrowserWindowInterface* const window = window_.get();
++  TabStripModel* const model = window ? window->GetTabStripModel() : nullptr;
++  if (!model || window->IsDeleteScheduled() || model->closing_all()) {
++    result_.aborted = true;
++    window_ = nullptr;
++    LOG(INFO) << "[workspaces] arc import: window closed after "
++              << result_.tabs << " tab(s); stopped";
++    Finish();
++    return;
++  }
++
++  base::ElapsedTimer timer;
++  bool first = true;
++  while (next_item_ < items_.size() &&
++         (first || timer.Elapsed() < kSliceBudget)) {
++    first = false;
++    const Item& item = items_[next_item_++];
++    std::vector<content::WebContents*> made;
++    for (const ArcTab& tab : item.tabs) {
++      if (content::WebContents* const contents =
++              AddSleepingTab(window, tab, item.guid, item.group, item.pin)) {
++        made.push_back(contents);
++        ++result_.tabs;
++      } else {
++        ++result_.skipped;
++      }
++    }
++    if (item.group && !made.empty() &&
++        !std::ranges::contains(groups_made_, *item.group)) {
++      groups_made_.push_back(*item.group);
++    }
++    // RestoreSplit, not AddToNewSplit: no promo, no metrics, and it is what
++    // lazy session restore uses between two sleeping tabs.
++    if (item.tabs.size() == 2 && made.size() == 2) {
++      const int a = model->GetIndexOfWebContents(made[0]);
++      const int b = model->GetIndexOfWebContents(made[1]);
++      if (a != TabStripModel::kNoTab && b == a + 1) {
++        model->RestoreSplit(split_tabs::SplitTabId::GenerateNew(), {a, b},
++                            split_tabs::SplitTabVisualData());
++        ++result_.splits;
++      }
++    }
++    // Named and collapsed after its last tab, the order session restore uses:
++    // adding a tab to a collapsed group expands it again (TabGroupView). A
++    // group made through AddRestoredTab is not a saved group until someone
++    // says so, and M153 expects every group to be one (a restart would save
++    // it anyway): the same pairing as BrowserLiveTabContext::AddRestoredTab,
++    // once per group. Saved groups as built -- owner, 2026-09-22 (design 5).
++    if (!item.group_title_to_apply.empty() && item.group &&
++        std::ranges::contains(groups_made_, *item.group)) {
++      model->ChangeTabGroupVisuals(
++          *item.group,
++          tab_groups::TabGroupVisualData(
++              base::UTF8ToUTF16(item.group_title_to_apply),
++              static_cast<tab_groups::TabGroupColorId>(
++                  color_++ %
++                  static_cast<int>(tab_groups::TabGroupColorId::kNumEntries)),
++              /*is_collapsed=*/true));
++      if (tab_groups::TabGroupSyncService* const saved_groups =
++              tab_groups::TabGroupSyncServiceFactory::GetForProfile(
++                  window->GetProfile());
++          saved_groups && !saved_groups->GetGroup(*item.group).has_value()) {
++        saved_groups->SaveGroup(
++            tab_groups::SavedTabGroupUtils::CreateSavedTabGroupFromLocalId(
++                *item.group));
++      }
++      ++result_.groups;
++    }
++  }
++
++  LOG(INFO) << "[workspaces] arc import: " << result_.tabs << " of "
++            << result_.planned << " tab(s)";
++  if (next_item_ >= items_.size()) {
++    Finish();
++    return;
++  }
++  SetStatus(l10n_util::GetStringFUTF16(
++      IDS_HELIUM_WORKSPACE_IMPORT_ARC_PROGRESS, base::FormatNumber(result_.tabs),
++      base::FormatNumber(result_.planned)));
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspaceArcImporter::ImportSlice,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void WorkspaceArcImporter::SetStatus(const std::u16string& text) {
++  BrowserWindowInterface* const window = window_.get();
++  BrowserUiController* const ui = window ? BrowserUiController::From(window)
++                                         : nullptr;
++  if (!ui) {
++    return;
++  }
++  for (StatusBubble* bubble : ui->GetStatusBubbles()) {
++    bubble->SetStatus(text);
++  }
++}
++
++void WorkspaceArcImporter::Finish() {
++  SetStatus(std::u16string());
++  if (result_.found && !result_.aborted && prefs_) {
++    // `started_`, not now: a tab Arc gains while this runs must count as new.
++    prefs_->SetTime(workspaces::prefs::kHeliumWorkspacesArcImportedAt,
++                    started_);
++  }
++  result_.elapsed = base::Time::Now() - started_;
++  if (result_.found) {
++    LOG(INFO) << "[workspaces] arc import: done: " << result_.tabs << " tab(s), "
++              << result_.groups << " group(s), " << result_.splits
++              << " split(s), " << result_.workspaces << " workspace(s), "
++              << result_.skipped << " skipped, startup "
++              << (result_.startup_changed ? "set to continue" : "unchanged")
++              << ", " << result_.elapsed.InMilliseconds() << " ms"
++              << (result_.aborted ? ", aborted" : "");
++  }
++  running_ = false;
++  prefs_ = nullptr;
++  items_.clear();
++  groups_made_.clear();
++  if (done_) {
++    std::move(done_).Run(result_);
++  }
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h
+@@ -0,0 +1,113 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_ARC_IMPORTER_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_ARC_IMPORTER_H_
++
++#include <map>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/tabs/workspaces/arc_import_plan.h"
++#include "components/tab_groups/tab_group_id.h"
++
++class BrowserWindowInterface;
++class PrefService;
++
++// "Import from Arc...": turns an ArcImportPlan (E14b) into sleeping tabs in the
++// window whose rail was clicked (design 5, E14 spec). A new window was built,
++// rehearsed and withdrawn the same day: closed before the original, it left the
++// session, and the next launch restored the original alone (LOCAL.md 40). Not
++// a view. It lives
++// beside the rail, its only caller, because chrome::AddRestoredTab belongs to
++// //chrome/browser/ui, which the workspaces target can never depend on (E10a),
++// and this directory already reaches it the way the rail reaches
++// browser_commands.h.
++//
++// Every tab is created through the session-restore door: no renderer, not
++// loaded until clicked, and tagged with its workspace, anchor and custom title
++// BEFORE it is inserted, through the extra-data hook 08 put there -- a tag
++// written after the insert would be a change, and a relayout, per tab.
++//
++// The tabs arrive in SLICES: posted tasks of a few dozen milliseconds each,
++// so the window paints, scrolls and answers between them and the status line
++// at its bottom-left counts up. One synchronous loop froze the window for
++// 324 s on the owner's 3,873 tabs (LOCAL.md 40). Each slice re-checks that the
++// window is still there; closing it is how an import is cancelled.
++class WorkspaceArcImporter {
++ public:
++  struct Result {
++    // False when Arc's file is missing, unreadable or not a sidebar.
++    bool found = false;
++    // The window was closed before the import finished.
++    bool aborted = false;
++    int tabs = 0;
++    int planned = 0;
++    int groups = 0;
++    int splits = 0;
++    int workspaces = 0;
++    // Left out: no web URL (counted by the parser) or an unusable one.
++    int skipped = 0;
++    // "On startup" was switched to "Continue where you left off". Without it
++    // the imported tabs would not come back after a restart.
++    bool startup_changed = false;
++    base::TimeDelta elapsed;
++  };
++  using DoneCallback = base::OnceCallback<void(const Result&)>;
++
++  explicit WorkspaceArcImporter(BrowserWindowInterface* browser);
++  WorkspaceArcImporter(const WorkspaceArcImporter&) = delete;
++  WorkspaceArcImporter& operator=(const WorkspaceArcImporter&) = delete;
++  ~WorkspaceArcImporter();
++
++  // True from Start() until `done` has run: the file is read off-thread and
++  // the tabs arrive over many tasks, and a second click must not start a
++  // second import.
++  bool running() const { return running_; }
++
++  // Only from a menu or command handler: it ends in TabStripModel inserts
++  // (design 2.2). `done` runs on this sequence, never if `this` is destroyed.
++  void Start(DoneCallback done);
++
++ private:
++  // One thing the strip takes as a whole: a tab, or a split view's two tabs,
++  // with everything AddRestoredTab needs to place it.
++  struct Item {
++    std::vector<workspaces::arc_import::ArcTab> tabs;
++    std::string guid;  // the workspace; empty only for a pinned favorite
++    std::optional<tab_groups::TabGroupId> group;
++    // Set on a group's last item: name and collapse the group after it.
++    std::string group_title_to_apply;
++    bool pin = false;
++  };
++
++  void OnPlanReady(base::Time started,
++                   std::optional<workspaces::arc_import::ArcImportPlan> plan);
++  void ImportSlice();
++  void Finish();
++  void SetStatus(const std::u16string& text);
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  // The same window, as a WeakPtr: a slice may run after it was closed.
++  base::WeakPtr<BrowserWindowInterface> window_;
++  bool running_ = false;
++  DoneCallback done_;
++  Result result_;
++  base::Time started_;
++  raw_ptr<PrefService> prefs_ = nullptr;
++  std::vector<Item> items_;
++  size_t next_item_ = 0;
++  // Groups that received at least one tab: only these exist in the model.
++  // A vector: TabGroupId has no ordering, and there are a few dozen.
++  std::vector<tab_groups::TabGroupId> groups_made_;
++  int color_ = 0;
++  base::WeakPtrFactory<WorkspaceArcImporter> weak_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_ARC_IMPORTER_H_
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -15,6 +15,8 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
++#include "base/functional/callback_helpers.h"
++#include "base/i18n/number_formatting.h"
+ #include "base/logging.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -88,6 +90,7 @@ static_assert(std::size(kIconPresetNames
+ constexpr int kMenuCommandNewTab = 17;
+ constexpr int kMenuCommandNewWorkspace = 18;
+ constexpr int kMenuCommandTabSearch = 19;
++constexpr int kMenuCommandImportArc = 20;
+ static_assert(kMenuCommandIconPresetFirst + std::size(kIconPresets) <=
+               kMenuCommandNewTab);
+ 
+@@ -243,7 +246,7 @@ WorkspaceRailView::WorkspaceRailView(
+     BrowserWindowInterface* browser,
+     tabs::VerticalTabStripStateController* state_controller,
+     views::View* new_tab_button)
+-    : browser_(browser) {
++    : browser_(browser), arc_importer_(browser) {
+   // Hidden until AddedToWidget() has looked at the list. Starting hidden rather
+   // than starting shown and hiding later is what keeps a profile with
+   // Workspaces switched off from seeing the rail flash on at startup.
+@@ -443,6 +446,9 @@ void WorkspaceRailView::OnAddPressed(con
+                                            IDS_HELIUM_WORKSPACE_NEW);
+   context_menu_model_->AddItemWithStringId(kMenuCommandTabSearch,
+                                            IDS_TAB_SEARCH_MENU);
++  context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  context_menu_model_->AddItemWithStringId(kMenuCommandImportArc,
++                                           IDS_HELIUM_WORKSPACE_IMPORT_ARC);
+   context_menu_runner_ = std::make_unique<views::MenuRunner>(
+       context_menu_model_.get(), views::MenuRunner::HAS_MNEMONICS);
+   // The event's source type, so a keyboard press opens the menu with its first
+@@ -590,6 +596,12 @@ void WorkspaceRailView::ShowContextMenuF
+ }
+ 
+ bool WorkspaceRailView::IsCommandIdEnabled(int command_id) const {
++  // Arc's file is read off-thread, so a second click could arrive before the
++  // first import has inserted anything.
++  if (command_id == kMenuCommandImportArc) {
++    return !arc_importer_.running();
++  }
++
+   // The default workspace cannot be deleted -- ParseWorkspaces() puts it back
+   // on the next read, so the item would report success and change nothing
+   // (workspace_prefs.h). Disabled rather than absent, so the menu has the same
+@@ -655,6 +667,11 @@ void WorkspaceRailView::ExecuteCommand(i
+       LOG(INFO) << "[workspaces] rail + menu: tab search";
+       chrome::ExecuteCommand(browser_, IDC_TAB_SEARCH);
+       return;
++    case kMenuCommandImportArc:
++      LOG(INFO) << "[workspaces] rail + menu: import from Arc";
++      arc_importer_.Start(base::BindOnce(&WorkspaceRailView::OnArcImportDone,
++                                         weak_factory_.GetWeakPtr()));
++      return;
+   }
+ 
+   workspaces::WorkspaceService* service =
+@@ -805,6 +822,40 @@ void WorkspaceRailView::ShowCloseConfirm
+   views::BubbleDialogDelegate::CreateBubbleDeprecated(
+       std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
+       ->Show();
++}
++
++void WorkspaceRailView::OnArcImportDone(
++    const WorkspaceArcImporter::Result& result) {
++  ui::DialogModel::Builder builder;
++  if (!result.found) {
++    builder.SetTitle(
++        l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_IMPORT_ARC_NOT_FOUND));
++  } else {
++    // Two strings, two placeholder counts: GetStringFUTF16 checks them.
++    builder.SetTitle(
++        result.aborted
++            ? l10n_util::GetStringFUTF16(IDS_HELIUM_WORKSPACE_IMPORT_ARC_ABORTED,
++                                         base::FormatNumber(result.tabs),
++                                         base::FormatNumber(result.planned))
++            : l10n_util::GetStringFUTF16(IDS_HELIUM_WORKSPACE_IMPORT_ARC_DONE,
++                                         base::FormatNumber(result.tabs)));
++    builder.AddParagraph(ui::DialogModelLabel(l10n_util::GetStringFUTF16(
++        IDS_HELIUM_WORKSPACE_IMPORT_ARC_DETAILS,
++        base::NumberToString16(result.groups),
++        base::NumberToString16(result.skipped))));
++    if (result.startup_changed) {
++      builder.AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(
++          IDS_HELIUM_WORKSPACE_IMPORT_ARC_STARTUP)));
++    }
++  }
++  builder.AddOkButton(base::DoNothing());
++
++  // Anchored to the rail, like the confirm bubble above.
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      builder.Build(), this, views::BubbleBorder::TOP_LEFT);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
+ }
+ 
+ void WorkspaceRailView::ShowNameBubble(
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -12,6 +12,7 @@
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/views/context_menu_controller.h"
+@@ -138,6 +139,9 @@ class WorkspaceRailView : public views::
+   // than Recently Closed can give back; runs the action only on the OK button.
+   void ShowCloseConfirmBubble(const std::string& guid, int count, bool deleting);
+ 
++  // Says what "Import from Arc..." did, or that Arc's data was not found.
++  void OnArcImportDone(const WorkspaceArcImporter::Result& result);
++
+   // Opens the one-textfield bubble both create and rename use, anchored to
+   // `anchor`. `on_accept` is run with whatever was typed, and not run at all if
+   // the bubble is dismissed.
+@@ -189,6 +193,10 @@ class WorkspaceRailView : public views::
+   base::CallbackListSubscription collapse_changed_subscription_;
+   base::CallbackListSubscription scrolled_subscription_;
+ 
++  // "Import from Arc..." on the + menu (E14c). Not a view; it sits here
++  // because this directory can reach chrome::AddRestoredTab.
++  WorkspaceArcImporter arc_importer_;
++
+   // For the name bubble's accept callback, which outlives this call stack and
+   // can outlive the rail: the bubble is owned by its own widget, and closing
+   // the window destroys the two in an order this view does not control.

@@ -1,0 +1,229 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -327,16 +327,31 @@ int WorkspaceService::CloseWorkspaceTabs
+   // means nothing after it. Handles survive that, and they also survive a close
+   // taking more than the tab it was asked for (a split closes as a unit), which
+   // a reverse-order index walk would not.
++  //
++  // Pinned tabs are skipped: they have no tag, and no tag resolves to the
++  // default workspace, so "Close all tabs" on Home closed every pinned tab
++  // until E13. A pinned tab belongs to every workspace (design 2.5), the
++  // same rule UnloadWorkspaceTabs applies below.
+   std::vector<tabs::TabHandle> doomed;
++  int pinned_kept = 0;
+   for (int i = 0; i < tab_strip_->count(); ++i) {
+     tabs::TabInterface* tab = tab_strip_->GetTabAtIndex(i);
+-    if (tab && IsTabOfWorkspace(tab, guid)) {
+-      doomed.push_back(tab->GetHandle());
++    if (!tab || !IsTabOfWorkspace(tab, guid)) {
++      continue;
+     }
++    if (tab->IsPinned()) {
++      ++pinned_kept;
++      continue;
++    }
++    doomed.push_back(tab->GetHandle());
+   }
+ 
++  // The kept count is the evidence for the pinned rule: Chromium reopens the
++  // last session's pinned tabs at startup, so how many tabs a close takes
++  // depends on history, and only this number says the rule ran (LOCAL.md 34).
+   LOG(INFO) << "[workspaces] closing " << doomed.size()
+-            << " tab(s) of workspace '" << guid << "' in this window";
++            << " tab(s) of workspace '" << guid << "' in this window, "
++            << pinned_kept << " pinned kept";
+ 
+   // CLOSE_CREATE_HISTORICAL_TAB so they land in Recently Closed. Each one still
+   // carries its guid in its session data, so reopening one lands back in this
+@@ -392,20 +407,49 @@ int WorkspaceService::UnloadWorkspaceTab
+   return static_cast<int>(candidates.size());
+ }
+ 
+-std::vector<tabs::TabInterface*> WorkspaceService::SelectedMovableTabs()
+-    const {
+-  std::vector<tabs::TabInterface*> tabs;
+-  for (tabs::TabInterface* tab : tab_strip_->selection_model().selected_tabs()) {
++std::vector<tabs::TabInterface*> WorkspaceService::MovableTabs(
++    const std::vector<tabs::TabInterface*>& picked) const {
++  // A split is drawn as one tab, so picking either half moves both (E13).
++  std::vector<split_tabs::SplitTabId> picked_splits;
++  for (tabs::TabInterface* tab : picked) {
++    if (tab && tab->GetSplit()) {
++      picked_splits.push_back(*tab->GetSplit());
++    }
++  }
++
++  // Walked in strip order, which also drops a tab picked twice.
++  std::vector<tabs::TabInterface*> movable;
++  for (int i = 0; i < tab_strip_->count(); ++i) {
++    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
+     // A pinned tab has no workspace -- it is drawn in all of them (design 2.5)
+     // -- so moving one would give it a guid and hide it everywhere but the
+     // destination. Skipped rather than refusing the whole move: a selection
+     // that happens to include a pinned tab should still move the others, and
+     // the count the menu shows has to agree with what actually happens.
+-    if (tab && tab->GetContents() && !tab->IsPinned()) {
+-      tabs.push_back(tab);
++    //
++    // And never a tab this window is hiding. A shift-click selects a model
++    // RANGE (TabStripModel::ExtendSelectionTo), and tabs stay where they are
++    // when they change workspace, so the range can include another
++    // workspace's tabs the user cannot see -- and moving one would re-tag it,
++    // and pull it out of its group, from a workspace it was never in (E13
++    // review).
++    if (!tab || !tab->GetContents() || tab->IsPinned() ||
++        !IsTabOnScreen(tab)) {
++      continue;
++    }
++    const std::optional<split_tabs::SplitTabId> split = tab->GetSplit();
++    if (std::ranges::contains(picked, tab) ||
++        (split && std::ranges::contains(picked_splits, *split))) {
++      movable.push_back(tab);
+     }
+   }
+-  return tabs;
++  return movable;
++}
++
++std::vector<tabs::TabInterface*> WorkspaceService::SelectedMovableTabs()
++    const {
++  const auto& selected = tab_strip_->selection_model().selected_tabs();
++  return MovableTabs({selected.begin(), selected.end()});
+ }
+ 
+ int WorkspaceService::SelectedMovableTabCount() const {
+@@ -431,27 +475,49 @@ int WorkspaceService::MoveTabsToWorkspac
+     return 0;
+   }
+ 
+-  int moved = 0;
+-  for (tabs::TabInterface* tab : tabs) {
+-    // The pinned check is here as well as in SelectedMovableTabs(), because
+-    // this is the door the tab context menu comes in through and it brings its
+-    // own set. A pinned tab is drawn in every workspace precisely because it
+-    // has no tag (design 2.5); giving it one would hide it everywhere but the
+-    // destination. Skipped, not refused: a selection that happens to include a
+-    // pinned tab should still move the others.
+-    if (!tab || !tab->GetContents() || tab->IsPinned()) {
+-      continue;
++  // Through MovableTabs() again, because the tab context menu comes in here
++  // with its own set: pinned tabs out, split partners in.
++  const std::vector<tabs::TabInterface*> moving = MovableTabs(tabs);
++  if (moving.empty()) {
++    return 0;
++  }
++
++  // A group is a folder, not one tab: a tab moved out of it leaves it, as a
++  // tab moved out of an Arc folder does -- unless every member is moving, and
++  // then the group goes whole. Tagging alone is not enough, because the strip
++  // draws a whole group by its FIRST tab's workspace (02-render): until E13 a
++  // moved middle tab went on being drawn where it no longer belonged, and a
++  // moved first tab carried the rest of its group off with it.
++  std::vector<tab_groups::TabGroupId> staying;
++  for (int i = 0; i < tab_strip_->count(); ++i) {
++    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
++    const std::optional<tab_groups::TabGroupId> group =
++        tab ? tab->GetGroup() : std::nullopt;
++    if (group && !std::ranges::contains(moving, tab) &&
++        !std::ranges::contains(staying, *group)) {
++      staying.push_back(*group);
+     }
+-    SetTag(tab->GetContents(), std::string(guid));
+-    ++moved;
++  }
++  std::vector<int> leaving;
++  for (tabs::TabInterface* tab : moving) {
++    const std::optional<tab_groups::TabGroupId> group = tab->GetGroup();
++    if (group && std::ranges::contains(staying, *group)) {
++      leaving.push_back(tab_strip_->GetIndexOfTab(tab));
++    }
++  }
++  // Legal here and nowhere near an observer: this runs from a menu handler.
++  // The TabGroupedStateChanged it fires is a leave, which keeps the tag.
++  if (!leaving.empty()) {
++    tab_strip_->RemoveFromGroup(leaving);
+   }
+ 
+-  if (moved == 0) {
+-    return 0;
++  for (tabs::TabInterface* tab : moving) {
++    SetTag(tab->GetContents(), std::string(guid));
+   }
+ 
+-  LOG(INFO) << "[workspaces] moved " << moved << " tab(s) -> workspace '"
+-            << guid << "'";
++  LOG(INFO) << "[workspaces] moved " << moving.size()
++            << " tab(s) -> workspace '" << guid << "', " << leaving.size()
++            << " left their group";
+ 
+   // The repaint that used to be here is gone, and this is the one place that
+   // proves the move: SetTag() now notifies on every tag change, so the tabs
+@@ -465,7 +531,7 @@ int WorkspaceService::MoveTabsToWorkspac
+   // the observer scope design 2.2 forbids mutating from.
+   EnsureActiveTabVisible();
+ 
+-  return moved;
++  return static_cast<int>(moving.size());
+ }
+ 
+ base::CallbackListSubscription
+@@ -1167,6 +1233,12 @@ void WorkspaceService::PersistTag(conten
+   session_service->AddTabExtraData(
+       session_tab_helper->window_id(), session_tab_helper->session_id(),
+       kAnchorUrlExtraDataKey, AnchorUrlForTab(contents));
++  // And the custom title, under the same rule. Missing until E13: a rename
++  // reached the session file only when a full rewrite happened to include it
++  // (Ctrl+Shift+T forces one), so a plain rename -> quit -> restart lost it.
++  session_service->AddTabExtraData(
++      session_tab_helper->window_id(), session_tab_helper->session_id(),
++      kCustomTitleExtraDataKey, CustomTitleForTab(contents));
+ }
+ 
+ void WorkspaceService::ApplyCollectionGuid(
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -220,7 +220,9 @@ class WorkspaceService : public TabStrip
+   // if the right-clicked tab is part of it, otherwise on that tab alone", which
+   // is not the same set as the selection.
+   //
+-  // Pinned tabs in `tabs` are skipped, not refused, for the reason above.
++  // Pinned tabs in `tabs` are skipped, not refused, for the reason above. A
++  // split moves whole; a grouped tab leaves its group unless the whole group
++  // is moving (E13).
+   int MoveTabsToWorkspace(const std::vector<tabs::TabInterface*>& tabs,
+                           std::string_view guid);
+ 
+@@ -362,8 +364,13 @@ class WorkspaceService : public TabStrip
+                               int index) override;
+   void OnSplitTabChanged(const SplitTabChange& change) override;
+ 
+-  // The selected tabs that a move would actually touch: everything selected in
+-  // this window except pinned tabs.
++  // The tabs a move of `picked` would actually touch, in strip order: `picked`
++  // without pinned tabs or tabs this window hides, plus the other half of any
++  // split it touches.
++  std::vector<tabs::TabInterface*> MovableTabs(
++      const std::vector<tabs::TabInterface*>& picked) const;
++
++  // MovableTabs() of everything selected in this window.
+   std::vector<tabs::TabInterface*> SelectedMovableTabs() const;
+ 
+   // The workspace `tab` belongs to, or empty for a tab that has never been
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
+@@ -101,9 +101,12 @@ void RestoreWorkspaceFromExtraData(
+   if (title_it != extra_data.end()) {
+     data->set_custom_title(title_it->second);
+     // The one line that proves a rename survived a restart or Ctrl+Shift+T;
+-    // the title itself is drawn by a repaint nothing else logs.
+-    LOG(INFO) << "[workspaces] restored custom title '" << title_it->second
+-              << "'";
++    // the title itself is drawn by a repaint nothing else logs. Not for an
++    // empty one: PersistTag writes the key for every tab, named or not.
++    if (!title_it->second.empty()) {
++      LOG(INFO) << "[workspaces] restored custom title '" << title_it->second
++                << "'";
++    }
+   }
+ }
+ 

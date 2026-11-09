@@ -1,0 +1,213 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
+ 
+ #include <array>
++#include <cstdint>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -79,6 +80,16 @@ inline constexpr char kHeliumWorkspacesT
+ inline constexpr int kCompactTabRowHeight = 30;
+ inline constexpr int kMaxTabRowHeight = 48;
+ 
++// A favorite (a Chromium-pinned tab) is an Arc top-row tile this tall at any
++// Tab style (C21); in the collapsed column it stays Helium's 30.
++inline constexpr int kFavoriteTileHeight = 44;
++
++// The card under the pinned rows (E17b) and under each favorite (C21): the
++// rows' text colour at this alpha, more on a dark strip, where the same alpha
++// reads fainter (at 0x0B the pinned pages and Today read as one list, C35).
++inline constexpr uint8_t kCardAlphaLight = 0x09;  // dark text: a light strip
++inline constexpr uint8_t kCardAlphaDark = 0x14;
++
+ // Whether the tab list glides when the mouse wheel rolls, instead of jumping
+ // (E18, design 5 "E18 spec" 3): the "Smooth scrolling in the tab list"
+ // setting, on by default. Read on every wheel step, so a change needs no
+--- a/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
+@@ -30,6 +30,11 @@ TabViewVerticalLayout::~TabViewVerticalL
+ 
+ void TabViewVerticalLayout::OnInstalled(views::View* host) {
+   TabView::LayoutManager::OnInstalled(host);
++  // Helium Workspaces (C21): a favorite's faint card (workspace_view_hooks.h),
++  // the only background a TabView gets: one given by Chromium or Helium would
++  // be fought silently.
++  DCHECK(!host->background());
++  host->SetBackground(workspaces::MakeFavoriteCard());
+   tab_children_configs_ = {
+       TabChildConfig(TabView().close_button_, kIconDesignWidth, kDefaultPadding,
+                      /*align_leading=*/false,
+--- a/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
+@@ -11,10 +11,18 @@
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "cc/paint/paint_flags.h"
+ #include "chrome/browser/sessions/session_restore.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/views/background.h"
+ 
+ namespace workspaces {
+ 
+@@ -55,6 +63,39 @@ const tabs::TabInterface* FirstDescendan
+ // would stall every strip; the constructor checks that in DCHECK builds.
+ int g_bulk_layout_depth = 0;
+ 
++// The faint card behind a favorite, an Arc top-row tile, in the pinned card's
++// colour (WorkspacePinnedSectionView::CardBackground). Not behind the tab in
++// front: Helium's active fill, painted first, tells it apart. A split favorite
++// never gets here (TabView::OnPaint returns first). Only
++// TabViewVerticalLayout installs it, and only on a TabView.
++class FavoriteCard : public views::Background {
++ public:
++  void Paint(gfx::Canvas* canvas, views::View* view) const override {
++    const auto& tab = static_cast<const TabView&>(*view);
++    const ui::ColorProvider* const provider = view->GetColorProvider();
++    if (!tab.pinned() || tab.IsActive() || !provider) {
++      return;
++    }
++    // The rows' own text colour; light text says the strip is dark. At half
++    // the pinned card's alpha (the owner's try): the card and Helium's
++    // highlight both step away from the strip, so a fainter card is what lets
++    // the favorite in front stand out (12 -> 15 levels light, 9 -> 15 dark).
++    const SkColor text =
++        provider->GetColor(kColorTabForegroundInactiveFrameActive);
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(SkColorSetA(
++        text, (color_utils::IsDark(text) ? prefs::kCardAlphaLight
++                                         : prefs::kCardAlphaDark) /
++                  2));
++    gfx::RectF bounds(view->GetLocalBounds());
++    bounds.Inset(0.5f);  // under the tab's 1 px outline
++    canvas->DrawRoundRect(
++        bounds, GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius),
++        flags);
++  }
++};
++
+ }  // namespace
+ 
+ bool IsChildDrawnForWorkspace(const TabCollectionNode* parent,
+@@ -93,10 +134,17 @@ bool IsRoomyTabRow(bool pinned, bool col
+ }
+ 
+ int TabRowHeightFor(bool pinned, bool collapsed, int helium_height) {
++  if (pinned && !collapsed) {
++    return prefs::kFavoriteTileHeight;
++  }
+   if (pinned || collapsed) {
+     return helium_height;
+   }
+   return prefs::TabRowHeight();
+ }
+ 
++std::unique_ptr<views::Background> MakeFavoriteCard() {
++  return std::make_unique<FavoriteCard>();
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/common/workspace_view_hooks.h
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.h
+@@ -7,6 +7,10 @@
+ 
+ #include <stddef.h>
+ 
++#include <memory>
++
++#include "ui/views/background.h"
++
+ class TabCollectionNode;
+ 
+ // Helium Workspaces: the bodies of the fork's hooks in the vertical tab
+@@ -49,9 +53,13 @@ bool IsBulkLayoutInProgress();
+ // and further from its title when roomy (IsRoomyTabRow). Compact keeps
+ // Helium's own inset and gap, whatever they become. `helium_height` is the
+ // height Helium's layout gives the tab.
++// A favorite outside the collapsed column is a tile (C21).
+ bool IsRoomyTabRow(bool pinned, bool collapsed);
+ int TabRowHeightFor(bool pinned, bool collapsed, int helium_height);
+ 
++// TabViewVerticalLayout::OnInstalled (C21): the faint card behind a favorite.
++std::unique_ptr<views::Background> MakeFavoriteCard();
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_WORKSPACE_VIEW_HOOKS_H_
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -208,12 +208,10 @@ constexpr float kActiveRowRadius = 8;
+ constexpr int kChevronSize = 12;
+ constexpr int kChevronSpace = kIndent;
+ 
+-// The card (E17b, design 5 "E17 spec" 3): the text colour at a whisper,
+-// more on a dark strip, where the same alpha reads fainter -- at 0x0B the
+-// pinned pages and Today read as one list (C35, the owner); 8 px in from the
+-// strip's sides and 4 px above and below the rows, its edge included.
+-constexpr SkAlpha kCardAlphaDark = 0x14;
+-constexpr SkAlpha kCardAlphaLight = 0x09;
++// The card (E17b, design 5 "E17 spec" 3): its alphas are
++// workspaces::prefs::kCardAlpha*, shared with the favorites' cards (C21);
++// 8 px in from the strip's sides and 4 px above and below the rows, its edge
++// included.
+ constexpr int kCardMargin = 8;
+ constexpr int kCardPadding = 4;
+ // C35: an edge round the card and a line under it, both in the colour of
+@@ -2206,8 +2204,9 @@ WorkspacePinnedSectionView::CardBackgrou
+   const SkColor text =
+       provider->GetColor(kColorTabForegroundInactiveFrameActive);
+   return views::CreateRoundedRectBackground(
+-      SkColorSetA(text, color_utils::IsDark(text) ? kCardAlphaLight
+-                                                  : kCardAlphaDark),
++      SkColorSetA(text, color_utils::IsDark(text)
++                            ? workspaces::prefs::kCardAlphaLight
++                            : workspaces::prefs::kCardAlphaDark),
+       kActiveRowRadius, kCardEdge);
+ }
+ 
+@@ -2463,13 +2462,17 @@ void WorkspacePinnedSectionView::Rebuild
+   // The open items' buttons are made here too, for the same reason.
+   //
+   // The list is its own card (E17b): a plain Background, no layer, so the
+-  // drop indicator still draws above it and the tabs. The column of the
+-  // collapsed strip is too narrow for side margins.
++  // drop indicator still draws above it and the tabs. In the collapsed
++  // column it is as wide as the favorites' tiles and the Today tabs there,
++  // the strip's own padding in from each side (the owner's try of C21).
++  const int card_margin =
++      collapsed_ ? GetLayoutConstant(
++                       LayoutConstant::kVerticalTabStripHorizontalPadding)
++                 : kCardMargin;
+   auto list = std::make_unique<views::View>();
+   list->SetLayoutManager(std::make_unique<views::BoxLayout>(
+       views::BoxLayout::Orientation::kVertical));
+-  list->SetProperty(views::kMarginsKey,
+-                    gfx::Insets::VH(0, collapsed_ ? 0 : kCardMargin));
++  list->SetProperty(views::kMarginsKey, gfx::Insets::VH(0, card_margin));
+   list->SetBorder(views::CreatePaddedBorder(
+       views::CreateRoundedRectBorder(kCardEdge, kActiveRowRadius,
+                                      ui::kColorSeparator),
+@@ -2505,10 +2508,9 @@ void WorkspacePinnedSectionView::Rebuild
+   }
+   ApplyStates(*list, links);
+   // After the header, and its line after it, as wide as the card (C35).
+-  const int line_margin = collapsed_ ? 0 : kCardMargin;
+   card_line_->SetProperty(views::kMarginsKey,
+-                          gfx::Insets::TLBR(kCardLineAbove, line_margin,
+-                                            kCardLineBelow, line_margin));
++                          gfx::Insets::TLBR(kCardLineAbove, card_margin,
++                                            kCardLineBelow, card_margin));
+   card_line_->SetVisible(true);
+   list_ = AddChildViewAt(std::move(list), 1);
+   LOG(INFO) << "[workspaces] pins: drew " << rows << " row(s) of '"

@@ -1,0 +1,2094 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
+@@ -11,9 +11,11 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/i18n/case_conversion.h"
++#include "base/i18n/string_compare.h"
+ #include "base/json/json_writer.h"
+ #include "base/json/values_util.h"
+ #include "base/logging.h"
++#include "base/no_destructor.h"
+ #include "base/notreached.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_split.h"
+@@ -23,6 +25,7 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
++#include "third_party/icu/source/i18n/unicode/coll.h"
+ 
+ namespace workspaces::archive {
+ namespace {
+@@ -452,6 +455,42 @@ std::u16string ShownTitle(std::string_vi
+                                                  : url);
+ }
+ 
++bool SortsBefore(const pins::PinNode& a, const pins::PinNode& b) {
++  // What each row is called on screen: a split by its left page.
++  const auto name = [](const pins::PinNode& row) {
++    const pins::PinNode& page =
++        row.type == pins::PinNode::Type::kSplit && !row.children.empty()
++            ? row.children.front()
++            : row;
++    return ShownTitle(page.custom_title, page.title, page.url);
++  };
++  // Chromium's own Sort by name for a bookmark folder (BookmarkModel's
++  // SortComparator): folders first, then the rest, each by name in the
++  // browser's language -- case and accents never decide alone, so "apple"
++  // sorts with "Apple" and "Äpfel" beside "Apfel" (B9).
++  const bool a_folder = a.type == pins::PinNode::Type::kFolder;
++  if (a_folder != (b.type == pins::PinNode::Type::kFolder)) {
++    return a_folder;
++  }
++  // One collator for the process: the language changes only at a restart,
++  // and sorting the biggest folder (1,159 rows) compares ~12,000 times.
++  static const base::NoDestructor<std::unique_ptr<icu::Collator>> collator([] {
++    UErrorCode error = U_ZERO_ERROR;
++    std::unique_ptr<icu::Collator> made(icu::Collator::createInstance(error));
++    if (U_FAILURE(error)) {
++      made.reset();
++    }
++    return made;
++  }());
++  const std::u16string name_a = name(a);
++  const std::u16string name_b = name(b);
++  if (!*collator) {
++    return base::i18n::FoldCase(name_a) < base::i18n::FoldCase(name_b);
++  }
++  return base::i18n::CompareString16WithCollator(**collator, name_a,
++                                                 name_b) == UCOL_LESS;
++}
++
+ std::vector<std::u16string> QueryWords(std::u16string_view query) {
+   return base::SplitString(base::i18n::FoldCase(query), base::kWhitespaceUTF16,
+                            base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.h
+@@ -25,6 +25,10 @@ namespace base {
+ class SequencedTaskRunner;
+ }
+ 
++namespace workspaces::pins {
++struct PinNode;
++}
++
+ // Arc's archive: every tab the user closes, kept per workspace for 60 days in
+ // a file of its own, so a close is never the end of a page (design 5, "E14d
+ // spec"). E14d.1 records; the screen that finds and restores is E14d.2's
+@@ -220,6 +224,10 @@ std::u16string ShownTitle(std::string_vi
+                           std::string_view title,
+                           std::string_view url);
+ 
++// Sort by name (C17): whether row `a` of a pinned folder goes before row `b`.
++// Here, beside ShownTitle, so it sorts by the name the section draws.
++bool SortsBefore(const pins::PinNode& a, const pins::PinNode& b);
++
+ // The query, case-folded (base::i18n::FoldCase) and split on whitespace, once
+ // per keystroke. Empty for an empty or all-space query.
+ std::vector<std::u16string> QueryWords(std::u16string_view query);
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
+@@ -22,6 +22,7 @@
+ #include "base/test/bind.h"
+ #include "base/test/task_environment.h"
+ #include "base/time/time.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace workspaces::archive {
+@@ -835,5 +836,59 @@ TEST(WorkspaceAutoArchiveTest, EveryVerd
+   EXPECT_EQ(SweepVerdictName(SweepVerdict::kDevice), "device");
+ }
+ 
++// ---------------------------------------------- Sort by name (C17)
++
++pins::PinNode Row(pins::PinNode::Type type,
++                  std::string title,
++                  std::string custom_title = std::string()) {
++  pins::PinNode row;
++  row.type = type;
++  row.id = title + custom_title;
++  row.title = std::move(title);
++  row.custom_title = std::move(custom_title);
++  row.url = "https://example.com/";
++  return row;
++}
++pins::PinNode Page(std::string title, std::string custom_title = {}) {
++  return Row(pins::PinNode::Type::kItem, std::move(title),
++             std::move(custom_title));
++}
++pins::PinNode Folder(std::string title) {
++  return Row(pins::PinNode::Type::kFolder, std::move(title));
++}
++
++TEST(WorkspaceSortTest, FoldersComeBeforePages) {
++  EXPECT_TRUE(SortsBefore(Folder("Zebra"), Page("Apple")));
++  EXPECT_FALSE(SortsBefore(Page("Apple"), Folder("Zebra")));
++  EXPECT_TRUE(SortsBefore(Folder("Apple"), Folder("Zebra")));
++}
++
++// Neither case nor an accent decides alone: the language's order does.
++TEST(WorkspaceSortTest, CaseAndAccentsSortWithTheirLetter) {
++  EXPECT_TRUE(SortsBefore(Page("apple"), Page("Banana")));
++  EXPECT_TRUE(SortsBefore(Page("Banana"), Page("cherry")));
++  // UTF-8 "Äpfel": a code-point order would put it after "Zebra".
++  EXPECT_TRUE(SortsBefore(Page("\xC3\x84pfel"), Page("Banana")));
++}
++
++// The name the row draws: the user's own first, a split's left page, and the
++// address when there is no title.
++TEST(WorkspaceSortTest, SortsByTheNameDrawn) {
++  EXPECT_TRUE(SortsBefore(Page("Zebra", "Alpha"), Page("Beta")));
++  pins::PinNode split = Row(pins::PinNode::Type::kSplit, "");
++  split.children = {Page("Aardvark"), Page("Zulu")};
++  EXPECT_TRUE(SortsBefore(split, Page("Beta")));
++  pins::PinNode untitled = Page("");
++  untitled.url = "https://zz.example/";
++  EXPECT_TRUE(SortsBefore(Page("Beta"), untitled));
++}
++
++// Equal names never swap: a strict order, so a stable sort keeps them as
++// they were.
++TEST(WorkspaceSortTest, EqualNamesAreNeitherBefore) {
++  EXPECT_FALSE(SortsBefore(Page("Docs"), Page("Docs")));
++  EXPECT_FALSE(SortsBefore(Folder("Docs"), Folder("Docs")));
++}
++
+ }  // namespace
+ }  // namespace workspaces::archive
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -8,6 +8,7 @@
+ #include <set>
+ #include <utility>
+ 
++#include "base/containers/to_vector.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/json/json_reader.h"
+@@ -538,6 +539,68 @@ bool PinStore::Rename(std::string_view i
+       Changed();
+       return true;
+     }
++  }
++  return false;
++}
++
++bool PinStore::SortFolder(
++    std::string_view id,
++    base::FunctionRef<bool(const PinNode&, const PinNode&)> less) {
++  if (!loaded_ || read_only_) {
++    return false;
++  }
++  for (auto& [guid, roots] : tree_) {
++    if (PinNode* node = FindNode(roots, id)) {
++      if (node->type != PinNode::Type::kFolder) {
++        return false;
++      }
++      std::vector<std::string> before =
++          base::ToVector(node->children, &PinNode::id);
++      std::ranges::stable_sort(node->children, less);
++      std::vector<std::string> after =
++          base::ToVector(node->children, &PinNode::id);
++      // A sort that moved nothing keeps the slot: Sort pressed twice must not
++      // lose the order the first one can give back.
++      if (after != before) {
++        sort_undo_ =
++            SortUndo{std::string(id), std::move(before), std::move(after)};
++      }
++      Changed();
++      return true;
++    }
++  }
++  return false;
++}
++
++bool PinStore::CanUndoSort(std::string_view id) const {
++  if (!sort_undo_ || sort_undo_->folder != id) {
++    return false;
++  }
++  const PinNode* const folder = Find(id);
++  return folder && folder->type == PinNode::Type::kFolder &&
++         base::ToVector(folder->children, &PinNode::id) == sort_undo_->after;
++}
++
++bool PinStore::UndoSort(std::string_view id) {
++  if (!loaded_ || read_only_ || !CanUndoSort(id)) {
++    return false;
++  }
++  for (auto& [guid, roots] : tree_) {
++    if (PinNode* folder = FindNode(roots, id)) {
++      // Its rows are the sort's `after`, in that order, and `before` holds
++      // the same ids: each is found once.
++      const std::vector<std::string>& after = sort_undo_->after;
++      std::vector<PinNode> rows;
++      rows.reserve(folder->children.size());
++      for (const std::string& row : sort_undo_->before) {
++        const auto at = std::ranges::find(after, row) - after.begin();
++        rows.push_back(std::move(folder->children.begin()[at]));
++      }
++      folder->children = std::move(rows);
++      sort_undo_.reset();
++      Changed();
++      return true;
++    }
+   }
+   return false;
+ }
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -223,12 +223,36 @@ class PinStore : public base::SupportsUs
+   // A folder's name, or an item's own (`custom_title`: empty shows the page's
+   // title again). False for Remove's reasons.
+   bool Rename(std::string_view id, std::string name);
++  // Puts the rows of folder `id` in `less`'s order (C17, "Sort by name"), one
++  // level: what a sub-folder holds keeps its own order. Stable, so rows
++  // `less` cannot tell apart keep theirs. False for Remove's reasons and for
++  // a row that is not a folder. A sort that moved a row is the one UndoSort
++  // puts back (B2): Arc's folders keep newest first, and a sort is the end of
++  // that record.
++  bool SortFolder(
++      std::string_view id,
++      base::FunctionRef<bool(const PinNode&, const PinNode&)> less);
++  // C17: whether UndoSort(id) can put folder `id` back -- it was the last
++  // folder sorted and its rows are still those ids in the order the sort
++  // left. In memory only: a restart forgets it.
++  bool CanUndoSort(std::string_view id) const;
++  // Puts folder `id`'s rows back in their order before the last SortFolder
++  // and forgets it. False when !CanUndoSort(id), before the load, or while
++  // read-only.
++  bool UndoSort(std::string_view id);
+ 
+   void AddObserver(Observer* observer);
+   void RemoveObserver(Observer* observer);
+ 
+  private:
+   struct LoadResult;
++  // The last SortFolder that moved a row (C17): its folder, and the folder's
++  // row ids before and after.
++  struct SortUndo {
++    std::string folder;
++    std::vector<std::string> before;
++    std::vector<std::string> after;
++  };
+   static LoadResult ReadFile(const base::FilePath& file);
+   void OnLoaded(LoadResult result);
+ 
+@@ -247,6 +271,9 @@ class PinStore : public base::SupportsUs
+   bool loaded_ = false;
+   bool read_only_ = false;
+   bool loaded_old_version_ = false;
++  // Never saved. Checked against the tree when asked, so no other change has
++  // to remember to clear it.
++  std::optional<SortUndo> sort_undo_;
+   base::ImportantFileWriter writer_;
+   base::ObserverList<Observer> observers_;
+   base::WeakPtrFactory<PinStore> weak_factory_{this};
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -664,6 +664,138 @@ TEST_F(PinStoreTest, RenameNamesAFolderO
+   EXPECT_EQ(again->Find("c")->title, "C page");
+ }
+ 
++// C17: Sort by name orders ONE folder's own rows, stably; a sub-folder's
++// inside keeps its order. The order itself is the caller's (here: by id).
++TEST_F(PinStoreTest, SortFolderOrdersOneLevelStably) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots(
++      "default",
++      {Folder("f", "Folder",
++              {Item("b1", "https://b1.example/"),
++               Folder("m", "Sub", {Item("s2", "https://s2.example/"),
++                                   Item("s1", "https://s1.example/")}),
++               Item("a", "https://a.example/"),
++               Item("b0", "https://b0.example/")}),
++       Item("top", "https://top.example/")}));
++  // By the first letter only: "b1" and "b0" tie, and keep their order.
++  const auto by_first_letter = [](const PinNode& a, const PinNode& b) {
++    return a.id.front() < b.id.front();
++  };
++  EXPECT_TRUE(store->SortFolder("f", by_first_letter));
++  EXPECT_FALSE(store->SortFolder("top", by_first_letter));
++  EXPECT_FALSE(store->SortFolder("nope", by_first_letter));
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->Find("f") && again->Find("m"));
++  EXPECT_EQ(RowIds(again->Find("f")->children),
++            (RowList{"a", "b1", "b0", "m"}));
++  EXPECT_EQ(RowIds(again->Find("m")->children), (RowList{"s2", "s1"}));
++  EXPECT_EQ(RowIds(again->tree().at("default")), (RowList{"f", "top"}));
++}
++
++bool ById(const PinNode& a, const PinNode& b) {
++  return a.id < b.id;
++}
++
++// Two folders of rows out of id order, and a row outside both.
++std::vector<PinNode> UnsortedRoots() {
++  return {Folder("f", "F",
++                 {Item("c", "https://c.example/"),
++                  Item("a", "https://a.example/"),
++                  Item("b", "https://b.example/")}),
++          Folder("g", "G",
++                 {Item("z", "https://z.example/"),
++                  Item("y", "https://y.example/")}),
++          Item("top", "https://top.example/")};
++}
++
++// C17 (B2): Undo sort puts the rows back, once, and is written like any
++// change. Sort pressed again on the sorted folder moves nothing, so the undo
++// still gives back the order before the first.
++TEST_F(PinStoreTest, UndoSortPutsTheRowsBack) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", UnsortedRoots()));
++  EXPECT_FALSE(store->CanUndoSort("f"));
++  EXPECT_FALSE(store->UndoSort("f"));
++  ASSERT_TRUE(store->SortFolder("f", &ById));
++  ASSERT_TRUE(store->SortFolder("f", &ById));
++  EXPECT_TRUE(store->CanUndoSort("f"));
++  EXPECT_FALSE(store->CanUndoSort("g"));
++  EXPECT_FALSE(store->UndoSort("g"));
++
++  CountingObserver observer;
++  store->AddObserver(&observer);
++  EXPECT_TRUE(store->UndoSort("f"));
++  EXPECT_EQ(observer.calls, 1);
++  store->RemoveObserver(&observer);
++  EXPECT_FALSE(store->CanUndoSort("f"));
++  EXPECT_FALSE(store->UndoSort("f"));
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->Find("f"));
++  EXPECT_EQ(RowIds(again->Find("f")->children), (RowList{"c", "a", "b"}));
++}
++
++// C17: the undo is for the rows as the sort left them. A row moved, added or
++// removed in the folder ends it; a change outside the folder does not.
++TEST_F(PinStoreTest, AChangeToTheSortedRowsEndsTheUndo) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", UnsortedRoots()));
++  ASSERT_TRUE(store->SortFolder("f", &ById));
++  ASSERT_TRUE(store->Rename("a", "Renamed"));
++  ASSERT_TRUE(store->Move("y", "default", "top", Where::kAfter));
++  EXPECT_TRUE(store->CanUndoSort("f"));
++
++  // Within the folder.
++  ASSERT_TRUE(store->Move("a", "default", "c", Where::kAfter));
++  EXPECT_FALSE(store->CanUndoSort("f"));
++  ASSERT_TRUE(store->SortFolder("f", &ById) && store->CanUndoSort("f"));
++  // Into it.
++  ASSERT_TRUE(store->Move("top", "default", "f", Where::kInto));
++  EXPECT_FALSE(store->CanUndoSort("f"));
++  ASSERT_TRUE(store->SortFolder("f", &ById) && store->CanUndoSort("f"));
++  // Out of it.
++  ASSERT_TRUE(store->Move("top", "default", "", Where::kAfter));
++  EXPECT_FALSE(store->CanUndoSort("f"));
++  ASSERT_TRUE(store->Move("c", "default", "a", Where::kBefore));
++  ASSERT_TRUE(store->SortFolder("f", &ById) && store->CanUndoSort("f"));
++  // A new row.
++  ASSERT_TRUE(store->Insert("default", Item("d", "https://d.example/"), "f",
++                            Where::kInto));
++  EXPECT_FALSE(store->CanUndoSort("f"));
++  EXPECT_FALSE(store->UndoSort("f"));
++  ASSERT_TRUE(store->SortFolder("f", &ById) && store->CanUndoSort("f"));
++  // A row gone.
++  ASSERT_TRUE(store->Remove("b"));
++  EXPECT_FALSE(store->CanUndoSort("f"));
++  EXPECT_FALSE(store->UndoSort("f"));
++  ASSERT_TRUE(store->Find("f"));
++  EXPECT_EQ(RowIds(store->Find("f")->children), (RowList{"a", "c", "d"}));
++}
++
++// C17: one slot. Sorting another folder replaces it; a refused sort -- an
++// item, no such row -- keeps it.
++TEST_F(PinStoreTest, TheUndoIsTheLastSortsOnly) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", UnsortedRoots()));
++  ASSERT_TRUE(store->SortFolder("f", &ById));
++  EXPECT_FALSE(store->SortFolder("top", &ById));
++  EXPECT_FALSE(store->SortFolder("nope", &ById));
++  EXPECT_TRUE(store->CanUndoSort("f"));
++
++  ASSERT_TRUE(store->SortFolder("g", &ById));
++  EXPECT_FALSE(store->CanUndoSort("f"));
++  EXPECT_FALSE(store->UndoSort("f"));
++  EXPECT_TRUE(store->UndoSort("g"));
++  ASSERT_TRUE(store->Find("f") && store->Find("g"));
++  EXPECT_EQ(RowIds(store->Find("f")->children), (RowList{"a", "b", "c"}));
++  EXPECT_EQ(RowIds(store->Find("g")->children), (RowList{"z", "y"}));
++}
++
+ // E19: a file written before splits cues the Arc split repair once per load,
+ // and stays version 1 -- every load cued again -- until a change writes it.
+ TEST_F(PinStoreTest, AVersionOneFileCuesTheRepairUntilAChangeWritesIt) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
+ 
+ namespace workspaces::prefs {
+ 
+@@ -72,6 +73,9 @@ void RegisterProfilePrefs(PrefRegistrySi
+ 
+   // Empty: Helium's own toolbar until the user reorders it (wish 6).
+   registry->RegisterListPref(kHeliumWorkspacesToolbarOrder);
++
++  // Empty: every card unfolded (C15).
++  registry->RegisterListPref(kHeliumWorkspacesPinsFolded);
+ }
+ 
+ base::DictValue DefaultWorkspacesDict() {
+@@ -382,6 +386,24 @@ base::TimeDelta ArchiveAfter(const PrefS
+   return minutes > 0 ? base::Minutes(minutes) : base::TimeDelta();
+ }
+ 
++bool IsPinsFolded(const PrefService* prefs, std::string_view guid) {
++  return prefs && prefs->GetList(kHeliumWorkspacesPinsFolded).contains(guid);
++}
++
++void SetPinsFolded(PrefService* prefs, std::string_view guid, bool folded) {
++  // An unchanged answer writes nothing: every window's section watches the
++  // pref and draws again on a change.
++  if (!prefs || IsPinsFolded(prefs, guid) == folded) {
++    return;
++  }
++  ScopedListPrefUpdate update(prefs, kHeliumWorkspacesPinsFolded);
++  if (folded) {
++    update->Append(guid);
++  } else {
++    update->EraseValue(base::Value(guid));
++  }
++}
++
+ void SetTabRowHeight(int height) {
+   g_tab_row_height =
+       height >= kCompactTabRowHeight && height <= kMaxTabRowHeight
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -101,6 +101,14 @@ inline constexpr char kHeliumWorkspacesW
+ inline constexpr char kHeliumWorkspacesToolbarOrder[] =
+     "helium.workspaces.toolbar_order";
+ 
++// The workspaces whose pinned card is folded (C15): a list of guids, empty by
++// default. The profile's, as a folder's open state is (D8), so every window
++// folds the card together. A deleted workspace's guid is left in it: guids are
++// never reused. A sibling of the prefs above for the reason above, and pinned
++// by the same test.
++inline constexpr char kHeliumWorkspacesPinsFolded[] =
++    "helium.workspaces.pins_folded";
++
+ // Keys inside kHeliumWorkspacesList.
+ inline constexpr char kSchemaVersionKey[] = "schema_version";
+ inline constexpr char kItemsKey[] = "items";
+@@ -295,6 +303,12 @@ std::vector<std::string> GetWorkspaceGui
+ // for 0, a negative value, and a null `prefs`.
+ base::TimeDelta ArchiveAfter(const PrefService* prefs);
+ 
++// C15: whether workspace `guid`'s pinned card is folded (the profile's: every
++// window the same). False for a null `prefs`.
++bool IsPinsFolded(const PrefService* prefs, std::string_view guid);
++// Folds or unfolds it; a null `prefs` does nothing.
++void SetPinsFolded(PrefService* prefs, std::string_view guid, bool folded);
++
+ // The tab row height the strips draw now (E18). Process-wide, because the
+ // tab's layout (tab_view_vertical_layout.cc) is handed no profile or window:
+ // each regular window's WorkspaceService sets it from
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -131,12 +131,13 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+   const std::string smooth_scrolling(kHeliumWorkspacesSmoothScrolling);
+   const std::string wide_sidebar(kHeliumWorkspacesWideSidebar);
+   const std::string toolbar_order(kHeliumWorkspacesToolbarOrder);
++  const std::string pins_folded(kHeliumWorkspacesPinsFolded);
+   for (const std::string& later : {imported_at, archive_after, tab_row_height,
+                                    smooth_scrolling, wide_sidebar,
+-                                   toolbar_order}) {
++                                   toolbar_order, pins_folded}) {
+     for (const std::string& other :
+          {enabled, list, imported_at, archive_after, tab_row_height,
+-          smooth_scrolling, wide_sidebar, toolbar_order}) {
++          smooth_scrolling, wide_sidebar, toolbar_order, pins_folded}) {
+       if (other == later) {
+         continue;
+       }
+@@ -266,6 +267,34 @@ TEST(WorkspacePrefsTest, ToolbarOrderDef
+   EXPECT_TRUE(pref_service.GetList(kHeliumWorkspacesToolbarOrder).empty());
+ }
+ 
++// ------------------------------------------------- pins folded (C15)
++
++// Each workspace folds on its own, a guid is stored once however often it is
++// folded, and a null PrefService answers unfolded and writes nothing.
++TEST(WorkspacePrefsTest, PinsFoldPerWorkspaceAndStoreEachGuidOnce) {
++  EXPECT_STREQ("helium.workspaces.pins_folded", kHeliumWorkspacesPinsFolded);
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++  EXPECT_FALSE(IsPinsFolded(&pref_service, "a"));
++
++  SetPinsFolded(&pref_service, "a", true);
++  SetPinsFolded(&pref_service, "a", true);
++  SetPinsFolded(&pref_service, "b", true);
++  EXPECT_TRUE(IsPinsFolded(&pref_service, "a"));
++  EXPECT_TRUE(IsPinsFolded(&pref_service, "b"));
++  EXPECT_EQ(pref_service.GetList(kHeliumWorkspacesPinsFolded).size(), 2u);
++
++  SetPinsFolded(&pref_service, "a", false);
++  SetPinsFolded(&pref_service, "c", false);
++  EXPECT_FALSE(IsPinsFolded(&pref_service, "a"));
++  EXPECT_TRUE(IsPinsFolded(&pref_service, "b"));
++  EXPECT_FALSE(IsPinsFolded(&pref_service, "c"));
++  EXPECT_EQ(pref_service.GetList(kHeliumWorkspacesPinsFolded).size(), 1u);
++
++  SetPinsFolded(nullptr, "a", true);
++  EXPECT_FALSE(IsPinsFolded(nullptr, "b"));
++}
++
+ // ---------------------------------------------------- wide sidebar (E18)
+ 
+ TEST(WorkspacePrefsTest, WideSidebarPrefNameIsStable) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -826,6 +826,49 @@ int WorkspaceService::MoveTabsToWorkspac
+   return static_cast<int>(moving.size());
+ }
+ 
++int WorkspaceService::RetagPinItemPages(
++    const std::vector<tabs::TabInterface*>& tabs,
++    std::string_view guid) {
++  if (!IsEnabled() || ResolveTabGuid(guid, known_guids_) != guid) {
++    return 0;
++  }
++
++  // MovableTabs' walk without its two skips, which are exactly the tabs that
++  // follow a row (B1): a pinned item's page, and one this window hides -- a
++  // page of another workspace's row, open in this window.
++  std::vector<split_tabs::SplitTabId> splits;
++  for (tabs::TabInterface* tab : tabs) {
++    if (tab && tab->GetSplit()) {
++      splits.push_back(*tab->GetSplit());
++    }
++  }
++  std::vector<tabs::TabInterface*> moving;
++  for (int i = 0; i < tab_strip_->count(); ++i) {
++    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
++    if (!tab || !tab->GetContents() || tab->IsPinned()) {
++      continue;
++    }
++    const std::optional<split_tabs::SplitTabId> split = tab->GetSplit();
++    if (std::ranges::contains(tabs, tab) ||
++        (split && std::ranges::contains(splits, *split))) {
++      moving.push_back(tab);
++    }
++  }
++  if (moving.empty()) {
++    return 0;
++  }
++
++  for (tabs::TabInterface* tab : moving) {
++    SetTag(tab->GetContents(), std::string(guid));
++  }
++  LOG(INFO) << "[workspaces] retagged " << moving.size()
++            << " pinned page(s) -> workspace '" << guid << "'";
++
++  // From a menu handler, as MoveTabsToWorkspace: legal to call directly.
++  EnsureActiveTabVisible();
++  return static_cast<int>(moving.size());
++}
++
+ base::AutoReset<std::string> WorkspaceService::StampInsertedTabsFor(
+     std::string guid) {
+   last_rebuilt_tab_ = tabs::TabHandle();
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -270,6 +270,17 @@ class WorkspaceService : public TabStrip
+   int MoveTabsToWorkspace(const std::vector<tabs::TabInterface*>& tabs,
+                           std::string_view guid);
+ 
++  // C3: the open pages of pinned items -- `tabs`, this window's -- follow
++  // their rows into workspace `guid`. Unlike MoveTabsToWorkspace it takes a
++  // pinned item's page (IsPinItemTab) and a tab this window hides; a split
++  // moves whole (its partner joins); a favorite (IsPinned) is skipped. Then
++  // EnsureActiveTabVisible, as a move away of the page on screen leaves it
++  // with no row here. Answers how many tabs were retagged; 0 while disabled
++  // or for a guid that is not a workspace (ResolveTabGuid(guid) != guid).
++  // ONLY FROM A MENU OR COMMAND HANDLER.
++  int RetagPinItemPages(const std::vector<tabs::TabInterface*>& tabs,
++                        std::string_view guid);
++
+   // While the returned object lives, a tab inserted into this window without a
+   // tag of its own is stamped `guid` instead of the workspace on screen. For a
+   // saved group reopened from Recently Closed: Chromium rebuilds it from its
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <cstdlib>
+ #include <memory>
++#include <set>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -14,6 +15,7 @@
+ #include "base/containers/span.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/i18n/number_formatting.h"
+ #include "base/logging.h"
+ #include "base/numerics/safe_conversions.h"
+@@ -64,6 +66,7 @@
+ #include "components/favicon/core/favicon_service.h"
+ #include "components/favicon_base/favicon_types.h"
+ #include "components/keyed_service/core/service_access_type.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
+@@ -78,6 +81,7 @@
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/accessibility/ax_enums.mojom.h"
+ #include "ui/base/base_window.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/menu_source_utils.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+@@ -249,11 +253,42 @@ constexpr int kCommandNewFolder = 5;
+ constexpr int kCommandColor = 6;
+ // An open page's Close (C26: the x is drawn only on mouse-over).
+ constexpr int kCommandClose = 7;
++// Every row's Move to workspace submenu (C3), and a folder's actions (C17).
++constexpr int kCommandMoveToWorkspace = 8;
++constexpr int kCommandOpenAll = 9;
++constexpr int kCommandCloseAll = 10;
++constexpr int kCommandSort = 11;
++constexpr int kCommandUndoSort = 12;
++constexpr int kCommandCopyLinks = 13;
+ constexpr int kCommandFirstColor = 20;
++// The Move to workspace submenu (C3): one item per workspace, in the bar's
++// order. ponytail: a 61st workspace is left out of the menu; a range of its
++// own past the pages' if anyone ever has that many.
++constexpr int kCommandFirstWorkspace = 40;
++constexpr int kCommandLastWorkspace = 99;
+ // A collapsed folder's pages (E17b): one item per page, in order.
+ constexpr int kCommandFirstPage = 100;
+ constexpr int kMenuIconSize = 16;
+ 
++// Open all (C17) asks first above this many pages: Chromium's rule for a
++// bookmark folder (kNumBookmarkUrlsBeforePrompting). It opens them in slices
++// of at most this long, the importer's, so the window keeps painting (M7).
++constexpr int kOpenAllAskAbove = 15;
++constexpr base::TimeDelta kOpenAllSlice = base::Milliseconds(40);
++
++// C8: a drag held this long over a closed folder opens it, over a folded
++// card's header unfolds it. ponytail: a calibration knob, Arc's feel by eye.
++constexpr base::TimeDelta kHoverOpenDelay = base::Milliseconds(500);
++// A pointer that moves more than this, either way, starts the wait again: a
++// drag that rests is not one passing by (B6).
++constexpr int kHoverSlop = 4;
++// Never a folder holding more: its rows would bury the place under the
++// pointer -- the biggest holds 1,159 (B6).
++constexpr int kHoverOpenMaxPages = 200;
++// What the drag is held over when it is the folded card's header: no row id
++// starts with a control character.
++constexpr char kUnfoldTarget[] = "\x01unfold";
++
+ // How the log says where a row went.
+ const char* WhereName(Where where) {
+   return where == Where::kInto    ? "into"
+@@ -533,6 +568,124 @@ const PinNode* FindItem(const workspaces
+   return nullptr;
+ }
+ 
++// Item ids, looked up by a folder's actions (C17).
++using ItemIds = std::set<std::string, std::less<>>;
++
++// The items with a page open in `windows`: one walk of their tabs, never
++// LinkedTab per item -- a folder holds up to 1,159, a window 5,000 tabs (M6).
++ItemIds OpenItemIds(const std::vector<BrowserWindowInterface*>& windows) {
++  ItemIds ids;
++  for (BrowserWindowInterface* const window : windows) {
++    TabStripModel* const model = window->GetTabStripModel();
++    for (int i = 0; i < model->count(); ++i) {
++      tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++      // A favorite keeps a link made while Workspaces was off, unjudged: its
++      // row is drawn closed, so it is no open page here (ReadLinks' rule).
++      if (tab->IsPinned()) {
++        continue;
++      }
++      std::string id = workspaces::PinItemForTab(tab->GetContents());
++      if (!id.empty()) {
++        ids.insert(std::move(id));
++      }
++    }
++  }
++  return ids;
++}
++
++// The ids of every item under `row`, any depth -- a split's pages are items --
++// copied: a change to the store replaces the tree they point into (M1).
++ItemIds ItemIdsUnder(const PinNode& row) {
++  std::vector<const PinNode*> items;
++  CollectItems(row, items);
++  ItemIds ids;
++  for (const PinNode* const item : items) {
++    ids.insert(item->id);
++  }
++  return ids;
++}
++
++// The tabs of `model` that are pages of `ids`; never a favorite, whose link is
++// unjudged (ReadLinks' rule).
++std::vector<tabs::TabInterface*> PagesOf(TabStripModel* model,
++                                         const ItemIds& ids) {
++  std::vector<tabs::TabInterface*> pages;
++  for (int i = 0; i < model->count(); ++i) {
++    tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++    if (!tab->IsPinned() &&
++        ids.contains(workspaces::PinItemForTab(tab->GetContents()))) {
++      pages.push_back(tab);
++    }
++  }
++  return pages;
++}
++
++// What Open all opens under `row` (C17), in the order the rows draw it: each
++// item, and each split as one -- its pages open as one split view (E19) --
++// with no page in `open`, a page open in any window (B4: one place).
++void CollectClosedUnits(const PinNode& row,
++                        const ItemIds& open,
++                        std::vector<const PinNode*>& units) {
++  if (row.type == PinNode::Type::kFolder) {
++    for (const PinNode& child : row.children) {
++      CollectClosedUnits(child, open, units);
++    }
++    return;
++  }
++  if (std::ranges::none_of(PageIds(row), [&open](const std::string& page) {
++        return open.contains(page);
++      })) {
++    units.push_back(&row);
++  }
++}
++
++// Adds the folders on the way to row `id` under `rows` to `path`, outermost
++// first, and answers whether `id` is there.
++bool PathTo(const std::vector<PinNode>& rows,
++            std::string_view id,
++            std::vector<std::string>& path) {
++  for (const PinNode& row : rows) {
++    if (row.id == id) {
++      return true;
++    }
++    if (row.type == PinNode::Type::kFolder) {
++      path.push_back(row.id);
++      if (PathTo(row.children, id, path)) {
++        return true;
++      }
++      path.pop_back();
++    }
++  }
++  return false;
++}
++
++// Whether row `id` is somewhere under `rows`, any depth.
++bool HoldsRow(const std::vector<PinNode>& rows, std::string_view id) {
++  std::vector<std::string> path;
++  return PathTo(rows, id, path);
++}
++
++// The folders holding a drop's place (C8): every folder on the way to row
++// `to`, and `to` itself for a drop into it. A folder a drag opened stays
++// open only when it is one of them (the owner).
++std::vector<std::string> KeptFolders(const workspaces::pins::PinTree& tree,
++                                     std::string_view to,
++                                     Where where) {
++  std::vector<std::string> kept;
++  if (to.empty()) {
++    return kept;
++  }
++  for (const auto& [workspace, roots] : tree) {
++    if (PathTo(roots, to, kept)) {
++      break;
++    }
++  }
++  if (where == Where::kInto) {
++    kept.emplace_back(to);
++  }
++  return kept;
++}
++
+ // The workspace the section shows (E17b, design 5 "E17 spec" 3): its mark --
+ // its symbol, else its emoji or letter, on the fill its chip has on the bar
+ // -- then its name, 12 px semibold. Made once, by the section; each rebuild
+@@ -547,19 +700,30 @@ const PinNode* FindItem(const workspaces
+ // every view above it, and the section's list would measure all its rows --
+ // 1,313 with the biggest folder open -- on every tab opened or closed. A new
+ // number only repaints.
+-class WorkspaceHeaderView : public views::View {
+-  METADATA_HEADER(WorkspaceHeaderView, views::View)
++//
++// Pressed, it folds the card to the page in front, or unfolds it (C15): a
++// button that is still the heading, expanded or collapsed when there are rows
++// to hide; folded, a chevron before the numbers says so.
++class WorkspaceHeaderView : public views::Button {
++  METADATA_HEADER(WorkspaceHeaderView, views::Button)
+ 
+  public:
+-  WorkspaceHeaderView() {
++  explicit WorkspaceHeaderView(views::Button::PressedCallback callback)
++      : views::Button(std::move(callback)) {
+     layout_ = SetLayoutManager(std::make_unique<views::BoxLayout>(
+         views::BoxLayout::Orientation::kHorizontal));
+     layout_->set_minimum_cross_axis_size(kHeaderHeight);
+     layout_->set_cross_axis_alignment(views::LayoutAlignment::kCenter);
+     layout_->set_between_child_spacing(kHeaderSpacing);
+     // One heading named after the workspace; what it is drawn with is not
+-    // read again.
++    // read again. After the Button's constructor, which set the button role
++    // (B10): a heading is never taken for the bar's chip of the same name,
++    // which the hands-free checks press as a button.
+     GetViewAccessibility().SetRole(ax::mojom::Role::kHeading);
++    // The ring drawn inside, as the rows': the section scrolls in a clipping
++    // view (M9). A hover and a press show as on the rows.
++    views::FocusRing::Get(this)->SetOutsetFocusRingDisabled(true);
++    ConfigureInkDrop(this);
+     icon_ = AddChildView(std::make_unique<views::ImageView>());
+     icon_->SetPreferredSize(gfx::Size(kHeaderMarkSize, kHeaderMarkSize));
+     // The header's tooltip, its numbers (E18), shows over the mark too: an
+@@ -644,6 +808,28 @@ class WorkspaceHeaderView : public views
+     return true;
+   }
+ 
++  // C15: whether the workspace has rows to hide -- a screen reader hears the
++  // heading expanded or collapsed only then (M5) -- and whether they are.
++  void SetFolded(bool has_rows, bool folded) {
++    if (!has_rows) {
++      GetViewAccessibility().RemoveExpandCollapseState();
++    } else if (folded) {
++      GetViewAccessibility().SetIsCollapsed();
++    } else {
++      GetViewAccessibility().SetIsExpanded();
++    }
++    if (folded == folded_) {
++      return;
++    }
++    folded_ = folded;
++    UpdateTooltip();
++    // The name makes room for the chevron (Layout).
++    if (!size().IsEmpty()) {
++      DeprecatedLayoutImmediately();
++    }
++    SchedulePaint();
++  }
++
+   // Never in the constructor -- no provider before the widget. Run again by
+   // the section when the window's active state changes, which is not a theme
+   // change.
+@@ -675,43 +861,73 @@ class WorkspaceHeaderView : public views
+     SchedulePaint();
+   }
+ 
+-  // views::View:
++  // views::Button:
+   void OnThemeChanged() override {
+-    views::View::OnThemeChanged();
++    views::Button::OnThemeChanged();
+     UpdateColors();
+   }
+ 
++  // Down goes on to the first row, as Up from it comes back here (B11).
++  bool OnKeyPressed(const ui::KeyEvent& event) override {
++    if (event.key_code() == ui::VKEY_DOWN && GetFocusManager()) {
++      GetFocusManager()->AdvanceFocus(/*reverse=*/false);
++      return true;
++    }
++    return views::Button::OnKeyPressed(event);
++  }
++
+   // The box places the mark and the name; the name then ends a gap before
+-  // the numbers, so a long one elides there. Run again when the width
+-  // changes, which can change what is drawn (CountsText).
++  // the numbers -- and the chevron of a folded card (C15) -- so a long one
++  // elides there. Run again when the width changes, which can change what is
++  // drawn (CountsText).
+   void Layout(PassKey) override {
+-    LayoutSuperclass<views::View>(this);
++    LayoutSuperclass<views::Button>(this);
+     counts_width_ = CountsWidth();
+-    if (counts_width_ > 0) {
+-      const int end = width() - kHeaderInset - counts_width_ - kCountGap;
++    const int end_width = counts_width_ + ChevronWidth();
++    if (end_width > 0) {
++      const int end = width() - kHeaderInset - end_width - kCountGap;
+       name_->SetSize(gfx::Size(std::clamp(end - name_->x(), 0, name_->width()),
+                                name_->height()));
+     }
+   }
+ 
+  protected:
+-  // views::View:
++  // views::Button:
+   //
+   // The numbers at the right end, in the tone the rows' text and "+ New Tab"
+   // have in this window's state. No opaque background under them, as under
+-  // the labels.
+-  void OnPaint(gfx::Canvas* canvas) override {
+-    views::View::OnPaint(canvas);
++  // the labels. Folded (C15), the chevron just before them, in the name's
++  // colour. Here, not in OnPaint, which a Button keeps for itself.
++  void PaintButtonContents(gfx::Canvas* canvas) override {
+     const std::u16string text = CountsText();
+     const ui::ColorProvider* const provider = GetColorProvider();
+-    if (text.empty() || !provider) {
++    if (!provider) {
+       return;
+     }
+     const bool frame_active = GetWidget() && GetWidget()->ShouldPaintAsActive();
++    const int text_width =
++        text.empty() ? 0 : gfx::GetStringWidth(text, counts_font_);
++    if (ChevronWidth() > 0) {
++      const ui::ColorId name_color =
++          frame_active ? kColorTabForegroundActiveFrameActive
++                       : kColorTabForegroundActiveFrameInactive;
++      const gfx::ImageSkia chevron =
++          ui::ImageModel::FromVectorIcon(kKeyboardArrowRightIcon, name_color,
++                                         kChevronSize)
++              .Rasterize(provider);
++      canvas->DrawImageInt(
++          chevron,
++          GetMirroredXWithWidthInView(
++              width() - kHeaderInset - text_width - ChevronWidth(),
++              kChevronSize),
++          (height() - kChevronSize) / 2);
++    }
++    if (text.empty()) {
++      return;
++    }
+     const SkColor color = provider->GetColor(
+         frame_active ? kColorTabForegroundInactiveFrameActive
+                      : kColorTabForegroundInactiveFrameInactive);
+-    const int text_width = gfx::GetStringWidth(text, counts_font_);
+     canvas->DrawStringRectWithFlags(
+         text, counts_font_, color,
+         GetMirroredRect(gfx::Rect(width() - kHeaderInset - text_width, 0,
+@@ -720,6 +936,12 @@ class WorkspaceHeaderView : public views
+   }
+ 
+  private:
++  // The room the chevron of a folded card takes before the numbers (C15):
++  // none unfolded, and none collapsed, where the header is its symbol only.
++  int ChevronWidth() const {
++    return folded_ && !collapsed_ ? kChevronSize + kHeaderSpacing : 0;
++  }
++
+   // What is drawn at the current width: nothing collapsed (D7), the pinned
+   // count alone on a narrow header (D6), the anchored count only when there
+   // are any (D3); nothing before the pins file has loaded.
+@@ -760,6 +982,11 @@ class WorkspaceHeaderView : public views
+                                          IDS_HELIUM_ANCHORED_TAB_COUNT,
+                                          anchored_)});
+     }
++    // The chevron's words (C15, B7).
++    if (folded_) {
++      base::StrAppend(&text, {u"\n", l10n_util::GetStringUTF16(
++                                         IDS_HELIUM_PINNED_SECTION_FOLDED)});
++    }
+     SetTooltipText(text);
+   }
+ 
+@@ -771,6 +998,7 @@ class WorkspaceHeaderView : public views
+   bool tint_glyph_ = true;
+   int color_ = workspaces::prefs::kGreyColor;
+   bool collapsed_ = false;
++  bool folded_ = false;
+   // The numbers (E18), their font, and the room the last layout left them.
+   // -1: the pins file has not loaded yet, and nothing is shown.
+   int pinned_ = -1;
+@@ -1058,6 +1286,16 @@ class PinRow : public views::LabelButton
+   bool open() const { return open_; }
+   bool peek() const { return peek_; }
+   void MarkPeek() { peek_ = true; }
++  // C8: takes over the drag of the row a rebuild replaced; its release is a
++  // drop. False for a row that is never dragged -- a peek row, a collapsed
++  // one: their drag callback is null (M2).
++  bool TakeDrag() {
++    if (on_drag_.is_null()) {
++      return false;
++    }
++    dragging_ = true;
++    return true;
++  }
+ 
+   // The pages it shows (E19): an item one, its own id; a split two, left
+   // first; a folder none.
+@@ -1212,9 +1450,11 @@ class PinRow : public views::LabelButton
+                                             : std::next(it) != rows.end()) {
+           (event.key_code() == ui::VKEY_UP ? *std::prev(it) : *std::next(it))
+               ->RequestFocus();
+-        } else if (event.key_code() == ui::VKEY_DOWN && GetFocusManager()) {
+-          // From the last row on to "+ New Tab", just below (E15c.1).
+-          GetFocusManager()->AdvanceFocus(/*reverse=*/false);
++        } else if (GetFocusManager()) {
++          // From the last row on to "+ New Tab", just below (E15c.1); from
++          // the first back to the header, a button since C15 (B11).
++          GetFocusManager()->AdvanceFocus(
++              /*reverse=*/event.key_code() == ui::VKEY_UP);
+         }
+         return true;
+       }
+@@ -1654,7 +1894,10 @@ WorkspacePinnedSectionView::WorkspacePin
+   // before E17b is gone. Helium's own button: the same action as Ctrl+T, and
+   // the bottom one is hidden while Workspaces is on (the rail, E13). Made once
+   // and off the widget; a rebuild replaces only the card.
+-  header_ = AddChildView(std::make_unique<WorkspaceHeaderView>());
++  // Unretained: the header is a child, deleted with this view.
++  header_ = AddChildView(std::make_unique<WorkspaceHeaderView>(
++      base::BindRepeating(&WorkspacePinnedSectionView::OnHeaderPressed,
++                          base::Unretained(this))));
+   header_->set_context_menu_controller(this);
+   new_tab_button_ =
+       AddChildView(std::make_unique<VerticalNewTabButton>(browser_));
+@@ -1704,6 +1947,13 @@ void WorkspacePinnedSectionView::AddedTo
+               &WorkspacePinnedSectionView::OnCollapseChanged,
+               base::Unretained(this)));
+     }
++    // The fold (C15): a header pressed in any window folds the card in all.
++    pref_change_registrar_ = std::make_unique<PrefChangeRegistrar>();
++    pref_change_registrar_->Init(profile->GetPrefs());
++    pref_change_registrar_->Add(
++        workspaces::prefs::kHeliumWorkspacesPinsFolded,
++        base::BindRepeating(&WorkspacePinnedSectionView::OnFoldPrefChanged,
++                            base::Unretained(this)));
+   }
+   paint_as_active_subscription_ =
+       GetWidget()->RegisterPaintAsActiveChangedCallback(base::BindRepeating(
+@@ -1815,7 +2065,10 @@ void WorkspacePinnedSectionView::Schedul
+ }
+ 
+ void WorkspacePinnedSectionView::ScheduleRowStates() {
+-  if (row_states_scheduled_) {
++  // Not while Open all runs (C17, B3): each page it opens would add its row's
++  // two buttons to the list in the widget, one layer walk each. Its end makes
++  // the rows again, off the widget.
++  if (row_states_scheduled_ || !open_all_id_.empty()) {
+     return;
+   }
+   row_states_scheduled_ = true;
+@@ -1878,11 +2131,17 @@ void WorkspacePinnedSectionView::Rebuild
+     favorites_glide_->Attach(strip ? strip->pinned_tabs_scroll_view()
+                                    : nullptr);
+   }
+-  // The dragged row is about to go, and with it the mouse release that would
+-  // end its drag: another window changed the pins, or the workspace changed.
+-  EndDrag();
++  // A drag goes on over the new rows (C8): a folder it held over opened, or
++  // another window changed the pins. Only its mark goes now; ResumeDrag(),
++  // at every way out of here, carries it on or ends it.
++  if (views::View* const indicator = drop_indicator_.view()) {
++    indicator->SetVisible(false);
++  }
++  base::ScopedClosureRunner resume_drag(base::BindOnce(
++      &WorkspacePinnedSectionView::ResumeDrag, base::Unretained(this)));
+   // Taken now, so a folder that is not drawn this time is not renamed later.
+   const std::string rename_id = std::exchange(rename_after_rebuild_, {});
++  const bool scroll_peek = std::exchange(scroll_folded_peek_, false);
+   // Whatever the rows turn out to be -- none included -- the tabs are judged
+   // again after them: a restart can bring pages whose item is gone, and the
+   // store's load is what arrives here (UpdateRowStates, ReadLinks).
+@@ -1932,6 +2191,20 @@ void WorkspacePinnedSectionView::Rebuild
+       drawn_pages_ += workspaces::pins::CountPages(root->children);
+     }
+   }
++  // C15: any row counts, an empty folder too -- a card of those, folded,
++  // could otherwise never unfold (M5).
++  has_rows_ = !roots.empty();
++  folded_ = has_rows_ &&
++            workspaces::prefs::IsPinsFolded(
++                browser_->GetProfile()->GetPrefs(), service->active_guid());
++  // A fold the card outlived -- its last row unpinned, deleted or moved away
++  // -- is forgotten, so the next pinned page is not born hidden (review).
++  // Only from a loaded, writable file: a card still loading is not empty.
++  if (shown && !has_rows_ && store_ && store_->loaded() &&
++      !store_->read_only()) {
++    workspaces::prefs::SetPinsFolded(browser_->GetProfile()->GetPrefs(),
++                                     service->active_guid(), false);
++  }
+   SetVisible(shown);
+   if (!shown) {
+     return;
+@@ -1952,6 +2225,8 @@ void WorkspacePinnedSectionView::Rebuild
+       break;
+     }
+   }
++  views::AsViewClass<WorkspaceHeaderView>(header_.get())
++      ->SetFolded(has_rows_, folded_);
+   LOG(INFO) << "[workspaces] pins: header '" << drawn_guid_ << "'";
+   // The bar's + has New tab in the column, which has no room for a title.
+   new_tab_button_->SetVisible(!collapsed_);
+@@ -1978,29 +2253,54 @@ void WorkspacePinnedSectionView::Rebuild
+   list->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(kCardPadding, 0)));
+   list->SetBackground(CardBackground());
+   const bool frame_active = IsFrameActive();
+-  size_t rows = 0;
+-  for (const PinNode* root : roots) {
+-    rows += AddRow(*list, *root, /*level=*/0, frame_active);
+-  }
+   // After drawn_guid_ is set (above): ReadLinks may unlink a tab, which tells
+   // the workspace callbacks at once (design review).
+   const Links links = ReadLinks();
+-  SyncPeek(*list, links);
++  size_t rows = 0;
++  if (folded_) {
++    // C15: folded, the card holds the page in front alone, as a peek row --
++    // its split's row for a split's page -- or there is no card, as with no
++    // rows (M4). SyncPeek would take it away: not run.
++    peek_id_ = FoldedPeekId(links);
++    if (!peek_id_.empty()) {
++      const PinNode* const split = SplitOfPage(store_->tree(), peek_id_);
++      rows = AddRow(*list, split ? *split : *store_->Find(peek_id_),
++                    /*level=*/0, frame_active, /*peek_at=*/0);
++    }
++  } else {
++    for (const PinNode* root : roots) {
++      rows += AddRow(*list, *root, /*level=*/0, frame_active);
++    }
++    SyncPeek(*list, links);
++  }
++  if (list->children().empty()) {
++    // Folded with no page in front (C15): no card. Logged all the same, the
++    // evidence the fold was drawn.
++    LOG(INFO) << "[workspaces] pins: drew 0 row(s) of '" << drawn_guid_
++              << "' in " << timer.Elapsed().InMilliseconds() << " ms";
++    return;
++  }
+   ApplyStates(*list, links);
+   // After the header.
+   list_ = AddChildViewAt(std::move(list), 1);
+   LOG(INFO) << "[workspaces] pins: drew " << rows << " row(s) of '"
+             << drawn_guid_ << "' in " << timer.Elapsed().InMilliseconds()
+             << " ms";
+-  if (focused_id.empty() && rename_id.empty()) {
++  // C15: a page brought to front while the card is folded has its one row
++  // scrolled into view, as an unfolded card's row is (review).
++  const bool scroll_folded = scroll_peek && folded_;
++  if (focused_id.empty() && rename_id.empty() && !scroll_folded) {
+     return;
+   }
+   // The new rows are not laid out yet -- every one at 0,0 -- and focusing one
+   // or opening the name box on one scrolls it into view: the list jumped to
+-  // its very top (E15d review). Laid out first, and only in these two cases.
++  // its very top (E15d review). Laid out first, and only in these cases.
+   if (views::Widget* const widget = GetWidget()) {
+     widget->LayoutRootViewIfNecessary();
+   }
++  if (scroll_folded) {
++    list_->children().front()->ScrollViewToVisible();
++  }
+   if (views::View* const row = RowFor(focused_id)) {
+     row->RequestFocus();
+   }
+@@ -2031,13 +2331,20 @@ void WorkspacePinnedSectionView::UpdateR
+       }
+     }
+   }
+-  if (list_) {
++  if (folded_) {
++    // C15: the folded card's one row follows the page in front -- made
++    // again, 0 or 1 row, cheap -- and SyncPeek leaves it alone (M4).
++    if (FoldedPeekId(links) != peek_id_) {
++      scroll_folded_peek_ = true;
++      ScheduleRebuild();
++    }
++  } else if (list_ && SyncPeek(*list_, links)) {
+     // The peek row first, so the scroll below finds it (C12): one row added
+     // or removed in place, never a rebuild per tab switch (design review).
+-    if (SyncPeek(*list_, links)) {
+-      preferred_height_.reset();
+-      PreferredSizeChanged();
+-    }
++    preferred_height_.reset();
++    PreferredSizeChanged();
++  }
++  if (list_) {
+     ApplyStates(*list_, links);
+   }
+   // The evidence that a restart brought the pages back as their rows.
+@@ -2292,6 +2599,50 @@ bool WorkspacePinnedSectionView::SyncPee
+   return true;
+ }
+ 
++std::string WorkspacePinnedSectionView::FoldedPeekId(const Links& links) const {
++  const std::string active_id =
++      links.active ? workspaces::PinItemForTab(links.active->GetContents())
++                   : std::string();
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (active_id.empty() || !links.open.contains(active_id) || !service ||
++      !store_) {
++    return std::string();
++  }
++  // Item against item, never a split's id (M4d): every row of this
++  // workspace's card, all the way down.
++  std::vector<const PinNode*> items;
++  for (const PinNode* const root : workspaces::pins::RootsForWorkspace(
++           store_->tree(), drawn_guid_, service->known_guids())) {
++    CollectItems(*root, items);
++  }
++  return std::ranges::contains(items, active_id, &PinNode::id)
++             ? active_id
++             : std::string();
++}
++
++void WorkspacePinnedSectionView::OnHeaderPressed() {
++  // A fold that hides nothing would hide the next pinned page (D9).
++  if (!has_rows_ || drawn_guid_.empty()) {
++    return;
++  }
++  // Every window follows, through the pref (Rebuild).
++  workspaces::prefs::SetPinsFolded(browser_->GetProfile()->GetPrefs(),
++                                   drawn_guid_, !folded_);
++  LOG(INFO) << "[workspaces] pins: " << (folded_ ? "unfolded" : "folded")
++            << " '" << drawn_guid_ << "'";
++}
++
++void WorkspacePinnedSectionView::OnFoldPrefChanged() {
++  // Another workspace's fold would make this window draw its 1,313 rows
++  // again for nothing (review).
++  if ((has_rows_ && workspaces::prefs::IsPinsFolded(
++                        browser_->GetProfile()->GetPrefs(), drawn_guid_)) !=
++      folded_) {
++    ScheduleRebuild();
++  }
++}
++
+ void WorkspacePinnedSectionView::OnFolderPressed(const std::string& id) {
+   if (store_) {
+     store_->ToggleFolder(id);
+@@ -2380,7 +2731,8 @@ void WorkspacePinnedSectionView::OnItemR
+ // static
+ void WorkspacePinnedSectionView::OpenItem(BrowserWindowInterface* browser,
+                                           const PinNode& item,
+-                                          std::string_view guid) {
++                                          std::string_view guid,
++                                          bool select) {
+   const GURL url(item.url);
+   if (!url.is_valid()) {
+     LOG(WARNING) << "[workspaces] pins: item '" << item.id
+@@ -2415,7 +2767,7 @@ void WorkspacePinnedSectionView::OpenIte
+   chrome::AddRestoredTab(
+       browser, base::span_from_ref(navigation), model->count(),
+       /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
+-      /*group=*/std::nullopt, /*select=*/true, /*pin=*/false,
++      /*group=*/std::nullopt, select, /*pin=*/false,
+       base::TimeTicks::Now(), base::Time::Now(),
+       /*storage_namespace=*/nullptr, sessions::SerializedUserAgentOverride(),
+       extra_data, /*from_session_restore=*/false,
+@@ -2427,11 +2779,12 @@ void WorkspacePinnedSectionView::OpenIte
+ // static
+ void WorkspacePinnedSectionView::OpenSplit(BrowserWindowInterface* browser,
+                                            const PinNode& split,
+-                                           std::string_view guid) {
++                                           std::string_view guid,
++                                           bool select) {
+   TabStripModel* const model = browser->GetTabStripModel();
+   for (const PinNode& page : split.children) {
+     if (!LinkedTab(model, page.id)) {
+-      OpenItem(browser, page, guid);
++      OpenItem(browser, page, guid, select);
+     }
+   }
+   tabs::TabInterface* const left = LinkedTab(model, split.children[0].id);
+@@ -2676,6 +3029,219 @@ void WorkspacePinnedSectionView::ShowDel
+       ->Show();
+ }
+ 
++void WorkspacePinnedSectionView::MoveRow(const std::string& id,
++                                         const std::string& guid) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || !store_ ||
++      workspaces::ResolveTabGuid(guid, service->known_guids()) != guid) {
++    return;
++  }
++  const PinNode* const row = store_->Find(id);
++  if (!row) {
++    return;
++  }
++  // Copied now: Move replaces the tree (M1).
++  const ItemIds ids = ItemIdsUnder(*row);
++  // Their open pages, one walk of each window's tabs.
++  std::vector<
++      std::pair<BrowserWindowInterface*, std::vector<tabs::TabInterface*>>>
++      pages;
++  for (BrowserWindowInterface* const window :
++       WindowsOf(browser_->GetProfile())) {
++    if (std::vector<tabs::TabInterface*> tabs =
++            PagesOf(window->GetTabStripModel(), ids);
++        !tabs.empty()) {
++      pages.emplace_back(window, std::move(tabs));
++    }
++  }
++  // Last in the target, after its last row DRAWN -- PinTabs' end, below a
++  // deleted workspace's rows in Home (B8, D1). The target stays as it is,
++  // folded or not.
++  const std::vector<const PinNode*> roots = workspaces::pins::RootsForWorkspace(
++      store_->tree(), guid, service->known_guids());
++  const std::string after = roots.empty() ? std::string() : roots.back()->id;
++  if (!store_->Move(id, guid, after, Where::kAfter)) {
++    LOG(WARNING) << "[workspaces] pins: could not move '" << id
++                 << "' to workspace '" << guid << "'";
++    return;
++  }
++  // The pages follow their rows, as a Today tab moves (the owner): pinned
++  // pages and hidden ones too, which MoveTabsToWorkspace skips (B1).
++  int moved = 0;
++  for (const auto& [window, tabs] : pages) {
++    if (workspaces::WorkspaceService* const there =
++            workspaces::WorkspaceService::From(window)) {
++      moved += there->RetagPinItemPages(tabs, guid);
++    }
++  }
++  LOG(INFO) << "[workspaces] pins: moved '" << id << "' to workspace '"
++            << guid << "', " << moved << " open page(s) with it";
++}
++
++void WorkspacePinnedSectionView::ShowOpenAllConfirm(const std::string& id,
++                                                    int pages) {
++  // Logged as Delete folder's confirm is, so a test can tell "asked, then
++  // cancelled" from "never asked".
++  LOG(INFO) << "[workspaces] confirm asked: open all of folder '" << id
++            << "', " << pages << " page(s)";
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(l10n_util::GetPluralStringFUTF16(
++              IDS_HELIUM_PINNED_FOLDER_CONFIRM_OPEN_ALL, pages))
++          .AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(
++              IDS_HELIUM_PINNED_FOLDER_CONFIRM_OPEN_ALL_BODY)))
++          .AddOkButton(
++              base::BindOnce(&WorkspacePinnedSectionView::StartOpenAll,
++                             weak_factory_.GetWeakPtr(), id),
++              ui::DialogModel::Button::Params().SetLabel(
++                  l10n_util::GetStringUTF16(
++                      IDS_HELIUM_PINNED_FOLDER_OPEN_ALL)))
++          .AddCancelButton(base::BindOnce(
++              [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), this, views::BubbleBorder::TOP_LEFT);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
++void WorkspacePinnedSectionView::StartOpenAll(const std::string& id) {
++  // One at a time: a second Open all while one runs does nothing.
++  const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
++  if (!open_all_id_.empty()) {
++    LOG(INFO) << "[workspaces] pins: open all of folder '" << id
++              << "' refused: one is running";
++    return;
++  }
++  if (!folder || drawn_guid_.empty()) {
++    return;
++  }
++  // Computed again: the confirm may have waited while pages opened.
++  std::vector<const PinNode*> units;
++  CollectClosedUnits(*folder, OpenItemIds(WindowsOf(browser_->GetProfile())),
++                     units);
++  if (units.empty()) {
++    return;
++  }
++  open_all_units_.clear();
++  for (const PinNode* const unit : units) {
++    open_all_units_.push_back(*unit);
++  }
++  open_all_next_ = 0;
++  open_all_id_ = id;
++  // In the folder's workspace whatever the window shows by the last slice.
++  open_all_guid_ = drawn_guid_;
++  open_all_pages_ = 0;
++  open_all_timer_ = base::ElapsedTimer();
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspacePinnedSectionView::OpenAllSlice,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void WorkspacePinnedSectionView::OpenAllSlice() {
++  // A window closing takes the rest with it.
++  TabStripModel* const model = browser_->GetTabStripModel();
++  const bool closing = browser_->IsDeleteScheduled() || model->closing_all();
++  if (!closing) {
++    // The strip lays out once after the slice, not once per tab (patch 37).
++    workspaces::ScopedBulkLayout bulk;
++    // A page opened meanwhile -- its row pressed -- is not opened twice.
++    const ItemIds open_here = OpenItemIds({browser_.get()});
++    // The folder as it is NOW (review): deleted, or moved to another
++    // workspace -- here or in another window -- and the run ends; a unit
++    // unpinned, deleted or moved out of it since is skipped.
++    const PinNode* const folder = store_ ? store_->Find(open_all_id_) : nullptr;
++    const workspaces::WorkspaceService* const service =
++        workspaces::WorkspaceService::From(browser_);
++    ItemIds in_folder;
++    if (folder && service &&
++        std::ranges::any_of(
++            workspaces::pins::RootsForWorkspace(store_->tree(), open_all_guid_,
++                                                service->known_guids()),
++            [this](const PinNode* root) {
++              return root->id == open_all_id_ ||
++                     HoldsRow(root->children, open_all_id_);
++            })) {
++      in_folder = ItemIdsUnder(*folder);
++    } else if (open_all_next_ < open_all_units_.size()) {
++      LOG(INFO) << "[workspaces] pins: open all of folder '" << open_all_id_
++                << "' stopped: the folder changed";
++      open_all_next_ = open_all_units_.size();
++    }
++    const base::ElapsedTimer slice;
++    bool first = true;
++    while (open_all_next_ < open_all_units_.size() &&
++           (first || slice.Elapsed() < kOpenAllSlice)) {
++      first = false;
++      const PinNode& unit = open_all_units_[open_all_next_++];
++      const std::vector<std::string> pages = PageIds(unit);
++      if (std::ranges::any_of(pages,
++                              [&](const std::string& page) {
++                                return open_here.contains(page) ||
++                                       !in_folder.contains(page);
++                              })) {
++        continue;
++      }
++      if (unit.type == PinNode::Type::kSplit) {
++        OpenSplit(browser_, unit, open_all_guid_, /*select=*/false);
++      } else {
++        OpenItem(browser_, unit, open_all_guid_, /*select=*/false);
++      }
++      open_all_pages_ += static_cast<int>(pages.size());
++    }
++    if (open_all_next_ < open_all_units_.size()) {
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&WorkspacePinnedSectionView::OpenAllSlice,
++                                    weak_factory_.GetWeakPtr()));
++      return;
++    }
++  }
++  LOG(INFO) << "[workspaces] pins: opened " << open_all_pages_
++            << " page(s) of folder '" << open_all_id_ << "' in "
++            << open_all_timer_.Elapsed().InMilliseconds() << " ms";
++  open_all_units_.clear();
++  open_all_id_.clear();
++  // The rows and their states, made again off the widget (B3).
++  ScheduleRebuild();
++}
++
++void WorkspacePinnedSectionView::CloseAll(const std::string& id) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
++  if (!service || !folder) {
++    return;
++  }
++  // An Open all running on this folder, on one inside it or on one holding
++  // it stops first: Close all changes nothing a slice could see (review).
++  if (!open_all_id_.empty()) {
++    const PinNode* const opening = store_->Find(open_all_id_);
++    if (open_all_id_ == id || HoldsRow(folder->children, open_all_id_) ||
++        (opening && HoldsRow(opening->children, id))) {
++      LOG(INFO) << "[workspaces] pins: open all of folder '" << open_all_id_
++                << "' stopped by Close all";
++      open_all_next_ = open_all_units_.size();
++    }
++  }
++  // This window's pages, as the row's x closes this window's (D4).
++  const std::vector<tabs::TabInterface*> pages =
++      PagesOf(browser_->GetTabStripModel(), ItemIdsUnder(*folder));
++  int asked = 0;
++  {
++    workspaces::ScopedBulkLayout bulk;
++    for (tabs::TabInterface* const tab : pages) {
++      asked += service->ClosePinItemPage(tab, "Close all") ? 1 : 0;
++    }
++  }
++  // Asked, not yet closed: a page with an unload handler answers later, and
++  // one that asks "Leave site?" may be kept -- each close is logged as it
++  // happens (B13, review).
++  LOG(INFO) << "[workspaces] pins: closing " << asked << " page(s) of folder '"
++            << id << "'";
++}
++
+ views::View* WorkspacePinnedSectionView::RowFor(std::string_view id) const {
+   if (!list_) {
+     return nullptr;
+@@ -2822,6 +3388,10 @@ void WorkspacePinnedSectionView::PinTabs
+     LOG(INFO) << "[workspaces] pins: pinned "
+               << (pages.size() == 2 ? "a split" : "a tab") << " as item '"
+               << id << "' " << WhereName(where) << " '" << after << "'";
++    // Never behind a fold, whatever the door -- the tab menu, Shift+Alt+D, a
++    // drop (C15, review): a background tab pinned there would vanish.
++    workspaces::prefs::SetPinsFolded(profile->GetPrefs(),
++                                     service->active_guid(), false);
+     after = id;
+     where = Where::kAfter;
+   }
+@@ -2974,7 +3544,7 @@ void WorkspacePinnedSectionView::OnRowDr
+     UpdateDrag();
+     return;
+   }
+-  // A drag ended by a rebuild (EndDrag) has nothing left to drop.
++  // A drag ended (EndDrag, ResumeDrag) has nothing left to drop.
+   const DropTarget target = step == DragStep::kDrop && drag_id_ == id
+                                 ? TargetAt(point_in_screen)
+                                 : DropTarget();
+@@ -2987,6 +3557,11 @@ void WorkspacePinnedSectionView::OnRowDr
+   } else if (target.list_index) {
+     UnpinItem(id, *target.list_index, target.list_group);
+   }
++  // C8: a folder the drag opened closes again unless the drop went into it;
++  // nothing is kept for a drop in the list, a cancel or no place at all.
++  CloseHoverOpened(store_ ? KeptFolders(store_->tree(), target.to,
++                                        target.where)
++                          : std::vector<std::string>());
+ }
+ 
+ void WorkspacePinnedSectionView::UpdateDrag() {
+@@ -3010,6 +3585,37 @@ void WorkspacePinnedSectionView::UpdateD
+   }
+   const DropTarget target =
+       dragging_tabs_ ? TabTargetAt(drag_point_) : TargetAt(drag_point_);
++  // C8: what a held drag would open -- a closed folder it would go into (the
++  // peek row under one included, RowTargetAt), not too big to bury the place
++  // (B6); or, for tabs, the header of a folded card (D13).
++  std::string hover;
++  if (target.where == Where::kInto) {
++    const auto* const row = views::AsViewClass<PinRow>(RowFor(target.to));
++    const PinNode* const folder = store_ ? store_->Find(target.to) : nullptr;
++    if (row && row->folder() && !row->open() && !row->peek() && folder &&
++        workspaces::pins::CountPages(folder->children) <= kHoverOpenMaxPages) {
++      hover = target.to;
++    }
++  } else if (folded_ && dragging_tabs_ && target.to.empty() &&
++             !target.indicator.IsEmpty()) {
++    hover = kUnfoldTarget;
++  }
++  // A new place, or the pointer moved on, starts the wait again; a scroll
++  // under a still pointer does not.
++  if (hover != hover_id_ ||
++      std::abs(drag_point_.x() - hover_point_.x()) > kHoverSlop ||
++      std::abs(drag_point_.y() - hover_point_.y()) > kHoverSlop) {
++    hover_id_ = hover;
++    hover_point_ = drag_point_;
++    hover_timer_.Stop();
++    if (!hover.empty()) {
++      // Unretained: the timer is a member, stopped with this view.
++      hover_timer_.Start(
++          FROM_HERE, kHoverOpenDelay,
++          base::BindOnce(&WorkspacePinnedSectionView::OnHoverOpen,
++                         base::Unretained(this)));
++    }
++  }
+   indicator->SetVisible(!target.indicator.IsEmpty());
+   if (target.indicator.IsEmpty()) {
+     return;
+@@ -3026,6 +3632,7 @@ void WorkspacePinnedSectionView::UpdateD
+ }
+ 
+ void WorkspacePinnedSectionView::BeginDrag() {
++  drag_guid_ = drawn_guid_;
+   if (views::ScrollView* const scroll_view = GetScrollView()) {
+     drag_scrolled_subscription_ =
+         scroll_view->AddContentsScrolledCallback(base::BindRepeating(
+@@ -3040,6 +3647,8 @@ void WorkspacePinnedSectionView::EndDrag
+   drag_id_.clear();
+   dragging_tabs_ = false;
+   drag_scrolled_subscription_ = {};
++  hover_timer_.Stop();
++  hover_id_.clear();
+   if (views::ScrollView* const scroll_view = GetScrollView()) {
+     drag_scroll_.StopScrolling(*scroll_view);
+   }
+@@ -3048,6 +3657,88 @@ void WorkspacePinnedSectionView::EndDrag
+   }
+ }
+ 
++void WorkspacePinnedSectionView::OnHoverOpen() {
++  // The rows are made again through the store's or the pref's observer,
++  // posted; ResumeDrag() carries the drag on over them.
++  const std::string id = std::exchange(hover_id_, {});
++  if (id == kUnfoldTarget) {
++    workspaces::prefs::SetPinsFolded(browser_->GetProfile()->GetPrefs(),
++                                     drawn_guid_, false);
++    hover_unfolded_ = true;
++    LOG(INFO) << "[workspaces] pins: a drag unfolded '" << drawn_guid_ << "'";
++    return;
++  }
++  // It STAYS open, a real open, until the drop decides (CloseHoverOpened).
++  if (store_ && store_->SetFolderOpen(id, true) &&
++      !std::ranges::contains(hover_opened_, id)) {
++    hover_opened_.push_back(id);
++    LOG(INFO) << "[workspaces] pins: a drag opened folder '" << id << "'";
++  }
++}
++
++void WorkspacePinnedSectionView::ResumeDrag() {
++  views::Widget* const widget = GetWidget();
++  if (dragging_tabs_) {
++    // A workspace switch under the drag: its tabs were judged for the one it
++    // began in (M8).
++    if (drawn_guid_ != drag_guid_ || !widget) {
++      EndDrag();
++      CloseHoverOpened({});
++      return;
++    }
++    // Laid out first: the new rows sit at 0,0 until then (M3).
++    widget->LayoutRootViewIfNecessary();
++    UpdateDrag();
++    return;
++  }
++  if (drag_id_.empty()) {
++    return;
++  }
++  // The dragged row's new self -- never a peek row, nor a collapsed one, which
++  // are not dragged (M2). The old row went with the old list: the root view
++  // let go of it with no capture lost, while the window kept the mouse.
++  PinRow* row = nullptr;
++  for (size_t i = 0; list_ && !row && i < list_->children().size(); ++i) {
++    auto* const pin_row =
++        views::AsViewClass<PinRow>(list_->children()[i].get());
++    if (pin_row->id() == drag_id_ && !pin_row->peek()) {
++      row = pin_row;
++    }
++  }
++  if (!row || collapsed_ || !widget || !widget->HasCapture() ||
++      !row->TakeDrag()) {
++    EndDrag();
++    CloseHoverOpened({});
++    return;
++  }
++  widget->SetCapture(row);
++  LOG(INFO) << "[workspaces] pins: the drag goes on over the rebuilt rows";
++  widget->LayoutRootViewIfNecessary();
++  UpdateDrag();
++}
++
++void WorkspacePinnedSectionView::CloseHoverOpened(
++    const std::vector<std::string>& kept) {
++  int closed = 0;
++  for (const std::string& id : std::exchange(hover_opened_, {})) {
++    if (!std::ranges::contains(kept, id) && store_ &&
++        store_->SetFolderOpen(id, false)) {
++      ++closed;
++    }
++  }
++  if (closed > 0) {
++    LOG(INFO) << "[workspaces] pins: closed " << closed
++              << " folder(s) a drag had opened";
++  }
++  // The card it unfolded, in the workspace the drag began in.
++  if (std::exchange(hover_unfolded_, false) && kept.empty()) {
++    workspaces::prefs::SetPinsFolded(browser_->GetProfile()->GetPrefs(),
++                                     drag_guid_, true);
++    LOG(INFO) << "[workspaces] pins: a drag folded '" << drag_guid_
++              << "' again";
++  }
++}
++
+ WorkspacePinnedSectionView::DropTarget WorkspacePinnedSectionView::TargetAt(
+     const gfx::Point& point_in_screen) {
+   // Only where the list is on screen: not over the favorites above it, the
+@@ -3073,9 +3764,11 @@ WorkspacePinnedSectionView::DropTarget W
+   if (!InZone(point_in_screen)) {
+     return DropTarget();
+   }
+-  if (!list_) {
++  if (!list_ || folded_) {
+     // An empty section (C24): the tab becomes its first pinned page, marked by
+-    // a line under the header.
++    // a line under the header. A folded one the same (C15): its last, at
++    // PinTabs' end -- never beside the folded card's one row, whose place is
++    // somewhere unseen (B5, M4).
+     DropTarget first;
+     first.where = Where::kAfter;
+     const int x = kCardMargin + kRowInset;
+@@ -3313,10 +4006,14 @@ TabDragContext* WorkspacePinnedSectionVi
+ void WorkspacePinnedSectionView::OnTabDragExited(
+     const gfx::Point& point_in_screen) {
+   EndDrag();
++  // C8: nothing dropped here; what the drag opened closes again.
++  CloseHoverOpened({});
+ }
+ 
+ void WorkspacePinnedSectionView::OnTabDragEnded() {
+   EndDrag();
++  // After a drop here, HandleTabDrop has closed them already.
++  CloseHoverOpened({});
+ }
+ 
+ bool WorkspacePinnedSectionView::CanDropTab() {
+@@ -3344,6 +4041,13 @@ void WorkspacePinnedSectionView::HandleT
+   if (target.where == Where::kInto && store_) {
+     store_->SetFolderOpen(target.to, true);
+   }
++  // Onto a folded card, PinTabs unfolded it (C15, B5).
++  // C8: the folders holding the drop stay open; the card the drag unfolded
++  // stays so -- the drop is in it.
++  hover_unfolded_ = false;
++  CloseHoverOpened(store_ ? KeptFolders(store_->tree(), target.to,
++                                        target.where)
++                          : std::vector<std::string>());
+ }
+ 
+ base::CallbackListSubscription
+@@ -3430,6 +4134,30 @@ void WorkspacePinnedSectionView::ShowCon
+     // "Rename workspace" (the owner's check of E15d.1).
+     context_menu_model_->AddItemWithStringId(kCommandRename,
+                                              IDS_BOOKMARKS_RENAME);
++    // C3: to any other workspace, as a Today tab's menu has it (D2); built
++    // like the Colour submenu, after the menu that points at it.
++    const workspaces::WorkspaceService* const service =
++        workspaces::WorkspaceService::From(browser_);
++    if (const std::vector<workspaces::prefs::WorkspaceEntry> entries =
++            service ? service->GetWorkspaces()
++                    : std::vector<workspaces::prefs::WorkspaceEntry>();
++        entries.size() > 1) {
++      workspace_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++      menu_workspace_guids_.clear();
++      for (const workspaces::prefs::WorkspaceEntry& entry : entries) {
++        const int command = kCommandFirstWorkspace +
++                            static_cast<int>(menu_workspace_guids_.size());
++        if (command > kCommandLastWorkspace) {
++          break;
++        }
++        workspace_menu_model_->AddItem(command,
++                                       WorkspaceRailView::DisplayName(entry));
++        menu_workspace_guids_.push_back(entry.guid);
++      }
++      context_menu_model_->AddSubMenuWithStringId(
++          kCommandMoveToWorkspace, IDS_HELIUM_PINNED_MOVE_TO_WORKSPACE,
++          workspace_menu_model_.get());
++    }
+     // Not on a peek row (C12): its place is inside the closed folder, where a
+     // new folder would land unseen (design review).
+     if (!row->peek()) {
+@@ -3454,6 +4182,43 @@ void WorkspacePinnedSectionView::ShowCon
+       context_menu_model_->AddSubMenuWithStringId(
+           kCommandColor, IDS_HELIUM_WORKSPACE_EDIT_COLOR,
+           color_menu_model_.get());
++      // C17, each shown only when it can do something (D7). Which pages are
++      // open: one walk of every window's tabs (M6).
++      if (const PinNode* const folder =
++              store_ ? store_->Find(row->id()) : nullptr) {
++        std::vector<const PinNode*> items;
++        CollectItems(*folder, items);
++        std::vector<const PinNode*> closed;
++        CollectClosedUnits(*folder,
++                           OpenItemIds(WindowsOf(browser_->GetProfile())),
++                           closed);
++        const ItemIds open_here = OpenItemIds({browser_.get()});
++        // Not while one runs: it would do nothing (D7, review).
++        if (!closed.empty() && open_all_id_.empty()) {
++          context_menu_model_->AddItemWithStringId(
++              kCommandOpenAll, IDS_HELIUM_PINNED_FOLDER_OPEN_ALL);
++        }
++        if (std::ranges::any_of(items, [&open_here](const PinNode* item) {
++              return open_here.contains(item->id);
++            })) {
++          context_menu_model_->AddItemWithStringId(
++              kCommandCloseAll, IDS_HELIUM_PINNED_FOLDER_CLOSE_ALL);
++        }
++        if (folder->children.size() >= 2) {
++          context_menu_model_->AddItemWithStringId(
++              kCommandSort, IDS_HELIUM_PINNED_FOLDER_SORT);
++        }
++        // B2: the order Arc's folders keep, newest first, is the only record
++        // of when a page was added -- the sort can be taken back.
++        if (store_->CanUndoSort(folder->id)) {
++          context_menu_model_->AddItemWithStringId(
++              kCommandUndoSort, IDS_HELIUM_PINNED_FOLDER_UNDO_SORT);
++        }
++        if (!items.empty()) {
++          context_menu_model_->AddItemWithStringId(
++              kCommandCopyLinks, IDS_HELIUM_PINNED_FOLDER_COPY_LINKS);
++        }
++      }
+       context_menu_model_->AddItemWithStringId(kCommandDeleteFolder,
+                                                IDS_HELIUM_PINNED_FOLDER_DELETE);
+     } else {
+@@ -3498,6 +4263,15 @@ void WorkspacePinnedSectionView::Execute
+     }
+     return;
+   }
++  if (command_id >= kCommandFirstWorkspace &&
++      command_id <= kCommandLastWorkspace) {
++    const size_t index =
++        static_cast<size_t>(command_id - kCommandFirstWorkspace);
++    if (index < menu_workspace_guids_.size()) {
++      MoveRow(id, menu_workspace_guids_[index]);
++    }
++    return;
++  }
+   switch (command_id) {
+     case kCommandUnpin:
+       UnpinItem(id);
+@@ -3544,6 +4318,64 @@ void WorkspacePinnedSectionView::Execute
+       }
+       break;
+     }
++    case kCommandOpenAll: {
++      // Asks above 15 pages, with no cap (the owner); a split counts two.
++      const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
++      if (!folder || !open_all_id_.empty()) {
++        break;
++      }
++      std::vector<const PinNode*> units;
++      CollectClosedUnits(*folder,
++                         OpenItemIds(WindowsOf(browser_->GetProfile())), units);
++      int pages = 0;
++      for (const PinNode* const unit : units) {
++        pages += static_cast<int>(PageIds(*unit).size());
++      }
++      if (pages > kOpenAllAskAbove) {
++        ShowOpenAllConfirm(id, pages);
++      } else if (pages > 0) {
++        StartOpenAll(id);
++      }
++      break;
++    }
++    case kCommandCloseAll:
++      CloseAll(id);
++      break;
++    case kCommandSort: {
++      const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
++      const size_t rows = folder ? folder->children.size() : 0;
++      // The rule is the owner's (SortsBefore): the name drawn, one level.
++      if (folder && store_->SortFolder(id, &workspaces::archive::SortsBefore)) {
++        LOG(INFO) << "[workspaces] pins: sorted folder '" << id << "' ("
++                  << rows << " row(s))";
++      }
++      break;
++    }
++    case kCommandUndoSort:
++      if (store_ && store_->UndoSort(id)) {
++        LOG(INFO) << "[workspaces] pins: undid the sort of folder '" << id
++                  << "'";
++      }
++      break;
++    case kCommandCopyLinks: {
++      // Every page's address, sub-folders' too, in the order drawn, one per
++      // line: what a paste into a note wants (D6).
++      const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
++      if (!folder) {
++        break;
++      }
++      std::vector<const PinNode*> items;
++      CollectItems(*folder, items);
++      std::vector<std::u16string> links;
++      for (const PinNode* const item : items) {
++        links.push_back(base::UTF8ToUTF16(item->url));
++      }
++      ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
++          .WriteText(base::JoinString(links, u"\n"));
++      LOG(INFO) << "[workspaces] pins: copied " << links.size()
++                << " link(s) of folder '" << id << "'";
++      break;
++    }
+     default:
+       break;
+   }
+@@ -3557,6 +4389,18 @@ bool WorkspacePinnedSectionView::IsComma
+          command_id - kCommandFirstColor == FolderColor(*folder, drawn_color_);
+ }
+ 
++bool WorkspacePinnedSectionView::IsCommandIdEnabled(int command_id) const {
++  // The workspace on screen is where the row already is (D2). Every other
++  // command, a collapsed folder's pages' too, which share this delegate (M10).
++  if (command_id < kCommandFirstWorkspace ||
++      command_id > kCommandLastWorkspace) {
++    return true;
++  }
++  const size_t index = static_cast<size_t>(command_id - kCommandFirstWorkspace);
++  return index < menu_workspace_guids_.size() &&
++         menu_workspace_guids_[index] != drawn_guid_;
++}
++
+ bool WorkspacePinnedSectionView::IsFrameActive() const {
+   return GetWidget() ? GetWidget()->ShouldPaintAsActive() : true;
+ }
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -16,6 +16,8 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
++#include "base/timer/elapsed_timer.h"
++#include "base/timer/timer.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_drag_scroll_handler.h"
+@@ -31,6 +33,7 @@
+ #include "ui/views/view_tracker.h"
+ 
+ class BrowserWindowInterface;
++class PrefChangeRegistrar;
+ class VerticalNewTabButton;
+ 
+ namespace tabs {
+@@ -84,6 +87,11 @@ class ScrollView;
+ // as a column of icons (E17b, "E17 spec" 6): the header's symbol, then the
+ // top-level rows without titles -- a folder's press lists its pages -- and
+ // no "+ New Tab" (the bar's + has it); nothing is dragged there.
++//
++// Since patch 71: a row moves to another workspace (C3); a folder opens,
++// closes, sorts or copies the pages it holds (C17); the header folds the card
++// to the page in front (C15); and a drag held over a closed folder opens it
++// (C8).
+ class WorkspacePinnedSectionView
+     : public views::View,
+       public workspaces::pins::PinStore::Observer,
+@@ -140,6 +148,8 @@ class WorkspacePinnedSectionView
+   void ExecuteCommand(int command_id, int event_flags) override;
+   // The folder menu's Colour ticks the folder's colour as drawn (E17b).
+   bool IsCommandIdChecked(int command_id) const override;
++  // Move to workspace (C3): every workspace but the one on screen.
++  bool IsCommandIdEnabled(int command_id) const override;
+ 
+   // This section as the target of a tab drag at the point (E15d): over its
+   // header and the card (InZone), when every dragged tab can be pinned --
+@@ -260,6 +270,14 @@ class WorkspacePinnedSectionView
+   // The one rule for Rebuild and the state pass alike: adds or removes that one
+   // row in `list`, and answers whether it changed anything.
+   bool SyncPeek(views::View& list, const Links& links);
++  // C15: the item a folded card shows -- the page in front, when it is one of
++  // this workspace's pages, any depth (D10); empty for none.
++  std::string FoldedPeekId(const Links& links) const;
++  // The header pressed: folds or unfolds the card (C15), for every window.
++  void OnHeaderPressed();
++  // The fold pref changed, here or in another window: a rebuild only when
++  // the card this window draws is folded or unfolded by it (review).
++  void OnFoldPrefChanged();
+   void OnFolderPressed(const std::string& id);
+   // Collapsed, a folder's press: a menu of every page under it, by title,
+   // each opened as its row would be (E17b).
+@@ -270,18 +288,21 @@ class WorkspacePinnedSectionView
+   void OnItemPressed(const std::string& id);
+   void OnItemClosePressed(const std::string& id);
+   void OnItemResetPressed(const std::string& id);
+-  // Opens `item` as a tab of `browser`, active, linked to the item and
+-  // anchored at its address; tagged for workspace `guid` when one is given
+-  // (ShowItem), else stamped with the one on screen.
++  // Opens `item` as a tab of `browser`, active -- in the background, not
++  // loaded until shown, without `select` (C17's Open all) -- linked to the
++  // item and anchored at its address; tagged for workspace `guid` when one is
++  // given (ShowItem), else stamped with the one on screen.
+   static void OpenItem(BrowserWindowInterface* browser,
+                        const workspaces::pins::PinNode& item,
+-                       std::string_view guid = {});
++                       std::string_view guid = {},
++                       bool select = true);
+   // E19: opens whatever page of `split` is not open in `browser` (OpenItem),
+   // then makes its two pages one split view there, its left page on the
+   // left -- unless a page is in a split view with another tab.
+   static void OpenSplit(BrowserWindowInterface* browser,
+                         const workspaces::pins::PinNode& split,
+-                        std::string_view guid = {});
++                        std::string_view guid = {},
++                        bool select = true);
+   // ShowItem's road for a page of `split` (E19): in the window that has a page
+   // of it open, this one first, the missing page is opened -- in workspace
+   // `key`, the store's key for the split's rows, entered first -- the two are
+@@ -300,6 +321,16 @@ class WorkspacePinnedSectionView
+   // Removes an item, or a folder with all it holds, closing their pages.
+   void DeleteRow(const std::string& id);
+   void ShowDeleteFolderConfirm(const std::string& id, int items);
++  // C3: row `id` -- a folder with all it holds -- goes last in workspace
++  // `guid`, and its open pages, in every window, follow it there.
++  void MoveRow(const std::string& id, const std::string& guid);
++  // C17's folder actions. Open all asks first above kOpenAllAskAbove pages,
++  // then opens the folder's closed pages in posted slices (OpenAllSlice).
++  void ShowOpenAllConfirm(const std::string& id, int pages);
++  void StartOpenAll(const std::string& id);
++  void OpenAllSlice();
++  // Closes every page under folder `id` open in this window.
++  void CloseAll(const std::string& id);
+   // The row drawn for `id`, or null.
+   views::View* RowFor(std::string_view id) const;
+   // Asks for a new name in the rail's bubble, anchored to the row (E15d).
+@@ -335,6 +366,17 @@ class WorkspacePinnedSectionView
+   // Follows the list's scrolling until EndDrag().
+   void BeginDrag();
+   void EndDrag();
++  // C8: a drag held over a closed folder opens it, over a folded card's
++  // header unfolds it.
++  void OnHoverOpen();
++  // C8: run at every exit of Rebuild(), which no longer ends a drag: a tab
++  // drag goes on over the new rows, a row drag is handed to its new row --
++  // or either ends, when it cannot.
++  void ResumeDrag();
++  // C8: the folders a drag opened close again -- all but `kept`, those
++  // holding the drop's place -- and a card it unfolded folds again when
++  // nothing is kept (the owner).
++  void CloseHoverOpened(const std::vector<std::string>& kept);
+   DropTarget TargetAt(const gfx::Point& point_in_screen);
+   // Where dragged tabs would be pinned: among the rows only.
+   DropTarget TabTargetAt(const gfx::Point& point_in_screen);
+@@ -397,6 +439,15 @@ class WorkspacePinnedSectionView
+   int new_tab_row_height_;
+   // The rows are the collapsed strip's column of icons (E17b).
+   bool collapsed_ = false;
++  // The workspace has a row, of any kind (M5); and its card is folded (C15):
++  // the page in front, if it is one of its pages, is its only row.
++  bool has_rows_ = false;
++  bool folded_ = false;
++  // Watches the fold (C15), which is the profile's: every window follows.
++  std::unique_ptr<PrefChangeRegistrar> pref_change_registrar_;
++  // The folded card's row changed with the page in front: the next Rebuild()
++  // scrolls it into view (C15, review).
++  bool scroll_folded_peek_ = false;
+   // The item whose page was last seen active: its row is scrolled into view
+   // and its last-used time stamped once per activation, not per tab change.
+   std::string active_id_;
+@@ -427,6 +478,27 @@ class WorkspacePinnedSectionView
+   base::CallbackListSubscription drag_scrolled_subscription_;
+   // A tab drag holding this as its target lets go of it (TabDragTarget).
+   base::OnceClosureList will_destroy_callbacks_;
++  // The workspace on screen when the drag began: a tab drag kept across a
++  // rebuild ends when it changed (M8).
++  std::string drag_guid_;
++  // C8: what the drag is held over -- a closed folder's id, or kUnfoldTarget
++  // -- and where the pointer was when that began; the folders it opened, and
++  // whether it unfolded the card, for CloseHoverOpened().
++  base::OneShotTimer hover_timer_;
++  std::string hover_id_;
++  gfx::Point hover_point_;
++  std::vector<std::string> hover_opened_;
++  bool hover_unfolded_ = false;
++
++  // C17's Open all while it runs (empty `open_all_id_`: none): its rows to
++  // open -- copies, the store may change between slices -- the next one, the
++  // workspace they open in, and the pages opened so far, for the log.
++  std::vector<workspaces::pins::PinNode> open_all_units_;
++  size_t open_all_next_ = 0;
++  std::string open_all_id_;
++  std::string open_all_guid_;
++  int open_all_pages_ = 0;
++  base::ElapsedTimer open_all_timer_;
+ 
+   // In front of the list's scroll view from each Rebuild() until the section
+   // leaves its widget, or goes: its own destructor takes it off (E18).
+@@ -444,6 +516,10 @@ class WorkspacePinnedSectionView
+   // row is its own.
+   std::string context_menu_page_id_;
+   std::unique_ptr<ui::SimpleMenuModel> color_menu_model_;
++  // Move to workspace (C3): the submenu, declared before the menu that points
++  // at it, as the Colour one; and its workspaces' guids, by command.
++  std::unique_ptr<ui::SimpleMenuModel> workspace_menu_model_;
++  std::vector<std::string> menu_workspace_guids_;
+   std::vector<std::string> menu_page_ids_;
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
+   std::unique_ptr<views::MenuRunner> context_menu_runner_;

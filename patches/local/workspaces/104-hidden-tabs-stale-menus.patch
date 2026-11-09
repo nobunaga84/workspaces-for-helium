@@ -1,0 +1,334 @@
+--- a/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
+@@ -48,18 +48,23 @@ class ExistingBaseSubMenuModel : public
+   static constexpr int kMinSplitTabSwapMenuModelCommandId = 1801;
+   static constexpr int kMinSplitViewLayoutMenuModelCommandId = 1901;
+   static constexpr int kMinSplitTabMuteMenuModelCommandId = 2001;
+-  // Helium Workspaces. ExistingWorkspaceSubMenuModel does not derive from this
+-  // class, but it takes a range from this list anyway: the list is what stops
+-  // two submenus, or a submenu and its parent, from meaning different things
+-  // by the same id. Registered here so the next range added does not overlap
+-  // it.
+-  static constexpr int kMinExistingWorkspaceCommandId = 2101;
+   // Helium Workspaces: the anchor submenu (workspace_anchor_sub_menu_model.h),
+-  // three fixed items.
+-  static constexpr int kMinWorkspaceAnchorCommandId = 2201;
++  // three fixed items. Our submenus do not derive from this class, but they
++  // take ranges from this list anyway: the list is what stops two submenus,
++  // or a submenu and its parent, from meaning different things by the same
++  // id. Registered here so the next range added does not overlap them.
++  static constexpr int kMinWorkspaceAnchorCommandId = 2101;
+   // Helium Workspaces (C33): the snooze submenu
+   // (workspace_snooze_sub_menu_model.h), its hours and Custom...
+-  static constexpr int kMinWorkspaceSnoozeCommandId = 2301;
++  static constexpr int kMinWorkspaceSnoozeCommandId = 2201;
++  // Helium Workspaces: ExistingWorkspaceSubMenuModel, one item per workspace
++  // with no cap, so it takes the TOP range. Below the anchors it ran into them
++  // past 100 workspaces, and a menu sends a click to the first submenu, depth
++  // first, that holds the id (ui::MenuModel::GetModelAndIndexForCommandId):
++  // the 101st name anchored the tab (review 2, R2-ID). The next ids above in
++  // the tab menu are the extension items' (IDC_EXTENSIONS_CONTEXT_CUSTOM_FIRST,
++  // 49000), ~46,700 workspaces away.
++  static constexpr int kMinExistingWorkspaceCommandId = 2301;
+ 
+   ExistingBaseSubMenuModel(const ExistingBaseSubMenuModel&) = delete;
+   ExistingBaseSubMenuModel& operator=(const ExistingBaseSubMenuModel&) = delete;
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -512,11 +512,13 @@ void TabMenuModel::Build(int index) {
+         std::ranges::find(entries, service->active_guid(),
+                           &workspaces::prefs::WorkspaceEntry::guid);
+     if (!site.empty() && entry != entries.end()) {
++      const bool stop = service->WorkspaceOfSite(site) == entry->guid;
++      site_rule_site_ = site;
++      site_rule_guid_ = stop ? std::string() : entry->guid;
+       AddItem(TabStripModel::CommandSiteRule,
+               l10n_util::GetStringFUTF16(
+-                  service->WorkspaceOfSite(site) == entry->guid
+-                      ? IDS_HELIUM_WORKSPACE_STOP_SITE_RULE
+-                      : IDS_HELIUM_WORKSPACE_SITE_RULE,
++                  stop ? IDS_HELIUM_WORKSPACE_STOP_SITE_RULE
++                       : IDS_HELIUM_WORKSPACE_SITE_RULE,
+                   base::UTF8ToUTF16(site),
+                   ExistingWorkspaceSubMenuModel::DisplayName(*entry)));
+     }
+--- a/chrome/browser/ui/tabs/tab_menu_model.h
++++ b/chrome/browser/ui/tabs/tab_menu_model.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_UI_TABS_TAB_MENU_MODEL_H_
+ 
+ #include <memory>
++#include <string>
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -64,6 +65,13 @@ class TabMenuModel : public ui::SimpleMe
+   void ActivatedAt(size_t index) override;
+   void ActivatedAt(size_t index, int event_flags) override;
+ 
++  // Helium Workspaces (C5): what the "Always open <site> in ..." item said
++  // when the menu opened -- its site (empty when it is not shown), and the
++  // workspace it sends the site to, empty for "Stop always opening ...". Its
++  // command carries both, so a click does what the words said (R2-10).
++  const std::string& site_rule_site() const { return site_rule_site_; }
++  const std::string& site_rule_guid() const { return site_rule_guid_; }
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+   // Returns the `ContextMenuMatcher` managing the extension-provided menu
+   // items. This must be public because `TabContextMenuController`, which
+@@ -96,6 +104,8 @@ class TabMenuModel : public ui::SimpleMe
+   std::unique_ptr<ui::SimpleMenuModel> move_to_workspace_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> anchor_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> snooze_submenu_;
++  std::string site_rule_site_;
++  std::string site_rule_guid_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_group_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_window_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel>
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -1598,6 +1598,7 @@ void TabStripModel::ExtendSelectionTo(in
+         {tabs_to_append.begin(), tabs_to_append.end()});
+   }
+ 
++  workspaces::DropHiddenTabs(delegate_.get(), new_model);
+   SetSelection(new_model, TabStripModelObserver::CHANGE_REASON_NONE,
+                /*triggered_by_other_operation=*/false);
+ }
+@@ -1700,6 +1701,7 @@ void TabStripModel::AddSelectionFromAnch
+     new_model.SetActiveTab(tab);
+   }
+ 
++  workspaces::DropHiddenTabs(delegate_.get(), new_model);
+   SetSelection(new_model, TabStripModelObserver::CHANGE_REASON_NONE,
+                /*triggered_by_other_operation=*/false);
+ }
+--- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
+@@ -36,6 +36,10 @@ constexpr int kToggleAnchor =
+     ExistingBaseSubMenuModel::kMinWorkspaceAnchorCommandId;
+ constexpr int kResetToAnchor = kToggleAnchor + 1;
+ constexpr int kReplaceAnchor = kToggleAnchor + 2;
++// Ranges that overlap route a click to the wrong submenu (R2-ID): checked here,
++// where this range's size is known.
++static_assert(kReplaceAnchor <
++              ExistingBaseSubMenuModel::kMinWorkspaceSnoozeCommandId);
+ 
+ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kTabTitleFieldId);
+ 
+@@ -155,7 +159,10 @@ WorkspaceAnchorSubMenuModel::WorkspaceAn
+     : ui::SimpleMenuModel(this),
+       browser_(browser),
+       tab_strip_(tab_strip),
+-      context_index_(context_index) {
++      // A null handle for an index not in the strip: every item disabled.
++      context_tab_(tab_strip->ContainsIndex(context_index)
++                       ? tab_strip->GetTabAtIndex(context_index)->GetHandle()
++                       : tabs::TabHandle()) {
+   const workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
+   const bool anchored = service && service->IsAnchored(ContextTab());
+@@ -176,9 +183,14 @@ bool WorkspaceAnchorSubMenuModel::Should
+   return service && service->IsEnabled();
+ }
+ 
++// The tab itself, not the index it had when the menu opened: the strip can
++// change under an open menu (a due tab archived, a snooze waking, a page's
++// window.close()), and the index then named the neighbour (R2-3). Null once
++// the tab closed or left this window.
+ tabs::TabInterface* WorkspaceAnchorSubMenuModel::ContextTab() const {
+-  return tab_strip_->ContainsIndex(context_index_)
+-             ? tab_strip_->GetTabAtIndex(context_index_)
++  tabs::TabInterface* const tab = context_tab_.Get();
++  return tab && tab_strip_->GetIndexOfTab(tab) != TabStripModel::kNoTab
++             ? tab
+              : nullptr;
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h
+@@ -6,15 +6,12 @@
+ #define CHROME_BROWSER_UI_TABS_WORKSPACE_ANCHOR_SUB_MENU_MODEL_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "ui/menus/simple_menu_model.h"
+ 
+ class BrowserWindowInterface;
+ class TabStripModel;
+ 
+-namespace tabs {
+-class TabInterface;
+-}
+-
+ // E11 "Rename tab": a tab-modal one-textfield dialog on `tab` that sets its
+ // custom title (empty restores the page's own). Declared here because this
+ // target is the one both the tab menu and the tab strip controller can reach;
+@@ -53,7 +50,7 @@ class WorkspaceAnchorSubMenuModel : publ
+ 
+   const raw_ptr<BrowserWindowInterface> browser_;
+   const raw_ptr<TabStripModel> tab_strip_;
+-  const int context_index_;
++  const tabs::TabHandle context_tab_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACE_ANCHOR_SUB_MENU_MODEL_H_
+--- a/chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.cc
+@@ -46,6 +46,9 @@ constexpr int kFirstHours =
+     ExistingBaseSubMenuModel::kMinWorkspaceSnoozeCommandId;
+ constexpr int kHourItems = static_cast<int>(std::size(kSnoozeHours));
+ constexpr int kCustom = kFirstHours + kHourItems;
++// Below the move submenu's range, which has no top (R2-ID).
++static_assert(kCustom <
++              ExistingBaseSubMenuModel::kMinExistingWorkspaceCommandId);
+ 
+ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSnoozeAmountFieldId);
+ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSnoozeUnitFieldId);
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
+@@ -47,6 +47,21 @@ base::RepeatingCallback<std::vector<tabs
+       base::Unretained(delegate), std::move(get_tabs));
+ }
+ 
++void DropHiddenTabs(const TabStripModelDelegate* delegate,
++                    tabs::TabStripModelSelectionState& selection) {
++  // Collected first: RemoveTabFromSelection() edits the set being walked.
++  std::vector<tabs::TabInterface*> hidden;
++  for (tabs::TabInterface* const tab : selection.selected_tabs()) {
++    if (tab != selection.active_tab() && tab != selection.anchor_tab() &&
++        !delegate->IsTabVisibleInActiveWorkspace(tab)) {
++      hidden.push_back(tab);
++    }
++  }
++  for (tabs::TabInterface* const tab : hidden) {
++    selection.RemoveTabFromSelection(tab);
++  }
++}
++
+ bool NewTabAtTopOfList(const TabStripModel& model, int* index) {
+   if ((*index >= 0 && *index <= model.count()) ||
+       (model.count() >= 1 &&
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
+@@ -21,6 +21,7 @@ class Range;
+ 
+ namespace tabs {
+ class TabInterface;
++class TabStripModelSelectionState;
+ }
+ 
+ // Helium Workspaces: what TabStripModel's workspace hooks do. Each hook there
+@@ -39,6 +40,16 @@ base::RepeatingCallback<std::vector<tabs
+     const TabStripModelDelegate* delegate,
+     base::RepeatingCallback<std::vector<tabs::TabInterface*>()> get_tabs);
+ 
++// ExtendSelectionTo and AddSelectionFromAnchorTo (review 2, R2-5): the range
++// they select holds every tab between its two ends in the model, and tabs keep
++// their place when they change workspace -- so another workspace's hidden tabs
++// were selected too, and every command on the selection took them along ("Add
++// tabs to new group" pulled them into the workspace on screen). Lets go of the
++// selected tabs this window does not draw, keeping the active tab (the one
++// clicked) and the anchor.
++void DropHiddenTabs(const TabStripModelDelegate* delegate,
++                    tabs::TabStripModelSelectionState& selection);
++
+ // AddTab, for a tab that is not a link's: true when it opens at the top of
+ // the list, as in Arc (E15c.1), with `index` set there. False, and `index`
+ // untouched, when the caller gave an index or Helium's "new tab next to the
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -723,15 +723,23 @@ std::string WorkspaceService::RuleWorksp
+   return std::ranges::contains(known_guids_, guid) ? guid : std::string();
+ }
+ 
+-void WorkspaceService::ToggleSiteRule(tabs::TabInterface* tab) {
++void WorkspaceService::ApplySiteRule(tabs::TabInterface* tab,
++                                     std::string_view shown_site,
++                                     std::string_view guid) {
+   const std::string site = RuleSiteOf(tab);
+   if (site.empty()) {
+     return;
+   }
+-  if (WorkspaceOfSite(site) == active_guid_) {
++  // A tab gone on to another site under the open menu, a sign-in hop (R2-10).
++  if (site != shown_site) {
++    LOG(INFO) << "[workspaces] site rule: refused, the tab's site changed";
++    return;
++  }
++  // What the words said, not the rules now: a "Stop ..." never adds a rule.
++  if (guid.empty()) {
+     RemoveSite(site);
+   } else {
+-    SetSiteWorkspace(site, active_guid_);
++    SetSiteWorkspace(site, guid);
+   }
+ }
+ 
+@@ -864,7 +872,8 @@ bool WorkspaceService::CanSnooze(tabs::T
+   // would dissolve it, and the page wake ungrouped (review #36).
+   return IsEnabled() && contents && !tab->IsPinned() && !tab->IsSplit() &&
+          !tab->GetGroup().has_value() && !IsAnchored(tab) &&
+-         PinItemForTab(contents).empty() && HasRestorableAddress(contents);
++         PinItemForTab(contents).empty() && HasRestorableAddress(contents) &&
++         IsTabVisible(tab);
+ }
+ 
+ int WorkspaceService::SnoozeTabs(const std::vector<tabs::TabInterface*>& tabs,
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -245,10 +245,15 @@ class WorkspaceService : public TabStrip
+   // the little window (D7) both ask.
+   std::string RuleWorkspaceForHost(std::string_view host) const;
+ 
+-  // C5, the tab menu's item: RuleSiteOf(tab) always opens in the workspace on
+-  // screen -- the tab's own, as the menu opens only on a tab drawn there (a
+-  // favorite in every one) -- or, when it already does, no longer by rule.
+-  void ToggleSiteRule(tabs::TabInterface* tab);
++  // C5, the tab menu's item, as its words said when the menu opened (R2-10):
++  // `shown_site` always opens in workspace `guid` -- the one on screen then,
++  // the tab's own, as the menu opens only on a tab drawn there (a favorite in
++  // every one) -- or, `guid` empty ("Stop always opening ..."), no longer by
++  // rule. Refused, logging "site rule: refused, the tab's site changed", when
++  // RuleSiteOf(tab) is no longer `shown_site`.
++  void ApplySiteRule(tabs::TabInterface* tab,
++                     std::string_view shown_site,
++                     std::string_view guid);
+ 
+   // Moves a workspace `offset` places along the list -- negative is earlier,
+   // positive is later -- changing the order the rail draws and the order
+@@ -648,7 +653,9 @@ class WorkspaceService : public TabStrip
+   // archived (ArchiveClosingTab), not an anchored tab, whose close resets it
+   // (E14a) and which this close would go round, not a split's half, which
+   // closes with its other half -- whose page the archive can give back (the
+-  // sweep's address rule: the tab must come back).
++  // sweep's address rule: the tab must come back). And only a tab of the
++  // workspace on screen: a Shift+click range of the strip held another
++  // workspace's hidden tabs (R2-4).
+   bool CanSnooze(tabs::TabInterface* tab) const;
+ 
+   // C33: closes those of `tabs` that CanSnooze(), each marked to wake at
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -565,12 +565,18 @@ void TabStripCollectionController::Execu
+     }
+     return;
+   }
+-  // C5: the clicked tab's site, by the window the tab is in now.
++  // C5: the clicked tab's site, by the window the tab is in now -- the site
++  // the open menu named (R2-10).
+   if (command_id == TabStripModel::CommandSiteRule) {
++    const TabMenuModel* const menu =
++        context_menu_controller_ ? context_menu_controller_->GetTabMenuModel()
++                                 : nullptr;
+     if (workspaces::WorkspaceService* const service =
+             workspaces::WorkspaceService::From(
+-                tab->GetBrowserWindowInterface())) {
+-      service->ToggleSiteRule(tab);
++                tab->GetBrowserWindowInterface());
++        service && menu) {
++      service->ApplySiteRule(tab, menu->site_rule_site(),
++                             menu->site_rule_guid());
+     }
+     return;
+   }

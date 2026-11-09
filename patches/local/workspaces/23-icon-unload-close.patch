@@ -1,0 +1,476 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -87,7 +87,9 @@ std::vector<WorkspaceEntry> ParseWorkspa
+     }
+ 
+     const std::string* const title = entry->FindString(kTitleKey);
+-    entries.push_back(WorkspaceEntry{*guid, title ? *title : std::string()});
++    const std::string* const icon = entry->FindString(kIconKey);
++    entries.push_back(WorkspaceEntry{*guid, title ? *title : std::string(),
++                                     icon ? *icon : std::string()});
+   }
+ 
+   if (entries.empty()) {
+@@ -133,6 +135,18 @@ std::vector<WorkspaceEntry> RenameWorksp
+   return entries;
+ }
+ 
++std::vector<WorkspaceEntry> SetWorkspaceIcon(std::vector<WorkspaceEntry> entries,
++                                             std::string_view guid,
++                                             std::string icon) {
++  for (WorkspaceEntry& entry : entries) {
++    if (entry.guid == guid) {
++      entry.icon = std::move(icon);
++      break;
++    }
++  }
++  return entries;
++}
++
+ std::vector<WorkspaceEntry> RemoveWorkspace(std::vector<WorkspaceEntry> entries,
+                                             std::string_view guid) {
+   // The default workspace cannot be removed. ParseWorkspaces() puts it back on
+@@ -197,6 +211,9 @@ base::DictValue SerializeWorkspaces(
+     if (!entry.title.empty()) {
+       item.Set(kTitleKey, entry.title);
+     }
++    if (!entry.icon.empty()) {
++      item.Set(kIconKey, entry.icon);
++    }
+     list.Append(std::move(item));
+   }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -56,6 +56,7 @@ inline constexpr char kItemsKey[] = "ite
+ // Keys inside one entry of kItemsKey.
+ inline constexpr char kGuidKey[] = "guid";
+ inline constexpr char kTitleKey[] = "title";
++inline constexpr char kIconKey[] = "icon";
+ 
+ // The schema this build writes, and the only one it is willing to interpret.
+ //
+@@ -70,6 +71,10 @@ inline constexpr int kSchemaVersion = 1;
+ struct WorkspaceEntry {
+   std::string guid;
+   std::string title;
++  // What the rail draws for this workspace in place of the title's first
++  // character -- an emoji, typed into the Change icon bubble (E11). Empty
++  // means "no icon", and an older build ignores the key (kSchemaVersion).
++  std::string icon;
+ };
+ 
+ void RegisterProfilePrefs(PrefRegistrySimple* registry);
+@@ -126,6 +131,9 @@ std::vector<WorkspaceEntry> AddWorkspace
+ std::vector<WorkspaceEntry> RenameWorkspace(std::vector<WorkspaceEntry> entries,
+                                             std::string_view guid,
+                                             std::string title);
++std::vector<WorkspaceEntry> SetWorkspaceIcon(std::vector<WorkspaceEntry> entries,
++                                             std::string_view guid,
++                                             std::string icon);
+ std::vector<WorkspaceEntry> RemoveWorkspace(std::vector<WorkspaceEntry> entries,
+                                             std::string_view guid);
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -395,6 +395,32 @@ TEST(WorkspaceWriteTest, RenameOfAnUnkno
+   EXPECT_EQ("Work", RenameWorkspace(TwoWorkspaces(), "gone", "X")[1].title);
+ }
+ 
++TEST(WorkspaceWriteTest, SetIconChangesOnlyTheIcon) {
++  const std::vector<WorkspaceEntry> after =
++      SetWorkspaceIcon(TwoWorkspaces(), "work", "\xF0\x9F\x9A\x80");
++
++  EXPECT_EQ(GuidsOf(TwoWorkspaces()), GuidsOf(after));
++  EXPECT_EQ("\xF0\x9F\x9A\x80", after[1].icon);
++  EXPECT_EQ("Work", after[1].title);
++  EXPECT_EQ("", after[0].icon);
++}
++
++// The icon rides the same entry as the title and comes back from the same
++// parse; an entry without one reads as "no icon", never as broken.
++TEST(WorkspaceWriteTest, IconRoundTripsThroughSerializeAndIsOptional) {
++  const std::vector<WorkspaceEntry> after = ParseWorkspaces(
++      SerializeWorkspaces(SetWorkspaceIcon(TwoWorkspaces(), "work", "*")));
++
++  ASSERT_EQ(2u, after.size());
++  EXPECT_EQ("", after[0].icon);
++  EXPECT_EQ("*", after[1].icon);
++  EXPECT_FALSE(SerializeWorkspaces(TwoWorkspaces())
++                   .FindList(kItemsKey)
++                   ->front()
++                   .GetDict()
++                   .contains(kIconKey));
++}
++
+ TEST(WorkspaceWriteTest, RemoveDropsTheNamedWorkspace) {
+   const std::vector<WorkspaceEntry> after =
+       RemoveWorkspace(TwoWorkspaces(), "work");
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -256,6 +256,12 @@ void WorkspaceService::RenameWorkspace(s
+       prefs_, prefs::RenameWorkspace(GetWorkspaces(), guid, title));
+ }
+ 
++void WorkspaceService::SetWorkspaceIcon(std::string_view guid,
++                                        const std::string& icon) {
++  prefs::WriteWorkspaces(
++      prefs_, prefs::SetWorkspaceIcon(GetWorkspaces(), guid, icon));
++}
++
+ void WorkspaceService::MoveWorkspace(std::string_view guid, int offset) {
+   // Guarded here for the same reason CreateWorkspace() is: one of the two
+   // callers is a keyboard command, which can fire while the feature is off and
+@@ -306,6 +312,14 @@ void WorkspaceService::DeleteWorkspace(s
+         RelativeWorkspaceGuid(known_guids_, active_guid_, /*offset=*/-1));
+   }
+ 
++  LOG(INFO) << "[workspaces] deleting workspace '" << guid << "'";
++  CloseWorkspaceTabs(guid);
++
++  prefs::WriteWorkspaces(prefs_,
++                         prefs::RemoveWorkspace(GetWorkspaces(), guid));
++}
++
++int WorkspaceService::CloseWorkspaceTabs(std::string_view guid) {
+   // Collected as handles before anything is closed, and re-resolved to an index
+   // on the way past. TabStripModel::CloseTabs() takes the whole set at once but
+   // is private, so these go one at a time through CloseWebContentsAt() -- and
+@@ -316,18 +330,19 @@ void WorkspaceService::DeleteWorkspace(s
+   std::vector<tabs::TabHandle> doomed;
+   for (int i = 0; i < tab_strip_->count(); ++i) {
+     tabs::TabInterface* tab = tab_strip_->GetTabAtIndex(i);
+-    if (tab && GuidOf(tab) == guid) {
++    if (tab && IsTabOfWorkspace(tab, guid)) {
+       doomed.push_back(tab->GetHandle());
+     }
+   }
+ 
+-  LOG(INFO) << "[workspaces] deleting workspace '" << guid << "' with "
+-            << doomed.size() << " tab(s) in this window";
++  LOG(INFO) << "[workspaces] closing " << doomed.size()
++            << " tab(s) of workspace '" << guid << "' in this window";
+ 
+   // CLOSE_CREATE_HISTORICAL_TAB so they land in Recently Closed. Each one still
+-  // carries the deleted guid in its session data, so reopening one resolves
+-  // through the orphan rule into the default workspace rather than into
+-  // nothing (workspace_stamping.h).
++  // carries its guid in its session data, so reopening one lands back in this
++  // workspace -- or, if the workspace was deleted meanwhile, resolves through
++  // the orphan rule into the default one (workspace_stamping.h).
++  int closed = 0;
+   for (const tabs::TabHandle& handle : doomed) {
+     tabs::TabInterface* const tab = handle.Get();
+     if (!tab) {
+@@ -337,11 +352,44 @@ void WorkspaceService::DeleteWorkspace(s
+     if (index != TabStripModel::kNoTab) {
+       tab_strip_->CloseWebContentsAt(
+           index, TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
++      ++closed;
+     }
+   }
++  return closed;
++}
+ 
+-  prefs::WriteWorkspaces(prefs_,
+-                         prefs::RemoveWorkspace(GetWorkspaces(), guid));
++int WorkspaceService::UnloadWorkspaceTabs(std::string_view guid, bool others) {
++  // Indices are stable across a discard -- the contents is replaced in place,
++  // nothing is inserted or removed -- so a forward index walk is safe here in
++  // a way it is not for CloseWorkspaceTabs above.
++  //
++  // The foreground tab is skipped by us and not left to the gate, because
++  // CommandDiscard invoked ON the foreground tab means "hibernate every other
++  // tab" (GetIndicesDiscardedByCommand), which is not the question asked. A
++  // selected background tab drags the whole selection through the command,
++  // foreground tab included; the gate declines that one for being visible.
++  // Pinned tabs carry no tag and belong to every workspace, so they are never
++  // "of" one and never "other" than one.
++  std::vector<int> candidates;
++  for (int i = 0; i < tab_strip_->count(); ++i) {
++    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
++    if (!tab || tab->IsPinned() || tab_strip_->IsTabInForeground(i)) {
++      continue;
++    }
++    if (IsTabOfWorkspace(tab, guid) == others) {
++      continue;
++    }
++    candidates.push_back(i);
++  }
++  // Logged BEFORE the discards, because a discard lands synchronously and
++  // the observer logs each one as "tab contents replaced": a line written
++  // afterwards reads as if the replacements caused the unload (LOCAL.md 31).
++  LOG(INFO) << "[workspaces] unload " << (others ? "all but" : "workspace")
++            << " '" << guid << "': asking " << candidates.size() << " tab(s)";
++  for (int i : candidates) {
++    tab_strip_->ExecuteContextMenuCommand(i, TabStripModel::CommandDiscard);
++  }
++  return static_cast<int>(candidates.size());
+ }
+ 
+ std::vector<tabs::TabInterface*> WorkspaceService::SelectedMovableTabs()
+@@ -997,6 +1045,12 @@ std::string WorkspaceService::GuidOf(tab
+   return tab ? WorkspaceGuidForTab(tab->GetContents()) : std::string();
+ }
+ 
++bool WorkspaceService::IsTabOfWorkspace(tabs::TabInterface* tab,
++                                        std::string_view guid) const {
++  return ResolveTabGuid(GuidOf(tab), known_guids_) ==
++         ResolveTabGuid(guid, known_guids_);
++}
++
+ void WorkspaceService::SetTag(content::WebContents* contents,
+                               std::string guid) {
+   if (!contents) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -144,6 +144,11 @@ class WorkspaceService : public TabStrip
+   // workspace acquires the title E7c deliberately did not give it.
+   void RenameWorkspace(std::string_view guid, const std::string& title);
+ 
++  // Sets what the rail draws for a workspace -- an emoji, typically -- or
++  // clears it with an empty string. Pref-only, like MoveWorkspace(): safe
++  // from anywhere.
++  void SetWorkspaceIcon(std::string_view guid, const std::string& icon);
++
+   // Moves a workspace `offset` places along the list -- negative is earlier,
+   // positive is later -- changing the order the rail draws and the order
+   // Shift+Alt+arrow cycles through. Does nothing at the ends of the list
+@@ -172,6 +177,26 @@ class WorkspaceService : public TabStrip
+   // ONLY CALL FROM A MENU OR COMMAND HANDLER: it closes tabs.
+   void DeleteWorkspace(std::string_view guid);
+ 
++  // Closes every tab of `guid` in this window with CLOSE_CREATE_HISTORICAL_TAB
++  // -- Ctrl+Shift+T is the undo -- and answers how many it closed. The
++  // workspace itself stays; DeleteWorkspace() is this plus the pref write.
++  // Closing out the active workspace leaves nothing on screen, and the removal
++  // path then spawns a fresh tab into it (EnsureActiveTabVisible, E9f).
++  //
++  // ONLY CALL FROM A MENU OR COMMAND HANDLER: it closes tabs.
++  int CloseWorkspaceTabs(std::string_view guid);
++
++  // Hibernates the tabs of `guid` -- or, with `others`, of every workspace
++  // except `guid` -- through Helium's own Hibernate command, one tab at a
++  // time, skipping pinned tabs and the foreground tab. Going through that
++  // command is the point: it is eligibility-gated, so a tab holding an unsaved
++  // form or playing audio stays awake, where the ungated discard anchors use
++  // would not. Answers how many tabs were asked; each one that actually sleeps
++  // is logged by the observer as "tab contents replaced".
++  //
++  // ONLY CALL FROM A MENU OR COMMAND HANDLER: it replaces WebContents.
++  int UnloadWorkspaceTabs(std::string_view guid, bool others);
++
+   // Moves the tabs the user has selected in this window into `guid`, and
+   // answers how many moved.
+   //
+@@ -339,6 +364,12 @@ class WorkspaceService : public TabStrip
+   // workspace" -- see IsVisibleInWorkspace.
+   std::string GuidOf(tabs::TabInterface* tab) const;
+ 
++  // Whether `tab` is drawn in workspace `guid` -- by the SAME resolution the
++  // render predicate uses (workspace_stamping.h): an empty tag and a tag
++  // naming a deleted workspace both mean the default one. Raw guid equality
++  // would skip exactly the tabs the user can see (E11 review).
++  bool IsTabOfWorkspace(tabs::TabInterface* tab, std::string_view guid) const;
++
+   // THE ONLY PLACE A TAG IS EVER WRITTEN. Every rule in this class -- insert,
+   // pin, unpin, group, split, contents replacement -- ends here, so that
+   // "membership changed" and "membership was written down" cannot drift apart.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -8,6 +8,7 @@
+ 
+ #include <memory>
+ #include <string>
++#include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+@@ -45,6 +46,10 @@ constexpr int kMenuCommandDelete = 2;
+ constexpr int kMenuCommandMoveTabsHere = 3;
+ constexpr int kMenuCommandMoveUp = 4;
+ constexpr int kMenuCommandMoveDown = 5;
++constexpr int kMenuCommandChangeIcon = 6;
++constexpr int kMenuCommandUnload = 7;
++constexpr int kMenuCommandUnloadOthers = 8;
++constexpr int kMenuCommandCloseAll = 9;
+ 
+ // What a workspace's button says.
+ //
+@@ -89,6 +94,18 @@ std::u16string DisplayNameForWorkspace(
+   return base::UTF8ToUTF16(entry.guid);
+ }
+ 
++// The entry a menu was opened on, or null if the list changed under it.
++const workspaces::prefs::WorkspaceEntry* FindEntry(
++    const std::vector<workspaces::prefs::WorkspaceEntry>& entries,
++    std::string_view guid) {
++  for (const workspaces::prefs::WorkspaceEntry& entry : entries) {
++    if (entry.guid == guid) {
++      return &entry;
++    }
++  }
++  return nullptr;
++}
++
+ // A rail button, with the one line that keeps it from crashing a DCHECK build.
+ //
+ // TopContainerButton's constructor calls SetPaintToLayer() and then
+@@ -224,8 +241,12 @@ void WorkspaceRailView::Rebuild() {
+   for (size_t i = 0; i < entries.size(); ++i) {
+     const std::u16string display_name = DisplayNameForWorkspace(entries[i]);
+ 
++    // An icon, when one has been set, replaces the first-character label
++    // outright; the full name stays in the tooltip either way.
+     auto button = MakeRailButton(
+-        LabelForWorkspace(display_name, i), display_name,
++        entries[i].icon.empty() ? LabelForWorkspace(display_name, i)
++                                : base::UTF8ToUTF16(entries[i].icon),
++        display_name,
+         base::BindRepeating(&WorkspaceRailView::OnWorkspacePressed,
+                             base::Unretained(this), entries[i].guid));
+     button->set_context_menu_controller(this);
+@@ -280,7 +301,8 @@ void WorkspaceRailView::OnWorkspacePress
+ 
+ void WorkspaceRailView::OnNewWorkspacePressed() {
+   ShowNameBubble(
+-      this, IDS_HELIUM_WORKSPACE_NEW, std::u16string(),
++      this, IDS_HELIUM_WORKSPACE_NEW, IDS_HELIUM_WORKSPACE_NAME_LABEL,
++      std::u16string(),
+       base::BindOnce(
+           [](base::WeakPtr<WorkspaceRailView> self,
+              const std::u16string& name) {
+@@ -330,6 +352,8 @@ void WorkspaceRailView::ShowContextMenuF
+ 
+   context_menu_model_->AddItemWithStringId(kMenuCommandRename,
+                                            IDS_HELIUM_WORKSPACE_RENAME);
++  context_menu_model_->AddItemWithStringId(kMenuCommandChangeIcon,
++                                           IDS_HELIUM_WORKSPACE_CHANGE_ICON);
+ 
+   // "Up" and "down" mean earlier and later in the list, which is left and
+   // right while the strip is expanded and the rail is drawn as a row, and
+@@ -346,6 +370,17 @@ void WorkspaceRailView::ShowContextMenuF
+   // every tab in the workspace, and it had been sitting directly under Rename
+   // when Rename was the only neighbour; putting two more one-word items
+   // against it makes a mis-click both likelier and more expensive.
++  // The three that act on the workspace's TABS (E11), in order of how much
++  // they take away: unloading keeps everything and can be undone by a click,
++  // closing keeps the workspace and can be undone by Ctrl+Shift+T.
++  context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  context_menu_model_->AddItemWithStringId(kMenuCommandUnload,
++                                           IDS_HELIUM_WORKSPACE_UNLOAD);
++  context_menu_model_->AddItemWithStringId(kMenuCommandUnloadOthers,
++                                           IDS_HELIUM_WORKSPACE_UNLOAD_OTHERS);
++  context_menu_model_->AddItemWithStringId(kMenuCommandCloseAll,
++                                           IDS_HELIUM_WORKSPACE_CLOSE_ALL);
++
+   context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   context_menu_model_->AddItemWithStringId(kMenuCommandDelete,
+                                            IDS_HELIUM_WORKSPACE_DELETE);
+@@ -367,6 +402,12 @@ bool WorkspaceRailView::IsCommandIdEnabl
+     return context_menu_guid_ != workspaces::kDefaultWorkspaceGuid;
+   }
+ 
++  // "Unload other workspaces" with nothing other is the same enabled-but-
++  // does-nothing item the rest of this function greys out.
++  if (command_id == kMenuCommandUnloadOthers) {
++    return guids_.size() > 1;
++  }
++
+   // Moving tabs into the workspace they are already in is a no-op, and an
+   // enabled item that does nothing is worse than a greyed one. Also disabled
+   // when the selection is all pinned tabs, since none of them would move.
+@@ -410,16 +451,13 @@ void WorkspaceRailView::ExecuteCommand(i
+ 
+   switch (command_id) {
+     case kMenuCommandRename: {
+-      std::u16string current;
+-      for (const workspaces::prefs::WorkspaceEntry& entry :
+-           service->GetWorkspaces()) {
+-        if (entry.guid == guid) {
+-          current = DisplayNameForWorkspace(entry);
+-          break;
+-        }
+-      }
++      const std::vector<workspaces::prefs::WorkspaceEntry> entries =
++          service->GetWorkspaces();
++      const workspaces::prefs::WorkspaceEntry* const entry =
++          FindEntry(entries, guid);
+       ShowNameBubble(
+-          this, IDS_HELIUM_WORKSPACE_RENAME, current,
++          this, IDS_HELIUM_WORKSPACE_RENAME, IDS_HELIUM_WORKSPACE_NAME_LABEL,
++          entry ? DisplayNameForWorkspace(*entry) : std::u16string(),
+           base::BindOnce(
+               [](base::WeakPtr<WorkspaceRailView> self, const std::string& guid,
+                  const std::u16string& name) {
+@@ -434,6 +472,43 @@ void WorkspaceRailView::ExecuteCommand(i
+               weak_factory_.GetWeakPtr(), guid));
+       break;
+     }
++    case kMenuCommandChangeIcon: {
++      // The same one-textfield bubble as Rename. Nothing here picks the
++      // emoji: Win+. (or the OS equivalent) types one into the field, which
++      // is what design 5 asks for and costs no picker of our own.
++      const std::vector<workspaces::prefs::WorkspaceEntry> entries =
++          service->GetWorkspaces();
++      const workspaces::prefs::WorkspaceEntry* const entry =
++          FindEntry(entries, guid);
++      ShowNameBubble(
++          this, IDS_HELIUM_WORKSPACE_CHANGE_ICON,
++          IDS_HELIUM_WORKSPACE_ICON_LABEL,
++          entry ? base::UTF8ToUTF16(entry->icon) : std::u16string(),
++          base::BindOnce(
++              [](base::WeakPtr<WorkspaceRailView> self, const std::string& guid,
++                 const std::u16string& icon) {
++                if (!self) {
++                  return;
++                }
++                if (workspaces::WorkspaceService* service =
++                        workspaces::WorkspaceService::From(self->browser_)) {
++                  service->SetWorkspaceIcon(guid, base::UTF16ToUTF8(icon));
++                }
++              },
++              weak_factory_.GetWeakPtr(), guid));
++      break;
++    }
++    case kMenuCommandUnload:
++      service->UnloadWorkspaceTabs(guid, /*others=*/false);
++      break;
++    case kMenuCommandUnloadOthers:
++      service->UnloadWorkspaceTabs(guid, /*others=*/true);
++      break;
++    case kMenuCommandCloseAll:
++      // Same no-confirmation reasoning as Delete below: every tab goes to
++      // Recently Closed with its tag, so Ctrl+Shift+T is the undo.
++      service->CloseWorkspaceTabs(guid);
++      break;
+     case kMenuCommandMoveTabsHere:
+       service->MoveSelectedTabsToWorkspace(guid);
+       break;
+@@ -457,6 +532,7 @@ void WorkspaceRailView::ExecuteCommand(i
+ void WorkspaceRailView::ShowNameBubble(
+     views::View* anchor,
+     int title_string_id,
++    int label_string_id,
+     const std::u16string& initial_text,
+     base::OnceCallback<void(const std::u16string&)> on_accept) {
+   auto delegate =
+@@ -472,7 +548,7 @@ void WorkspaceRailView::ShowNameBubble(
+           .AddCancelButton(base::DoNothing())
+           .AddTextfield(
+               kWorkspaceNameFieldId,
+-              l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_NAME_LABEL),
++              l10n_util::GetStringUTF16(label_string_id),
+               initial_text, ui::DialogModelTextfield::Params())
+           .SetInitiallyFocusedField(kWorkspaceNameFieldId)
+           .Build();
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -110,6 +110,7 @@ class WorkspaceRailView : public views::
+   // the bubble is dismissed.
+   void ShowNameBubble(views::View* anchor,
+                       int title_string_id,
++                      int label_string_id,
+                       const std::u16string& initial_text,
+                       base::OnceCallback<void(const std::u16string&)> on_accept);
+ 

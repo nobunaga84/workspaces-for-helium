@@ -1,0 +1,97 @@
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -102,6 +102,7 @@ source_set("impl") {
+     "//chrome/browser/sessions",
+     "//chrome/browser/ui/tabs/workspaces:archive",
+     "//chrome/browser/ui/tabs/workspaces:pins",
++    "//components/favicon/content",
+     "//components/favicon/core",
+     "//components/favicon_base",
+     "//components/keyed_service/core",
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -63,6 +63,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
+ #include "chrome/grit/generated_resources.h"
++#include "components/favicon/content/content_favicon_driver.h"
+ #include "components/favicon/core/favicon_service.h"
+ #include "components/favicon_base/favicon_types.h"
+ #include "components/keyed_service/core/service_access_type.h"
+@@ -1140,6 +1141,17 @@ class SplitPage : public views::View {
+     closed_ = closed;
+   }
+ 
++  // The open page's own icon, from its tab (patch 78): drawn from now on
++  // and kept when the page sleeps again. A lookup still on its way is
++  // dropped, so it cannot put an older icon back.
++  void TakePageIcon(const gfx::ImageSkia& image) {
++    if (image.BackedBySameObjectAs(favicon_)) {
++      return;
++    }
++    favicon_tasks_.TryCancelAll();
++    OnFavicon(image);
++  }
++
+  private:
+   void OnFavicon(const gfx::ImageSkia& image) {
+     favicon_ = image;
+@@ -1407,6 +1419,26 @@ class PinRow : public views::LabelButton
+     }
+   }
+ 
++  // The open page's own icon, from its tab (patch 78). The one looked up
++  // when the row was made can be a globe -- a page never visited in this
++  // profile -- or an older icon of the same site (the host fallback); this
++  // one is drawn from now on and kept when the page sleeps again. A
++  // split's page draws it in its half; a split in the collapsed column
++  // shows its first page's, as its lookup does.
++  void SetPageIcon(size_t index, const gfx::ImageSkia& image) {
++    if (index < split_pages_.size()) {
++      split_pages_[index]->TakePageIcon(image);
++      return;
++    }
++    if (index != 0 || image.BackedBySameObjectAs(page_icon_)) {
++      return;
++    }
++    page_icon_ = image;
++    // A lookup still on its way cannot put the older icon back.
++    favicon_tasks_.TryCancelAll();
++    OnFavicon(image);
++  }
++
+   // views::LabelButton:
+   //
+   // A folder's chevron sits in the room its border keeps before the icon, and
+@@ -1781,6 +1813,8 @@ class PinRow : public views::LabelButton
+   // The icon drawn in the text color (a folder's in its own); null once the
+   // page's own icon arrived.
+   raw_ptr<const gfx::VectorIcon> vector_icon_ = nullptr;
++  // The icon an open page lent the row (SetPageIcon); null until then.
++  gfx::ImageSkia page_icon_;
+   base::CancelableTaskTracker favicon_tasks_;
+ };
+ 
+@@ -2532,11 +2566,21 @@ void WorkspacePinnedSectionView::ApplySt
+         row->SetPageState(page, PinRow::ItemState::kSleeping, false);
+         continue;
+       }
++      content::WebContents* const contents = it->second->GetContents();
++      const bool drifted = workspaces::HasDrifted(contents);
+       row->SetPageState(page,
+                         it->second == links.active
+                             ? PinRow::ItemState::kActive
+                             : PinRow::ItemState::kOpen,
+-                        workspaces::HasDrifted(it->second->GetContents()));
++                        drifted);
++      // The page at its item's address lends the row its own icon (patch
++      // 78); one gone somewhere else leaves the item's. A new icon is a
++      // change of the tab, which brings this walk back (OnTabChangedAt).
++      const favicon::ContentFaviconDriver* const favicons =
++          favicon::ContentFaviconDriver::FromWebContents(contents);
++      if (!drifted && favicons && favicons->FaviconIsValid()) {
++        row->SetPageIcon(page, favicons->GetFavicon().AsImageSkia());
++      }
+     }
+   }
+ }

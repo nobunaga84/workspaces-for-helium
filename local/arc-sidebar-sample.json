@@ -1,0 +1,613 @@
+{
+ "version": 1,
+ "sidebar": {
+  "containers": [
+   {
+    "littleBrowser": {
+     "_0": "mini"
+    }
+   },
+   {
+    "items": [],
+    "spaces": [],
+    "topAppsContainerIDs": []
+   },
+   {
+    "global": {}
+   },
+   {
+    "items": [
+     "fav1",
+     {
+      "id": "fav1",
+      "title": null,
+      "createdAt": 803705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=1",
+        "savedTitle": "Sample page 1"
+       }
+      }
+     },
+     "fav2",
+     {
+      "id": "fav2",
+      "title": null,
+      "createdAt": 803705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=2",
+        "savedTitle": "Sample page 2"
+       }
+      }
+     },
+     "p3",
+     {
+      "id": "p3",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=3",
+        "savedTitle": "Sample page 3"
+       }
+      }
+     },
+     "p4",
+     {
+      "id": "p4",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=4",
+        "savedTitle": "Sample page 4"
+       }
+      }
+     },
+     "p5",
+     {
+      "id": "p5",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=5",
+        "savedTitle": "Sample page 5"
+       }
+      }
+     },
+     "a6",
+     {
+      "id": "a6",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=6",
+        "savedTitle": "Sample page 6"
+       }
+      }
+     },
+     "a7",
+     {
+      "id": "a7",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=7",
+        "savedTitle": "Sample page 7"
+       }
+      }
+     },
+     "a8",
+     {
+      "id": "a8",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=8",
+        "savedTitle": "Sample page 8"
+       }
+      }
+     },
+     "a9",
+     {
+      "id": "a9",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=9",
+        "savedTitle": "Sample page 9"
+       }
+      }
+     },
+     "b10",
+     {
+      "id": "b10",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=10",
+        "savedTitle": "Sample page 10"
+       }
+      }
+     },
+     "b11",
+     {
+      "id": "b11",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=11",
+        "savedTitle": "Sample page 11"
+       }
+      }
+     },
+     "b12",
+     {
+      "id": "b12",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=12",
+        "savedTitle": "Sample page 12"
+       }
+      }
+     },
+     "s13",
+     {
+      "id": "s13",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=13",
+        "savedTitle": "Sample page 13"
+       }
+      }
+     },
+     "s14",
+     {
+      "id": "s14",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=14",
+        "savedTitle": "Sample page 14"
+       }
+      }
+     },
+     "r15",
+     {
+      "id": "r15",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=15",
+        "savedTitle": "Sample page 15"
+       }
+      }
+     },
+     "r16",
+     {
+      "id": "r16",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=16",
+        "savedTitle": "Sample page 16"
+       }
+      }
+     },
+     "n17",
+     {
+      "id": "n17",
+      "title": "My own name",
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=17",
+        "savedTitle": "Sample page 17"
+       }
+      }
+     },
+     "x1",
+     {
+      "id": "x1",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "chrome://settings/",
+        "savedTitle": "Settings"
+       }
+      }
+     },
+     "x2",
+     {
+      "id": "x2",
+      "title": null,
+      "createdAt": 804705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "",
+        "savedTitle": "No address"
+       }
+      }
+     },
+     "t18",
+     {
+      "id": "t18",
+      "title": null,
+      "createdAt": 808249861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=18",
+        "savedTitle": "Sample page 18"
+       }
+      }
+     },
+     "t19",
+     {
+      "id": "t19",
+      "title": null,
+      "createdAt": 808249861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=19",
+        "savedTitle": "Sample page 19"
+       }
+      }
+     },
+     "t20",
+     {
+      "id": "t20",
+      "title": null,
+      "createdAt": 808249861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=20",
+        "savedTitle": "Sample page 20"
+       }
+      }
+     },
+     "u21",
+     {
+      "id": "u21",
+      "title": null,
+      "createdAt": 811702261.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=21",
+        "savedTitle": "Sample page 21",
+        "timeLastActiveAt": 811705261.6377373
+       }
+      }
+     },
+     "u22",
+     {
+      "id": "u22",
+      "title": null,
+      "createdAt": 811702261.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=22",
+        "savedTitle": "Sample page 22",
+        "timeLastActiveAt": 811705261.6377373
+       }
+      }
+     },
+     "u23",
+     {
+      "id": "u23",
+      "title": null,
+      "createdAt": 811702261.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=23",
+        "savedTitle": "Sample page 23",
+        "timeLastActiveAt": 811705261.6377373
+       }
+      }
+     },
+     "w24",
+     {
+      "id": "w24",
+      "title": null,
+      "createdAt": 806705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=24",
+        "savedTitle": "Sample page 24"
+       }
+      }
+     },
+     "w25",
+     {
+      "id": "w25",
+      "title": null,
+      "createdAt": 806705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=25",
+        "savedTitle": "Sample page 25"
+       }
+      }
+     },
+     "w26",
+     {
+      "id": "w26",
+      "title": null,
+      "createdAt": 806705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=26",
+        "savedTitle": "Sample page 26"
+       }
+      }
+     },
+     "w27",
+     {
+      "id": "w27",
+      "title": null,
+      "createdAt": 806705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "tab": {
+        "savedURL": "https://example.com/?arc-sample=27",
+        "savedTitle": "Sample page 27"
+       }
+      }
+     },
+     "splitB",
+     {
+      "id": "splitB",
+      "title": null,
+      "createdAt": 802705861.6377373,
+      "parentID": null,
+      "childrenIds": [
+       "s13",
+       "s14"
+      ],
+      "data": {
+       "splitView": {}
+      }
+     },
+     "splitRoot",
+     {
+      "id": "splitRoot",
+      "title": null,
+      "createdAt": 802705861.6377373,
+      "parentID": null,
+      "childrenIds": [
+       "r15",
+       "r16"
+      ],
+      "data": {
+       "splitView": {}
+      }
+     },
+     "B",
+     {
+      "id": "B",
+      "title": "Beta",
+      "createdAt": 802705861.6377373,
+      "parentID": null,
+      "childrenIds": [
+       "b10",
+       "b11",
+       "b12",
+       "splitB"
+      ],
+      "data": {
+       "list": {}
+      }
+     },
+     "A",
+     {
+      "id": "A",
+      "title": "Alpha",
+      "createdAt": 802705861.6377373,
+      "parentID": null,
+      "childrenIds": [
+       "B",
+       "a6",
+       "a7",
+       "a8",
+       "a9"
+      ],
+      "data": {
+       "list": {}
+      }
+     },
+     "favc",
+     {
+      "id": "favc",
+      "title": null,
+      "createdAt": 802705861.6377373,
+      "parentID": null,
+      "childrenIds": [
+       "fav1",
+       "fav2"
+      ],
+      "data": {
+       "itemContainer": {}
+      }
+     },
+     "p1",
+     {
+      "id": "p1",
+      "title": null,
+      "createdAt": 802705861.6377373,
+      "parentID": null,
+      "childrenIds": [
+       "p3",
+       "p4",
+       "p5",
+       "A",
+       "splitRoot",
+       "n17",
+       "x1",
+       "x2"
+      ],
+      "data": {
+       "itemContainer": {}
+      }
+     },
+     "u1",
+     {
+      "id": "u1",
+      "title": null,
+      "createdAt": 802705861.6377373,
+      "parentID": null,
+      "childrenIds": [
+       "t18",
+       "t19",
+       "t20",
+       "u21",
+       "u22",
+       "u23"
+      ],
+      "data": {
+       "itemContainer": {}
+      }
+     },
+     "p2",
+     {
+      "id": "p2",
+      "title": null,
+      "createdAt": 802705861.6377373,
+      "parentID": null,
+      "childrenIds": [
+       "w24",
+       "w25",
+       "w26",
+       "w27"
+      ],
+      "data": {
+       "itemContainer": {}
+      }
+     },
+     "u2",
+     {
+      "id": "u2",
+      "title": null,
+      "createdAt": 802705861.6377373,
+      "parentID": null,
+      "childrenIds": [],
+      "data": {
+       "itemContainer": {}
+      }
+     }
+    ],
+    "spaces": [
+     "sp1",
+     {
+      "id": "sp1",
+      "title": "Arc Sample One",
+      "containerIDs": [
+       "unpinned",
+       "u1",
+       "pinned",
+       "p1"
+      ],
+      "customInfo": {
+       "iconType": {
+        "emoji": 128640,
+        "emoji_v2": "\ud83d\ude80"
+       }
+      }
+     },
+     "sp2",
+     {
+      "id": "sp2",
+      "title": "Arc Sample Two",
+      "newContainerIDs": [
+       {
+        "pinned": {}
+       },
+       "p2",
+       {
+        "unpinned": {}
+       },
+       "u2"
+      ]
+     }
+    ],
+    "topAppsContainerIDs": [
+     {
+      "default": true
+     },
+     "favc"
+    ]
+   }
+  ]
+ }
+}

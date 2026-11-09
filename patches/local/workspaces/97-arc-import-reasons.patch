@@ -1,0 +1,552 @@
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan.cc
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.cc
+@@ -5,10 +5,13 @@
+ #include "chrome/browser/ui/tabs/workspaces/arc_import_plan.h"
+ 
+ #include <algorithm>
++#include <cstdint>
+ #include <map>
++#include <optional>
+ #include <set>
+ #include <utility>
+ 
++#include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversion_utils.h"
+@@ -350,12 +353,19 @@ std::string SpaceIcon(const base::DictVa
+ 
+ }  // namespace
+ 
+-std::optional<ArcImportPlan> ParseArcSidebarJson(std::string_view json) {
+-  const std::optional<base::DictValue> root =
+-      base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
+-  const base::DictValue* const container = root ? MainContainer(*root) : nullptr;
+-  if (!container) {
+-    return std::nullopt;
++ArcReadResult ParseArcSidebarJson(std::string_view json) {
++  const std::optional<base::Value> root =
++      base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  if (!root) {
++    return base::unexpected(ArcReadProblem::kUnreadable);
++  }
++  const base::DictValue* const container =
++      root->is_dict() ? MainContainer(root->GetDict()) : nullptr;
++  // Without its two lists a main sidebar imports nothing at all: a key Arc
++  // renamed, not an Arc never used (that one has both, empty).
++  if (!container || !container->FindList("items") ||
++      !container->FindList("spaces")) {
++    return base::unexpected(ArcReadProblem::kUnknownFormat);
+   }
+   const ItemIndex items = IndexById(container->FindList("items"));
+   Walker walker(items);
+@@ -394,6 +404,24 @@ std::optional<ArcImportPlan> ParseArcSid
+   return plan;
+ }
+ 
++ArcReadResult ReadArcSidebar(const base::FilePath& path) {
++  // The size from the folder entry, before the file is opened: an oversize
++  // file is refused unread.
++  const std::optional<int64_t> size =
++      path.empty() ? std::nullopt : base::GetFileSize(path);
++  if (!size) {
++    return base::unexpected(ArcReadProblem::kNotFound);
++  }
++  if (*size > static_cast<int64_t>(kMaxSidebarBytes)) {
++    return base::unexpected(ArcReadProblem::kTooBig);
++  }
++  std::string json;
++  if (!base::ReadFileToStringWithMaxSize(path, &json, kMaxSidebarBytes)) {
++    return base::unexpected(ArcReadProblem::kUnreadable);
++  }
++  return ParseArcSidebarJson(json);
++}
++
+ base::Time FromArcSeconds(double seconds) {
+   return base::Time::FromSecondsSinceUnixEpoch(seconds +
+                                                kArcEpochOffsetSeconds);
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan.h
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.h
+@@ -5,12 +5,14 @@
+ #ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_ARC_IMPORT_PLAN_H_
+ #define CHROME_BROWSER_UI_TABS_WORKSPACES_ARC_IMPORT_PLAN_H_
+ 
+-#include <optional>
++#include <cstddef>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/files/file_path.h"
+ #include "base/time/time.h"
++#include "base/types/expected.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ 
+ // Arc's StorableSidebar.json turned into plain values: what "Import from
+@@ -20,7 +22,8 @@
+ // workspaces_unittests (design 3.10). The file is someone else's undocumented
+ // format, read from outside the profile, so nothing here trusts it: a missing
+ // key skips the item, a cycle or an absurd depth is refused, and a file that
+-// does not look like a sidebar at all is std::nullopt rather than an empty plan.
++// does not look like a sidebar at all is an ArcReadProblem rather than an empty
++// plan.
+ namespace workspaces::arc_import {
+ 
+ struct ArcTab {
+@@ -94,10 +97,30 @@ struct ArcImportPlan {
+   bool operator==(const ArcImportPlan&) const = default;
+ };
+ 
+-// std::nullopt when `json` is not JSON or holds no main sidebar. Little Arc
+-// windows, which the file lists beside the main sidebar and sometimes before
+-// it, are ignored.
+-std::optional<ArcImportPlan> ParseArcSidebarJson(std::string_view json);
++// Why Arc's file gave no plan: each has its own sentence in the import bubble.
++// One "not found" for all four told a user whose Arc is installed that it is
++// not (the negative review's arc-import F4).
++enum class ArcReadProblem {
++  kNotFound,       // no file there
++  kTooBig,         // over kMaxSidebarBytes
++  kUnreadable,     // the read failed, or the text stops part-way (Arc saving)
++  kUnknownFormat,  // JSON, but not a sidebar this code knows
++};
++
++// The owner's file is 8 MB. A cap, because it is read whole into memory and
++// comes from outside the profile.
++inline constexpr size_t kMaxSidebarBytes = 64 * 1024 * 1024;
++
++using ArcReadResult = base::expected<ArcImportPlan, ArcReadProblem>;
++
++// kUnreadable when `json` is not JSON, kUnknownFormat when it holds no main
++// sidebar with its `items` and `spaces` lists. Little Arc windows, which the
++// file lists beside the main sidebar and sometimes before it, are ignored.
++ArcReadResult ParseArcSidebarJson(std::string_view json);
++
++// Reads `path` and parses it. Blocks: the thread pool only. Arc may be
++// running; the read does not lock the file.
++ArcReadResult ReadArcSidebar(const base::FilePath& path);
+ 
+ // Arc stamps seconds since 2001-01-01 UTC.
+ base::Time FromArcSeconds(double seconds);
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan_unittest.cc
+@@ -11,8 +11,10 @@
+ #include <vector>
+ 
+ #include "base/environment.h"
++#include "base/files/file.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/time/time.h"
+@@ -96,6 +98,14 @@ std::string RowShape(const std::vector<p
+   return out;
+ }
+ 
++// The reason there is no plan; nullopt when there is one.
++std::optional<ArcReadProblem> ProblemOf(const ArcReadResult& result) {
++  if (result.has_value()) {
++    return std::nullopt;
++  }
++  return result.error();
++}
++
+ constexpr char kOneSpace[] =
+     R"("containerIDs":["unpinned","u","pinned","p"])";
+ 
+@@ -134,7 +144,7 @@ TEST(ArcImportPlanTest, WalksSpacesFolde
+        Space("s2", "",
+              R"("newContainerIDs":[{"unpinned":{}},"u2",{"pinned":{}},"p2"])",
+              R"(,"customInfo":{"iconType":{"emoji":128640}})")});
+-  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(
++  const ArcReadResult plan = ParseArcSidebarJson(
+       Sidebar(items, spaces, R"([{"default":true},"fav"])"));
+ 
+   ASSERT_TRUE(plan);
+@@ -175,7 +185,7 @@ TEST(ArcImportPlanTest, ALittleArcWindow
+        Parent("lp", "itemContainer", R"(["l1"])"), ",",
+        Tab("l1", "https://little.example/", "Little", 10), R"(],"spaces":[)",
+        Space("ls", "Little", R"("containerIDs":["pinned","lp"])"), "]},"});
+-  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++  const ArcReadResult plan = ParseArcSidebarJson(Sidebar(
+       base::StrCat({Parent("p", "itemContainer", R"(["t1"])"), ",",
+                     Tab("t1", "https://one.example/", "One", 10)}),
+       Space("s1", "Real", kOneSpace), "[]", little));
+@@ -187,7 +197,7 @@ TEST(ArcImportPlanTest, ALittleArcWindow
+ }
+ 
+ TEST(ArcImportPlanTest, OnlyWebPagesAreImported) {
+-  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++  const ArcReadResult plan = ParseArcSidebarJson(Sidebar(
+       base::StrCat(
+           {Parent("p", "itemContainer", R"(["a","b","c","d","e"])"), ",",
+            Tab("a", "https://ok.example/", "Ok", 10), ",",
+@@ -204,7 +214,7 @@ TEST(ArcImportPlanTest, OnlyWebPagesAreI
+ }
+ 
+ TEST(ArcImportPlanTest, ANameIsCustomOnlyWhenItDiffersFromThePageTitle) {
+-  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++  const ArcReadResult plan = ParseArcSidebarJson(Sidebar(
+       base::StrCat({Parent("p", "itemContainer", R"(["a","b","c"])"), ",",
+                     Tab("a", "https://a.example/", "Page", 10,
+                         R"(,"title":"Page")"),
+@@ -226,7 +236,7 @@ TEST(ArcImportPlanTest, ANameIsCustomOnl
+ }
+ 
+ TEST(ArcImportPlanTest, LastActiveFallsBackToCreated) {
+-  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++  const ArcReadResult plan = ParseArcSidebarJson(Sidebar(
+       base::StrCat({Parent("u", "itemContainer", R"(["a","b"])"), ",",
+                     Tab("a", "https://a.example/", "A", 100, "",
+                         R"(,"timeLastActiveAt":250.5)"),
+@@ -250,7 +260,7 @@ TEST(ArcImportPlanTest, ArcSecondsCountF
+ TEST(ArcImportPlanTest, ACycleEndsAndIsCounted) {
+   // A's child is B and B's child is A. Without the visited set this recurses
+   // until the stack is gone; the file comes from outside the profile.
+-  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++  const ArcReadResult plan = ParseArcSidebarJson(Sidebar(
+       base::StrCat({Parent("p", "itemContainer", R"(["A"])"), ",",
+                     Parent("A", "list", R"(["B","t1"])", "A"), ",",
+                     Parent("B", "list", R"(["A","t2"])", "B"), ",",
+@@ -277,7 +287,7 @@ TEST(ArcImportPlanTest, AFolderChainDeep
+   }
+   base::StrAppend(&items,
+                   {",", Tab("deep", "https://deep.example/", "Deep", 10)});
+-  const std::optional<ArcImportPlan> plan =
++  const ArcReadResult plan =
+       ParseArcSidebarJson(Sidebar(items, Space("s1", "S", kOneSpace)));
+ 
+   ASSERT_TRUE(plan);
+@@ -295,22 +305,62 @@ TEST(ArcImportPlanTest, AFolderChainDeep
+   EXPECT_TRUE(pins::PinTreeFromValue(pins::PinTreeToValue(tree)).has_value());
+ }
+ 
+-TEST(ArcImportPlanTest, NotASidebarIsNoPlanRatherThanAnEmptyOne) {
+-  EXPECT_FALSE(ParseArcSidebarJson(""));
+-  EXPECT_FALSE(ParseArcSidebarJson("{\"sidebar\":"));
+-  EXPECT_FALSE(ParseArcSidebarJson("[1,2,3]"));
+-  EXPECT_FALSE(ParseArcSidebarJson(R"({"sidebar":{"containers":[]}})"));
++TEST(ArcImportPlanTest, NotASidebarIsAReasonRatherThanAnEmptyPlan) {
++  // Text that stops part-way, as Arc's file does while Arc is saving it.
++  EXPECT_EQ(ProblemOf(ParseArcSidebarJson("")), ArcReadProblem::kUnreadable);
++  EXPECT_EQ(ProblemOf(ParseArcSidebarJson("{\"sidebar\":")),
++            ArcReadProblem::kUnreadable);
++  // JSON, but not Arc's sidebar as this code knows it.
++  EXPECT_EQ(ProblemOf(ParseArcSidebarJson("[1,2,3]")),
++            ArcReadProblem::kUnknownFormat);
++  EXPECT_EQ(ProblemOf(ParseArcSidebarJson(R"({"sidebar":{"containers":[]}})")),
++            ArcReadProblem::kUnknownFormat);
+   // Only a Little Arc window, no {"global":{}} pair.
+-  EXPECT_FALSE(ParseArcSidebarJson(
+-      R"({"sidebar":{"containers":[{"littleBrowser":{}},{"items":[],"spaces":[]}]}})"));
++  EXPECT_EQ(
++      ProblemOf(ParseArcSidebarJson(
++          R"({"sidebar":{"containers":[{"littleBrowser":{}},{"items":[],"spaces":[]}]}})")),
++      ArcReadProblem::kUnknownFormat);
++  // A main sidebar without one of its two lists: a key Arc renamed, which
++  // would otherwise import nothing and say "Imported 0 tabs".
++  EXPECT_EQ(ProblemOf(ParseArcSidebarJson(
++                R"({"sidebar":{"containers":[{"global":{}},{"items":[]}]}})")),
++            ArcReadProblem::kUnknownFormat);
++  EXPECT_EQ(ProblemOf(ParseArcSidebarJson(
++                R"({"sidebar":{"containers":[{"global":{}},{"spaces":[]}]}})")),
++            ArcReadProblem::kUnknownFormat);
+   // A sidebar with nothing in it IS a plan: Arc installed, never used.
+-  const std::optional<ArcImportPlan> empty = ParseArcSidebarJson(Sidebar("", ""));
++  const ArcReadResult empty = ParseArcSidebarJson(Sidebar("", ""));
+   ASSERT_TRUE(empty);
+   EXPECT_EQ(*empty, ArcImportPlan());
+ }
+ 
++TEST(ArcImportPlanTest, EachReadProblemHasItsOwnReason) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  const base::FilePath file = dir.GetPath().AppendASCII("StorableSidebar.json");
++  EXPECT_EQ(ProblemOf(ReadArcSidebar(base::FilePath())),
++            ArcReadProblem::kNotFound);
++  EXPECT_EQ(ProblemOf(ReadArcSidebar(file)), ArcReadProblem::kNotFound);
++
++  ASSERT_TRUE(base::WriteFile(file, Sidebar("", "")));
++  EXPECT_EQ(ProblemOf(ReadArcSidebar(file)), std::nullopt);
++  {
++    // Another program holds it and lets nobody read it meanwhile.
++    base::File lock(file, base::File::FLAG_OPEN | base::File::FLAG_READ |
++                              base::File::FLAG_WIN_EXCLUSIVE_READ);
++    ASSERT_TRUE(lock.IsValid());
++    EXPECT_EQ(ProblemOf(ReadArcSidebar(file)), ArcReadProblem::kUnreadable);
++  }
++  {
++    // One byte over the cap (the length set, nothing written).
++    base::File big(file, base::File::FLAG_OPEN | base::File::FLAG_WRITE);
++    ASSERT_TRUE(big.SetLength(kMaxSidebarBytes + 1));
++  }
++  EXPECT_EQ(ProblemOf(ReadArcSidebar(file)), ArcReadProblem::kTooBig);
++}
++
+ TEST(ArcImportPlanTest, AReimportKeepsOnlyWhatArcGainedSince) {
+-  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(Sidebar(
++  const ArcReadResult plan = ParseArcSidebarJson(Sidebar(
+       base::StrCat({Parent("fav", "itemContainer", R"(["f1","f2"])"), ",",
+                     Tab("f1", "https://f1.example/", "F1", 10), ",",
+                     Tab("f2", "https://f2.example/", "F2", 500), ",",
+@@ -363,7 +413,7 @@ TEST(ArcImportPlanTest, CountsFromARealS
+   std::string json;
+   ASSERT_TRUE(base::ReadFileToString(base::FilePath::FromUTF8Unsafe(*path),
+                                      &json));
+-  const std::optional<ArcImportPlan> plan = ParseArcSidebarJson(json);
++  const ArcReadResult plan = ParseArcSidebarJson(json);
+   ASSERT_TRUE(plan);
+ 
+   std::cout << "ARC favorites=" << plan->favorites.size()
+--- a/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
++++ b/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
+@@ -161,9 +161,18 @@
+   <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_ABORTED" desc="Title of the bubble shown when an import from the Arc browser stopped because its window was closed. $1 = tabs imported, $2 = tabs planned.">
+     The import stopped: its window was closed after <ph name="DONE">$1<ex>1,200</ex></ph> of <ph name="TOTAL">$2<ex>3,873</ex></ph> tabs
+   </message>
+-  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_NOT_FOUND" desc="Title of the bubble shown when the Arc browser's data could not be found or read.">
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_NOT_FOUND" desc="Title of the bubble shown when the Arc browser's data file is not on this computer.">
+     Arc's data was not found on this computer
+   </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_TOO_BIG" desc="Title of the bubble shown when the Arc browser's data file is bigger than the import reads (64 MB), so nothing was imported.">
++    Arc's data is too large to import (over 64 MB)
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_UNREADABLE" desc="Title of the bubble shown when the Arc browser's data file is there but could not be read, or stops part-way because Arc was saving it at that moment: importing again with Arc closed may work.">
++    Arc's data could not be read. Quit Arc, then try again
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_UNKNOWN_FORMAT" desc="Title of the bubble shown when the Arc browser's data file was read but is laid out in a way this browser does not know, for example after an Arc update. Nothing was imported.">
++    Arc's data is in a format Helium can't read
++  </message>
+   <message name="IDS_HELIUM_WORKSPACE_ARCHIVE" desc="Item on the workspace rail's + menu, and the title of the screen it opens: the tabs the user closed, kept for 60 days, which can be searched and reopened.">
+     Archive
+   </message>
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
+@@ -13,10 +13,10 @@
+ #include "base/containers/span.h"
+ #include "base/environment.h"
+ #include "base/files/file_path.h"
+-#include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/i18n/number_formatting.h"
+ #include "base/logging.h"
++#include "base/notreached.h"
+ #include "base/path_service.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -54,14 +54,12 @@ namespace {
+ 
+ using workspaces::arc_import::ArcImportPlan;
+ using workspaces::arc_import::ArcItem;
++using workspaces::arc_import::ArcReadProblem;
++using workspaces::arc_import::ArcReadResult;
+ using workspaces::arc_import::ArcTab;
+ using workspaces::arc_import::ArcUnit;
+ using workspaces::arc_import::ArcWorkspace;
+ 
+-// The owner's file is 8 MB. A cap, because it is read whole into memory and
+-// comes from outside the profile.
+-constexpr size_t kMaxSidebarBytes = 64 * 1024 * 1024;
+-
+ // How long one slice may keep the UI thread. Long enough that a slice does
+ // real work, short enough that the window keeps painting between slices.
+ constexpr base::TimeDelta kSliceBudget = base::Milliseconds(40);
+@@ -90,16 +88,19 @@ base::FilePath ArcSidebarPath() {
+   return base::FilePath();
+ }
+ 
+-// On the thread pool: the read blocks, and the parsed tree (which includes a
+-// sync copy of the sidebar nobody uses) lives and dies here. Only the plan
+-// crosses back. Arc may be running; the read does not lock the file.
+-std::optional<ArcImportPlan> ReadAndParse(const base::FilePath& path) {
+-  std::string json;
+-  if (path.empty() ||
+-      !base::ReadFileToStringWithMaxSize(path, &json, kMaxSidebarBytes)) {
+-    return std::nullopt;
++// For the log, in lower-case words: switch-day.ps1 reads them.
++const char* ProblemName(ArcReadProblem problem) {
++  switch (problem) {
++    case ArcReadProblem::kNotFound:
++      return "no sidebar file";
++    case ArcReadProblem::kTooBig:
++      return "file too big";
++    case ArcReadProblem::kUnreadable:
++      return "file unreadable";
++    case ArcReadProblem::kUnknownFormat:
++      return "unknown format";
+   }
+-  return workspaces::arc_import::ParseArcSidebarJson(json);
++  NOTREACHED();
+ }
+ 
+ // One sleeping tab, tagged before it is inserted. ALWAYS appended (a pinned
+@@ -193,11 +194,11 @@ void CollectSplits(const std::vector<wor
+ }
+ 
+ // RepairSplits' reply, back on the UI thread.
+-void PairArcSplits(base::WeakPtr<Profile> profile,
+-                   std::optional<ArcImportPlan> plan) {
+-  if (!profile || !plan) {
++void PairArcSplits(base::WeakPtr<Profile> profile, ArcReadResult plan) {
++  if (!profile || !plan.has_value()) {
+     LOG(INFO) << "[workspaces] pins: split repair -- "
+-              << (plan ? "the profile is gone" : "no readable Arc sidebar");
++              << (plan.has_value() ? "the profile is gone"
++                                   : ProblemName(plan.error()));
+     return;
+   }
+   workspaces::pins::PinStore* const store =
+@@ -241,7 +242,7 @@ void WorkspaceArcImporter::RepairSplits(
+       FROM_HERE,
+       {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
+        base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
+-      base::BindOnce(&ReadAndParse, ArcSidebarPath()),
++      base::BindOnce(&workspaces::arc_import::ReadArcSidebar, ArcSidebarPath()),
+       base::BindOnce(&PairArcSplits, profile->GetWeakPtr()));
+ }
+ 
+@@ -261,21 +262,24 @@ void WorkspaceArcImporter::Start(DoneCal
+       FROM_HERE,
+       {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
+        base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
+-      base::BindOnce(&ReadAndParse, ArcSidebarPath()),
++      base::BindOnce(&workspaces::arc_import::ReadArcSidebar, ArcSidebarPath()),
+       base::BindOnce(&WorkspaceArcImporter::OnPlanReady,
+                      weak_factory_.GetWeakPtr(), base::Time::Now()));
+ }
+ 
+-void WorkspaceArcImporter::OnPlanReady(base::Time started,
+-                                       std::optional<ArcImportPlan> plan) {
++void WorkspaceArcImporter::OnPlanReady(base::Time started, ArcReadResult plan) {
+   // A reply to a posted task, so outside every observer: inserting is legal.
+   started_ = started;
+   workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
+   Profile* const profile = browser_->GetProfile();
+-  if (!plan || !service || !service->IsEnabled() || !profile) {
++  if (!plan.has_value() || !service || !service->IsEnabled() || !profile) {
++    if (!plan.has_value()) {
++      result_.problem = plan.error();
++    }
+     LOG(INFO) << "[workspaces] arc import: nothing imported ("
+-              << (plan ? "workspaces unavailable" : "no readable Arc sidebar")
++              << (plan.has_value() ? "workspaces unavailable"
++                                   : ProblemName(plan.error()))
+               << ")";
+     Finish();
+     return;
+@@ -343,16 +347,6 @@ void WorkspaceArcImporter::OnPlanReady(b
+                  "is a later stage)";
+   }
+ 
+-  // Imported tabs live in the session file and nowhere else. The Windows
+-  // default for "On startup" is the New Tab page, which would drop them all
+-  // at the next launch (LOCAL.md 37).
+-  if (SessionStartupPref::GetStartupPref(profile).type !=
+-      SessionStartupPref::LAST) {
+-    SessionStartupPref::SetStartupPref(
+-        profile, SessionStartupPref(SessionStartupPref::LAST));
+-    result_.startup_changed = true;
+-  }
+-
+   // This window, held weakly: a slice may run after the user closed it.
+   window_ = browser_->GetWeakPtr();
+   ImportSlice();
+@@ -463,10 +457,29 @@ void WorkspaceArcImporter::SetStatus(con
+ 
+ void WorkspaceArcImporter::Finish() {
+   SetStatus(std::u16string());
++  // Only an import that finished, and only for what arrived (the negative
++  // review's arc-import F8 and F5's first half):
++  // - the import time: a re-run skips every tab Arc made before it, and the
++  //   auto-archive sweep holds back EVERY tab until it has aged past it
++  //   (`not_before`), so a run that brought nothing must not move it;
++  // - "On startup": imported tabs live in the session file and nowhere else.
++  //   The Windows default is the New Tab page, which would drop them all at
++  //   the next launch (LOCAL.md 37). A policy-managed setting is not ours to
++  //   change, and the bubble must not say it was changed.
+   if (result_.found && !result_.aborted && prefs_) {
+     // `started_`, not now: a tab Arc gains while this runs must count as new.
+-    prefs_->SetTime(workspaces::prefs::kHeliumWorkspacesArcImportedAt,
+-                    started_);
++    // Pinned rows count too: they are imported once.
++    if (result_.tabs > 0 || result_.pinned > 0) {
++      prefs_->SetTime(workspaces::prefs::kHeliumWorkspacesArcImportedAt,
++                      started_);
++    }
++    if (result_.tabs > 0 && !SessionStartupPref::TypeIsManaged(prefs_) &&
++        SessionStartupPref::GetStartupPref(prefs_).type !=
++            SessionStartupPref::LAST) {
++      SessionStartupPref::SetStartupPref(
++          prefs_, SessionStartupPref(SessionStartupPref::LAST));
++      result_.startup_changed = true;
++    }
+   }
+   result_.elapsed = base::Time::Now() - started_;
+   if (result_.found) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h
+@@ -46,8 +46,12 @@ class Profile;
+ class WorkspaceArcImporter {
+  public:
+   struct Result {
+-    // False when Arc's file is missing, unreadable or not a sidebar.
++    // False when Arc's file gave no plan (`problem` says why), or Workspaces
++    // went off during the read.
+     bool found = false;
++    // kNotFound also for Workspaces off: a race, as the rail hides with it.
++    workspaces::arc_import::ArcReadProblem problem =
++        workspaces::arc_import::ArcReadProblem::kNotFound;
+     // The window was closed before the import finished.
+     bool aborted = false;
+     int tabs = 0;
+@@ -60,8 +64,9 @@ class WorkspaceArcImporter {
+     int workspaces = 0;
+     // Left out: no web URL (counted by the parser) or an unusable one.
+     int skipped = 0;
+-    // "On startup" was switched to "Continue where you left off". Without it
+-    // the imported tabs would not come back after a restart.
++    // "On startup" was switched to "Continue where you left off", at the end
++    // and only when tabs arrived. Without it they would not come back after a
++    // restart.
+     bool startup_changed = false;
+     base::TimeDelta elapsed;
+   };
+@@ -102,7 +107,7 @@ class WorkspaceArcImporter {
+   };
+ 
+   void OnPlanReady(base::Time started,
+-                   std::optional<workspaces::arc_import::ArcImportPlan> plan);
++                   workspaces::arc_import::ArcReadResult plan);
+   void ImportSlice();
+   void Finish();
+   void SetStatus(const std::u16string& text);
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -2423,8 +2423,22 @@ void WorkspaceRailView::OnArcImportDone(
+     const WorkspaceArcImporter::Result& result) {
+   ui::DialogModel::Builder builder;
+   if (!result.found) {
+-    builder.SetTitle(
+-        l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_IMPORT_ARC_NOT_FOUND));
++    // One sentence per reason (the negative review's arc-import F4).
++    int title = IDS_HELIUM_WORKSPACE_IMPORT_ARC_NOT_FOUND;
++    switch (result.problem) {
++      case workspaces::arc_import::ArcReadProblem::kNotFound:
++        break;
++      case workspaces::arc_import::ArcReadProblem::kTooBig:
++        title = IDS_HELIUM_WORKSPACE_IMPORT_ARC_TOO_BIG;
++        break;
++      case workspaces::arc_import::ArcReadProblem::kUnreadable:
++        title = IDS_HELIUM_WORKSPACE_IMPORT_ARC_UNREADABLE;
++        break;
++      case workspaces::arc_import::ArcReadProblem::kUnknownFormat:
++        title = IDS_HELIUM_WORKSPACE_IMPORT_ARC_UNKNOWN_FORMAT;
++        break;
++    }
++    builder.SetTitle(l10n_util::GetStringUTF16(title));
+   } else {
+     // Two strings, two placeholder counts: GetStringFUTF16 checks them.
+     builder.SetTitle(

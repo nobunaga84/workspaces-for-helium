@@ -1,0 +1,14 @@
+<!doctype html>
+<!-- check-c20.ps1 (C20, patch 89): the page every card shows. A counter that keeps counting (a reload restarts it) and
+     one pushState at the first load, so the page has 2 history entries (A1, R1); "C20 next link" to follow inside the
+     card (B1). The middle is blank: the check clicks there to give the card's page the keyboard. -->
+<title>E18 c20target</title>
+<body style="margin:0;background:#fff;font:16px sans-serif">
+<p id="n" style="margin:8px">0</p>
+<p style="margin:8px"><a id="next" href="c20next.html">C20 next link</a></p>
+<script>
+  let n = 0;
+  setInterval(() => { document.getElementById("n").textContent = ++n; }, 100);
+  if (!location.hash) history.pushState(null, "", "#pushed");
+</script>
+</body>

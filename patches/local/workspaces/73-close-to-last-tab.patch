@@ -1,0 +1,443 @@
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -462,6 +462,16 @@ base::Time BrowserTabStripModelDelegate:
+   return data ? data->left_at() : base::Time();
+ }
+ 
++std::optional<int> BrowserTabStripModelDelegate::GetLastUsedTabIndex(
++    const gfx::Range& closing) const {
++  // The walk lives in the service: the anchor reset asks it too (D15), one
++  // walk for both doors. The service answers nullopt while Workspaces is off
++  // (D3), and a service-less window is stock.
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  return service ? service->LastUsedTabIndex(closing) : std::nullopt;
++}
++
+ bool BrowserTabStripModelDelegate::IsTabAnchored(
+     const tabs::TabInterface* tab) const {
+   // IsEnabled() because anchors are dormant while Workspaces is off (E10b):
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.h
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.h
+@@ -88,6 +88,8 @@ class BrowserTabStripModelDelegate : pub
+       const tabs::TabInterface* tab) const override;
+   bool IsTabCycleStop(const tabs::TabInterface* tab) const override;
+   base::Time GetTabLeftTime(const tabs::TabInterface* tab) const override;
++  std::optional<int> GetLastUsedTabIndex(
++      const gfx::Range& closing) const override;
+   bool IsTabAnchored(const tabs::TabInterface* tab) const override;
+   bool ResetAnchoredTabInsteadOfClosing(tabs::TabInterface* tab,
+                                         const char* via) override;
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -6153,6 +6153,14 @@ std::optional<int> TabStripModel::Determ
+   const gfx::Range block_tabs =
+       gfx::Range(start_index, start_index + block_size);
+ 
++  // Workspaces C34: closing the tab on screen returns to the tab of this
++  // workspace the user left last -- before the opener rules below (the
++  // owner's answer).
++  if (const std::optional<int> last = workspaces::LastUsedTabOnClose(
++          *this, block_tabs, tab_or_collection)) {
++    return GetTabIndexAfterClosing(*last, block_tabs);
++  }
++
+   // Applies the ranked preferences in order, considering only the tabs that the
+   // caller deems selectable. `focused_group` restricts the candidates to the
+   // tabs the user is allowed to activate while that group is focused; when it
+--- a/chrome/browser/ui/tabs/tab_strip_model_delegate.h
++++ b/chrome/browser/ui/tabs/tab_strip_model_delegate.h
+@@ -30,6 +30,7 @@ class WebContents;
+ }
+ 
+ namespace gfx {
++class Range;
+ class Rect;
+ }
+ 
+@@ -255,6 +256,16 @@ class TabStripModelDelegate {
+     return base::Time();
+   }
+ 
++  // The tab a close of the active tab lands on instead of Chromium's opener /
++  // neighbour rule (C34): the index, BEFORE the removal, of the tab of the
++  // workspace on screen the user left last, never inside `closing`; nullopt
++  // for Chromium's rule. nullopt by default: stock behaviour and the test
++  // delegate's. Fork addition (C34).
++  virtual std::optional<int> GetLastUsedTabIndex(
++      const gfx::Range& closing) const {
++    return std::nullopt;
++  }
++
+   // Whether `tab` is an anchored tab of an enabled Workspaces window. The
+   // range closes ("Close other tabs", "Close tabs below/above") skip these the
+   // way they skip pinned tabs. Same delegate route, and the same default-false
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
+@@ -6,8 +6,10 @@
+ 
+ #include <algorithm>
+ #include <utility>
++#include <variant>
+ 
+ #include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -15,12 +17,14 @@
+ #include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_selection_state.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
++#include "ui/gfx/range/range.h"
+ #include "url/gurl.h"
+ 
+ namespace workspaces {
+@@ -187,4 +191,37 @@ void SelectMRUTab(TabStripModel* model,
+   model->ActivateTab(tabs::TabHandle(cycle->front()).Get(), detail);
+ }
+ 
++std::optional<int> LastUsedTabOnClose(const TabStripModel& model,
++                                      const gfx::Range& closing,
++                                      const tabs::ChildPtr& closing_what) {
++  const tabs::TabStripModelSelectionState& selection = model.selection_model();
++  const tabs::TabInterface* const active = selection.active_tab();
++  if (model.closing_all() || !active || model.GetFocusedGroup()) {
++    return std::nullopt;
++  }
++  if (const auto* const tab =
++          std::get_if<tabs::DanglingUntriagedTabInterface>(&closing_what)) {
++    // One tab, pointers only. A split half: RemoveTabFromIndexImpl shows its
++    // partner instead (D4).
++    if (selection.size() != 1 || active != tab->get() || active->IsSplit()) {
++      return std::nullopt;
++    }
++  } else {
++    // A group or a split: every selected tab inside the block, the active one
++    // among them. The size first: an index lookup is a walk.
++    const int start = static_cast<int>(closing.GetMin());
++    const int end = static_cast<int>(closing.GetMax());
++    if (selection.size() > closing.length() ||
++        !std::ranges::all_of(
++            selection.selected_tabs(),
++            [&](const raw_ptr<tabs::TabInterface>& selected) {
++              const int index = model.GetIndexOfTab(selected.get());
++              return index >= start && index < end;
++            })) {
++      return std::nullopt;
++    }
++  }
++  return model.delegate()->GetLastUsedTabIndex(closing);
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
+@@ -5,14 +5,20 @@
+ #ifndef CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
+ #define CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
+ 
++#include <optional>
+ #include <vector>
+ 
+ #include "base/functional/callback.h"
++#include "components/tabs/public/tab_collection_types.h"
+ 
+ class TabStripModel;
+ class TabStripModelDelegate;
+ struct TabStripUserGestureDetails;
+ 
++namespace gfx {
++class Range;
++}
++
+ namespace tabs {
+ class TabInterface;
+ }
+@@ -55,6 +61,18 @@ void SelectMRUTab(TabStripModel* model,
+                   bool next,
+                   TabStripUserGestureDetails detail);
+ 
++// DetermineNewSelectedIndex (C34): closing the tab on screen returns to the
++// tab of this workspace the user left last -- before the opener rules (the
++// owner's answer). The index, BEFORE the removal, of that tab, when the
++// active tab leaves and no selected tab stays (the callers keep a selected
++// one first). nullopt for Chromium's rule: a split half (its partner is
++// shown, D4), the window closing, a focused group. `closing` is the block of
++// tabs going, `closing_what` the tab or collection DetermineNewSelectedIndex
++// was given.
++std::optional<int> LastUsedTabOnClose(const TabStripModel& model,
++                                      const gfx::Range& closing,
++                                      const tabs::ChildPtr& closing_what);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -14,6 +14,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/auto_reset.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+ #include "base/logging.h"
+@@ -215,6 +216,14 @@ bool WasRecentlyAudible(const performanc
+          (since.has_value() && *since < archive::kRecentlyAudibleFor);
+ }
+ 
++// When the user last left `tab` (WorkspaceTabData::left_at), or a null time
++// when it was not left in this run (C34).
++base::Time LeftAt(const tabs::TabInterface* tab) {
++  const WorkspaceTabData* const data =
++      WorkspaceTabData::FromWebContents(tab->GetContents());
++  return data ? data->left_at() : base::Time();
++}
++
+ }  // namespace
+ 
+ DEFINE_USER_DATA(WorkspaceService);
+@@ -590,8 +599,15 @@ int WorkspaceService::CloseWorkspaceTabs
+   // a reverse-order index walk would not.
+   //
+   int pinned_kept = 0;
+-  const std::vector<tabs::TabHandle> doomed =
++  std::vector<tabs::TabHandle> doomed =
+       TabsToClose(guid, &pinned_kept, today_only);
++  // The active tab LAST (C34, A4): a close of the active tab lands on the tab
++  // left last, often another doomed one, which would then be shown, stamped
++  // left and closed in its turn, one after another. Last, the active tab
++  // closes once, onto a tab that stays.
++  if (const tabs::TabInterface* const active = tab_strip_->GetActiveTab()) {
++    PutLast(doomed, active->GetHandle());
++  }
+ 
+   // The kept count is the evidence for the pinned rule: Chromium reopens the
+   // last session's pinned tabs at startup, so how many tabs a close takes
+@@ -1096,6 +1112,7 @@ void WorkspaceService::EnsureActiveTabVi
+ 
+   const int target = TargetTabIndexForActiveWorkspace();
+   if (target != TabStripModel::kNoTab) {
++    const base::AutoReset<bool> repair(&repair_activation_, true);
+     tab_strip_->ActivateTabAt(target);
+     return;
+   }
+@@ -1326,8 +1343,9 @@ void WorkspaceService::OnTabStripModelCh
+   // here (design 2.2), and not gated, so the clock is right when the feature
+   // comes back. The old contents is alive here even for a close: a closed
+   // tab's is destroyed only after the observers ran
+-  // (TabStripModel::SendDetachWebContentsNotifications).
+-  if (selection.active_tab_changed() &&
++  // (TabStripModel::SendDetachWebContentsNotifications). Not a repair's
++  // move either (repair_activation_, C34): the user did not leave that tab.
++  if (!repair_activation_ && selection.active_tab_changed() &&
+       selection.old_tab != selection.new_tab && selection.old_contents) {
+     WorkspaceTabData::GetOrCreateForWebContents(selection.old_contents.get())
+         ->set_left_at(base::Time::Now());
+@@ -1391,9 +1409,15 @@ void WorkspaceService::OnTabStripModelCh
+     if (IsEnabled() && !IsTabOnScreen(selection.new_tab)) {
+       PostEnsureActiveTabVisible();
+     } else if (selection.active_tab_changed() &&
+-               IsDrawnAsPinnedRow(selection.new_tab)) {
++               IsDrawnAsPinnedRow(selection.new_tab) &&
++               LeftAt(selection.new_tab).is_null()) {
+       // The close landed on an open pinned page: the list's own neighbour is
+-      // what the user expects. Posted, for the same reason as above.
++      // what the user expects. Posted, for the same reason as above. Only a
++      // page never left (D14): a left one is C34's pick -- Chromium's rule
++      // runs then only when no tab on screen was left -- and returning to the
++      // page left last is the point. The few closes C34 does not decide (a
++      // multi-selection, a split half, group focus) land on a tab Chromium
++      // chose for its own reason, and stay there too.
+       base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+           FROM_HERE, base::BindOnce(&WorkspaceService::MoveOffPinnedPage,
+                                     weak_factory_.GetWeakPtr()));
+@@ -1532,6 +1556,47 @@ bool WorkspaceService::IsTabOnScreen(tab
+   return !tab || tab->IsPinned() || IsTabVisible(tab);
+ }
+ 
++std::optional<int> WorkspaceService::LastUsedTabIndex(
++    const gfx::Range& excluded) const {
++  // D3: Workspaces off is stock, as anchors are dormant while off.
++  if (!IsEnabled()) {
++    return std::nullopt;
++  }
++  // The strip's own iterator and a counter, never GetTabAtIndex(i): an index
++  // lookup walks the collection tree, and this runs on every close of the
++  // active tab in a window that may hold 3,862 tabs (LOCAL.md 37, C2). The
++  // cheap questions first; the group's, only of a tab that would win (A5).
++  int best = TabStripModel::kNoTab;
++  base::Time best_left;
++  int index = 0;
++  for (tabs::TabInterface* const tab : *tab_strip_) {
++    const int i = index++;
++    if (excluded.Contains(gfx::Range(i, i + 1))) {
++      continue;
++    }
++    const base::Time left = LeftAt(tab);
++    if (left.is_null() || left <= best_left || !IsTabOnScreen(tab)) {
++      continue;
++    }
++    // Chromium's own exclusion (D1): a tab folded away is not landed on.
++    if (const std::optional<tab_groups::TabGroupId> group = tab->GetGroup();
++        group && tab_strip_->IsGroupCollapsed(*group)) {
++      continue;
++    }
++    best = i;
++    best_left = left;
++  }
++  // ponytail: one of Chromium's batch closes (a group, "Close tabs below")
++  // whose pick is another tab of the batch walks again for that one -- k
++  // walks of ~0.1 ms at 3,862 tabs, k log lines; the fork's own bulk closes
++  // close the active tab last instead. Pass the whole batch if it shows.
++  if (best == TabStripModel::kNoTab) {
++    return std::nullopt;
++  }
++  LOG(INFO) << "[workspaces] last used tab -> index " << best;
++  return best;
++}
++
+ void WorkspaceService::CarryTagAcrossReplacement(
+     const TabStripModelChange::Replace* replace) {
+   if (!replace || !replace->old_contents || !replace->new_contents) {
+@@ -1882,6 +1947,7 @@ void WorkspaceService::MoveOffPinnedPage
+   const int index = tab_strip_->active_index();
+   const int target = ListTabNear(index, -1);
+   if (target != index) {
++    const base::AutoReset<bool> repair(&repair_activation_, true);
+     tab_strip_->ActivateTabAt(
+         target, TabStripUserGestureDetails(
+                     TabStripUserGestureDetails::GestureType::kOther));
+@@ -2295,11 +2361,14 @@ bool WorkspaceService::HibernateAnchored
+   }
+ 
+   // Move activation away first, from this command, never from an observer
+-  // (design 2.2). Candidates are the other tabs drawn in the active
+-  // workspace, outside collapsed groups; the walk is the tested helper
+-  // SelectRelativeTab used before M153 gave it its own bounded loop.
++  // (design 2.2). To the user this is a close, so it lands where a close
++  // does (C34, D15): the tab left last. Without one, the other tabs drawn in
++  // the active workspace, outside collapsed groups; the walk is the tested
++  // helper SelectRelativeTab used before M153 gave it its own bounded loop.
+   if (index == tab_strip_->active_index()) {
+-    const int fallback = ListTabNear(index, 1);
++    const std::optional<int> last =
++        LastUsedTabIndex(gfx::Range(index, index + 1));
++    const int fallback = last ? *last : ListTabNear(index, 1);
+     if (fallback == index) {
+       // Nothing else to show in this workspace: spawn one, the way switching
+       // into an empty workspace does. StampInsertedTab tags it as it lands.
+@@ -2313,6 +2382,14 @@ bool WorkspaceService::HibernateAnchored
+       return false;
+     }
+   }
++  // Put away, so no longer a tab "left last" (D17, review C34-1): the move
++  // above stamped it, and the next close would wake it again. Cleared before
++  // the discard -- CarryTagAcrossReplacement copies only a set time -- and
++  // before the two branches that keep the page live.
++  if (WorkspaceTabData* const data =
++          WorkspaceTabData::FromWebContents(contents)) {
++    data->set_left_at(base::Time());
++  }
+ 
+   // A page with a "Leave site?" listener is put away but kept LIVE, not
+   // discarded: the discard never runs beforeunload, so typed text, an upload
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -38,6 +38,10 @@ namespace content {
+ class WebContents;
+ }
+ 
++namespace gfx {
++class Range;
++}
++
+ namespace tabs {
+ class VerticalTabStripStateController;
+ }
+@@ -383,6 +387,16 @@ class WorkspaceService : public TabStrip
+   // it too, so that the list matches the strip by the same rule.
+   bool IsTabOnScreen(tabs::TabInterface* tab) const;
+ 
++  // C34: the index of the tab of this window the user LEFT last
++  // (WorkspaceTabData::left_at) among those on screen (IsTabOnScreen: the
++  // workspace's Today tabs, its open pinned pages, favorites), outside
++  // `excluded` and outside collapsed groups -- the tab a close of the active
++  // tab returns to. nullopt while disabled, or when none of them was left in
++  // this run (left_at is not saved: after a restart the first closes follow
++  // Chromium's rule). Read-only: legal while the model is mid-removal, which
++  // is when TabStripModel asks (through its delegate).
++  std::optional<int> LastUsedTabIndex(const gfx::Range& excluded) const;
++
+   // Stage 5 anchors (design 5, E10 spec). An anchored tab remembers a home
+   // URL; Ctrl+W puts it to sleep there instead of closing it.
+   //
+@@ -781,6 +795,13 @@ class WorkspaceService : public TabStrip
+   // switch as the one exit from the filtered state that never tidies up.
+   base::CallbackListSubscription layout_mode_subscription_;
+ 
++  // True while a repair (EnsureActiveTabVisible, MoveOffPinnedPage) moves
++  // activation: the tab it moves off was not LEFT by the user, so the
++  // observer's left_at stamp skips it (C34, review C34-2) -- else a page the
++  // user never chose becomes the next close's landing. Set with a
++  // base::AutoReset around the activation; a new repair does the same.
++  bool repair_activation_ = false;
++
+   // The tab the user was last on in each workspace, so switching back returns
+   // them to what they were reading rather than to the top of the strip -- Arc
+   // and Zen both do this.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+ #define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+ 
++#include <algorithm>
+ #include <cstddef>
+ #include <optional>
+ #include <string>
+@@ -254,6 +255,18 @@ std::vector<size_t> ReconciledUnitOrder(
+     const std::vector<std::string>& unit_guids,
+     const std::vector<std::string>& workspace_order);
+ 
++// Moves `item` to the end of `items`, the others in their order; nothing when
++// it is not there. A bulk close puts the active tab LAST with it (C34, A4):
++// each close before it is of a background tab, which lands nowhere, and the
++// last lands once, on a tab that stays -- not on a doomed one that would be
++// shown, a sleeping one reloaded, and closed in its turn.
++template <typename T>
++void PutLast(std::vector<T>& items, const T& item) {
++  if (const auto it = std::ranges::find(items, item); it != items.end()) {
++    std::rotate(it, it + 1, items.end());
++  }
++}
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -3225,9 +3225,13 @@ void WorkspacePinnedSectionView::CloseAl
+       open_all_next_ = open_all_units_.size();
+     }
+   }
+-  // This window's pages, as the row's x closes this window's (D4).
+-  const std::vector<tabs::TabInterface*> pages =
++  // This window's pages, as the row's x closes this window's (D4). The page
++  // in front LAST (C34, review F3): its close lands on the page left last,
++  // often another of this folder, which would be shown -- a sleeping one
++  // reloaded -- and closed in its turn. Last, it closes once.
++  std::vector<tabs::TabInterface*> pages =
+       PagesOf(browser_->GetTabStripModel(), ItemIdsUnder(*folder));
++  workspaces::PutLast(pages, browser_->GetTabStripModel()->GetActiveTab());
+   int asked = 0;
+   {
+     workspaces::ScopedBulkLayout bulk;

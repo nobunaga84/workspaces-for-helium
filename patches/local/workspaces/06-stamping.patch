@@ -1,0 +1,1015 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -67,9 +67,16 @@ source_set("workspaces") {
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs:tabs",
+     "//components/prefs",
++    "//components/tab_groups",
+     "//components/tabs:public",
+     "//content/public/browser",
+     "//ui/base/unowned_user_data",
++
++    # For the empty GURL() handed to TabStripModelDelegate::AddTabAt when a
++    # workspace has no tab to show. Reachable today only through the
++    # public_deps of targets above, which is not ours to rely on across a
++    # rebase, and this target includes url/gurl.h directly.
++    "//url",
+   ]
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -4,14 +4,20 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ 
++#include <algorithm>
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <utility>
+ #include <vector>
+ 
++#include "base/functional/bind.h"
++#include "base/location.h"
+ #include "base/logging.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+@@ -19,6 +25,7 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
++#include "url/gurl.h"
+ 
+ namespace workspaces {
+ 
+@@ -104,8 +111,104 @@ void WorkspaceService::SetActiveWorkspac
+   workspace_changed_callbacks_.Notify();
+ }
+ 
++void WorkspaceService::SwitchToWorkspace(std::string_view guid) {
++  if (!IsEnabled()) {
++    return;
++  }
++
++  // Remember the tab being left behind before active_guid_ moves, so coming
++  // back lands on it rather than on the top of the strip.
++  if (tabs::TabInterface* active = tab_strip_->GetActiveTab()) {
++    last_active_[active_guid_] = active->GetHandle();
++  }
++
++  const std::string previous = active_guid_;
++
++  // THE ORDER OF THESE TWO STEPS IS LOAD-BEARING, and getting it wrong is
++  // silent. ActivateTabAt() below notifies observers synchronously and this
++  // object is one of them, so the auto-switch branch in OnTabStripModelChanged
++  // runs inside that call. If active_guid_ had not moved yet, that branch
++  // would read the old guid, decide the newly activated tab is foreign, and
++  // switch straight back -- and the symptom is a shortcut that appears to do
++  // nothing at all, a long way from the line that caused it.
++  SetActiveWorkspace(guid);
++  if (active_guid_ == previous) {
++    return;
++  }
++
++  // Mutating the model is legal here and nowhere else in this class: this runs
++  // from BrowserCommandController, outside the observer scope design 2.2
++  // forbids mutating from.
++  const int target = TargetTabIndexForActiveWorkspace();
++  if (target != TabStripModel::kNoTab) {
++    tab_strip_->ActivateTabAt(target);
++    return;
++  }
++
++  // The workspace has no tabs. Leaving the user on a blank strip while a
++  // foreign page is still showing underneath is the same broken state the
++  // removal path repairs, so give the workspace a tab instead. This is why a
++  // workspace is never seen empty, which is also what Arc does.
++  //
++  // AddTabAt goes through TabStripModelDelegate rather than chrome::NewTab
++  // because this target must not depend on //chrome/browser/ui (design 3.1),
++  // and the delegate is an interface //chrome/browser/ui/tabs already owns.
++  // The new tab is stamped into this workspace by the insert path, since
++  // active_guid_ has already moved.
++  tab_strip_->delegate()->AddTabAt(GURL(), /*index=*/-1, /*foreground=*/true);
++}
++
+ void WorkspaceService::ActivateRelativeWorkspace(int offset) {
+-  SetActiveWorkspace(RelativeWorkspaceGuid(workspaces_, active_guid_, offset));
++  SwitchToWorkspace(RelativeWorkspaceGuid(workspaces_, active_guid_, offset));
++}
++
++int WorkspaceService::TargetTabIndexForActiveWorkspace() const {
++  // The tab the user was last on here, if it still exists and still belongs.
++  // Both have to be re-checked: the handle answers null once the tab is
++  // closed, GetIndexOfTab answers kNoTab once it has been dragged into another
++  // window, and IsTabVisible answers false if it was re-tagged while away.
++  const auto it = last_active_.find(active_guid_);
++  if (it != last_active_.end()) {
++    if (tabs::TabInterface* remembered = it->second.Get()) {
++      const int index = tab_strip_->GetIndexOfTab(remembered);
++      if (index != TabStripModel::kNoTab && IsTabOnScreen(remembered)) {
++        return index;
++      }
++    }
++  }
++
++  // Falling back to any tab that is on screen, which includes a pinned tab.
++  // Landing on a pinned tab is a real answer rather than a near miss: it is
++  // drawn in this workspace, so the user can see where they were put.
++  for (int i = 0; i < tab_strip_->count(); ++i) {
++    if (IsTabOnScreen(tab_strip_->GetTabAtIndex(i))) {
++      return i;
++    }
++  }
++  return TabStripModel::kNoTab;
++}
++
++void WorkspaceService::EnsureActiveTabVisible() {
++  if (!IsEnabled()) {
++    return;
++  }
++
++  // An empty strip means this window is on its way out. Adding a tab here
++  // would resurrect a window the user just closed.
++  if (tab_strip_->empty()) {
++    return;
++  }
++
++  if (IsTabOnScreen(tab_strip_->GetActiveTab())) {
++    return;
++  }
++
++  const int target = TargetTabIndexForActiveWorkspace();
++  if (target != TabStripModel::kNoTab) {
++    tab_strip_->ActivateTabAt(target);
++    return;
++  }
++  tab_strip_->delegate()->AddTabAt(GURL(), /*index=*/-1, /*foreground=*/true);
+ }
+ 
+ base::CallbackListSubscription
+@@ -133,36 +236,238 @@ void WorkspaceService::OnTabStripModelCh
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+     const TabStripSelectionChange& selection) {
+-  if (change.type() != TabStripModelChange::kInserted) {
++  // Stamping is deliberately NOT behind IsEnabled(). A tab opened while the
++  // gate is shut still joins whichever workspace was last active, so it
++  // reappears where the user would expect on the way back to vertical.
++  // Refusing to stamp instead would pile those tabs into the default
++  // workspace, which is not better and is more code (LOCAL.md 12).
++  if (change.type() == TabStripModelChange::kInserted) {
++    for (const auto& inserted : change.GetInsert()->contents) {
++      StampInsertedTab(inserted.tab.get());
++    }
++  }
++
++  if (change.type() == TabStripModelChange::kReplaced) {
++    CarryTagAcrossReplacement(change.GetReplace());
++    // Returning rather than falling through to auto-switch is the point.
++    // DiscardWebContentsAt sets selection.new_contents when it discards the
++    // *active* tab, so active_tab_changed() is true here even though the user
++    // activated nothing -- that is what CHANGE_REASON_REPLACED means. Left to
++    // fall through, a background discard of the tab you were reading would
++    // drag the whole window to another workspace on its own.
+     return;
+   }
+ 
+-  for (const auto& inserted : change.GetInsert()->contents) {
+-    tabs::TabInterface* tab = inserted.tab.get();
+-    if (!tab) {
+-      continue;
++  if (change.type() == TabStripModelChange::kRemoved) {
++    // A close picks the next active tab before observers run, and
++    // DetermineNewSelectedIndex knows nothing about workspaces, so it can land
++    // on a tab this window is hiding -- and it can do so even when the active
++    // workspace still has tabs of its own, which leaves the user looking at
++    // one workspace's strip while reading another workspace's page.
++    //
++    // Repair by moving the tab, never the workspace. Following the tab here is
++    // what would make Ctrl+W throw the user into a workspace they did not ask
++    // for, which is why ResolveActiveWorkspaceAfterSelection refuses to answer
++    // for a removal.
++    //
++    // Posted because activating or opening a tab is a TabStripModel mutation
++    // and we are inside the observer scope that forbids them (design 2.2).
++    //
++    // selection.new_tab is the tab the close landed on, so the common case --
++    // it landed somewhere the user can see -- is settled here and posts
++    // nothing at all. Reading the model is legal in an observer; only mutating
++    // it is not. A null new_tab means the strip is empty and this window is
++    // closing, and IsTabOnScreen answers true for null so that also posts
++    // nothing.
++    if (IsEnabled() && !IsTabOnScreen(selection.new_tab)) {
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&WorkspaceService::EnsureActiveTabVisible,
++                                    weak_factory_.GetWeakPtr()));
+     }
+-    content::WebContents* contents = tab->GetContents();
+-    if (!contents) {
++    return;
++  }
++
++  // Nothing to follow if the user can already see the tab they landed on.
++  //
++  // This guard is here for pinned tabs specifically, and without it Ctrl+1
++  // would be a workspace switch. Pinning clears the tag, so a pinned tab reads
++  // as the *default* workspace by guid while being drawn in every one of them
++  // -- activate one from workspace "second" and the rule below would dutifully
++  // move the whole window to "default". Same pinned-tab door as IsTabOnScreen
++  // exists for (LOCAL.md 13).
++  if (selection.active_tab_changed() && !IsTabOnScreen(selection.new_tab)) {
++    // Zen's auto-switch. Follows the tab rather than moving it, and so needs
++    // no model call at all -- the tab the caller wanted is already active,
++    // which is the only reason this is legal from inside an observer.
++    if (std::optional<std::string> target =
++            ResolveActiveWorkspaceAfterSelection(GuidOf(selection.new_tab),
++                                                 active_guid_,
++                                                 /*is_removal=*/false)) {
++      SetActiveWorkspace(*target);
++    }
++  }
++}
++
++void WorkspaceService::OnTabPinnedStateChanged(tabs::TabInterface* tab,
++                                               int index) {
++  if (!tab || !tab->GetContents()) {
++    return;
++  }
++
++  // Pinning clears the tag and unpinning joins the workspace on screen: a
++  // pinned tab is a global Favorite rather than a member of one workspace
++  // (design 2.5).
++  //
++  // Clearing does NOT make the tab visible everywhere, and the difference
++  // matters. An empty guid means the *default* workspace, not every
++  // workspace, so on its own this would hide a pinned tab from every other
++  // one. What actually draws pinned tabs everywhere is that they render from
++  // a container the E6a predicate never reaches, plus the short-circuit in
++  // BrowserTabStripModelDelegate::IsTabVisibleInActiveWorkspace. Neither is
++  // replaced by this line (LOCAL.md 13).
++  // Asked of the tab rather than of the model at `index`, so this does not
++  // depend on the index being the post-move one. Pinning reorders the strip,
++  // and TabStripModel fires this notification after the move with the final
++  // index -- true today, but not something this needs to rely on.
++  WorkspaceTabData::GetOrCreateForWebContents(tab->GetContents())
++      ->set_guid(tab->IsPinned() ? std::string() : active_guid_);
++}
++
++void WorkspaceService::TabGroupedStateChanged(
++    TabStripModel* tab_strip_model,
++    std::optional<tab_groups::TabGroupId> old_group,
++    std::optional<tab_groups::TabGroupId> new_group,
++    tabs::TabInterface* tab,
++    int index) {
++  // Leaving a group is not a workspace change: the tab keeps the tag it had.
++  // Design 2.5 defines no rule for it, and inventing one would mean a tab
++  // silently changing workspace on an ungroup.
++  if (!new_group.has_value()) {
++    return;
++  }
++
++  // The arriving tab is excluded by identity rather than by `index`, so this
++  // does not depend on which index the notification carried -- joining a group
++  // can move the tab.
++  std::vector<std::string> member_guids;
++  for (int i = 0; i < tab_strip_->count(); ++i) {
++    tabs::TabInterface* member = tab_strip_->GetTabAtIndex(i);
++    if (member != tab && tab_strip_->GetTabGroupForTab(i) == new_group) {
++      member_guids.push_back(GuidOf(member));
++    }
++  }
++  ApplyCollectionGuid(tab, member_guids);
++}
++
++void WorkspaceService::OnSplitTabChanged(const SplitTabChange& change) {
++  if (change.type != SplitTabChange::Type::kAdded) {
++    return;
++  }
++  const SplitTabChange::AddedChange* added = change.GetAddedChange();
++  if (!added) {
++    return;
++  }
++
++  // Worth being honest about the value of this rule: today it can only ever be
++  // a no-op. A split is formed from tabs the user can see, so its members
++  // already share the active workspace, and the commands that could have
++  // reached a hidden tab were scoped in E7a. It is here because it is eight
++  // lines and because the split is the one collection design 2.7 warns is easy
++  // to forget -- not because a case is known to reach it.
++  //
++  // Membership is read from the model rather than from added->tabs(), because
++  // an AddedChange with reason kSplitTabUpdated carries only the tab that
++  // joined and not the split it joined. Resolved once for the whole set so two
++  // tabs entering a brand new split cannot each adopt the other's tag and swap.
++  std::vector<std::string> member_guids;
++  for (int i = 0; i < tab_strip_->count(); ++i) {
++    tabs::TabInterface* candidate = tab_strip_->GetTabAtIndex(i);
++    if (tab_strip_->GetSplitForTab(i) != change.split_id) {
+       continue;
+     }
++    const bool is_joining =
++        std::ranges::any_of(added->tabs(), [candidate](const auto& entry) {
++          return entry.first == candidate;
++        });
++    if (!is_joining) {
++      member_guids.push_back(GuidOf(candidate));
++    }
++  }
++
++  for (const auto& entry : added->tabs()) {
++    ApplyCollectionGuid(entry.first, member_guids);
++  }
++}
+ 
+-    WorkspaceTabData* tab_data =
+-        WorkspaceTabData::GetOrCreateForWebContents(contents);
++bool WorkspaceService::IsTabOnScreen(tabs::TabInterface* tab) const {
++  // Fails open on null exactly as IsTabVisible does: an empty strip must read
++  // as "nothing to repair", not as "everything is hidden".
++  return !tab || tab->IsPinned() || IsTabVisible(tab);
++}
+ 
+-    // The opener's workspace is not consulted yet -- reading it needs the
+-    // opener lookup that arrives with the rest of the stamping table. Passing
+-    // empty here makes ResolveGuidForInsertedTab fall through to the active
+-    // workspace, which is the right answer for every tab a user opens directly.
+-    tab_data->set_guid(ResolveGuidForInsertedTab(
+-        tab_data->guid(), /*opener_guid=*/std::string_view(), active_guid_));
+-
+-    // Temporary: the visible proof that the service is wired into a real
+-    // window and observing a real tab strip. Replaced when rendering starts
+-    // reading these tags.
+-    LOG(INFO) << "[workspaces] tab inserted at index " << inserted.index
+-              << " -> workspace '" << tab_data->guid() << "'";
++void WorkspaceService::CarryTagAcrossReplacement(
++    const TabStripModelChange::Replace* replace) {
++  if (!replace || !replace->old_contents || !replace->new_contents) {
++    return;
+   }
++  const WorkspaceTabData* old_data =
++      WorkspaceTabData::FromWebContents(replace->old_contents);
++  if (!old_data || old_data->guid().empty()) {
++    return;
++  }
++
++  WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
++      ->set_guid(old_data->guid());
++
++  // Logged because this is otherwise completely invisible: nothing about a
++  // discard is user-initiated, so a silent failure here would surface days
++  // later as "workspaces forgets tabs sometimes".
++  LOG(INFO) << "[workspaces] tab contents replaced at index " << replace->index
++            << " -> carried workspace '" << old_data->guid() << "'";
++}
++
++std::string WorkspaceService::GuidOf(tabs::TabInterface* tab) const {
++  if (!tab || !tab->GetContents()) {
++    return std::string();
++  }
++  const WorkspaceTabData* tab_data =
++      WorkspaceTabData::FromWebContents(tab->GetContents());
++  return tab_data ? tab_data->guid() : std::string();
++}
++
++void WorkspaceService::ApplyCollectionGuid(
++    tabs::TabInterface* tab,
++    const std::vector<std::string>& member_guids) {
++  if (!tab || !tab->GetContents()) {
++    return;
++  }
++  WorkspaceTabData* tab_data =
++      WorkspaceTabData::GetOrCreateForWebContents(tab->GetContents());
++  tab_data->set_guid(
++      ResolveGuidForCollectionJoin(member_guids, tab_data->guid()));
++}
++
++void WorkspaceService::StampInsertedTab(tabs::TabInterface* tab) {
++  if (!tab || !tab->GetContents()) {
++    return;
++  }
++  WorkspaceTabData* tab_data =
++      WorkspaceTabData::GetOrCreateForWebContents(tab->GetContents());
++
++  // The opener is deliberately not consulted. It is whichever tab was active
++  // at insertion rather than the tab that spawned this one, so honouring it
++  // stamps a tab opened in an empty workspace for the workspace being left --
++  // see the comment on ResolveGuidForInsertedTab, and do not reinstate it.
++  tab_data->set_guid(
++      ResolveGuidForInsertedTab(tab_data->guid(), active_guid_));
++
++  // active_guid_ is in the line because without it this log cannot answer the
++  // question it exists for. "-> workspace 'default'" is the same text whether
++  // the tab joined the workspace on screen or was stamped for a different one,
++  // and telling those apart by eye is what a browser session was spent on.
++  LOG(INFO) << "[workspaces] tab inserted at index "
++            << tab_strip_->GetIndexOfTab(tab) << " -> workspace '"
++            << tab_data->guid() << "' (active '" << active_guid_ << "')";
+ }
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SERVICE_H_
+ #define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SERVICE_H_
+ 
++#include <map>
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -13,17 +15,18 @@
+ #include "base/functional/callback_forward.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ref.h"
++#include "base/memory/weak_ptr.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/tab_groups/tab_group_id.h"
++// For tabs::TabHandle, which is TabInterface::Handle and so needs the full
++// declaration rather than the forward declaration that used to be enough here.
++#include "components/tabs/public/tab_interface.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ 
+ class BrowserWindowInterface;
+ class PrefService;
+ class TabStripModel;
+ 
+-namespace tabs {
+-class TabInterface;
+-}  // namespace tabs
+-
+ namespace workspaces {
+ 
+ // One per browser window. Owns which workspace that window is showing, and
+@@ -86,11 +89,25 @@ class WorkspaceService : public TabStrip
+   // IsVisibleInWorkspace.
+   //
+   // This changes only our own bookkeeping -- it calls nothing on
+-  // TabStripModel -- so the re-entrancy rule above is not in play. Keep it
+-  // that way: the moment switching also has to move or activate a tab, that
+-  // part belongs in a posted task, not here.
++  // TabStripModel -- so the re-entrancy rule above is not in play, and it is
++  // therefore the version the observer is allowed to call. KEEP IT THAT WAY.
++  // If you are looking for the switch that also moves the user onto a tab they
++  // can see, that is SwitchToWorkspace() below, and it is deliberately a
++  // different name rather than a bool on this one: the distinction is "may
++  // this touch TabStripModel", which is not something to leave to an argument
++  // at a call site.
+   void SetActiveWorkspace(std::string_view guid);
+ 
++  // Shows `guid` and moves the user onto a tab of it -- the one they were last
++  // on there if it is still around, otherwise the first visible tab, otherwise
++  // a brand new tab.
++  //
++  // ONLY EVER CALL THIS FROM A COMMAND HANDLER. It activates a tab, so calling
++  // it from a TabStripModelObserver method would trip the re-entrancy CHECK
++  // described above. Everything that reaches it today comes in through
++  // ActivateRelativeWorkspace() from BrowserCommandController.
++  void SwitchToWorkspace(std::string_view guid);
++
+   // Shows the workspace `offset` positions from the active one, wrapping at
+   // both ends. +1 is next, -1 is previous.
+   void ActivateRelativeWorkspace(int offset);
+@@ -125,6 +142,64 @@ class WorkspaceService : public TabStrip
+       TabStripModel* tab_strip_model,
+       const TabStripModelChange& change,
+       const TabStripSelectionChange& selection) override;
++  void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++  void TabGroupedStateChanged(TabStripModel* tab_strip_model,
++                              std::optional<tab_groups::TabGroupId> old_group,
++                              std::optional<tab_groups::TabGroupId> new_group,
++                              tabs::TabInterface* tab,
++                              int index) override;
++  void OnSplitTabChanged(const SplitTabChange& change) override;
++
++  // Whether `tab` is actually on screen right now, which is NOT the same
++  // question as IsTabVisible().
++  //
++  // IsTabVisible() answers about guids. A pinned tab is drawn in every
++  // workspace whatever guid it carries, because it renders from a container
++  // the E6a layout predicate never reaches -- so for a pinned tab the two
++  // answers differ, and it is this one that matches the screen.
++  //
++  // Everything that decides where to put the user has to ask this rather than
++  // IsTabVisible(), or closing a tab in a non-default workspace would move
++  // them off a pinned tab sitting in plain sight at the top of the strip.
++  // BrowserTabStripModelDelegate::IsTabVisibleInActiveWorkspace short-circuits
++  // on pinned for the same reason; this is the second door onto that rule and
++  // it does not inherit it (LOCAL.md 13).
++  bool IsTabOnScreen(tabs::TabInterface* tab) const;
++
++  // The workspace `tab` belongs to, or empty for a tab that has never been
++  // stamped or has no contents. Empty means the default workspace, never "no
++  // workspace" -- see IsVisibleInWorkspace.
++  std::string GuidOf(tabs::TabInterface* tab) const;
++
++  // Applies the collection rule to `tab` given the tags of the other members
++  // it is joining. Shared by the group and split paths, which differ only in
++  // how the membership is looked up.
++  void ApplyCollectionGuid(tabs::TabInterface* tab,
++                           const std::vector<std::string>& member_guids);
++
++  // Stamps a newly inserted tab with the workspace it belongs to.
++  void StampInsertedTab(tabs::TabInterface* tab);
++
++  // Moves the workspace tag onto a tab's replacement WebContents.
++  //
++  // Membership lives on a WebContentsUserData, and Chromium swaps the
++  // WebContents out from under a tab that keeps its identity -- Memory Saver
++  // discarding an idle tab, and prerendering swapping in a prepared one, both
++  // arrive here as kReplaced. Without this the tag is left on the discarded
++  // contents and the tab silently rejoins the default workspace, minutes after
++  // the user last touched it and with nothing on screen tying it to
++  // Workspaces.
++  void CarryTagAcrossReplacement(const TabStripModelChange::Replace* replace);
++
++  // The index this window should activate to show the active workspace, or
++  // TabStripModel::kNoTab when the workspace has no tab in this strip at all.
++  int TargetTabIndexForActiveWorkspace() const;
++
++  // Repairs the "the active tab is not one you can see" state after a removal.
++  //
++  // MUST BE POSTED, never called straight from an observer: it activates a tab
++  // and can open one, both of which are TabStripModel mutations.
++  void EnsureActiveTabVisible();
+ 
+   const raw_ref<TabStripModel> tab_strip_;
+ 
+@@ -143,8 +218,31 @@ class WorkspaceService : public TabStrip
+   // reads this, so replacing it later is a local change.
+   std::vector<std::string> workspaces_;
+ 
++  // The tab the user was last on in each workspace, so switching back returns
++  // them to what they were reading rather than to the top of the strip -- Arc
++  // and Zen both do this.
++  //
++  // A TabHandle rather than a pointer because a remembered tab can be closed,
++  // or dragged into another window, at any time and without telling us.
++  // Handles self-invalidate: Get() simply answers null afterwards, so this map
++  // needs no pruning and no observer of its own. Stale entries cost one dead
++  // int32 each.
++  std::map<std::string, tabs::TabHandle> last_active_;
++
+   base::RepeatingClosureList workspace_changed_callbacks_;
+ 
++  // For EnsureActiveTabVisible(), which is posted and so can outlive the
++  // window that scheduled it -- closing the last tab of a window schedules the
++  // repair and then destroys this service before it runs.
++  //
++  // Not last, which is where the Chromium style guide normally puts a weak
++  // factory, because scoped_data_holder_ below has a stronger claim on the
++  // slot and this one does not actually need it: the posted task is delivered
++  // by the message loop, which cannot interleave with a destructor, so by the
++  // time it runs every member here is gone and the WeakPtr is already null
++  // whichever order they were declared in.
++  base::WeakPtrFactory<WorkspaceService> weak_factory_{this};
++
+   // Must be last: it publishes `this` to the window, so everything else has to
+   // be initialised before it, and it must be torn down first.
+   ui::ScopedUnownedUserData<WorkspaceService> scoped_data_holder_;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -4,25 +4,39 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ 
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+ 
+ namespace workspaces {
+ 
++namespace {
++
++// An empty guid means the implicit default workspace everywhere in this file,
++// never "no workspace". Spelling that out once keeps the rules below from each
++// having to remember it.
++std::string_view Effective(std::string_view guid) {
++  return guid.empty() ? kDefaultWorkspaceGuid : guid;
++}
++
++}  // namespace
++
+ std::string ResolveGuidForInsertedTab(std::string_view existing_guid,
+-                                      std::string_view opener_guid,
+                                       std::string_view active_guid) {
+   if (!existing_guid.empty()) {
+     return std::string(existing_guid);
+   }
+-  if (!opener_guid.empty()) {
+-    return std::string(opener_guid);
+-  }
+-  if (!active_guid.empty()) {
+-    return std::string(active_guid);
++  return std::string(Effective(active_guid));
++}
++
++std::string ResolveGuidForCollectionJoin(
++    const std::vector<std::string>& member_guids,
++    std::string_view joining_guid) {
++  if (member_guids.empty()) {
++    return std::string(Effective(joining_guid));
+   }
+-  return std::string(kDefaultWorkspaceGuid);
++  return std::string(Effective(member_guids.front()));
+ }
+ 
+ bool IsVisibleInWorkspace(std::string_view tab_guid,
+@@ -32,11 +46,22 @@ bool IsVisibleInWorkspace(std::string_vi
+     return true;
+   }
+ 
+-  const std::string_view effective_tab =
+-      tab_guid.empty() ? kDefaultWorkspaceGuid : tab_guid;
+-  const std::string_view effective_active =
+-      active_guid.empty() ? kDefaultWorkspaceGuid : active_guid;
+-  return effective_tab == effective_active;
++  return Effective(tab_guid) == Effective(active_guid);
++}
++
++std::optional<std::string> ResolveActiveWorkspaceAfterSelection(
++    std::string_view new_active_tab_guid,
++    std::string_view active_guid,
++    bool is_removal) {
++  if (is_removal) {
++    return std::nullopt;
++  }
++
++  const std::string_view target = Effective(new_active_tab_guid);
++  if (target == Effective(active_guid)) {
++    return std::nullopt;
++  }
++  return std::string(target);
+ }
+ 
+ std::string RelativeWorkspaceGuid(const std::vector<std::string>& workspaces,
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+ #define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+ 
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -30,20 +31,66 @@ namespace workspaces {
+ inline constexpr std::string_view kDefaultWorkspaceGuid = "default";
+ 
+ // Which workspace a tab joins when it is inserted into a tab strip. Applied in
+-// order (design 2.5):
++// order:
+ //
+ //  1. A tab that already carries a tag keeps it. This is the case that makes
+ //     dragging a tab between windows and restoring a session work at all: the
+ //     tag travels on the tab, so the receiving window must not overwrite it.
+-//  2. Otherwise it joins its opener's workspace, so a link opened from a tab
+-//     lands beside the tab it came from.
+-//  3. Otherwise it joins whatever workspace is active in this window.
++//  2. Otherwise it joins whatever workspace is active in this window.
++//
++// DESIGN 2.5 HAS A THIRD RULE BETWEEN THESE TWO -- "tag = opener's tag if it
++// has one" -- AND IT IS WRONG. It shipped in E7b, broke the browser, and was
++// removed the same day. Do not put it back. What it costs is not subtle: the
++// window bounces back to the previous workspace every time you open a tab in
++// an empty one.
++//
++// The rule reads as "a link opened from a tab lands beside the tab it came
++// from", which is a reasonable thing to want. Chromium's opener is not that.
++// tab_strip_model.cc sets the opener to whichever tab was *active* at
++// insertion -- including for a plain Ctrl+T, which inherits an opener under
++// PAGE_TRANSITION_TYPED so that closing the new tab re-activates the old one.
++// It is a close-behaviour hint, not a statement about which task a tab belongs
++// to.
++//
++// So the opener's workspace equals the active workspace in every case except
++// one: when the active tab is not in the active workspace. That state is
++// reachable exactly while switching into a workspace with no tabs of its own,
++// which is when the service spawns a tab -- and the spawned tab would then be
++// stamped for the workspace being left rather than the one being entered.
++// Rule 2 below already gives the right answer in every case rule 3 would have
++// answered differently, so it is redundant when it is right and harmful when
++// it is not.
+ //
+ // Never returns empty; falls back to kDefaultWorkspaceGuid.
+ std::string ResolveGuidForInsertedTab(std::string_view existing_guid,
+-                                      std::string_view opener_guid,
+                                       std::string_view active_guid);
+ 
++// Which workspace a tab joins when it is added to a tab group or a split
++// (design 2.5). `member_guids` holds the tags of the collection's *other*
++// members; `joining_guid` is the tag the arriving tab carries.
++//
++// The collection wins, always. A group that mixed workspaces would be drawn
++// half-visible -- the render predicate resolves a collection to its first
++// descendant tab, so the members that disagreed would be laid out inside a
++// container that is not shown, and no amount of switching would reveal them.
++// One tag per collection is what keeps that unrepresentable.
++//
++// `member_guids[0]` decides rather than a majority or a most-recent rule.
++// Members can only ever disagree if some earlier rule already broke the
++// invariant, and in that case any answer is equally arbitrary; a first-wins
++// rule is the one a reader can predict without knowing the history.
++//
++// An empty entry in `member_guids` is a real answer -- it means that member is
++// in the implicit default workspace -- so it is normalised rather than skipped.
++// Reading it as "no opinion" would let a newcomer's tag beat a default-workspace
++// group, which is the mixing this exists to prevent.
++//
++// With no members at all the arriving tab keeps its own tag and thereby defines
++// the collection's. Never returns empty.
++std::string ResolveGuidForCollectionJoin(
++    const std::vector<std::string>& member_guids,
++    std::string_view joining_guid);
++
+ // Whether a tab is drawn, given the workspace it belongs to, the workspace its
+ // window is currently showing, and whether Workspaces is switched on at all
+ // (design 2.7 and 2.8).
+@@ -68,6 +115,38 @@ bool IsVisibleInWorkspace(std::string_vi
+                           std::string_view active_guid,
+                           bool workspaces_enabled);
+ 
++// Which workspace the window should show after the active tab changed, or
++// nullopt to leave it alone. This is Zen's auto-switch (design 2.5): when
++// something activates a tab of another workspace, the window follows the tab
++// rather than the tab being dragged to the window.
++//
++// It is worth being clear about why this direction is free. Ctrl+Tab, an
++// extension activating a tab, an omnibox "switch to this tab", and a link
++// opening in another workspace are four different code paths, and every one of
++// them ends in an active-tab change. Following the tab covers all four with one
++// branch instead of intercepting each path separately -- and it needs no
++// TabStripModel call at all, since the tab the caller wants is already active.
++// That is what makes it legal from inside a TabStripModelObserver, where every
++// mutator is forbidden (design 2.2).
++//
++// `is_removal` is the whole subtlety. On a close, Chromium picks the next
++// active tab *before* observers run, and DetermineNewSelectedIndex knows
++// nothing about workspaces, so it can land on a foreign tab. Following it there
++// would mean Ctrl+W silently threw the user into someone else's workspace --
++// the exact opposite of what Arc does, and the reason this returns nullopt for
++// a removal instead. The caller repairs a removal by moving the *tab*, which is
++// the other half of the same rule.
++//
++// An empty guid means the implicit default workspace on both sides, exactly as
++// it does in IsVisibleInWorkspace, so a tab that has never been stamped does
++// not read as "switch to nowhere". The returned guid is never empty; nullopt is
++// the only way this says "do nothing", which keeps it distinguishable from
++// "switch to the default workspace".
++std::optional<std::string> ResolveActiveWorkspaceAfterSelection(
++    std::string_view new_active_tab_guid,
++    std::string_view active_guid,
++    bool is_removal);
++
+ // The workspace `offset` positions away from `active_guid` in
+ // `workspaces`, wrapping at both ends: next-from-last is the first, and
+ // previous-from-first is the last. Switching is a cycle, never a dead end,
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ 
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -25,32 +26,50 @@ bool IsVisibleWhenEnabled(std::string_vi
+ // tab between windows and restoring a session work: the tag travels on the tab,
+ // so the receiving window must not restamp it with its own active workspace.
+ TEST(WorkspaceStampingTest, ExistingGuidIsKept) {
+-  EXPECT_EQ("work", ResolveGuidForInsertedTab("work", "personal", "personal"));
++  EXPECT_EQ("work", ResolveGuidForInsertedTab("work", "personal"));
+ }
+ 
+-// Rule 2 -- a link opened from a tab lands beside the tab it came from, even
+-// when that tab is not in the active workspace.
+-TEST(WorkspaceStampingTest, OpenerGuidUsedWhenUntagged) {
+-  EXPECT_EQ("work", ResolveGuidForInsertedTab("", "work", "personal"));
+-}
+-
+-// Rule 3 -- a plain new tab joins the workspace you are looking at.
+-TEST(WorkspaceStampingTest, ActiveGuidUsedWithoutOpener) {
+-  EXPECT_EQ("personal", ResolveGuidForInsertedTab("", "", "personal"));
++// Rule 2 -- a new tab joins the workspace you are looking at, and NOTHING ELSE
++// gets a vote.
++//
++// This is the regression test for the bug that E7b shipped and removed the same
++// day. There used to be an opener rule between these two, and because Chromium
++// hands every plain Ctrl+T an opener pointing at the currently active tab, a tab
++// opened while switching into an empty workspace was stamped for the workspace
++// being *left*. Auto-switch then followed that tag and threw the window back,
++// so an empty workspace could never be populated at all.
++//
++// The shape to keep: whatever else is true of the strip, the answer for an
++// untagged tab is the active workspace.
++TEST(WorkspaceStampingTest, UntaggedTabJoinsTheActiveWorkspace) {
++  EXPECT_EQ("personal", ResolveGuidForInsertedTab("", "personal"));
++  EXPECT_EQ("second", ResolveGuidForInsertedTab("", "second"));
+ }
+ 
+ // The result is never empty: an untagged tab belongs to the implicit default
+ // workspace rather than to nothing (design 2.4).
+ TEST(WorkspaceStampingTest, FallsBackToDefaultWorkspace) {
+-  EXPECT_EQ(kDefaultWorkspaceGuid, ResolveGuidForInsertedTab("", "", ""));
++  EXPECT_EQ(kDefaultWorkspaceGuid, ResolveGuidForInsertedTab("", ""));
+ }
+ 
+-// Precedence is existing > opener > active, checked as one chain rather than
+-// relying on the three tests above to imply it.
+-TEST(WorkspaceStampingTest, PrecedenceIsExistingThenOpenerThenActive) {
+-  EXPECT_EQ("a", ResolveGuidForInsertedTab("a", "b", "c"));
+-  EXPECT_EQ("b", ResolveGuidForInsertedTab("", "b", "c"));
+-  EXPECT_EQ("c", ResolveGuidForInsertedTab("", "", "c"));
++// Precedence is existing > active, checked as one chain rather than relying on
++// the tests above to imply it.
++TEST(WorkspaceStampingTest, PrecedenceIsExistingThenActive) {
++  EXPECT_EQ("a", ResolveGuidForInsertedTab("a", "c"));
++  EXPECT_EQ("c", ResolveGuidForInsertedTab("", "c"));
++}
++
++// A tab opened while entering an empty workspace must land in the workspace
++// being entered, and must then be one the strip actually draws there. If these
++// two disagreed the window would spawn a tab it immediately hides, which is the
++// exact loop the opener rule created.
++TEST(WorkspaceStampingTest, TabSpawnedForAnEmptyWorkspaceIsVisibleInIt) {
++  const std::string stamped = ResolveGuidForInsertedTab("", "second");
++  EXPECT_EQ("second", stamped);
++  EXPECT_TRUE(IsVisibleWhenEnabled(stamped, "second"));
++  EXPECT_EQ(std::nullopt,
++            ResolveActiveWorkspaceAfterSelection(stamped, "second",
++                                                 /*is_removal=*/false));
+ }
+ 
+ TEST(WorkspaceVisibilityTest, TabInActiveWorkspaceIsVisible) {
+@@ -104,12 +123,18 @@ TEST(WorkspaceVisibilityTest, EnablingIs
+ // whatever ResolveGuidForInsertedTab returns must satisfy IsVisibleInWorkspace
+ // against that window's active guid. If these two ever disagree, opening a tab
+ // would make it disappear immediately.
++//
++// THIS TEST EXISTED WHILE THE OPENER BUG SHIPPED, AND PASSED THE WHOLE TIME.
++// It asserted the right invariant, but only ever fed the function an empty
++// opener -- the one input for which the broken rule could not fire. An
++// invariant test is only worth the inputs it is given, and the input that
++// mattered was the one the caller supplied in production and no test ever did.
+ TEST(WorkspaceStampingTest, NewlyStampedTabIsVisibleInItsWindow) {
+   const std::string_view actives[] = {std::string_view(""),
+                                       std::string_view("work"),
+                                       kDefaultWorkspaceGuid};
+   for (std::string_view active : actives) {
+-    const std::string stamped = ResolveGuidForInsertedTab("", "", active);
++    const std::string stamped = ResolveGuidForInsertedTab("", active);
+     EXPECT_TRUE(IsVisibleWhenEnabled(stamped, active))
+         << "stamped '" << stamped << "' but hidden in active '" << active
+         << "'";
+@@ -280,5 +305,142 @@ TEST(WorkspaceNextVisibleTabTest, Landed
+   }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Joining a group or a split (design 2.5).
++// ---------------------------------------------------------------------------
++
++// The first tab into a collection is what defines the collection's workspace,
++// because there is nothing else to ask.
++TEST(WorkspaceCollectionJoinTest, FirstMemberDefinesTheCollection) {
++  EXPECT_EQ("work", ResolveGuidForCollectionJoin({}, "work"));
++}
++
++// ...and if that first tab was never stamped, the collection is in the default
++// workspace rather than in no workspace at all.
++TEST(WorkspaceCollectionJoinTest, FirstMemberUntaggedMeansDefault) {
++  EXPECT_EQ(kDefaultWorkspaceGuid, ResolveGuidForCollectionJoin({}, ""));
++}
++
++// The collection wins over the arriving tab. This is the whole point of the
++// rule: a tab dragged into a group changes workspace, rather than the group
++// ending up with members in two of them.
++TEST(WorkspaceCollectionJoinTest, CollectionBeatsTheJoiningTab) {
++  EXPECT_EQ("work", ResolveGuidForCollectionJoin({"work"}, "personal"));
++}
++
++// An untagged member is a real answer -- it means that member is in the default
++// workspace -- so it must beat a tagged newcomer. Reading it as "no opinion"
++// and letting "personal" through is exactly the mixing this rule exists to
++// prevent, and it is the easiest version of this function to get wrong.
++TEST(WorkspaceCollectionJoinTest, UntaggedMemberStillBeatsTheJoiningTab) {
++  EXPECT_EQ(kDefaultWorkspaceGuid,
++            ResolveGuidForCollectionJoin({""}, "personal"));
++}
++
++// Members can only disagree if some earlier rule already broke the invariant.
++// Any answer is arbitrary at that point; first-wins is pinned here so it is at
++// least predictable without knowing the history.
++TEST(WorkspaceCollectionJoinTest, FirstMemberWinsWhenMembersDisagree) {
++  EXPECT_EQ("work", ResolveGuidForCollectionJoin({"work", "personal"}, ""));
++}
++
++// A group whose members all went through this rule is drawn all-or-nothing.
++// If it were not, the render predicate -- which resolves a collection to its
++// first descendant tab -- would lay the disagreeing members out inside a
++// container that is not shown, and no amount of switching would reveal them.
++TEST(WorkspaceCollectionJoinTest, EveryMemberOfAGroupSharesVisibility) {
++  const std::string group_guid = ResolveGuidForCollectionJoin({"work"}, "");
++  const std::vector<std::string> joiners = {"personal", "", "work"};
++
++  for (const std::string& joiner : joiners) {
++    const std::string settled = ResolveGuidForCollectionJoin({"work"}, joiner);
++    EXPECT_EQ(IsVisibleWhenEnabled(group_guid, "work"),
++              IsVisibleWhenEnabled(settled, "work"))
++        << "joiner '" << joiner << "' disagreed with its group";
++    EXPECT_EQ(IsVisibleWhenEnabled(group_guid, "personal"),
++              IsVisibleWhenEnabled(settled, "personal"))
++        << "joiner '" << joiner << "' disagreed with its group";
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Auto-switch (design 2.5).
++// ---------------------------------------------------------------------------
++
++// Activating a tab of another workspace brings the window to it. This one
++// branch is what makes Ctrl+Tab, an extension, the omnibox and a link opening
++// elsewhere all coherent without intercepting any of those paths.
++TEST(WorkspaceAutoSwitchTest, FollowsATabFromAnotherWorkspace) {
++  EXPECT_EQ("work", ResolveActiveWorkspaceAfterSelection("work", "personal",
++                                                         /*is_removal=*/false));
++}
++
++// Nothing to do when the tab is already in the workspace on screen, which is
++// the overwhelmingly common case -- every ordinary tab switch takes this path.
++TEST(WorkspaceAutoSwitchTest, StaysPutWithinTheSameWorkspace) {
++  EXPECT_EQ(std::nullopt,
++            ResolveActiveWorkspaceAfterSelection("work", "work",
++                                                 /*is_removal=*/false));
++}
++
++// THE RULE THAT MAKES Ctrl+W SAFE. On a close Chromium has already picked the
++// next active tab, knowing nothing about workspaces, so it can hand us a
++// foreign one. Following it would throw the user into a workspace they never
++// asked for -- the exact anti-Arc behaviour design 2.5 calls out. The caller
++// repairs a removal by moving the tab instead.
++TEST(WorkspaceAutoSwitchTest, NeverFollowsARemoval) {
++  EXPECT_EQ(std::nullopt,
++            ResolveActiveWorkspaceAfterSelection("work", "personal",
++                                                 /*is_removal=*/true));
++}
++
++// An untagged tab is in the default workspace, not in none, so activating one
++// switches rather than being ignored. Getting this wrong would strand the
++// window on a workspace whose tabs it is no longer showing.
++TEST(WorkspaceAutoSwitchTest, UntaggedTabMeansTheDefaultWorkspace) {
++  EXPECT_EQ(kDefaultWorkspaceGuid,
++            ResolveActiveWorkspaceAfterSelection("", "work",
++                                                 /*is_removal=*/false));
++  EXPECT_EQ(std::nullopt,
++            ResolveActiveWorkspaceAfterSelection("", kDefaultWorkspaceGuid,
++                                                 /*is_removal=*/false));
++}
++
++// nullopt is the only way this says "do nothing". An empty string would be
++// indistinguishable from "switch to the default workspace", and the caller
++// feeds the result straight into SetActiveWorkspace(), which reads empty as
++// the default -- so an empty sentinel would silently switch.
++TEST(WorkspaceAutoSwitchTest, NeverAnswersWithAnEmptyGuid) {
++  for (std::string_view tab_guid : {"", "work", "default"}) {
++    for (std::string_view active : {"", "personal"}) {
++      const std::optional<std::string> target =
++          ResolveActiveWorkspaceAfterSelection(tab_guid, active,
++                                               /*is_removal=*/false);
++      if (target.has_value()) {
++        EXPECT_FALSE(target->empty())
++            << "tab '" << tab_guid << "' active '" << active << "'";
++      }
++    }
++  }
++}
++
++// After an auto-switch the tab that caused it must be one the strip draws. If
++// these two rules ever disagreed, activating a foreign tab would move the
++// window to a workspace that still hides it, and the user would be reading a
++// page with no tab anywhere on screen.
++TEST(WorkspaceAutoSwitchTest, LandedWorkspaceShowsTheTabThatCausedIt) {
++  for (std::string_view tab_guid : {"work", "personal", ""}) {
++    const std::optional<std::string> target =
++        ResolveActiveWorkspaceAfterSelection(tab_guid, "personal",
++                                             /*is_removal=*/false);
++    // A std::string rather than a string_view: the ternary's common type is
++    // std::string, so a view would be left dangling at the semicolon.
++    const std::string settled =
++        target.has_value() ? *target : std::string("personal");
++    EXPECT_TRUE(IsVisibleWhenEnabled(tab_guid, settled))
++        << "tab '" << tab_guid << "' invisible in '" << settled << "'";
++  }
++}
++
+ }  // namespace
+ }  // namespace workspaces

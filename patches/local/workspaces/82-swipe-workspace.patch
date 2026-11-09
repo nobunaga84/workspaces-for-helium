@@ -1,0 +1,232 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -36,6 +36,7 @@
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+@@ -86,6 +87,9 @@
+ #include "ui/compositor/layer.h"
+ #include "ui/compositor/layer_tree_owner.h"
+ #include "ui/compositor/paint_recorder.h"
++#include "ui/events/event.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/event_handler.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/color_utils.h"
+ #include "ui/gfx/geometry/rect_f.h"
+@@ -706,6 +710,126 @@ class WorkspaceChip : public WorkspaceRa
+ BEGIN_METADATA(WorkspaceChip)
+ END_METADATA
+ 
++// C7: a sideways scroll over the sidebar -- a touchpad's two-finger swipe, a
++// mouse's thumb wheel, a tilted wheel -- shows the workspace beside this one
++// on the bar, once per swipe, and stops at either end (the owner's answers).
++// Modelled on Chromium's VerticalTabStripFocusSwipeController (its Windows
++// road), which exists only behind the disabled kTabGroupsFocusing and turns
++// focused tab groups instead: the same 15 units to lock a swipe's direction,
++// 75 to switch, and a swipe ends after 300 ms without a wheel. Its "forward"
++// (a negative offset) is not taken: on Windows a view's wheel keeps
++// WM_MOUSEHWHEEL's sign, positive to the right (events_win_utils.cc; Blink
++// flips it, views do not). A pre-target handler on the region view, so it
++// sees a wheel over any part of the sidebar -- the list, the pinned section,
++// this bar -- before the view under the mouse does.
++class WorkspaceRailView::SwipeSwitch : public ui::EventHandler {
++ public:
++  explicit SwipeSwitch(WorkspaceRailView* rail) : rail_(rail) {}
++  SwipeSwitch(const SwipeSwitch&) = delete;
++  SwipeSwitch& operator=(const SwipeSwitch&) = delete;
++  ~SwipeSwitch() override { Detach(); }
++
++  // Once: the same region again does nothing, so each AddedToWidget() can
++  // ask. Let go when the region goes first, as the glide does (WheelGlide).
++  void Attach(views::View* region) {
++    if (region == region_) {
++      return;
++    }
++    Detach();
++    region_ = region;
++    if (region_) {
++      region_->AddPreTargetHandler(this);
++      tracker_.SetView(region_);
++      tracker_.SetIsDeletingCallback(
++          base::BindOnce(&SwipeSwitch::Detach, base::Unretained(this)));
++    }
++  }
++
++  void Detach() {
++    if (region_) {
++      region_->RemovePreTargetHandler(this);
++      region_ = nullptr;
++      tracker_.SetView(nullptr);
++    }
++  }
++
++  // ui::EventHandler:
++  void OnMouseEvent(ui::MouseEvent* event) override {
++    // Not while a button is held (a tab drag, the edge's resize), nor with a
++    // modifier: Ctrl and Shift change what a wheel means elsewhere.
++    constexpr int kNotWith = ui::EF_LEFT_MOUSE_BUTTON |
++                             ui::EF_MIDDLE_MOUSE_BUTTON |
++                             ui::EF_RIGHT_MOUSE_BUTTON | ui::EF_CONTROL_DOWN |
++                             ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN;
++    if (!event->IsMouseWheelEvent() || (event->flags() & kNotWith)) {
++      return;
++    }
++    const workspaces::WorkspaceService* const service =
++        workspaces::WorkspaceService::From(rail_->browser_);
++    if (!service || !service->IsEnabled()) {
++      return;
++    }
++
++    // An event not taken comes here again for each view it bubbles up to
++    // (RootView::OnMouseWheel), the same event: counted once, by the time it
++    // was made.
++    const base::TimeTicks now = event->time_stamp();
++    if (now == last_wheel_) {
++      return;
++    }
++    if (now - last_wheel_ > kSwipeEnds) {
++      axis_ = Axis::kNone;
++      total_x_ = 0;
++      total_y_ = 0;
++      switched_ = false;
++    }
++    last_wheel_ = now;
++
++    // The first direction to lead by kLockAt holds for the whole swipe: a
++    // list scroll drifting sideways never switches (wish 2's glide has it),
++    // and a swipe that starts a little diagonal still does.
++    const ui::MouseWheelEvent* const wheel = event->AsMouseWheelEvent();
++    total_x_ += wheel->x_offset();
++    total_y_ += wheel->y_offset();
++    if (axis_ == Axis::kNone) {
++      if (std::abs(total_y_) >= kLockAt &&
++          std::abs(total_y_) > std::abs(total_x_)) {
++        axis_ = Axis::kVertical;
++      } else if (std::abs(total_x_) >= kLockAt &&
++                 std::abs(total_x_) > std::abs(total_y_)) {
++        axis_ = Axis::kSideways;
++      }
++    }
++    if (axis_ != Axis::kSideways) {
++      return;
++    }
++    event->SetHandled();
++    event->StopPropagation();
++    if (switched_ || std::abs(total_x_) < kSwitchAt) {
++      return;
++    }
++    switched_ = true;
++    // Scrolling right, as a wide page would scroll right, is the chip to the
++    // right.
++    rail_->SwitchBeside(total_x_ > 0 ? 1 : -1);
++  }
++
++ private:
++  enum class Axis { kNone, kVertical, kSideways };
++  static constexpr int kLockAt = 15;
++  static constexpr int kSwitchAt = 75;
++  static constexpr base::TimeDelta kSwipeEnds = base::Milliseconds(300);
++
++  const raw_ptr<WorkspaceRailView> rail_;
++  raw_ptr<views::View> region_ = nullptr;
++  views::ViewTracker tracker_;
++  base::TimeTicks last_wheel_;
++  Axis axis_ = Axis::kNone;
++  int total_x_ = 0;
++  int total_y_ = 0;
++  bool switched_ = false;
++};
++
+ WorkspaceRailView::WorkspaceRailView(
+     BrowserWindowInterface* browser,
+     tabs::VerticalTabStripStateController* state_controller,
+@@ -836,6 +960,17 @@ WorkspaceRailView::~WorkspaceRailView()
+ void WorkspaceRailView::AddedToWidget() {
+   views::FlexLayoutView::AddedToWidget();
+ 
++  // C7: the whole sidebar, which holds this bar -- not just the bar.
++  views::View* region = parent();
++  while (region && region->GetProperty(views::kElementIdentifierKey) !=
++                       kTabStripRegionElementId) {
++    region = region->parent();
++  }
++  if (!swipe_switch_) {
++    swipe_switch_ = std::make_unique<SwipeSwitch>(this);
++  }
++  swipe_switch_->Attach(region);
++
+   // base::Unretained is safe on both: the subscriptions are members, so they
+   // are cancelled when this view is destroyed, and the service's callback lists
+   // bind a weak pointer of their own so a service that dies first is also fine
+@@ -1043,6 +1178,41 @@ void WorkspaceRailView::OnWorkspacePress
+   service->SwitchToWorkspace(guid);
+ }
+ 
++void WorkspaceRailView::SwitchBeside(int step) {
++  // Posted out of the wheel event: a switch rebuilds rows, maybe the one
++  // under the mouse that the event is on its way to.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<WorkspaceRailView> self, int step) {
++            workspaces::WorkspaceService* const service =
++                self ? workspaces::WorkspaceService::From(self->browser_)
++                     : nullptr;
++            if (!service) {
++              return;
++            }
++            const std::vector<std::string>& guids = self->guids_;
++            const auto it = std::ranges::find(guids, service->active_guid());
++            if (it == guids.end()) {
++              LOG(INFO) << "[workspaces] swipe " << step << ": '"
++                        << service->active_guid() << "' is not on the bar";
++              return;
++            }
++            const ptrdiff_t to = (it - guids.begin()) + step;
++            if (to < 0 || to >= std::ssize(guids)) {
++              LOG(INFO) << "[workspaces] swipe " << step
++                        << ": no workspace there";
++              return;
++            }
++            LOG(INFO) << "[workspaces] swipe " << step << ": '"
++                      << service->active_guid() << "' -> '" << guids[to]
++                      << "'";
++            // A copy: the switch may rebuild the bar, and guids_ with it.
++            service->SwitchToWorkspace(std::string(guids[to]));
++          },
++          weak_factory_.GetWeakPtr(), step));
++}
++
+ void WorkspaceRailView::OnTabStripModelChanged(
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -297,6 +297,12 @@ class WorkspaceRailView : public views::
+ 
+   // A chip's press: the tab behind its badge (C14, D10), else a switch.
+   void OnWorkspacePressed(const std::string& guid);
++
++  // C7: the sideways scroll over the sidebar (SwipeSwitch), and the switch it
++  // asks for -- the workspace `step` chips from the one on screen, nothing
++  // past either end.
++  class SwipeSwitch;
++  void SwitchBeside(int step);
+   void OnNewWorkspacePressed();
+   void OnAddPressed(const ui::Event& event);
+ 
+@@ -424,6 +430,9 @@ class WorkspaceRailView : public views::
+   // C4: a tab drag holding this bar as its target lets go of it.
+   base::OnceClosureList will_destroy_callbacks_;
+ 
++  // C7: made by the first AddedToWidget(), on the sidebar from then on.
++  std::unique_ptr<SwipeSwitch> swipe_switch_;
++
+   base::CallbackListSubscription workspace_changed_subscription_;
+   // C14: a switch or a tag change moves tabs on and off screen. Its own
+   // binding, not UpdateHighlight's, which also runs after every layout.

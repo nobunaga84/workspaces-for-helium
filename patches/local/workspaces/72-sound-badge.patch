@@ -1,0 +1,590 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <iterator>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <type_traits>
+@@ -20,26 +21,43 @@
+ #include "base/functional/callback_helpers.h"
+ #include "base/i18n/number_formatting.h"
+ #include "base/logging.h"
++#include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "cc/paint/paint_flags.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/recently_audible_helper.h"
++#include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
++#include "chrome/browser/ui/tabs/alert/tab_alert_icon.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_group_theme.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/top_container_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_edit_bubble_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tab_groups/tab_group_color.h"
++#include "components/tab_groups/tab_group_id.h"
++#include "components/tab_groups/tab_group_visual_data.h"
++#include "components/tabs/public/tab_alert.h"
++#include "components/tabs/public/tab_group.h"
+ #include "components/vector_icons/vector_icons.h"
++#include "content/public/browser/web_contents.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/l10n/l10n_util.h"
+@@ -50,7 +68,10 @@
+ #include "ui/base/models/image_model.h"
+ #include "ui/color/color_id.h"
+ #include "ui/color/color_provider.h"
++#include "ui/compositor/paint_recorder.h"
++#include "ui/gfx/canvas.h"
+ #include "ui/gfx/color_utils.h"
++#include "ui/gfx/image/image_skia.h"
+ #include "ui/gfx/text_constants.h"
+ #include "ui/gfx/vector_icon_types.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+@@ -65,6 +86,7 @@
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/layout/flex_layout_types.h"
+ #include "ui/views/layout/layout_types.h"
++#include "ui/views/paint_info.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+@@ -115,6 +137,12 @@ constexpr SkAlpha kInactiveChipAlpha = 0
+ constexpr SkAlpha kCurrentFillAlphaDark = 0x33;
+ constexpr SkAlpha kCurrentFillAlphaLight = 0x22;
+ 
++// A chip's badge (C14, D9): Chromium's 12 px alert icon on a 14 px disc of
++// the bar's own colour, so it reads over the chip's symbol, flush with the
++// chip's bottom-right corner.
++constexpr int kBadgeDiscSize = 14;
++constexpr int kBadgeIconSize = 12;
++
+ // The arrows' chevrons (E17a), smaller than the 20 px icons of Helium's own
+ // buttons because the arrows are narrower.
+ constexpr int kArrowIconSize = 14;
+@@ -312,6 +340,75 @@ void ShowCloseConfirm(views::View* ancho
+       ->Show();
+ }
+ 
++// The alert a chip shows for `tab` (C14, D8), or nullopt: screen, tab or
++// camera / microphone capture, or sound -- sound only while it is heard, as a
++// muted tab that plays holds kAudioMuting AND kAudioPlaying (B3). The top one
++// by Chromium's own order, CompareAlerts, which ranks capture above sound.
++// IsAlertActive per alert rather than GetAllActiveAlerts, which copies a
++// vector, since every kAll of every tab in the window asks.
++//
++// A discarded tab -- an anchor put away playing -- shows nothing: the
++// controller keeps the old contents' alerts across a discard and nothing
++// clears them (review C14-1), and a sleeping page cannot play or record. For
++// the same stale flag after it wakes, sound also needs the contents' own
++// recently-audible state, the one Chromium's speaker follows.
++std::optional<tabs::TabAlert> BadgeAlertFor(const tabs::TabInterface* tab) {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  const tabs::TabAlertController* const controller =
++      contents && !contents->WasDiscarded()
++          ? tabs::TabAlertController::From(tab)
++          : nullptr;
++  if (!controller) {
++    return std::nullopt;
++  }
++  const RecentlyAudibleHelper* const audible =
++      RecentlyAudibleHelper::FromWebContents(contents);
++  const bool heard = audible && audible->WasRecentlyAudible();
++  std::optional<tabs::TabAlert> top;
++  for (const tabs::TabAlert alert :
++       {tabs::TabAlert::kDesktopCapturing, tabs::TabAlert::kTabCapturing,
++        tabs::TabAlert::kMediaRecording, tabs::TabAlert::kAudioRecording,
++        tabs::TabAlert::kVideoRecording, tabs::TabAlert::kAudioPlaying}) {
++    if (!controller->IsAlertActive(alert) ||
++        (alert == tabs::TabAlert::kAudioPlaying &&
++         (!heard ||
++          controller->IsAlertActive(tabs::TabAlert::kAudioMuting)))) {
++      continue;
++    }
++    if (!top || tabs::CompareAlerts()(alert, *top)) {
++      top = alert;
++    }
++  }
++  return top;
++}
++
++// One tab a chip's badge could stand for, while WorkspaceRailView::BadgedTab
++// picks among them. On the stack for that one walk only.
++struct BadgeCandidate {
++  raw_ptr<tabs::TabInterface> tab = nullptr;
++  tabs::TabAlert alert = tabs::TabAlert::kNone;
++  bool collapsed = false;
++  base::Time left_at;
++  int index = 0;
++};
++
++// Whether `a` is the better tab to stand behind a badge than `b`: the higher
++// alert (D10), then a tab outside a collapsed group, which the press would
++// have to open first (B9), then the tab left last (D10), then the earlier in
++// the strip.
++bool Outranks(const BadgeCandidate& a, const BadgeCandidate& b) {
++  if (a.alert != b.alert) {
++    return tabs::CompareAlerts()(a.alert, b.alert);
++  }
++  if (a.collapsed != b.collapsed) {
++    return !a.collapsed;
++  }
++  if (a.left_at != b.left_at) {
++    return a.left_at > b.left_at;
++  }
++  return a.index < b.index;
++}
++
+ }  // namespace
+ 
+ // A workspace's chip on the bar (E17a, design 5 "E17 spec" 2): its preset
+@@ -354,6 +451,39 @@ class WorkspaceChip : public WorkspaceRa
+     UpdateColors();
+   }
+ 
++  // The workspace's name, which is also the tooltip MakeRailButton gave the
++  // chip; SetBadge puts it back (C14).
++  void set_name(std::u16string name) { name_ = std::move(name); }
++
++  // C14: the badge (D9) for `alert`, and `line` -- "<alert> - <tab title>",
++  // for the tab behind it -- under the name in the tooltip (D11); nullopt
++  // and an empty line for none. Returns whether the alert changed, for the
++  // rail's log (D13). A changed line alone re-sets the text (B7) and paints
++  // nothing.
++  bool SetBadge(std::optional<tabs::TabAlert> alert, std::u16string line) {
++    if (alert == badge_ && line == badge_line_) {
++      return false;
++    }
++    const bool alert_changed = alert != badge_;
++    badge_ = alert;
++    badge_line_ = std::move(line);
++    SetTooltipText(badge_ ? base::StrCat({name_, u"\n", badge_line_}) : name_);
++    // A new tooltip renames a button whose name was its old tooltip
++    // (Button::OnTooltipTextChanged), and the hands-free scripts press a chip
++    // by its workspace's exact name (B6): the name is put back, and the line
++    // is the description, which a screen reader says after it.
++    GetViewAccessibility().SetName(name_);
++    if (badge_) {
++      GetViewAccessibility().SetDescription(badge_line_);
++    } else {
++      GetViewAccessibility().RemoveDescription();
++    }
++    if (alert_changed) {
++      SchedulePaint();
++    }
++    return alert_changed;
++  }
++
+   // Resolved here and never in the constructor: a view has no ColorProvider
+   // until it is in a widget. Called again by OnThemeChanged and, through the
+   // rail, whenever the window's active state changes, which is not a theme
+@@ -388,11 +518,51 @@ class WorkspaceChip : public WorkspaceRa
+     UpdateColors();
+   }
+ 
++  // views::View:
++  //
++  // The badge is painted after the children, not in PaintButtonContents: the
++  // chip's symbol and letter are child views, which paint after the button's
++  // own contents and would cover it (B4). Colours are resolved here, at paint
++  // time, so a theme or frame-state change needs no re-set; UpdateColors'
++  // SetBackground repaints on the latter.
++  void PaintChildren(const views::PaintInfo& info) override {
++    WorkspaceRailButton::PaintChildren(info);
++    const ui::ColorProvider* const provider = GetColorProvider();
++    if (!badge_ || !provider) {
++      return;
++    }
++    ui::PaintRecorder recorder(info.context(), size());
++    gfx::Canvas* const canvas = recorder.canvas();
++    const gfx::Rect disc(width() - kBadgeDiscSize, height() - kBadgeDiscSize,
++                         kBadgeDiscSize, kBadgeDiscSize);
++    // kColorToolbar: Helium paints the strip's FrameTheme background with it
++    // (ThemedBackground), so the disc is a hole in the symbol, not a blob.
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(provider->GetColor(kColorToolbar));
++    canvas->DrawCircle(disc.CenterPoint(), kBadgeDiscSize / 2, flags);
++    // Chromium's own icon and colour for the alert, as an inactive tab draws
++    // them (D9).
++    const gfx::ImageSkia icon =
++        ui::ImageModel::FromVectorIcon(
++            tabs::GetAlertIcon(*badge_),
++            tabs::GetAlertIndicatorColor(
++                *badge_, /*is_tab_active=*/false,
++                GetWidget() && GetWidget()->ShouldPaintAsActive()),
++            kBadgeIconSize)
++            .Rasterize(provider);
++    const int inset = (kBadgeDiscSize - kBadgeIconSize) / 2;
++    canvas->DrawImageInt(icon, disc.x() + inset, disc.y() + inset);
++  }
++
+  private:
+   int color_ = workspaces::prefs::kGreyColor;
+   raw_ptr<const gfx::VectorIcon> icon_ = nullptr;
+   bool tint_text_ = false;
+   bool current_ = false;
++  std::u16string name_;
++  std::optional<tabs::TabAlert> badge_;
++  std::u16string badge_line_;
+ };
+ 
+ BEGIN_METADATA(WorkspaceChip)
+@@ -533,10 +703,26 @@ void WorkspaceRailView::AddedToWidget()
+     workspace_changed_subscription_ = service->RegisterWorkspaceChangedCallback(
+         base::BindRepeating(&WorkspaceRailView::UpdateHighlight,
+                             base::Unretained(this)));
++    // Posted: a switch notifies more than once (C14).
++    badge_workspace_changed_subscription_ =
++        service->RegisterWorkspaceChangedCallback(
++            base::BindRepeating(&WorkspaceRailView::ScheduleUpdateBadges,
++                                base::Unretained(this)));
+     workspace_list_changed_subscription_ =
+         service->RegisterWorkspaceListChangedCallback(base::BindRepeating(
+             &WorkspaceRailView::Rebuild, base::Unretained(this)));
+   }
++  // The tab strip, for the badges (C14). Once: this runs again on a re-add,
++  // and an observer added twice is FATAL in a Dcheck build (B1). Never
++  // removed by hand -- ~TabStripModelObserver does it. Then one walk for the
++  // tabs that were alerting before the rail was made: nothing says so again.
++  if (!TabStripModelObserver::IsObservingAny(this)) {
++    TabStripModel* const model = browser_->GetTabStripModel();
++    model->AddObserver(this);
++    for (tabs::TabInterface* const tab : *model) {
++      UpdateAlerting(tab);
++    }
++  }
+   // The frame's active state is not a theme change (top_container_button.cc
+   // subscribes to it for the same reason), and the chips' colours depend on
+   // it (E17a). Replaced on every add, so a re-added rail follows its new
+@@ -612,11 +798,12 @@ void WorkspaceRailView::Rebuild() {
+     // a preset symbol says nothing; it draws the symbol (E17a).
+     const gfx::VectorIcon* const icon =
+         SymbolIcon(workspaces::prefs::EffectiveSymbol(entries[i]));
++    const std::u16string name = DisplayName(entries[i]);
+     auto button = MakeRailButton<WorkspaceChip>(
+-        icon ? std::u16string() : ButtonText(entries[i], i),
+-        DisplayName(entries[i]),
++        icon ? std::u16string() : ButtonText(entries[i], i), name,
+         base::BindRepeating(&WorkspaceRailView::OnWorkspacePressed,
+                             base::Unretained(this), entries[i].guid));
++    button->set_name(name);
+     button->SetLook(colors[i], icon, /*tint_text=*/entries[i].icon.empty());
+     button->set_context_menu_controller(this);
+ 
+@@ -625,6 +812,8 @@ void WorkspaceRailView::Rebuild() {
+   }
+ 
+   UpdateHighlight();
++  // New chips start bare; badged here, not a task later (C14).
++  UpdateBadges();
+ }
+ 
+ void WorkspaceRailView::UpdateHighlight() {
+@@ -662,6 +851,38 @@ void WorkspaceRailView::OnWorkspacePress
+     return;
+   }
+ 
++  // C14: a badged chip goes to the tab behind its badge (the owner's answer,
++  // D10), worked out again now rather than kept from the last paint (B2).
++  // The mouse, Enter / Space and a screen reader's default action all land
++  // here: the chip has one callback.
++  if (tabs::TabInterface* const tab = BadgedTab(guid)) {
++    LOG(INFO) << "[workspaces] rail chip '" << guid
++              << "' -> the tab behind its badge";
++    // Ranked after every other tab, a tab in a collapsed group can still be
++    // the only one (B9): its group opens first, the way the group header's
++    // own toggle builds the visual data (TabStripCollectionController), so
++    // the tab shown is drawn.
++    TabStripModel* const model = browser_->GetTabStripModel();
++    if (const std::optional<tab_groups::TabGroupId> group = tab->GetGroup();
++        group && model->IsGroupCollapsed(*group)) {
++      const TabGroup* const tab_group =
++          model->group_model()->GetTabGroup(*group);
++      model->ChangeTabGroupVisuals(
++          *group,
++          tab_groups::TabGroupVisualData(tab_group->visual_data()->title(),
++                                         tab_group->visual_data()->color(),
++                                         /*is_collapsed=*/false),
++          tab_group->IsCustomized());
++    }
++    // ShowTab, not a bare ActivateTabAt: it enters the tab's workspace first,
++    // so the tab the user leaves is remembered as a switch remembers it (B2)
++    // -- the quick search box's road to a tab (C1). The activation then makes
++    // the switch itself.
++    if (WorkspacePinnedSectionView::ShowTab(browser_, *tab)) {
++      return;
++    }
++  }
++
+   // SwitchToWorkspace and not SetActiveWorkspace: this moves the user onto a
+   // tab they can see, which is a TabStripModel mutation and therefore only
+   // legal outside the observer scope (design 2.2). A button press is delivered
+@@ -670,6 +891,145 @@ void WorkspaceRailView::OnWorkspacePress
+   service->SwitchToWorkspace(guid);
+ }
+ 
++void WorkspaceRailView::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  // C14. Only reads and a posted task here: never a model mutation from an
++  // observer method.
++  bool changed = false;
++  switch (change.type()) {
++    case TabStripModelChange::kInserted:
++      // A tab can arrive already playing: dragged in from another window.
++      for (const TabStripModelChange::ContentsWithIndex& inserted :
++           change.GetInsert()->contents) {
++        changed |= UpdateAlerting(inserted.tab);
++      }
++      break;
++    case TabStripModelChange::kRemoved:
++      for (const TabStripModelChange::RemovedTab& removed :
++           change.GetRemove()->contents) {
++        changed |= alerting_.erase(removed.tab->GetHandle()) > 0;
++      }
++      break;
++    case TabStripModelChange::kReplaced:
++      // A discard or a prerender swap: new contents. A discarded tab reads as
++      // silent (BadgeAlertFor); a swapped-in page as whatever it holds.
++      changed = UpdateAlerting(change.GetReplace()->tab);
++      break;
++    default:
++      break;
++  }
++  if (changed) {
++    ScheduleUpdateBadges();
++  }
++}
++
++void WorkspaceRailView::OnTabChangedAt(tabs::TabInterface* tab,
++                                       TabChangeType change_type) {
++  // Sound, its mute and every capture all arrive as kAll (the C14 review);
++  // kLoadingOnly comes per load and never carries an alert (B10).
++  if (change_type == TabChangeType::kAll && tab && UpdateAlerting(tab)) {
++    ScheduleUpdateBadges();
++  }
++}
++
++bool WorkspaceRailView::UpdateAlerting(tabs::TabInterface* tab) {
++  if (BadgeAlertFor(tab)) {
++    alerting_.insert(tab->GetHandle());
++    return true;
++  }
++  return alerting_.erase(tab->GetHandle()) > 0;
++}
++
++void WorkspaceRailView::ScheduleUpdateBadges() {
++  if (badges_scheduled_) {
++    return;
++  }
++  badges_scheduled_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspaceRailView::UpdateBadges,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void WorkspaceRailView::UpdateBadges() {
++  badges_scheduled_ = false;
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || !service->IsEnabled()) {
++    return;
++  }
++  // ponytail: a badged chip scrolled out of the row gives the arrows no cue
++  // (D12); add one if workspaces ever outgrow the bar.
++  for (size_t i = 0; i < buttons_.size(); ++i) {
++    tabs::TabInterface* const tab = BadgedTab(guids_[i]);
++    const std::optional<tabs::TabAlert> alert =
++        tab ? BadgeAlertFor(tab) : std::nullopt;
++    // D11: Chromium's own words for the alert, then the name the tab's row
++    // draws -- the user's, else the page's (TabUIHelper::GetTitle's rule).
++    std::u16string line;
++    if (alert) {
++      const std::string custom_title =
++          workspaces::CustomTitleForTab(tab->GetContents());
++      line = base::StrCat(
++          {tabs::TabAlertController::GetTabAlertStateText(*alert), u" - ",
++           custom_title.empty() ? tab->GetContents()->GetTitle()
++                                : base::UTF8ToUTF16(custom_title)});
++    }
++    if (buttons_[i]->SetBadge(alert, std::move(line))) {
++      LOG(INFO) << "[workspaces] rail badge '" << guids_[i] << "' -> "
++                << (alert ? base::NumberToString(static_cast<int>(*alert))
++                          : std::string("none"));
++    }
++  }
++}
++
++tabs::TabInterface* WorkspaceRailView::BadgedTab(std::string_view guid) const {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return nullptr;
++  }
++  TabStripModel* const model = browser_->GetTabStripModel();
++  BadgeCandidate best;
++  for (const tabs::TabHandle& handle : alerting_) {
++    tabs::TabInterface* const tab = handle.Get();
++    if (!tab) {
++      continue;
++    }
++    // The workspace the strip draws the tab in (B8): an orphan's tag and the
++    // empty one resolve to Home, as they do for the strip. A tab on screen
++    // -- of the workspace shown, or a favorite, drawn in every workspace --
++    // shows its own alert icon and lights no chip (D7). "On screen" is not
++    // "drawn": a page of the workspace shown that sits in a closed folder or
++    // a collapsed group lights nothing either (D16).
++    const std::string tag =
++        workspaces::WorkspaceGuidForTab(tab->GetContents());
++    if (workspaces::ResolveTabGuid(tag, service->known_guids()) != guid ||
++        service->IsTabOnScreen(tab)) {
++      continue;
++    }
++    const std::optional<tabs::TabAlert> alert = BadgeAlertFor(tab);
++    const int index = model->GetIndexOfTab(tab);
++    if (!alert || index == TabStripModel::kNoTab) {
++      continue;
++    }
++    const std::optional<tab_groups::TabGroupId> group = tab->GetGroup();
++    const workspaces::WorkspaceTabData* const data =
++        workspaces::WorkspaceTabData::FromWebContents(tab->GetContents());
++    const BadgeCandidate candidate{
++        .tab = tab,
++        .alert = *alert,
++        .collapsed = group && model->IsGroupCollapsed(*group),
++        .left_at = data ? data->left_at() : base::Time(),
++        .index = index};
++    if (!best.tab || Outranks(candidate, best)) {
++      best = candidate;
++    }
++  }
++  return best.tab;
++}
++
+ void WorkspaceRailView::OnAddPressed(const ui::Event& event) {
+   // Logged, so "clicking + again closes the menu" is countable: one open per
+   // click that should open, and none for the click that closes it.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -11,9 +11,12 @@
+ #include <vector>
+ 
+ #include "base/callback_list.h"
++#include "base/containers/flat_set.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+@@ -91,12 +94,15 @@ DECLARE_ELEMENT_IDENTIFIER_VALUE(kWorksp
+ // browser_command_controller.cc, browser_shortcut_metadata.cc); that is E9c's
+ // to do once, for the shortcut as well.
+ //
+-// This view knows nothing about prefs or tab strips. It asks WorkspaceService
+-// for the list and tells it what to do; everything else is the service's
+-// (design 3.1).
++// This view knows nothing about prefs. It asks WorkspaceService for the list
++// and tells it what to do; everything else is the service's (design 3.1).
++// Since C14 it watches its window's tab strip for one thing only: which tabs
++// play sound or record, for the badge a chip shows while such a tab is not on
++// screen.
+ class WorkspaceRailView : public views::FlexLayoutView,
+                           public views::ContextMenuController,
+-                          public ui::SimpleMenuModel::Delegate {
++                          public ui::SimpleMenuModel::Delegate,
++                          public TabStripModelObserver {
+   METADATA_HEADER(WorkspaceRailView, views::FlexLayoutView)
+ 
+  public:
+@@ -139,6 +145,16 @@ class WorkspaceRailView : public views::
+   void ExecuteCommand(int command_id, int event_flags) override;
+   bool IsCommandIdEnabled(int command_id) const override;
+ 
++  // TabStripModelObserver (C14): which tabs of this window carry an alert a
++  // chip shows. Added once, in AddedToWidget, and never removed by hand:
++  // ~TabStripModelObserver does it.
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabChangedAt(tabs::TabInterface* tab,
++                      TabChangeType change_type) override;
++
+   // The menu a workspace's chip opens, for workspace `guid`, at `point` (in
+   // screen coordinates) over `source`'s widget. Public for the pinned
+   // section's header, which shows the same menu for the workspace it heads
+@@ -208,10 +224,29 @@ class WorkspaceRailView : public views::
+   // on every switch, and it is the only thing a switch changes here.
+   void UpdateHighlight();
+ 
++  // A chip's press: the tab behind its badge (C14, D10), else a switch.
+   void OnWorkspacePressed(const std::string& guid);
+   void OnNewWorkspacePressed();
+   void OnAddPressed(const ui::Event& event);
+ 
++  // C14: puts `tab` in `alerting_` or takes it out. True when the tab is or
++  // was alerting: either way a chip's badge or its tooltip's line, which
++  // names the tab, may have changed (B7).
++  bool UpdateAlerting(tabs::TabInterface* tab);
++
++  // C14: one posted UpdateBadges for any number of changes before it runs.
++  void ScheduleUpdateBadges();
++
++  // C14: gives every chip the badge of its workspace's alerting tabs that are
++  // not on screen (D7-D9), the tooltip line that says which tab (D11), and
++  // logs each chip whose alert changed (D13).
++  void UpdateBadges();
++
++  // C14: the tab behind workspace `guid`'s badge (D10, B9), or null when the
++  // chip has none. Worked out on every ask and never kept: the press asks
++  // again, and the strip can change in between (B2).
++  tabs::TabInterface* BadgedTab(std::string_view guid) const;
++
+   // Brings the next workspace button past the visible edge into view, one
+   // whole button at a time: `direction` -1 for earlier, +1 for later.
+   void SlideBy(int direction);
+@@ -282,7 +317,17 @@ class WorkspaceRailView : public views::
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
+   std::unique_ptr<views::MenuRunner> context_menu_runner_;
+ 
++  // C14: the tabs of this window with an alert a chip shows (BadgeAlertFor),
++  // whatever their workspace. Handles, not pointers: a handle whose tab is
++  // gone reads null instead of dangling. A handful at most, so UpdateBadges
++  // walks it once per chip.
++  base::flat_set<tabs::TabHandle> alerting_;
++  bool badges_scheduled_ = false;
++
+   base::CallbackListSubscription workspace_changed_subscription_;
++  // C14: a switch or a tag change moves tabs on and off screen. Its own
++  // binding, not UpdateHighlight's, which also runs after every layout.
++  base::CallbackListSubscription badge_workspace_changed_subscription_;
+   base::CallbackListSubscription workspace_list_changed_subscription_;
+   base::CallbackListSubscription collapse_changed_subscription_;
+   base::CallbackListSubscription scrolled_subscription_;

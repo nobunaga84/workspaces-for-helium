@@ -1,0 +1,650 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -141,9 +141,8 @@
+ // never has to reopen it. 34110-34999 is entirely free -- Helium's own ids
+ // stop at 34091 and the upstream block above ends at 34108.
+ //
+-// NEXT, PREV, NEW, MOVE_UP and MOVE_DOWN are wired today. The others are
+-// named so that the range is visibly spoken for, and 34128-34139 is left
+-// spare.
++// CLOSE, RENAME, MOVE_TAB_TO and TOGGLE_RAIL are named so that the range is
++// visibly spoken for; every other id is wired. 34132-34139 is left spare.
+ #define IDC_HELIUM_WORKSPACE_NEXT     34110
+ #define IDC_HELIUM_WORKSPACE_PREV     34111
+ #define IDC_HELIUM_WORKSPACE_1        34112
+@@ -162,6 +161,12 @@
+ #define IDC_HELIUM_WORKSPACE_TOGGLE_RAIL 34125
+ #define IDC_HELIUM_WORKSPACE_MOVE_UP 34126
+ #define IDC_HELIUM_WORKSPACE_MOVE_DOWN 34127
++// C13 + C22: back to the workspace shown before this one, pin / unpin the
++// page in front, close the Today tabs, open the Archive.
++#define IDC_HELIUM_WORKSPACE_BACK     34128
++#define IDC_HELIUM_WORKSPACE_PIN_TAB  34129
++#define IDC_HELIUM_WORKSPACE_CLEAR    34130
++#define IDC_HELIUM_WORKSPACE_ARCHIVE  34131
+ 
+ // Page-related commands
+ #define IDC_BOOKMARK_THIS_TAB           35000
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -275,6 +275,29 @@ const AcceleratorMapping kAcceleratorMap
+      IDC_HELIUM_WORKSPACE_MOVE_UP},
+     {ui::VKEY_DOWN, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
+      IDC_HELIUM_WORKSPACE_MOVE_DOWN},
++    // C13 + C22: the digits, D, K and H are free with Shift+Alt in every map
++    // and conditional append of this file. Workspace N by its place on the
++    // bar, 0 back to the last one -- Ctrl+1..9 stay Chromium's tab keys. D
++    // pins the page in front (Arc's Ctrl+D is Bookmark this tab here), K
++    // clears Today, H opens the Archive. No numpad digits: with NumLock on,
++    // Shift turns them into navigation keys.
++    {ui::VKEY_1, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_1},
++    {ui::VKEY_2, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_2},
++    {ui::VKEY_3, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_3},
++    {ui::VKEY_4, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_4},
++    {ui::VKEY_5, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_5},
++    {ui::VKEY_6, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_6},
++    {ui::VKEY_7, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_7},
++    {ui::VKEY_8, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_8},
++    {ui::VKEY_9, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_9},
++    {ui::VKEY_0, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
++     IDC_HELIUM_WORKSPACE_BACK},
++    {ui::VKEY_D, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
++     IDC_HELIUM_WORKSPACE_PIN_TAB},
++    {ui::VKEY_K, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
++     IDC_HELIUM_WORKSPACE_CLEAR},
++    {ui::VKEY_H, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
++     IDC_HELIUM_WORKSPACE_ARCHIVE},
+     {ui::VKEY_HOME, ui::EF_ALT_DOWN, IDC_HOME},
+     {ui::VKEY_E, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+     {ui::VKEY_F, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -356,6 +356,7 @@ void WorkspaceService::SetActiveWorkspac
+   if (std::string_view(active_guid_) == effective_guid) {
+     return;
+   }
++  last_guid_ = active_guid_;
+   active_guid_ = std::string(effective_guid);
+ 
+   LOG(INFO) << "[workspaces] active workspace -> '" << active_guid_ << "'";
+@@ -439,6 +440,20 @@ void WorkspaceService::ActivateRelativeW
+       RelativeWorkspaceGuid(known_guids_, active_guid_, offset));
+ }
+ 
++void WorkspaceService::ActivateWorkspaceAt(size_t index) {
++  // Copies, not views: the switch writes last_guid_ and a pref observer may
++  // refresh known_guids_ while SwitchToWorkspace() still holds its argument.
++  if (index < known_guids_.size()) {
++    SwitchToWorkspace(std::string(known_guids_[index]));
++  }
++}
++
++void WorkspaceService::ActivateLastWorkspace() {
++  if (std::ranges::contains(known_guids_, last_guid_)) {
++    SwitchToWorkspace(std::string(last_guid_));
++  }
++}
++
+ std::string WorkspaceService::CreateWorkspace(const std::string& title) {
+   // Guarded here rather than at the call sites, because there are two now --
+   // the rail's "+" and IDC_HELIUM_WORKSPACE_NEW -- and only one of them can
+@@ -564,7 +579,8 @@ void WorkspaceService::DeleteWorkspace(s
+                          prefs::RemoveWorkspace(GetWorkspaces(), guid));
+ }
+ 
+-int WorkspaceService::CloseWorkspaceTabs(std::string_view guid) {
++int WorkspaceService::CloseWorkspaceTabs(std::string_view guid,
++                                         bool today_only) {
+   // Collected as handles before anything is closed, and re-resolved to an index
+   // on the way past. TabStripModel::CloseTabs() takes the whole set at once but
+   // is private, so these go one at a time through CloseWebContentsAt() -- and
+@@ -574,14 +590,16 @@ int WorkspaceService::CloseWorkspaceTabs
+   // a reverse-order index walk would not.
+   //
+   int pinned_kept = 0;
+-  const std::vector<tabs::TabHandle> doomed = TabsToClose(guid, &pinned_kept);
++  const std::vector<tabs::TabHandle> doomed =
++      TabsToClose(guid, &pinned_kept, today_only);
+ 
+   // The kept count is the evidence for the pinned rule: Chromium reopens the
+   // last session's pinned tabs at startup, so how many tabs a close takes
+   // depends on history, and only this number says the rule ran (LOCAL.md 34).
+   LOG(INFO) << "[workspaces] closing " << doomed.size()
+             << " tab(s) of workspace '" << guid << "' in this window, "
+-            << pinned_kept << " pinned kept";
++            << pinned_kept << " pinned kept"
++            << (today_only ? ", pinned pages kept (Clear Today)" : "");
+ 
+   // CLOSE_CREATE_HISTORICAL_TAB so they land in Recently Closed. Each one still
+   // carries its guid in its session data, so reopening one lands back in this
+@@ -605,7 +623,8 @@ int WorkspaceService::CloseWorkspaceTabs
+ 
+ std::vector<tabs::TabHandle> WorkspaceService::TabsToClose(
+     std::string_view guid,
+-    int* pinned_kept) const {
++    int* pinned_kept,
++    bool today_only) const {
+   // Pinned tabs are skipped: they have no tag, and no tag resolves to the
+   // default workspace, so "Close all tabs" on Home closed every pinned tab
+   // until E13. A pinned tab belongs to every workspace (design 2.5), the
+@@ -622,13 +641,17 @@ std::vector<tabs::TabHandle> WorkspaceSe
+       }
+       continue;
+     }
++    if (today_only && IsDrawnAsPinnedRow(tab)) {
++      continue;
++    }
+     doomed.push_back(tab->GetHandle());
+   }
+   return doomed;
+ }
+ 
+-int WorkspaceService::CountTabsToClose(std::string_view guid) const {
+-  return static_cast<int>(TabsToClose(guid, nullptr).size());
++int WorkspaceService::CountTabsToClose(std::string_view guid,
++                                       bool today_only) const {
++  return static_cast<int>(TabsToClose(guid, nullptr, today_only).size());
+ }
+ 
+ int WorkspaceService::UnloadWorkspaceTabs(std::string_view guid, bool others) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -143,6 +143,14 @@ class WorkspaceService : public TabStrip
+   // both ends. +1 is next, -1 is previous.
+   void ActivateRelativeWorkspace(int offset);
+ 
++  // C13: shows the workspace at `index` of the list -- the bar's order, 0 the
++  // first -- and does nothing past its end. And shows the workspace this
++  // window showed before the one on screen, so pressing it twice comes back;
++  // nothing when that one was deleted. Both end in SwitchToWorkspace(): ONLY
++  // FROM A MENU OR COMMAND HANDLER.
++  void ActivateWorkspaceAt(size_t index);
++  void ActivateLastWorkspace();
++
+   // Adds a workspace, gives it a fresh guid, and shows it. Returns the guid.
+   //
+   // The guid is a random UUID rather than anything derived from the title: a
+@@ -209,12 +217,15 @@ class WorkspaceService : public TabStrip
+   // Closing out the active workspace leaves nothing on screen, and the removal
+   // path then spawns a fresh tab into it (EnsureActiveTabVisible, E9f).
+   //
++  // With `today_only` (C22, Arc's "Clear"), an open pinned page's tab is kept
++  // too: only the tabs the Today list draws close.
++  //
+   // ONLY CALL FROM A MENU OR COMMAND HANDLER: it closes tabs.
+-  int CloseWorkspaceTabs(std::string_view guid);
++  int CloseWorkspaceTabs(std::string_view guid, bool today_only = false);
+ 
+-  // How many tabs CloseWorkspaceTabs(guid) would close, so a menu can ask
+-  // first when that is more than Recently Closed keeps (E13.5).
+-  int CountTabsToClose(std::string_view guid) const;
++  // How many tabs CloseWorkspaceTabs(guid, today_only) would close, so a menu
++  // can ask first when that is more than Recently Closed keeps (E13.5).
++  int CountTabsToClose(std::string_view guid, bool today_only = false) const;
+ 
+   // Hibernates the tabs of `guid` -- or, with `others`, of every workspace
+   // except `guid` -- through Helium's own Hibernate command, one tab at a
+@@ -515,7 +526,8 @@ class WorkspaceService : public TabStrip
+   // would otherwise have matched. One collector, so the confirm's count and the
+   // close cannot disagree.
+   std::vector<tabs::TabHandle> TabsToClose(std::string_view guid,
+-                                           int* pinned_kept) const;
++                                           int* pinned_kept,
++                                           bool today_only) const;
+ 
+   // THE ONLY PLACE A TAG IS EVER WRITTEN. Every rule in this class -- insert,
+   // pin, unpin, group, split, contents replacement -- ends here, so that
+@@ -720,6 +732,9 @@ class WorkspaceService : public TabStrip
+   base::RepeatingTimer auto_archive_timer_;
+ 
+   std::string active_guid_;
++  // The workspace shown before active_guid_, for ActivateLastWorkspace()
++  // (C13). Written by SetActiveWorkspace(), the one door every switch takes.
++  std::string last_guid_;
+ 
+   // What StampInsertedTab() stamps an untagged tab with while a
+   // StampInsertedTabsFor() lives; empty: the workspace on screen.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
+@@ -44,6 +44,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -579,7 +580,8 @@ struct WorkspaceArchiveView::Row {
+ 
+ // static
+ void WorkspaceArchiveView::Show(BrowserWindowInterface* browser,
+-                                views::View* anchor) {
++                                views::View* anchor,
++                                views::BubbleBorder::Arrow arrow) {
+   const base::ElapsedTimer timer;
+   const workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser);
+@@ -622,7 +624,7 @@ void WorkspaceArchiveView::Show(BrowserW
+   // Rising above the bar's Archive button, as the bar's other bubbles do
+   // (E17a's editor), with the spec's corners (E17c).
+   auto bubble = std::make_unique<views::BubbleDialogModelHost>(
+-      std::move(model), anchor, views::BubbleBorder::BOTTOM_LEFT);
++      std::move(model), anchor, arrow);
+   bubble->set_fixed_width(kWidth);
+   bubble->set_corner_radius(kBubbleRadius);
+   views::Widget* const widget =
+@@ -652,6 +654,16 @@ void WorkspaceArchiveView::Show(BrowserW
+             << timer.Elapsed().InMilliseconds() << " ms";
+ }
+ 
++// static
++void WorkspaceArchiveView::ShowOverPage(BrowserWindowInterface* browser) {
++  if (BrowserView* const browser_view =
++          BrowserView::GetBrowserViewForBrowser(browser)) {
++    LOG(INFO) << "[workspaces] shortcut: archive";
++    Show(browser, browser_view->contents_container(),
++         views::BubbleBorder::FLOAT);
++  }
++}
++
+ WorkspaceArchiveView::WorkspaceArchiveView(
+     BrowserWindowInterface* browser,
+     workspaces::archive::ArchiveStore* store)
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
+@@ -14,6 +14,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/menus/simple_menu_model.h"
++#include "ui/views/bubble/bubble_border.h"
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/controls/textfield/textfield_controller.h"
+ #include "ui/views/view.h"
+@@ -154,10 +155,16 @@ class WorkspaceArchiveView : public view
+ 
+  public:
+   // Opens the screen for `browser`'s profile and window, anchored to `anchor`
+-  // (the bar's Archive button). Does nothing while Workspaces is off in
+-  // `browser`, or within 250 ms of this window's screen closing (the class
+-  // comment).
+-  static void Show(BrowserWindowInterface* browser, views::View* anchor);
++  // (the bar's Archive button) by `arrow`. Does nothing while Workspaces is
++  // off in `browser`, or within 250 ms of this window's screen closing (the
++  // class comment).
++  static void Show(
++      BrowserWindowInterface* browser,
++      views::View* anchor,
++      views::BubbleBorder::Arrow arrow = views::BubbleBorder::BOTTOM_LEFT);
++  // The Archive shortcut's (C22): centred over the page, since zen mode
++  // usually hides the bar and its button.
++  static void ShowOverPage(BrowserWindowInterface* browser);
+ 
+   WorkspaceArchiveView(const WorkspaceArchiveView&) = delete;
+   WorkspaceArchiveView& operator=(const WorkspaceArchiveView&) = delete;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -316,6 +316,49 @@ std::vector<BrowserWindowInterface*> Win
+   return windows;
+ }
+ 
++// Unpin's second half, once item `id`'s page is open in a window (UnpinItem,
++// the Pin shortcut): every page of it goes to the top of its window's list --
++// to `index` of `here`, in `group` if given, when it was dropped there -- and
++// becomes an ordinary tab; then the row goes.
++void UnlinkItem(BrowserWindowInterface* here,
++                workspaces::pins::PinStore& store,
++                const std::string& id,
++                int index,
++                std::optional<tab_groups::TabGroupId> group) {
++  for (BrowserWindowInterface* const window :
++       WindowsOf(here->GetProfile())) {
++    workspaces::WorkspaceService* const service =
++        workspaces::WorkspaceService::From(window);
++    TabStripModel* const model = window->GetTabStripModel();
++    if (tabs::TabInterface* const tab = LinkedTab(model, id); tab && service) {
++      // Moved while still linked, THEN unlinked: the list scrolls to an active
++      // tab that moves, but not to a pinned page's (TabStripView::OnTabChanged,
++      // E15c), so it stays where it is (the owner, E15d). A page's tab never
++      // sits in a group, and the top of the list is the first tab of a unit,
++      // so that move joins no group (GetGroupToAssign looks at the new
++      // neighbours). A drop into a group is told which group: the drop's
++      // place is inside it or at its first tab, so the group stays whole.
++      const bool dropped_here = window == here && index >= 0;
++      const int from = model->GetIndexOfTab(tab);
++      const int to =
++          dropped_here ? index : service->TopOfListIndex(/*opener=*/nullptr);
++      const int final_index = from < to ? to - 1 : to;
++      if (dropped_here && group) {
++        model->MoveWebContentsAt(from, final_index,
++                                 /*select_after_move=*/false, group);
++      } else if (to >= 0 && final_index != from) {
++        model->MoveWebContentsAt(from, final_index,
++                                 /*select_after_move=*/false);
++      }
++      service->SetPinItem(tab, std::string());
++      service->SetAnchored(tab, false);
++    }
++  }
++  store.Remove(id);
++  LOG(INFO) << "[workspaces] pins: unpinned item '" << id << "'"
++            << (index >= 0 ? " (dropped in the list)" : "");
++}
++
+ // `row` if it is an item, else every item under it, in the order the rows
+ // draw them: what Delete closes, and the pages a collapsed folder lists.
+ void CollectItems(const PinNode& row, std::vector<const PinNode*>& items) {
+@@ -1878,38 +1921,7 @@ void WorkspacePinnedSectionView::UnpinIt
+                 << "' from another window";
+     }
+   }
+-  for (BrowserWindowInterface* const window :
+-       WindowsOf(browser_->GetProfile())) {
+-    workspaces::WorkspaceService* const service =
+-        workspaces::WorkspaceService::From(window);
+-    TabStripModel* const model = window->GetTabStripModel();
+-    if (tabs::TabInterface* const tab = LinkedTab(model, id); tab && service) {
+-      // Moved while still linked, THEN unlinked: the list scrolls to an active
+-      // tab that moves, but not to a pinned page's (TabStripView::OnTabChanged,
+-      // E15c), so it stays where it is (the owner, E15d). A page's tab never
+-      // sits in a group, and the top of the list is the first tab of a unit,
+-      // so that move joins no group (GetGroupToAssign looks at the new
+-      // neighbours). A drop into a group is told which group: the drop's
+-      // place is inside it or at its first tab, so the group stays whole.
+-      const bool dropped_here = window == browser_ && index >= 0;
+-      const int from = model->GetIndexOfTab(tab);
+-      const int to =
+-          dropped_here ? index : service->TopOfListIndex(/*opener=*/nullptr);
+-      const int final_index = from < to ? to - 1 : to;
+-      if (dropped_here && group) {
+-        model->MoveWebContentsAt(from, final_index,
+-                                 /*select_after_move=*/false, group);
+-      } else if (to >= 0 && final_index != from) {
+-        model->MoveWebContentsAt(from, final_index,
+-                                 /*select_after_move=*/false);
+-      }
+-      service->SetPinItem(tab, std::string());
+-      service->SetAnchored(tab, false);
+-    }
+-  }
+-  store_->Remove(id);
+-  LOG(INFO) << "[workspaces] pins: unpinned item '" << id << "'"
+-            << (index >= 0 ? " (dropped in the list)" : "");
++  UnlinkItem(browser_, *store_, id, index, group);
+ }
+ 
+ void WorkspacePinnedSectionView::DeleteRow(const std::string& id) {
+@@ -2105,6 +2117,34 @@ void WorkspacePinnedSectionView::PinTabs
+   }
+ }
+ 
++// static
++void WorkspacePinnedSectionView::TogglePin(BrowserWindowInterface* browser) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  tabs::TabInterface* const tab = browser->GetTabStripModel()->GetActiveTab();
++  if (!service || !service->IsEnabled() || !tab) {
++    return;
++  }
++  if (service->IsPinItemTab(tab)) {
++    Profile* const profile = browser->GetProfile();
++    workspaces::pins::PinStore* const store =
++        workspaces::pins::PinStore::GetOrCreate(profile, profile->GetPath());
++    const std::string id = workspaces::PinItemForTab(tab->GetContents());
++    if (const PinNode* const item = store->Find(id);
++        item && item->type == PinNode::Type::kItem) {
++      UnlinkItem(browser, *store, id, /*index=*/-1, std::nullopt);
++    }
++    return;
++  }
++  if (!CanPin(*service, tab)) {
++    LOG(INFO) << "[workspaces] shortcut: pin -- the page in front cannot be "
++                 "pinned (a favorite, in a group or a split, or not a web "
++                 "page)";
++    return;
++  }
++  PinTabs(browser, {tab});
++}
++
+ WorkspacePinnedSectionView::DropTarget::DropTarget() = default;
+ WorkspacePinnedSectionView::DropTarget::DropTarget(const DropTarget&) = default;
+ WorkspacePinnedSectionView::DropTarget&
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -172,6 +172,11 @@ class WorkspacePinnedSectionView
+       std::vector<tabs::TabInterface*> tabs,
+       std::string_view to = {},
+       workspaces::pins::Where where = workspaces::pins::Where::kAfter);
++  // The Pin shortcut (C22, Arc's Ctrl+D): the page in front, a Today tab, is
++  // pinned at the end of the section as the menu's "Pin tab" does; the open
++  // page of a pinned page is unpinned to the top of the list, as the row's
++  // Unpin. A tab neither can take does nothing. ONLY FROM A COMMAND HANDLER.
++  static void TogglePin(BrowserWindowInterface* browser);
+ 
+  private:
+   // The list's glide under the mouse wheel (E18); in the .cc.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/top_container_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_edit_bubble_view.h"
+@@ -275,6 +276,42 @@ class WorkspaceNameDialogDelegate : publ
+   base::OnceCallback<void(const std::u16string&)> on_accept_;
+ };
+ 
++// Asks before a close takes `count` tabs, more than Recently Closed can give
++// back, anchored to `anchor` by `arrow`; runs `on_accept` only on the OK
++// button. `what` names it in the log, so a test can tell "asked, then
++// cancelled, nothing closed" from "never asked".
++void ShowCloseConfirm(views::View* anchor,
++                      views::BubbleBorder::Arrow arrow,
++                      std::string_view what,
++                      const std::string& guid,
++                      int count,
++                      bool deleting,
++                      base::OnceClosure on_accept) {
++  LOG(INFO) << "[workspaces] confirm asked: " << what << " of workspace '"
++            << guid << "', " << count << " tab(s)";
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(l10n_util::GetPluralStringFUTF16(
++              deleting ? IDS_HELIUM_WORKSPACE_CONFIRM_DELETE
++                       : IDS_HELIUM_WORKSPACE_CONFIRM_CLOSE_ALL,
++              count))
++          .AddParagraph(ui::DialogModelLabel(
++              l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_CONFIRM_BODY)))
++          .AddOkButton(std::move(on_accept),
++                       ui::DialogModel::Button::Params().SetLabel(
++                           l10n_util::GetStringUTF16(
++                               deleting ? IDS_HELIUM_WORKSPACE_DELETE
++                                        : IDS_HELIUM_WORKSPACE_CLOSE_ALL)))
++          .AddCancelButton(base::BindOnce(
++              [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), anchor, arrow);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
+ }  // namespace
+ 
+ // A workspace's chip on the bar (E17a, design 5 "E17 spec" 2): its preset
+@@ -970,11 +1007,6 @@ void WorkspaceRailView::RenameFromEditor
+ void WorkspaceRailView::ShowCloseConfirmBubble(const std::string& guid,
+                                                int count,
+                                                bool deleting) {
+-  // Logged when asked and when cancelled, so a test can tell "asked, then
+-  // cancelled, nothing closed" from "never asked".
+-  LOG(INFO) << "[workspaces] confirm asked: "
+-            << (deleting ? "delete" : "close all") << " of workspace '" << guid
+-            << "', " << count << " tab(s)";
+   auto on_accept = base::BindOnce(
+       [](base::WeakPtr<WorkspaceRailView> self, const std::string& guid,
+          bool deleting) {
+@@ -990,30 +1022,42 @@ void WorkspaceRailView::ShowCloseConfirm
+         }
+       },
+       weak_factory_.GetWeakPtr(), guid, deleting);
+-
+-  std::unique_ptr<ui::DialogModel> model =
+-      ui::DialogModel::Builder()
+-          .SetTitle(l10n_util::GetPluralStringFUTF16(
+-              deleting ? IDS_HELIUM_WORKSPACE_CONFIRM_DELETE
+-                       : IDS_HELIUM_WORKSPACE_CONFIRM_CLOSE_ALL,
+-              count))
+-          .AddParagraph(ui::DialogModelLabel(
+-              l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_CONFIRM_BODY)))
+-          .AddOkButton(std::move(on_accept),
+-                       ui::DialogModel::Button::Params().SetLabel(
+-                           l10n_util::GetStringUTF16(
+-                               deleting ? IDS_HELIUM_WORKSPACE_DELETE
+-                                        : IDS_HELIUM_WORKSPACE_CLOSE_ALL)))
+-          .AddCancelButton(base::BindOnce(
+-              [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
+-          .Build();
+-
+   // Anchored to the rail, like the name bubble below.
+-  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
+-      std::move(model), this, views::BubbleBorder::TOP_LEFT);
+-  views::BubbleDialogDelegate::CreateBubbleDeprecated(
+-      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
+-      ->Show();
++  ShowCloseConfirm(this, views::BubbleBorder::TOP_LEFT,
++                   deleting ? "delete" : "close all", guid, count, deleting,
++                   std::move(on_accept));
++}
++
++// static
++void WorkspaceRailView::ClearToday(BrowserWindowInterface* browser) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  BrowserView* const browser_view =
++      BrowserView::GetBrowserViewForBrowser(browser);
++  if (!service || !service->IsEnabled() || !browser_view) {
++    return;
++  }
++  // A copy: the close below switches nothing, but the confirm outlives this.
++  const std::string guid = service->active_guid();
++  const int count = service->CountTabsToClose(guid, /*today_only=*/true);
++  LOG(INFO) << "[workspaces] shortcut: clear Today, " << count << " tab(s)";
++  if (count <= kRecentlyClosedLimit) {
++    service->CloseWorkspaceTabs(guid, /*today_only=*/true);
++    return;
++  }
++  ShowCloseConfirm(
++      browser_view->contents_container(), views::BubbleBorder::FLOAT,
++      "clear Today", guid, count, /*deleting=*/false,
++      base::BindOnce(
++          [](base::WeakPtr<BrowserWindowInterface> browser,
++             const std::string& guid) {
++            if (workspaces::WorkspaceService* const service =
++                    browser ? workspaces::WorkspaceService::From(browser.get())
++                            : nullptr) {
++              service->CloseWorkspaceTabs(guid, /*today_only=*/true);
++            }
++          },
++          browser->GetWeakPtr(), guid));
+ }
+ 
+ void WorkspaceRailView::OnArcImportDone(
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -148,6 +148,12 @@ class WorkspaceRailView : public views::
+                             const gfx::Point& point,
+                             ui::mojom::MenuSourceType source_type);
+ 
++  // The Clear Today shortcut (C22, Arc's "Clear"): closes the Today tabs of
++  // the workspace `browser` shows, keeping its open pinned pages and its
++  // favorites; above the menu's limit it asks first, centred over the page
++  // (zen mode usually hides the bar). ONLY FROM A COMMAND HANDLER.
++  static void ClearToday(BrowserWindowInterface* browser);
++
+   // Opens the one-textfield bubble New workspace uses, anchored to `anchor`.
+   // `on_accept` is run with whatever was typed, and not run at all if the
+   // bubble is dismissed. The pinned section's Rename (E15d) and the "Edit
+--- a/chrome/browser/ui/workspace_command_hooks.cc
++++ b/chrome/browser/ui/workspace_command_hooks.cc
+@@ -7,10 +7,14 @@
+ #include <string>
+ 
+ #include "base/i18n/rtl.h"
++#include "base/strings/string_number_conversions.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/command_updater.h"
+ #include "chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+ #include "chrome/grit/generated_resources.h"
+ 
+ namespace workspaces {
+@@ -77,6 +81,36 @@ bool ExecuteWorkspaceCommand(BrowserWind
+             id == IDC_HELIUM_WORKSPACE_MOVE_UP ? -1 : 1);
+       }
+       break;
++    // C13: workspace N by its place on the bar, and back to the last one.
++    case IDC_HELIUM_WORKSPACE_1:
++    case IDC_HELIUM_WORKSPACE_2:
++    case IDC_HELIUM_WORKSPACE_3:
++    case IDC_HELIUM_WORKSPACE_4:
++    case IDC_HELIUM_WORKSPACE_5:
++    case IDC_HELIUM_WORKSPACE_6:
++    case IDC_HELIUM_WORKSPACE_7:
++    case IDC_HELIUM_WORKSPACE_8:
++    case IDC_HELIUM_WORKSPACE_9:
++    case IDC_HELIUM_WORKSPACE_BACK:
++      if (WorkspaceService* service = WorkspaceService::From(browser)) {
++        if (id == IDC_HELIUM_WORKSPACE_BACK) {
++          service->ActivateLastWorkspace();
++        } else {
++          service->ActivateWorkspaceAt(
++              static_cast<size_t>(id - IDC_HELIUM_WORKSPACE_1));
++        }
++      }
++      break;
++    // C22: each is the bar's or the pinned section's own action.
++    case IDC_HELIUM_WORKSPACE_PIN_TAB:
++      WorkspacePinnedSectionView::TogglePin(browser);
++      break;
++    case IDC_HELIUM_WORKSPACE_CLEAR:
++      WorkspaceRailView::ClearToday(browser);
++      break;
++    case IDC_HELIUM_WORKSPACE_ARCHIVE:
++      WorkspaceArchiveView::ShowOverPage(browser);
++      break;
+     default:
+       return false;
+   }
+@@ -96,6 +130,10 @@ void EnableWorkspaceCommands(CommandUpda
+ 
+ std::optional<browser_shortcuts::BrowserShortcutCommandLabel>
+ WorkspaceShortcutLabel(int id) {
++  if (id >= IDC_HELIUM_WORKSPACE_1 && id <= IDC_HELIUM_WORKSPACE_9) {
++    return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_N,
++                 base::NumberToString16(id - IDC_HELIUM_WORKSPACE_1 + 1)};
++  }
+   switch (id) {
+     case IDC_HELIUM_WORKSPACE_NEXT:
+       return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_NEXT};
+@@ -107,6 +145,14 @@ WorkspaceShortcutLabel(int id) {
+       return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_MOVE_UP};
+     case IDC_HELIUM_WORKSPACE_MOVE_DOWN:
+       return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_MOVE_DOWN};
++    case IDC_HELIUM_WORKSPACE_BACK:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_BACK};
++    case IDC_HELIUM_WORKSPACE_PIN_TAB:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_PIN_TAB};
++    case IDC_HELIUM_WORKSPACE_CLEAR:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_CLEAR};
++    case IDC_HELIUM_WORKSPACE_ARCHIVE:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_ARCHIVE};
+     default:
+       return std::nullopt;
+   }

@@ -1,0 +1,58 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -21,7 +21,9 @@
+ #include "base/uuid.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -71,6 +73,31 @@ bool AsksBeforeLeaving(content::WebConte
+   return asks;
+ }
+ 
++// The workspace a new window opens on: the one the user is in -- that of the
++// window of this profile activated last, not the new one itself and not a
++// window without Workspaces (a popup) -- design 1, E15e. Home when there is
++// none, as at startup. A restored window then follows its selected tab (the
++// auto-switch in OnTabStripModelChanged), as before.
++std::string InitialWorkspace(BrowserWindowInterface* window) {
++  std::string guid(kDefaultWorkspaceGuid);
++  if (!window) {
++    return guid;
++  }
++  ProfileBrowserCollection::GetForProfile(window->GetProfile())
++      ->ForEach(
++          [&](BrowserWindowInterface* other) {
++            const WorkspaceService* const service =
++                other == window ? nullptr : WorkspaceService::From(other);
++            if (!service) {
++              return true;
++            }
++            guid = service->active_guid();
++            return false;
++          },
++          BrowserCollection::Order::kActivation);
++  return guid;
++}
++
+ }  // namespace
+ 
+ DEFINE_USER_DATA(WorkspaceService);
+@@ -83,10 +110,12 @@ WorkspaceService::WorkspaceService(
+     : tab_strip_(tab_strip_model),
+       browser_window_(browser_window),
+       prefs_(prefs),
+-      active_guid_(kDefaultWorkspaceGuid),
++      active_guid_(InitialWorkspace(browser_window)),
+       known_guids_(prefs::GetWorkspaceGuids(prefs)),
+       scoped_data_holder_(unowned_user_data_host, *this) {
+   tab_strip_->AddObserver(this);
++  LOG(INFO) << "[workspaces] a window opens on workspace '" << active_guid_
++            << "'";
+ 
+   // Watched rather than polled, and watched on the PROFILE's pref, so a
+   // workspace created in one window reaches every other window's rail and

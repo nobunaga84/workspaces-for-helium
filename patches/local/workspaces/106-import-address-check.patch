@@ -1,0 +1,539 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -41,8 +41,8 @@ source_set("archive") {
+ }
+ 
+ # Export and import of the workspace list, the pinned pages and the Archive as
+-# one json file, and the pinned pages as a csv (C19.1, LOCAL.md 103). //base
+-# and //crypto only, no Profile and no view: the whole of it is tested in
++# one json file, and the pinned pages as a csv (C19.1, LOCAL.md 103). //base,
++# //crypto and //url only, no Profile and no view: the whole of it is tested in
+ # workspaces_unittests, and local/workspaces-transfer.py reads and writes the
+ # same file.
+ source_set("transfer") {
+@@ -55,11 +55,13 @@ source_set("transfer") {
+     ":archive",
+     ":pins",
+   ]
+-  # ":prefs" for the workspace list's schema version (transfer F9).
++  # ":prefs" for the workspace list's schema version (transfer F9); "//url":
++  # an address is judged as GURL reads it (R2-16).
+   deps = [
+     ":prefs",
+     "//base",
+     "//crypto",
++    "//url",
+   ]
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_transfer.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_transfer.cc
+@@ -24,6 +24,8 @@
+ #include "base/time/time.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "crypto/hash.h"
++#include "url/gurl.h"
++#include "url/url_constants.h"
+ 
+ namespace workspaces::transfer {
+ 
+@@ -88,32 +90,36 @@ void AppendCsvField(std::string& out, st
+ }
+ 
+ // Transfer F8: a script, or a file on another computer -- Windows would
+-// connect to it. Every other address is one this browser keeps itself (the
+-// Archive takes any valid address, Replace pinned URL any page), so a file
+-// it exported always comes back in.
++// connect to it. Judged as the browser opens it (R2-16): GURL trims the text,
++// drops tabs and newlines, reads a backslash as a slash and, on Windows, any
++// file address that is not a drive and not three slashes as a computer. A
++// view-source page loads the address inside it, never another view-source
++// (HandleViewSource, browser_url_handler_impl.cc), so one look inside is all.
+ bool IsForeignAddress(std::string_view url) {
+-  constexpr auto kInsensitive = base::CompareCase::INSENSITIVE_ASCII;
+-  return base::StartsWith(url, "javascript:", kInsensitive) ||
+-         (base::StartsWith(url, "file://", kInsensitive) &&
+-          !base::StartsWith(url, "file:///", kInsensitive));
+-}
+-
+-// The first address in `nodes`, at any depth, IsForeignAddress names.
+-const std::string* ForeignAddress(const std::vector<PinNode>& nodes) {
+-  for (const PinNode& node : nodes) {
+-    if (node.type == PinNode::Type::kItem && IsForeignAddress(node.url)) {
+-      return &node.url;
+-    }
+-    if (const std::string* inner = ForeignAddress(node.children)) {
+-      return inner;
++  GURL parsed(url);
++  if (parsed.SchemeIs(url::kViewSourceScheme)) {
++    parsed = GURL(parsed.GetContentPiece());
++  }
++  return parsed.SchemeIs(url::kJavaScriptScheme) ||
++         (parsed.SchemeIsFile() && parsed.has_host());
++}
++
++// Every page in `nodes` IsForeignAddress names left out, at any depth (R2-17:
++// the file is read without them, rather than refused). A split left with one
++// page is that page again, as EraseNode's (E19); one left with none goes.
++void LeaveOutForeign(std::vector<PinNode>& nodes) {
++  for (PinNode& node : nodes) {
++    LeaveOutForeign(node.children);
++    if (node.type == PinNode::Type::kSplit && node.children.size() == 1) {
++      PinNode page = std::move(node.children.front());
++      node = std::move(page);
+     }
+   }
+-  return nullptr;
+-}
+-
+-std::string ForeignAddressError(std::string_view url) {
+-  return "The file holds an address this browser does not import: " +
+-         std::string(url.substr(0, 40));
++  std::erase_if(nodes, [](const PinNode& node) {
++    return node.type == PinNode::Type::kItem
++               ? IsForeignAddress(node.url)
++               : node.type == PinNode::Type::kSplit && node.children.empty();
++  });
+ }
+ 
+ struct CsvRow {
+@@ -232,7 +238,11 @@ std::string BuildExport(const base::Dict
+   return Json(doc);
+ }
+ 
+-ParseResult ParseExport(std::string_view json) {
++namespace {
++
++// ParseExport, or with `keep_foreign` every row as the file has it: for a copy
++// in Workspace Backups, the browser's own file (R2-17).
++ParseResult Parse(std::string_view json, bool keep_foreign) {
+   ParseResult result;
+   const auto fail = [&result](std::string error) {
+     result.error = std::move(error);
+@@ -323,9 +333,11 @@ ParseResult ParseExport(std::string_view
+             "The pinned pages in the file are in a form this browser cannot "
+             "read.");
+       }
+-      for (const auto& [guid, rows] : *parsed.pins) {
+-        if (const std::string* url = ForeignAddress(rows)) {
+-          return fail(ForeignAddressError(*url));
++      if (!keep_foreign) {
++        for (auto& [guid, rows] : *parsed.pins) {
++          const int pages = pins::CountPages(rows);
++          LeaveOutForeign(rows);
++          parsed.left_out += pages - pins::CountPages(rows);
+         }
+       }
+     } else {
+@@ -334,10 +346,11 @@ ParseResult ParseExport(std::string_view
+         return fail(
+             "The Archive in the file is in a form this browser cannot read.");
+       }
+-      for (const archive::ArchiveEntry& entry : *parsed.archive) {
+-        if (IsForeignAddress(entry.url)) {
+-          return fail(ForeignAddressError(entry.url));
+-        }
++      if (!keep_foreign) {
++        parsed.left_out += static_cast<int>(
++            std::erase_if(*parsed.archive, [](const archive::ArchiveEntry& e) {
++              return IsForeignAddress(e.url);
++            }));
+       }
+     }
+   }
+@@ -350,9 +363,15 @@ ParseResult ParseExport(std::string_view
+   return result;
+ }
+ 
++}  // namespace
++
++ParseResult ParseExport(std::string_view json) {
++  return Parse(json, /*keep_foreign=*/false);
++}
++
+ std::optional<std::string> WithoutClearedEntries(std::string_view export_json,
+                                                  base::Time since) {
+-  ParseResult parsed = ParseExport(export_json);
++  ParseResult parsed = Parse(export_json, /*keep_foreign=*/true);
+   if (!parsed.value || !parsed.value->archive) {
+     return std::nullopt;
+   }
+--- a/chrome/browser/ui/tabs/workspaces/workspace_transfer.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_transfer.h
+@@ -25,9 +25,9 @@
+ // workspaces read and write this; local/workspaces-transfer.py reads and
+ // writes the very same file, which is how each is tested against the other.
+ //
+-// //base and //crypto only, no Profile and no view, so all of it is tested in
+-// workspaces_unittests (design 3.10). Applying an import to the live stores is
+-// not here: ParseExport() only checks and reads.
++// //base, //crypto and //url only, no Profile and no view, so all of it is
++// tested in workspaces_unittests (design 3.10). Applying an import to the live
++// stores is not here: ParseExport() only checks and reads.
+ //
+ // The file:
+ //   { "format": "helium-workspaces-export", "version": 1,
+@@ -74,7 +74,10 @@ struct Export {
+   std::optional<std::vector<archive::ArchiveEntry>> archive;
+   std::string exported_at;
+   std::string source;
++  // Of what is left: the pages and entries below are not in it.
+   Counts counts;
++  // Pinned pages and Archive entries ParseExport left out (transfer F8).
++  int left_out = 0;
+ };
+ 
+ // `workspace_prefs`' workspace list and the two stores' contents, counted: the
+@@ -104,8 +107,10 @@ struct ParseResult {
+ };
+ 
+ // Checks and reads an export file's text. Nothing is applied. Refused too: a
+-// workspace list of another schema (F9), a script's address or a file on
+-// another computer (F8).
++// workspace list of another schema (F9). Left out, counted in `left_out`: a
++// pinned page or Archive entry at a script's address or a file on another
++// computer (F8), judged as the browser opens it (R2-16), so a file the
++// browser wrote itself always comes back in (R2-17).
+ ParseResult ParseExport(std::string_view json);
+ 
+ // The pinned pages as a table a spreadsheet opens (UTF-8 with a byte-order
+@@ -126,8 +131,10 @@ inline constexpr base::FilePath::CharTyp
+ 
+ // Transfer F7: the Archive screen's Clear reaches those copies too, by its own
+ // rule (archive::IsClearedBy). `export_json` without the archive entries
+-// cleared from `since`; std::nullopt when none goes, when it has no Archive,
+-// or when it is not an export this version reads (it is then left alone).
++// cleared from `since`, every other row kept as it was (F8's included: the
++// copy is the browser's own); std::nullopt when none goes, when it has no
++// Archive, or when it is not an export this version reads (it is then left
++// alone).
+ std::optional<std::string> WithoutClearedEntries(std::string_view export_json,
+                                                  base::Time since);
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_transfer_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_transfer_unittest.cc
+@@ -365,60 +365,136 @@ TEST(WorkspaceTransferTest, ACsvWithNoPi
+ }
+ 
+ // Transfer F8: a script, or a file on another computer (Windows connects to
+-// it), refuses the whole file -- in a pinned page at any depth or in the
+-// Archive. Every address this browser keeps itself comes back in: the Archive
+-// takes any valid address (an extension's page, about:, data:).
+-TEST(WorkspaceTransferTest, AScriptOrAFileOnAnotherComputerIsRefused) {
+-  const auto pins = [](std::string_view row) {
++// it), is left out -- a pinned page at any depth, an Archive entry -- and the
++// rest of the file is read (R2-17: the browser's own export refused whole
++// when its Archive held a page from a network share). Judged as the browser
++// opens the address (R2-16, IsForeignAddress), so the forms the raw text hid
++// are left out too. Every address this browser keeps itself comes back in: the
++// Archive takes any valid address (an extension's page, about:, data:).
++TEST(WorkspaceTransferTest, AScriptOrAFileOnAnotherComputerIsLeftOut) {
++  const auto item = [](std::string_view id, std::string_view url) {
++    // Written by the json writer, so a tab or a backslash stays itself.
++    return base::StrCat({R"({"type":"item","id":")", id,
++                         R"(","title":"T","url":)",
++                         base::WriteJson(base::Value(url)).value(), "}"});
++  };
++  const auto pins = [](std::string_view rows) {
+     return Craft({{kPrefsMember, kPrefsText},
+                   {kPinsMember,
+                    base::StrCat({R"({"version":2,"workspaces":{"default":[)",
+-                                 row, "]}}"})}});
++                                 rows, "]}}"})}});
++  };
++  const auto entry = [](std::string_view id, std::string_view url) {
++    return base::StrCat({R"({"id":")", id, R"(","url":)",
++                         base::WriteJson(base::Value(url)).value(),
++                         R"(,"title":"t","workspace":"default",)"
++                         R"("reason":"manual","archived_at":"13437074330809987",)"
++                         R"("last_active":"13437074330809987"})"});
+   };
+-  const auto item = [](std::string_view url) {
+-    return base::StrCat(
+-        {R"({"type":"item","id":"a","title":"A","url":")", url, R"("})"});
++  // A web page, then `url`.
++  const auto archive = [&entry](std::string_view url) {
++    return Craft({{kPrefsMember, kPrefsText},
++                  {kArchiveMember,
++                   base::StrCat({R"({"version":1,"entries":[)",
++                                 entry("k", "https://k.example/"), ",",
++                                 entry("x", url), "]}"})}});
+   };
+-  const auto archive = [](std::string_view url) {
+-    return Craft(
+-        {{kPrefsMember, kPrefsText},
+-         {kArchiveMember,
+-          base::StrCat({R"({"version":1,"entries":[{"id":"x","url":")", url,
+-                        R"(","title":"t","workspace":"default","reason":"manual",)"
+-                        R"("archived_at":"13437074330809987",)"
+-                        R"("last_active":"13437074330809987"}]})"})}});
++  // The ids of pinned rows or Archive entries.
++  const auto ids = [](const auto& rows) {
++    std::vector<std::string> out;
++    for (const auto& row : rows) {
++      out.push_back(row.id);
++    }
++    return out;
+   };
++
+   for (const std::string_view ok :
+        {"https://a.example/", "http://a.example/", "chrome://settings/",
+         "file:///C:/Docs/a.pdf", "HTTPS://A.EXAMPLE/",
+         "chrome-extension://abc/dashboard.html", "about:blank",
+         "data:text/html,x", "view-source:https://a.example/",
+         "ftp://a.example/"}) {
+-    EXPECT_TRUE(ParseExport(pins(item(ok))).value) << ok;
+-    EXPECT_TRUE(ParseExport(archive(ok)).value) << ok;
++    const ParseResult in_pins = ParseExport(pins(item("a", ok)));
++    ASSERT_TRUE(in_pins.value) << ok << ": " << in_pins.error;
++    EXPECT_EQ(ids(in_pins.value->pins->at("default")),
++              std::vector<std::string>{"a"})
++        << ok;
++    EXPECT_EQ(in_pins.value->left_out, 0) << ok;
++    const ParseResult in_archive = ParseExport(archive(ok));
++    ASSERT_TRUE(in_archive.value) << ok << ": " << in_archive.error;
++    EXPECT_EQ(in_archive.value->archive->size(), 2u) << ok;
++    EXPECT_EQ(in_archive.value->left_out, 0) << ok;
+   }
++  // The plain forms, then those the raw text hid (R2-16).
+   for (const std::string_view bad :
+        {"javascript:alert(1)", "JavaScript:x", "file://host/share/x.html",
+-        "FILE://host/x"}) {
+-    const ParseResult result = ParseExport(pins(item(bad)));
+-    EXPECT_FALSE(result.value) << bad;
+-    EXPECT_NE(result.error.find("address"), std::string::npos) << result.error;
+-    EXPECT_FALSE(ParseExport(archive(bad)).value) << bad;
++        "FILE://host/x", "file:////host/share/x", "file:\\\\host\\share\\x",
++        "file:host/share/x", " file://host/share/x", "\nfile://host/x",
++        "java\tscript:alert(1)", "view-source:file://host/share/x"}) {
++    const ParseResult in_pins = ParseExport(
++        pins(base::StrCat({item("k", "https://k.example/"), ",",
++                           item("a", bad)})));
++    EXPECT_TRUE(in_pins.value) << bad << ": " << in_pins.error;
++    if (in_pins.value) {
++      EXPECT_EQ(ids(in_pins.value->pins->at("default")),
++                std::vector<std::string>{"k"})
++          << bad;
++      EXPECT_EQ(in_pins.value->left_out, 1) << bad;
++    }
++    const ParseResult in_archive = ParseExport(archive(bad));
++    EXPECT_TRUE(in_archive.value) << bad << ": " << in_archive.error;
++    if (in_archive.value) {
++      EXPECT_EQ(ids(*in_archive.value->archive), std::vector<std::string>{"k"})
++          << bad;
++      EXPECT_EQ(in_archive.value->left_out, 1) << bad;
++    }
+   }
+-  // Inside a folder, and one half of a split.
+-  EXPECT_FALSE(ParseExport(pins(base::StrCat(
+-                               {R"({"type":"folder","id":"f","title":"F",)"
+-                                R"("children":[)",
+-                                item("javascript:x"), "]}"})))
+-                   .value);
+-  EXPECT_FALSE(
+-      ParseExport(pins(base::StrCat(
+-                      {R"({"type":"split","id":"s","title":"","children":[)",
+-                       R"({"type":"item","id":"l","title":"L",)"
+-                       R"("url":"https://l.example/"},)"
+-                       R"({"type":"item","id":"r","title":"R",)"
+-                       R"("url":"file://host/r"}]})"})))
+-          .value);
++
++  // Inside a folder, which stays; one half of a split, whose other half stays
++  // as a page (EraseNode's rule, E19); both halves, and the split goes.
++  const ParseResult nested = ParseExport(pins(base::StrCat(
++      {R"({"type":"folder","id":"f","title":"F","children":[)",
++       item("f1", "javascript:x"), "]},",
++       R"({"type":"split","id":"s","title":"","children":[)",
++       item("l", "https://l.example/"), ",", item("r", "file://host/r"), "]},",
++       R"({"type":"split","id":"t","title":"","children":[)",
++       item("t1", "file:////host/1"), ",", item("t2", "javascript:y"), "]}"})));
++  ASSERT_TRUE(nested.value) << nested.error;
++  const std::vector<PinNode>& rows = nested.value->pins->at("default");
++  EXPECT_EQ(ids(rows), (std::vector<std::string>{"f", "l"}));
++  ASSERT_EQ(rows.size(), 2u);
++  EXPECT_TRUE(rows[0].children.empty());
++  EXPECT_EQ(rows[1].type, PinNode::Type::kItem);
++  EXPECT_EQ(rows[1].url, "https://l.example/");
++  // f1, r, t1 and t2; the counts are of what is left: page l, folder f.
++  EXPECT_EQ(nested.value->left_out, 4);
++  EXPECT_EQ(nested.value->counts, (Counts{0, 1, 1, 0}));
++}
++
++// R2-17: a before-import copy is the browser's own file. The Archive screen's
++// Clear rewrites one that holds a page from a network share (it could not,
++// when the copy was refused whole), and keeps that page in it.
++TEST(WorkspaceTransferTest, ClearingACopyKeepsItsNetworkSharePage) {
++  std::vector<ArchiveEntry> entries = Entries();
++  ArchiveEntry share = entries[0];
++  share.id = "e2";
++  share.url = "file://fileserver/docs/report.pdf";
++  share.archived_at -= base::Seconds(100);  // Before the range: it stays.
++  entries.push_back(share);
++  const std::string text =
++      BuildExport(Prefs(), nullptr, &entries, kExportedAt, "test");
++
++  const std::optional<std::string> cleared =
++      WithoutClearedEntries(text, entries[0].archived_at);
++  ASSERT_TRUE(cleared);
++  EXPECT_EQ(cleared->find("https://e.example/"), std::string::npos);
++  EXPECT_NE(cleared->find("file://fileserver/docs/report.pdf"),
++            std::string::npos);
++  // Imported, the copy comes in without that page, and says so.
++  const ParseResult imported = ParseExport(*cleared);
++  ASSERT_TRUE(imported.value) << imported.error;
++  EXPECT_TRUE(imported.value->archive->empty());
++  EXPECT_EQ(imported.value->left_out, 1);
+ }
+ 
+ // Transfer F9: a workspace list of another schema would import, then read as
+--- a/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
++++ b/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
+@@ -318,6 +318,9 @@
+   <message name="IDS_HELIUM_WORKSPACE_IMPORT_CONFIRM_BODY" desc="Body of that question. $1-$3 are what the browser has now (workspaces, pinned pages, archived tabs), $4-$6 what the file holds.">
+     Now: <ph name="NOW_WORKSPACES">$1<ex>5</ex></ph> workspaces, <ph name="NOW_PAGES">$2<ex>25</ex></ph> pinned pages, <ph name="NOW_ARCHIVED">$3<ex>12</ex></ph> archived tabs. In the file: <ph name="FILE_WORKSPACES">$4<ex>4</ex></ph> workspaces, <ph name="FILE_PAGES">$5<ex>3434</ex></ph> pinned pages, <ph name="FILE_ARCHIVED">$6<ex>1638</ex></ph> archived tabs. The tabs you have open stay open. A copy of what you have now is saved first.
+   </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_LEFT_OUT" desc="Extra paragraph of that question when pinned pages or archived tabs in the file have an address this browser does not import: a script, or a file on another computer, which Windows would connect to. $1 = how many.">
++    Left out: <ph name="COUNT">$1<ex>2</ex></ph> pinned pages or archived tabs whose address is a script or a file on another computer, which this browser does not import.
++  </message>
+   <message name="IDS_HELIUM_WORKSPACE_IMPORT_REPLACE" desc="Button that replaces the workspaces, pinned pages and Archive with those of the file.">
+     Replace
+   </message>
+@@ -330,6 +333,9 @@
+   <message name="IDS_HELIUM_WORKSPACE_TRANSFER_LOADING" desc="Reason shown when export or import is tried before the pinned pages and Archive have loaded.">
+     Your pinned pages or Archive are still loading. Try again in a moment.
+   </message>
++  <message name="IDS_HELIUM_WORKSPACE_TRANSFER_ARC_RUNNING" desc="Reason shown when an import or export of workspaces is refused because an import from the Arc browser is running: the workspaces it fills would be replaced, or saved without its tabs still to come.">
++    Import from Arc is still running. Try again when it has finished.
++  </message>
+   <message name="IDS_HELIUM_WORKSPACE_TRANSFER_READONLY" desc="Reason shown when the pinned pages or Archive file could not be read at startup, so it is protected.">
+     Your pinned pages or Archive file could not be read when the browser started, so it is protected and cannot be replaced.
+   </message>
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -2209,9 +2209,11 @@ bool WorkspaceRailView::IsCommandIdEnabl
+   // The default workspace cannot be deleted -- ParseWorkspaces() puts it back
+   // on the next read, so the item would report success and change nothing
+   // (workspace_prefs.h). Disabled rather than absent, so the menu has the same
+-  // shape everywhere and the reason is visible rather than mysterious.
++  // shape everywhere and the reason is visible rather than mysterious. And
++  // while an Arc import runs (R2-19): its tabs still to come would land in Home.
+   if (command_id == kMenuCommandDelete) {
+-    return context_menu_guid_ != workspaces::kDefaultWorkspaceGuid;
++    return context_menu_guid_ != workspaces::kDefaultWorkspaceGuid &&
++           !WorkspaceArcImporter::IsRunning(browser_->GetProfile());
+   }
+ 
+   // "Hibernate other workspaces" with nothing other is the same enabled-but-
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_transfer_ui.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_transfer_ui.cc
+@@ -22,6 +22,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/thread_pool.h"
+ #include "base/time/time.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_sidebar_bubble.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -186,6 +187,14 @@ bool WorkspaceTransferUi::automatic() co
+ 
+ bool WorkspaceTransferUi::StoresReady(std::u16string* reason) const {
+   Profile* const profile = browser_->GetProfile();
++  // R2-20: an Arc import begun since the menu opened (from another window,
++  // while the file box was open) stamps its tabs with workspaces the file's
++  // list would replace. The menu greys Import only as it opens.
++  if (WorkspaceArcImporter::IsRunning(profile)) {
++    *reason =
++        l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_TRANSFER_ARC_RUNNING);
++    return false;
++  }
+   const PinStore* pins = PinsOf(profile);
+   const ArchiveStore* archive = ArchiveOf(profile);
+   if (!pins->loaded() || !archive->loaded()) {
+@@ -284,6 +293,15 @@ void WorkspaceTransferUi::ExportTo(const
+   // Transfer F1: a store that could not be read at start-up holds nothing, so
+   // the file would look whole and lack every row. A csv needs the pins only.
+   Profile* const profile = browser_->GetProfile();
++  // R2-20's race, here too: an Arc import begun while the Save box was open
++  // still adds pinned rows and workspaces the file would miss.
++  if (WorkspaceArcImporter::IsRunning(profile)) {
++    LOG(WARNING) << "[workspaces] export: refused, an Arc import is running";
++    ShowMessage(
++        l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_EXPORT_FAILED),
++        l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_TRANSFER_ARC_RUNNING));
++    return;
++  }
+   if (PinsOf(profile)->read_only() ||
+       (!csv && ArchiveOf(profile)->read_only())) {
+     LOG(WARNING) << "[workspaces] export: refused, a store is read-only";
+@@ -375,7 +393,8 @@ void WorkspaceTransferUi::OnImportRead(b
+             << pending_->imported.counts.workspaces << " workspace(s), "
+             << pending_->imported.counts.pinned_pages << " pinned page(s), "
+             << pending_->imported.counts.archive_entries
+-            << " archive entr(ies)";
++            << " archive entr(ies); " << pending_->imported.left_out
++            << " left out (a script or a file on another computer)";
+   if (automatic()) {
+     Apply();
+   } else {
+@@ -391,19 +410,26 @@ void WorkspaceTransferUi::AskToReplace()
+   }
+   const transfer::Counts& now = pending_->now;
+   const transfer::Counts& file = pending_->imported.counts;
++  ui::DialogModel::Builder builder;
++  builder
++      .SetTitle(
++          l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_IMPORT_CONFIRM_TITLE))
++      .AddParagraph(ui::DialogModelLabel(l10n_util::GetStringFUTF16(
++          IDS_HELIUM_WORKSPACE_IMPORT_CONFIRM_BODY,
++          {base::FormatNumber(now.workspaces),
++           base::FormatNumber(now.pinned_pages),
++           base::FormatNumber(now.archive_entries),
++           base::FormatNumber(file.workspaces),
++           base::FormatNumber(file.pinned_pages),
++           base::FormatNumber(file.archive_entries)},
++          nullptr)));
++  // R2-17: said before Replace, not found missing after it.
++  if (const int left_out = pending_->imported.left_out) {
++    builder.AddParagraph(ui::DialogModelLabel(l10n_util::GetStringFUTF16(
++        IDS_HELIUM_WORKSPACE_IMPORT_LEFT_OUT, base::FormatNumber(left_out))));
++  }
+   auto model =
+-      ui::DialogModel::Builder()
+-          .SetTitle(l10n_util::GetStringUTF16(
+-              IDS_HELIUM_WORKSPACE_IMPORT_CONFIRM_TITLE))
+-          .AddParagraph(ui::DialogModelLabel(l10n_util::GetStringFUTF16(
+-              IDS_HELIUM_WORKSPACE_IMPORT_CONFIRM_BODY,
+-              {base::FormatNumber(now.workspaces),
+-               base::FormatNumber(now.pinned_pages),
+-               base::FormatNumber(now.archive_entries),
+-               base::FormatNumber(file.workspaces),
+-               base::FormatNumber(file.pinned_pages),
+-               base::FormatNumber(file.archive_entries)},
+-              nullptr)))
++      builder
+           .AddOkButton(base::BindOnce(&WorkspaceTransferUi::Apply,
+                                       weak_factory_.GetWeakPtr()),
+                        ui::DialogModel::Button::Params().SetLabel(
+@@ -457,7 +483,8 @@ void WorkspaceTransferUi::ApplyAfterBack
+       backed_up ? std::u16string()
+                 : l10n_util::GetStringUTF16(
+                       IDS_HELIUM_WORKSPACE_IMPORT_BACKUP_FAILED);
+-  // The stores may have changed state while the copy was written.
++  // The stores may have changed state while the copy was written, or an Arc
++  // import begun (R2-20).
+   if (!backed_up || !StoresReady(&reason)) {
+     LOG(WARNING) << "[workspaces] import: refused: " << reason;
+     ShowMessage(l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_IMPORT_FAILED),
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_transfer_ui.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_transfer_ui.h
+@@ -78,7 +78,8 @@ class WorkspaceTransferUi : public ui::S
+   // A short message under the anchor: `title`, then `body` when not empty.
+   void ShowMessage(const std::u16string& title, const std::u16string& body);
+   // Whether the pinned pages and the Archive can be read and replaced now:
+-  // loaded, and not protected as unreadable. Else says why in `reason`.
++  // loaded, not protected as unreadable, and no Arc import filling the
++  // workspaces (R2-20). Else says why in `reason`.
+   bool StoresReady(std::u16string* reason) const;
+   bool automatic() const;
+ 

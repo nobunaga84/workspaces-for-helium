@@ -1,0 +1,439 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -112,10 +112,13 @@ std::vector<WorkspaceEntry> ParseWorkspa
+   return entries;
+ }
+ 
++std::vector<WorkspaceEntry> GetWorkspaces(const PrefService* prefs) {
++  return prefs ? ParseWorkspaces(prefs->GetDict(kHeliumWorkspacesList))
++               : DefaultOnly();
++}
++
+ std::vector<std::string> GetWorkspaceGuids(const PrefService* prefs) {
+-  const std::vector<WorkspaceEntry> entries =
+-      prefs ? ParseWorkspaces(prefs->GetDict(kHeliumWorkspacesList))
+-            : DefaultOnly();
++  const std::vector<WorkspaceEntry> entries = GetWorkspaces(prefs);
+ 
+   std::vector<std::string> guids;
+   guids.reserve(entries.size());
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -101,12 +101,16 @@ base::DictValue DefaultWorkspacesDict();
+ // instead of having it flattened.
+ std::vector<WorkspaceEntry> ParseWorkspaces(const base::DictValue& dict);
+ 
+-// The workspace guids for this profile, in cycling order -- what
+-// RelativeWorkspaceGuid consumes.
++// This profile's workspaces, in the order they are stored -- which is the order
++// the rail draws them in and the order switching cycles through.
+ //
+ // Tolerates a null `prefs` and answers with the default workspace, matching
+ // every other caller-facing guarantee here, because the service holds a
+ // PrefService it declines to assume is non-null.
++std::vector<WorkspaceEntry> GetWorkspaces(const PrefService* prefs);
++
++// The same list with only the guids, which is what RelativeWorkspaceGuid
++// consumes.
+ std::vector<std::string> GetWorkspaceGuids(const PrefService* prefs);
+ 
+ }  // namespace workspaces::prefs
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -151,6 +151,10 @@ void WorkspaceService::SwitchToWorkspace
+   tab_strip_->delegate()->AddTabAt(GURL(), /*index=*/-1, /*foreground=*/true);
+ }
+ 
++std::vector<prefs::WorkspaceEntry> WorkspaceService::GetWorkspaces() const {
++  return prefs::GetWorkspaces(prefs_);
++}
++
+ void WorkspaceService::ActivateRelativeWorkspace(int offset) {
+   // Read per switch rather than cached in a member. This runs at keyboard
+   // rate, so the cost is irrelevant, and it means there is no stale copy to
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -17,6 +17,7 @@
+ #include "base/memory/raw_ref.h"
+ #include "base/memory/weak_ptr.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "components/tab_groups/tab_group_id.h"
+ // For tabs::TabHandle, which is TabInterface::Handle and so needs the full
+ // declaration rather than the forward declaration that used to be enough here.
+@@ -106,16 +107,29 @@ class WorkspaceService : public TabStrip
+   // on there if it is still around, otherwise the first visible tab, otherwise
+   // a brand new tab.
+   //
+-  // ONLY EVER CALL THIS FROM A COMMAND HANDLER. It activates a tab, so calling
+-  // it from a TabStripModelObserver method would trip the re-entrancy CHECK
+-  // described above. Everything that reaches it today comes in through
+-  // ActivateRelativeWorkspace() from BrowserCommandController.
++  // NEVER CALL THIS FROM A TabStripModelObserver. It activates a tab, so
++  // calling it from inside an observer notification would trip the re-entrancy
++  // CHECK described above. A command handler is safe, and so is a button press
++  // in the rail -- both are delivered from the message loop rather than from
++  // inside the model's guarded scope. The two callers today are
++  // ActivateRelativeWorkspace() from BrowserCommandController and
++  // WorkspaceRailView.
+   void SwitchToWorkspace(std::string_view guid);
+ 
+   // Shows the workspace `offset` positions from the active one, wrapping at
+   // both ends. +1 is next, -1 is previous.
+   void ActivateRelativeWorkspace(int offset);
+ 
++  // This profile's workspaces, in stored order. Never empty, and the default
++  // workspace is always in it (workspace_prefs.h).
++  //
++  // Here so that a view can draw the list without learning what a PrefService
++  // is: the rail asks the service, exactly as it asks for active_guid() and
++  // calls SwitchToWorkspace(). Read per call rather than cached, for the reason
++  // ActivateRelativeWorkspace() gives -- there is no stale copy to invalidate
++  // once E9b starts editing the list.
++  std::vector<prefs::WorkspaceEntry> GetWorkspaces() const;
++
+   // Runs `callback` after every actual change of active workspace. This is
+   // how a workspace switch reaches the tab strip: the visibility predicate
+   // is re-read on each layout, so the view layer only needs to be told to
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -15,6 +15,7 @@ source_set("vertical") {
+     "vertical_tab_strip_scroll_bar.h",
+     "vertical_tab_strip_segmented_control.h",
+     "vertical_tab_strip_top_container.h",
++    "workspace_rail_view.h",
+   ]
+ 
+   public_deps = [ "//chrome/browser/ui/views/tabs/common" ]
+@@ -46,6 +47,7 @@ source_set("impl") {
+     "vertical_tab_strip_scroll_bar.cc",
+     "vertical_tab_strip_segmented_control.cc",
+     "vertical_tab_strip_top_container.cc",
++    "workspace_rail_view.cc",
+   ]
+ 
+   deps = [
+@@ -68,6 +70,8 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs:utils",
+     "//chrome/browser/ui/tabs/organizer:impl",
+     "//chrome/browser/ui/tabs/saved_tab_groups",
++    "//chrome/browser/ui/tabs/workspaces",
++    "//chrome/browser/ui/tabs/workspaces:prefs",
+     "//chrome/browser/ui/user_education",
+     "//chrome/browser/ui/views:layout_provider",
+     "//chrome/browser/ui/views/frame",
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+@@ -9,6 +9,7 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/views/view_class_properties.h"
+ 
+@@ -35,6 +36,15 @@ VerticalTabStripBottomContainer::Vertica
+ 
+   new_tab_button_ = AddChildView(std::move(new_tab_button));
+ 
++  // Helium Workspaces: the workspace switcher, after the new tab button so it
++  // sits at the bottom of the strip the way Arc's and Zen's do. It keeps no
++  // pointer here and needs nothing from UpdateButtonStyles below -- it takes
++  // the collapse state from the same controller this container does, which is
++  // what keeps this feature to one hunk in one file. It hides itself unless
++  // the profile has more than one workspace.
++  AddChildView(
++      std::make_unique<WorkspaceRailView>(browser_, state_controller));
++
+   OnCollapseStateChanged(state_controller->GetCollapseState());
+   collapsed_state_change_subscription_ =
+       state_controller->RegisterOnCollapseChanged(base::BindRepeating(
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -0,0 +1,184 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
++
++#include <stddef.h>
++
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/views/tabs/vertical/top_container_button.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/views/layout/layout_types.h"
++
++namespace {
++
++// What a workspace's button says.
++//
++// TopContainerButton is a fixed square -- CalculatePreferredSize returns
++// kVerticalTabStripCollapseButtonSize both ways -- so this has to be one
++// character, not a name. That is also the only shape that survives the strip
++// being collapsed to an icon rail, which is the state the rail has to work in
++// as much as the expanded one.
++//
++// The title's first character if there is a title, otherwise the workspace's
++// position in the list, which is the same number Shift+Alt+arrow counts
++// through. The full name is in the tooltip either way.
++std::u16string LabelForWorkspace(const workspaces::prefs::WorkspaceEntry& entry,
++                                 size_t index) {
++  const std::u16string title = base::UTF8ToUTF16(entry.title);
++  if (title.empty()) {
++    return base::NumberToString16(static_cast<int>(index) + 1);
++  }
++
++  // One character means one code point, not one UTF-16 unit. Half a surrogate
++  // pair renders as a replacement glyph, and a title can already be an emoji
++  // today -- local/set-workspaces-pref.py takes whatever it is given, and the
++  // emoji field design 2.4 plans for does not exist yet, so an emoji name is
++  // the obvious thing for someone to try first.
++  const bool is_lead_surrogate = (title[0] & 0xFC00) == 0xD800;
++  return title.substr(0, is_lead_surrogate && title.size() > 1 ? 2 : 1);
++}
++
++// The full name, or the guid when there is no name. The guid is chosen by hand
++// in this build (local/set-workspaces-pref.py), so it is a real answer rather
++// than a placeholder -- and it is better than a localised "Workspace 2", which
++// would mean a string resource in generated_resources.grd, one of the hottest
++// files in the tree, for a name E9b is about to make editable anyway.
++std::u16string TooltipForWorkspace(
++    const workspaces::prefs::WorkspaceEntry& entry) {
++  return base::UTF8ToUTF16(entry.title.empty() ? entry.guid : entry.title);
++}
++
++}  // namespace
++
++WorkspaceRailView::WorkspaceRailView(
++    BrowserWindowInterface* browser,
++    tabs::VerticalTabStripStateController* state_controller)
++    : browser_(browser) {
++  // Hidden until AddedToWidget() has looked at the list. Starting hidden rather
++  // than starting shown and hiding later is what keeps a profile that never
++  // opts in from seeing the rail flash on at startup.
++  SetVisible(false);
++
++  if (state_controller) {
++    OnCollapseStateChanged(state_controller->GetCollapseState());
++    collapse_changed_subscription_ = state_controller->RegisterOnCollapseChanged(
++        base::BindRepeating(&WorkspaceRailView::OnCollapseStateChanged,
++                            base::Unretained(this)));
++  }
++}
++
++WorkspaceRailView::~WorkspaceRailView() = default;
++
++void WorkspaceRailView::AddedToWidget() {
++  views::FlexLayoutView::AddedToWidget();
++
++  // base::Unretained is safe both times: the subscription is a member, so it is
++  // cancelled when this view is destroyed, and the service's callback list
++  // binds a weak pointer of its own so a service that dies first is also fine
++  // (workspace_service.h).
++  if (workspaces::WorkspaceService* service =
++          workspaces::WorkspaceService::From(browser_)) {
++    workspace_changed_subscription_ = service->RegisterWorkspaceChangedCallback(
++        base::BindRepeating(&WorkspaceRailView::UpdateHighlight,
++                            base::Unretained(this)));
++  }
++
++  Rebuild();
++}
++
++void WorkspaceRailView::Rebuild() {
++  RemoveAllChildViews();
++  buttons_.clear();
++  guids_.clear();
++
++  workspaces::WorkspaceService* service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || !service->IsEnabled()) {
++    SetVisible(false);
++    return;
++  }
++
++  const std::vector<workspaces::prefs::WorkspaceEntry> entries =
++      service->GetWorkspaces();
++
++  // One workspace is not a switcher. Design 5 wants stock Helium to stay stock
++  // until someone opts in, and a rail offering a single destination is worse
++  // than no rail: it takes space at the bottom of the strip to say nothing.
++  if (entries.size() < 2) {
++    SetVisible(false);
++    return;
++  }
++
++  for (size_t i = 0; i < entries.size(); ++i) {
++    auto button = std::make_unique<TopContainerButton>();
++    button->SetText(LabelForWorkspace(entries[i], i));
++    button->SetTooltipText(TooltipForWorkspace(entries[i]));
++    button->SetCallback(
++        base::BindRepeating(&WorkspaceRailView::OnWorkspacePressed,
++                            base::Unretained(this), entries[i].guid));
++
++    guids_.push_back(entries[i].guid);
++    buttons_.push_back(AddChildView(std::move(button)));
++  }
++
++  SetVisible(true);
++  UpdateHighlight();
++}
++
++void WorkspaceRailView::UpdateHighlight() {
++  const workspaces::WorkspaceService* service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return;
++  }
++
++  // SetHighlighted rather than a colour of our own: it is the ink-drop
++  // highlight Chromium already uses for "this button's thing is the one that is
++  // currently up", so it follows the theme, dark mode and the strip's own
++  // colours without this file naming a single ui::ColorId.
++  const std::string& active_guid = service->active_guid();
++  for (size_t i = 0; i < buttons_.size(); ++i) {
++    buttons_[i]->SetHighlighted(guids_[i] == active_guid);
++  }
++}
++
++void WorkspaceRailView::OnWorkspacePressed(const std::string& guid) {
++  workspaces::WorkspaceService* service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return;
++  }
++
++  // SwitchToWorkspace and not SetActiveWorkspace: this moves the user onto a
++  // tab they can see, which is a TabStripModel mutation and therefore only
++  // legal outside the observer scope (design 2.2). A button press is delivered
++  // from the message loop, so this is as safe a caller as the command handler
++  // the method was written for.
++  service->SwitchToWorkspace(guid);
++}
++
++void WorkspaceRailView::OnCollapseStateChanged(
++    tabs::VerticalTabStripCollapseState state) {
++  // Follows the parent container: a row beside the new tab button when the
++  // strip is expanded, a column under it when the strip is an icon rail. Taking
++  // this from the controller rather than from the container is what keeps
++  // vertical_tab_strip_bottom_container.h out of this patch entirely.
++  const bool collapsed = state != tabs::VerticalTabStripCollapseState::kExpanded;
++  SetOrientation(collapsed ? views::LayoutOrientation::kVertical
++                           : views::LayoutOrientation::kHorizontal);
++}
++
++BEGIN_METADATA(WorkspaceRailView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_RAIL_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_RAIL_VIEW_H_
++
++#include <string>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/layout/flex_layout_view.h"
++
++class BrowserWindowInterface;
++class TopContainerButton;
++
++namespace tabs {
++class VerticalTabStripStateController;
++enum class VerticalTabStripCollapseState;
++}  // namespace tabs
++
++// The workspace switcher: one button per workspace, at the bottom of the
++// vertical tab strip beside the new tab button (design 5, and the owner request
++// recorded there on 2026-09-10).
++//
++// Read-only in this build. It shows the workspaces and switches between them;
++// creating, renaming, deleting and reordering arrive with the context menu in
++// E9b, and until then the list is edited with local/set-workspaces-pref.py.
++//
++// STOCK HELIUM STAYS STOCK. The rail hides itself entirely when there is one
++// workspace or when Workspaces is switched off, so a profile that never opts in
++// sees the tab strip it had before (design 5, "hide the rail entirely when there
++// is one workspace"). A hidden view is what that has to mean rather than an
++// absent one: the container lays out whatever children it has, and
++// IsPositionInWindowCaption already skips invisible children when deciding what
++// is draggable window caption.
++//
++// This view knows nothing about prefs or tab strips. It asks WorkspaceService
++// for the list and tells it to switch; everything else is the service's
++// (design 3.1).
++class WorkspaceRailView : public views::FlexLayoutView {
++  METADATA_HEADER(WorkspaceRailView, views::FlexLayoutView)
++
++ public:
++  // `state_controller` is the vertical strip's own, and is subscribed to
++  // directly rather than being driven by the parent container.
++  //
++  // That is deliberate and it is what keeps this feature out of
++  // vertical_tab_strip_bottom_container.h entirely: driving the rail from
++  // VerticalTabStripBottomContainer::UpdateButtonStyles would have cost a
++  // forward declaration, a raw_ptr member and a third hunk, all of them inside
++  // hunks layout/vertical.patch already owns (LOCAL.md 1).
++  WorkspaceRailView(BrowserWindowInterface* browser,
++                    tabs::VerticalTabStripStateController* state_controller);
++  WorkspaceRailView(const WorkspaceRailView&) = delete;
++  WorkspaceRailView& operator=(const WorkspaceRailView&) = delete;
++  ~WorkspaceRailView() override;
++
++  // views::View:
++  //
++  // The rail is built here rather than in the constructor. WorkspaceService is
++  // reached through BrowserWindowInterface, and its answer to IsEnabled()
++  // depends on the vertical-tab-strip controller being up; being in a widget is
++  // the cheapest moment that is certainly after all of that, and it needs no
++  // subscription of its own. Switching kHeliumLayout destroys and rebuilds the
++  // whole view tree (design 2.7), so this runs again on the way back to
++  // vertical.
++  void AddedToWidget() override;
++
++ private:
++  // Throws the buttons away and makes them again from the current list, then
++  // decides whether the rail is shown at all.
++  void Rebuild();
++
++  // Moves the highlight to the workspace now being shown. Cheap enough to run
++  // on every switch, and it is the only thing a switch changes here -- the
++  // list itself cannot change in this build.
++  void UpdateHighlight();
++
++  void OnWorkspacePressed(const std::string& guid);
++
++  void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++
++  // Parallel to `buttons_`: the guid each button switches to. Held separately
++  // because a button carries no workspace identity of its own, and binding the
++  // guid into the pressed callback is not enough -- UpdateHighlight() has to
++  // ask, per button, "is this the active one".
++  std::vector<std::string> guids_;
++  std::vector<raw_ptr<TopContainerButton>> buttons_;
++
++  base::CallbackListSubscription workspace_changed_subscription_;
++  base::CallbackListSubscription collapse_changed_subscription_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_RAIL_VIEW_H_

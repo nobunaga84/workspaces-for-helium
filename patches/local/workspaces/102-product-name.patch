@@ -1,0 +1,63 @@
+--- a/chrome/app/chromium_strings.grd
++++ b/chrome/app/chromium_strings.grd
+@@ -294,10 +294,10 @@
+         </then>
+         <else>
+           <message name="IDS_PRODUCT_NAME" desc="The Chrome application name" translateable="false">
+-            Chromium
++            Workspaces for Helium
+           </message>
+           <message name="IDS_SHORT_PRODUCT_NAME" desc="The Chrome application short name." translateable="false">
+-            Chromium
++            Workspaces for Helium
+           </message>
+         </else>
+       </if>
+@@ -452,7 +452,7 @@
+           </then>
+           <else>
+             <message name="IDS_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for titles displayed in tabs and popup windows">
+-              <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Chromium
++              <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Workspaces for Helium
+             </message>
+           </else>
+         </if>
+@@ -491,7 +491,7 @@
+         </then>
+         <else>
+           <message name="IDS_ACCESSIBLE_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for the accessible name of a tabbed browser window">
+-            <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Chromium
++            <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Workspaces for Helium
+           </message>
+         </else>
+       </if>
+@@ -1168,7 +1168,7 @@
+           </then>
+           <else>
+             <message name="IDS_ABOUT" desc="The text label of the About Chrome menu item">
+-              About &amp;Chromium
++              About &amp;Workspaces for Helium
+             </message>
+           </else>
+         </if>
+--- a/chrome/app/settings_chromium_strings.grdp
++++ b/chrome/app/settings_chromium_strings.grdp
+@@ -19,7 +19,7 @@
+     </then>
+     <else>
+       <message name="IDS_SETTINGS_ABOUT_PROGRAM" desc="Menu title for the About Chromium page.">
+-        About Chromium
++        About Workspaces for Helium
+       </message>
+       <message name="IDS_SETTINGS_GET_HELP_USING_CHROME" desc="Text of the button which takes the user to the Chrome help page.">
+         Get help with Chromium
+--- a/chrome/app/theme/chromium/BRANDING
++++ b/chrome/app/theme/chromium/BRANDING
+@@ -1,6 +1,6 @@
+ COMPANY_FULLNAME=The Helium Authors
+ COMPANY_SHORTNAME=The Helium Authors
+-PRODUCT_FULLNAME=Helium
++PRODUCT_FULLNAME=Workspaces for Helium
+ PRODUCT_SHORTNAME=Helium
+ PRODUCT_INSTALLER_FULLNAME=Helium Installer
+ PRODUCT_INSTALLER_SHORTNAME=Helium Installer

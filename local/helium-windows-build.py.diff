@@ -1,0 +1,16 @@
+diff --git a/build.py b/build.py
+index 682396c..5d3e9b1 100644
+--- a/build.py
++++ b/build.py
+@@ -50,7 +50,10 @@ def _get_vcvars_path(name='64'):
+     """
+     vswhere_exe = '%ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe'
+     result = subprocess.run(
+-        '"{}" -products * -prerelease -latest -property installationPath'.format(vswhere_exe),
++        # LOCAL: require ATL. Chromium needs ATL on the toolset vcvars selects; a bare
++        # -latest can resolve to a Build Tools install whose default toolset has no
++        # atlmfc, which fails deep into the build. See LOCAL.md.
++        '"{}" -products * -prerelease -latest -requires Microsoft.VisualStudio.Component.VC.ATL -property installationPath'.format(vswhere_exe),
+         shell=True,
+         check=True,
+         stdout=subprocess.PIPE,

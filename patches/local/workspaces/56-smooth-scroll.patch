@@ -1,0 +1,365 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -63,6 +63,9 @@ void RegisterProfilePrefs(PrefRegistrySi
+   // Compact, today's look (E18).
+   registry->RegisterIntegerPref(kHeliumWorkspacesTabRowHeight,
+                                 kCompactTabRowHeight);
++
++  // On: the owner asked for it (E18).
++  registry->RegisterBooleanPref(kHeliumWorkspacesSmoothScrolling, true);
+ }
+ 
+ base::DictValue DefaultWorkspacesDict() {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -79,6 +79,14 @@ inline constexpr char kHeliumWorkspacesT
+ inline constexpr int kCompactTabRowHeight = 30;
+ inline constexpr int kMaxTabRowHeight = 48;
+ 
++// Whether the tab list glides when the mouse wheel rolls, instead of jumping
++// (E18, design 5 "E18 spec" 3): the "Smooth scrolling in the tab list"
++// setting, on by default. Read on every wheel step, so a change needs no
++// observer. A sibling of the prefs above for the reason above, and pinned by
++// the same test.
++inline constexpr char kHeliumWorkspacesSmoothScrolling[] =
++    "helium.workspaces.smooth_scrolling";
++
+ // Keys inside kHeliumWorkspacesList.
+ inline constexpr char kSchemaVersionKey[] = "schema_version";
+ inline constexpr char kItemsKey[] = "items";
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -128,10 +128,11 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+   const std::string imported_at(kHeliumWorkspacesArcImportedAt);
+   const std::string archive_after(kHeliumWorkspacesArchiveAfterMinutes);
+   const std::string tab_row_height(kHeliumWorkspacesTabRowHeight);
++  const std::string smooth_scrolling(kHeliumWorkspacesSmoothScrolling);
+   for (const std::string& later :
+-       {imported_at, archive_after, tab_row_height}) {
+-    for (const std::string& other :
+-         {enabled, list, imported_at, archive_after, tab_row_height}) {
++       {imported_at, archive_after, tab_row_height, smooth_scrolling}) {
++    for (const std::string& other : {enabled, list, imported_at, archive_after,
++                                     tab_row_height, smooth_scrolling}) {
+       if (other == later) {
+         continue;
+       }
+@@ -231,6 +232,21 @@ TEST(WorkspacePrefsTest, TabStyleRulesFo
+   SetTabRowHeight(kCompactTabRowHeight);
+ }
+ 
++// ------------------------------------------------ smooth scrolling (E18)
++
++TEST(WorkspacePrefsTest, SmoothScrollingPrefNameIsStable) {
++  EXPECT_STREQ("helium.workspaces.smooth_scrolling",
++               kHeliumWorkspacesSmoothScrolling);
++}
++
++// On is the default: the owner asked for the glide.
++TEST(WorkspacePrefsTest, SmoothScrollingDefaultsToOn) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesSmoothScrolling));
++}
++
+ // ------------------------------------------------------- registered default
+ 
+ TEST(WorkspacePrefsTest, RegistersWorkspacesPref) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -16,6 +16,7 @@
+ #include "base/functional/bind.h"
+ #include "base/i18n/number_formatting.h"
+ #include "base/logging.h"
++#include "base/numerics/safe_conversions.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -45,6 +46,7 @@
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
+@@ -59,6 +61,7 @@
+ #include "components/favicon/core/favicon_service.h"
+ #include "components/favicon_base/favicon_types.h"
+ #include "components/keyed_service/core/service_access_type.h"
++#include "components/prefs/pref_service.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
+ #include "components/tab_groups/tab_group_color.h"
+@@ -80,7 +83,11 @@
+ #include "ui/color/color_provider.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/events/event.h"
++#include "ui/events/event_handler.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/animation/animation.h"
++#include "ui/gfx/animation/linear_animation.h"
++#include "ui/gfx/animation/tween.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/codec/png_codec.h"
+ #include "ui/gfx/color_utils.h"
+@@ -90,6 +97,7 @@
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/gfx/text_utils.h"
+ #include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/animation/animation_delegate_views.h"
+ #include "ui/views/background.h"
+ #include "ui/views/border.h"
+ #include "ui/views/bubble/bubble_border.h"
+@@ -108,6 +116,7 @@
+ #include "ui/views/layout/box_layout.h"
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/view_tracker.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+ #include "url/gurl.h"
+@@ -192,6 +201,13 @@ constexpr int kNewTabInsetVertical = 4;
+ constexpr int kNewTabInsetCompact = 7;
+ constexpr int kNewTabInsetRoomy = kCardMargin + kRowInset;
+ 
++// How long the list glides for one mouse wheel step (E18, design 5 "E18
++// spec" 3): a whole notch the longest, as long as a web page takes for one;
++// a smaller step shorter, down to the shortest, so the list keeps up with a
++// mouse that sends many small steps (the owner's, D13).
++constexpr base::TimeDelta kGlideShortest = base::Milliseconds(100);
++constexpr base::TimeDelta kGlideLongest = base::Milliseconds(200);
++
+ // The header (E17b): 34 px, the workspace's mark -- the size of its chip on
+ // the bar, with its 16 px icon -- then the name, which starts where the rows'
+ // titles do.
+@@ -974,6 +990,148 @@ END_METADATA
+ 
+ }  // namespace
+ 
++// The mouse wheel's glide (E18, design 5 "E18 spec" 3). Chromium moves the
++// list a whole wheel step at once (ScrollBar::OnMouseWheel); this moves it to
++// the same place over a short ease-out, frame by frame.
++//
++// It stands in front of the list's scroll view as a pre-target handler: every
++// wheel event over a row, a tab or the scroll bar comes here before Chromium
++// sees it, and one taken here goes no further. The scroll view does not own
++// its handlers, so this one is taken off again -- when the section leaves its
++// widget, and when it goes. The section lives in that scroll view's contents,
++// made and deleted with them, so the scroll view is there for every frame.
++//
++// Each frame first checks the list is still where the glide last put it.
++// Anything else that moved it -- a drag's auto-scroll, the active tab brought
++// into view, the keyboard, the scroll bar -- wins, and the glide stops there.
++class WorkspacePinnedSectionView::WheelGlide
++    : public ui::EventHandler,
++      public views::AnimationDelegateViews {
++ public:
++  // The animation ticks with `section`'s widget's frames. `prefs` are the
++  // profile's, which outlive every window's views.
++  WheelGlide(views::View* section, const PrefService* prefs)
++      : views::AnimationDelegateViews(section), prefs_(prefs) {}
++  WheelGlide(const WheelGlide&) = delete;
++  WheelGlide& operator=(const WheelGlide&) = delete;
++  ~WheelGlide() override { Detach(); }
++
++  // Glides `scroll_view`'s wheel from now on. Once: the same one again does
++  // nothing, so each Rebuild() can ask.
++  void Attach(views::ScrollView* scroll_view) {
++    if (scroll_view == scroll_view_) {
++      return;
++    }
++    Detach();
++    scroll_view_ = scroll_view;
++    if (scroll_view_) {
++      scroll_view_->AddPreTargetHandler(this);
++      // Let go just before the scroll view goes, whatever goes first when a
++      // window closes: the favorites' scroll view is no ancestor of the
++      // section, so the section's own leaving may come too late for it.
++      tracker_.SetView(scroll_view_);
++      tracker_.SetIsDeletingCallback(
++          base::BindOnce(&WheelGlide::Detach, base::Unretained(this)));
++    }
++  }
++
++  // Stops where the list is, and lets go of the scroll view.
++  void Detach() {
++    animation_.Stop();
++    if (scroll_view_) {
++      scroll_view_->RemovePreTargetHandler(this);
++      scroll_view_ = nullptr;
++      tracker_.SetView(nullptr);
++    }
++  }
++
++  // ui::EventHandler:
++  void OnMouseEvent(ui::MouseEvent* event) override {
++    // Not taken: the event goes on to Chromium's own jump, and comes here
++    // again for each view it bubbles up to -- so nothing is kept from it.
++    // Off with the setting, and with Windows' animation effects (D13).
++    if (event->type() != ui::EventType::kMousewheel || !scroll_view_ ||
++        !scroll_view_->contents() ||
++        !prefs_->GetBoolean(
++            workspaces::prefs::kHeliumWorkspacesSmoothScrolling) ||
++        !gfx::Animation::ShouldRenderRichAnimation() ||
++        event->IsControlDown() || event->IsShiftDown()) {
++      return;
++    }
++    const ui::MouseWheelEvent* const wheel = event->AsMouseWheelEvent();
++    // Sideways is not the list's; and a list that fits has nowhere to go.
++    if (wheel->x_offset() != 0 || wheel->y_offset() == 0 ||
++        !scroll_view_->IsVerticalContentOverflowing()) {
++      return;
++    }
++    // Every step glides, a whole notch or a smoothing mouse's small one
++    // (D13). Counted from where a running glide is headed, so quick steps
++    // add up; never past either end, or a spin there would pile up and the
++    // way back would seem stuck.
++    const int bottom = scroll_view_->contents()->height() -
++                       scroll_view_->GetVisibleRect().height();
++    // A running glide is carried on only if the list is still where its last
++    // frame left it; if something else moved it since, this step starts anew
++    // from where the list is.
++    const bool carry_on = animation_.is_animating() && Offset() == written_;
++    const int from = carry_on ? target_ : Offset();
++    target_ = std::clamp(from - wheel->y_offset(), 0, bottom);
++    start_ = Offset();
++    written_ = start_;
++    if (!carry_on) {
++      glide_from_ = start_;
++    }
++    const int step = std::min(std::abs(wheel->y_offset()),
++                              ui::MouseWheelEvent::kWheelDelta);
++    duration_ = kGlideShortest + (kGlideLongest - kGlideShortest) * step /
++                                     ui::MouseWheelEvent::kWheelDelta;
++    // A running glide starts its ease again from here: a new duration
++    // restarts it, where Start() alone would do nothing.
++    animation_.SetDuration(duration_);
++    animation_.Start();
++    event->SetHandled();
++  }
++
++  // gfx::AnimationDelegate:
++  void AnimationProgressed(const gfx::Animation* animation) override {
++    if (Offset() != written_) {
++      animation_.Stop();
++      return;
++    }
++    const double y = gfx::Tween::DoubleValueBetween(
++        gfx::Tween::CalculateValue(gfx::Tween::EASE_OUT,
++                                   animation_.GetCurrentValue()),
++        start_, target_);
++    scroll_view_->ScrollToPosition(scroll_view_->vertical_scroll_bar(),
++                                   base::ClampRound(y));
++    // Read back, not assumed: ScrollToPosition clamps, and the list may have
++    // grown shorter since the step.
++    written_ = Offset();
++  }
++  void AnimationEnded(const gfx::Animation* animation) override {
++    LOG(INFO) << "[workspaces] glide: " << glide_from_ << " -> " << written_
++              << " (" << duration_.InMilliseconds() << " ms)";
++  }
++
++ private:
++  // How far the list is scrolled down, in whole DIP.
++  int Offset() const {
++    return base::ClampRound(scroll_view_->CurrentOffset().y());
++  }
++
++  const raw_ptr<const PrefService> prefs_;
++  raw_ptr<views::ScrollView> scroll_view_ = nullptr;
++  views::ViewTracker tracker_;
++  gfx::LinearAnimation animation_{this};
++  // Where the glide began, for the log; where the current ease starts and is
++  // headed; where the last frame left the list; and the current ease's length.
++  int glide_from_ = 0;
++  int start_ = 0;
++  int target_ = 0;
++  int written_ = 0;
++  base::TimeDelta duration_;
++};
++
+ WorkspacePinnedSectionView::Links::Links() = default;
+ WorkspacePinnedSectionView::Links::Links(Links&&) = default;
+ WorkspacePinnedSectionView::Links& WorkspacePinnedSectionView::Links::operator=(
+@@ -1002,6 +1160,12 @@ WorkspacePinnedSectionView::WorkspacePin
+   new_tab_button_ =
+       AddChildView(std::make_unique<VerticalNewTabButton>(browser_));
+   new_tab_button_->set_context_menu_controller(this);
++  // The wheel's glide (E18): made here, put in front of the scroll view by
++  // Rebuild().
++  glide_ =
++      std::make_unique<WheelGlide>(this, browser_->GetProfile()->GetPrefs());
++  favorites_glide_ =
++      std::make_unique<WheelGlide>(this, browser_->GetProfile()->GetPrefs());
+ }
+ 
+ WorkspacePinnedSectionView::~WorkspacePinnedSectionView() {
+@@ -1053,6 +1217,10 @@ void WorkspacePinnedSectionView::AddedTo
+ 
+ void WorkspacePinnedSectionView::RemovedFromWidget() {
+   paint_as_active_subscription_ = {};
++  // Off the scroll view while both are surely there (E18); the next Rebuild()
++  // puts it back.
++  glide_->Detach();
++  favorites_glide_->Detach();
+   views::View::RemovedFromWidget();
+ }
+ 
+@@ -1193,6 +1361,19 @@ void WorkspacePinnedSectionView::Rebuild
+   // Helium's tabs' too, with Workspaces off (E18). The rows below are made
+   // at the new height.
+   ApplyTabStyle();
++  // The wheel's glide (E18), likewise before the hidden return, so Helium's
++  // own strip glides with Workspaces off too. Here, not in AddedToWidget(),
++  // where the scroll view is not safe to ask for yet; and only in a widget,
++  // since leaving one is what takes it off again.
++  if (GetWidget()) {
++    views::ScrollView* const list = GetScrollView();
++    glide_->Attach(list);
++    // The favorites above the list glide too: the strip's other scroll view.
++    const TabStripView* const strip =
++        list ? views::AsViewClass<TabStripView>(list->parent()) : nullptr;
++    favorites_glide_->Attach(strip ? strip->pinned_tabs_scroll_view()
++                                   : nullptr);
++  }
+   // The dragged row is about to go, and with it the mouse release that would
+   // end its drag: another window changed the pins, or the workspace changed.
+   EndDrag();
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -79,7 +79,8 @@ class ScrollView;
+ //
+ // Made by TabStripCollectionController for every vertical strip of a regular
+ // profile, and mounted by the one hunk in TabStripView::AddScrollViewContents.
+-// It hides itself while Workspaces is off. With the strip collapsed it stays,
++// It hides itself while Workspaces is off -- and still, on or off, makes the
++// list glide under the mouse wheel (E18). With the strip collapsed it stays,
+ // as a column of icons (E17b, "E17 spec" 6): the header's symbol, then the
+ // top-level rows without titles -- a folder's press lists its pages -- and
+ // no "+ New Tab" (the bar's + has it); nothing is dragged there.
+@@ -173,6 +174,9 @@ class WorkspacePinnedSectionView
+       workspaces::pins::Where where = workspaces::pins::Where::kAfter);
+ 
+  private:
++  // The list's glide under the mouse wheel (E18); in the .cc.
++  class WheelGlide;
++
+   // The pages of this window that belong to items, by item id, and the tab
+   // that is active. Reading them also drops every link that no longer holds
+   // (ReadLinks).
+@@ -374,6 +378,13 @@ class WorkspacePinnedSectionView
+   // A tab drag holding this as its target lets go of it (TabDragTarget).
+   base::OnceClosureList will_destroy_callbacks_;
+ 
++  // In front of the list's scroll view from each Rebuild() until the section
++  // leaves its widget, or goes: its own destructor takes it off (E18).
++  std::unique_ptr<WheelGlide> glide_;
++  // The same for the favorites grid above the list, the strip's other scroll
++  // view (E18 review); it lets go of it on its own if that view goes first.
++  std::unique_ptr<WheelGlide> favorites_glide_;
++
+   // The row menu, and the row it was opened on. A folder's menu holds the
+   // Colour submenu, declared first so it outlives the menu that points at it
+   // (E17b). A collapsed folder's menu of pages runs on the same model and

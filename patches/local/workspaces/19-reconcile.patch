@@ -1,0 +1,739 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -115,6 +115,12 @@ source_set("workspaces") {
+     "//chrome/browser/ui/tabs:tabs",
+     "//components/prefs",
+     "//components/sessions",
++
++    # "//components/split_tabs" for split_tabs::SplitTabId, which Reconcile()
++    # names directly: a split is one of the three things it has to move whole.
++    # Reachable today through the public_deps of :tab_strip, which is not ours
++    # to rely on across a rebase.
++    "//components/split_tabs",
+     "//components/tab_groups",
+     "//components/tabs:public",
+     "//content/public/browser",
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ 
+ #include <algorithm>
++#include <cstddef>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -29,6 +30,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/content/session_tab_helper.h"
++#include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/gurl.h"
+@@ -66,6 +68,19 @@ WorkspaceService::WorkspaceService(
+         base::BindRepeating(&WorkspaceService::OnEnabledChanged,
+                             base::Unretained(this)));
+   }
++
++  // The layout half of the gate. The pref above says whether the feature is
++  // wanted on this profile; this says whether this window draws the strip that
++  // can honour it, and switching to classic is one of the two ways this window
++  // stops filtering (Reconcile()).
++  //
++  // Reachable here at all only because browser_window_features.cc already
++  // constructs the controller before this service, for the gate's sake.
++  if (tabs::VerticalTabStripStateController* vertical_tabs = VerticalTabs()) {
++    layout_mode_subscription_ = vertical_tabs->RegisterOnModeChanged(
++        base::BindRepeating(&WorkspaceService::OnLayoutModeChanged,
++                            base::Unretained(this)));
++  }
+ }
+ 
+ WorkspaceService::~WorkspaceService() {
+@@ -93,14 +108,17 @@ bool WorkspaceService::IsEnabled() const
+   // HeliumLayoutType enum value into this fork, where a rebase could drift
+   // them apart without a word.
+   //
+-  // Null when the vertical-tabs feature is off, because BrowserWindowFeatures
+-  // builds the controller only in that case -- which is exactly when this
+-  // should answer false anyway.
+-  const tabs::VerticalTabStripStateController* vertical_tabs =
+-      tabs::VerticalTabStripStateController::From(browser_window_);
++  const tabs::VerticalTabStripStateController* const vertical_tabs =
++      VerticalTabs();
+   return vertical_tabs && vertical_tabs->ShouldDisplayVerticalTabs();
+ }
+ 
++tabs::VerticalTabStripStateController* WorkspaceService::VerticalTabs() const {
++  return browser_window_
++             ? tabs::VerticalTabStripStateController::From(browser_window_)
++             : nullptr;
++}
++
+ void WorkspaceService::SetActiveWorkspace(std::string_view guid) {
+   // Checked here rather than in the command handler because this is the one
+   // funnel every switch goes through, now and later. Without it the shortcut
+@@ -411,13 +429,9 @@ void WorkspaceService::OnWorkspaceListCh
+   if (ResolveTabGuid(active_guid_, known_guids_) != active_guid_) {
+     SetActiveWorkspace(kDefaultWorkspaceGuid);
+ 
+-    // The active tab is very likely one of the ones that just became invisible.
+-    // Posted rather than called: this runs from a pref observer, which can be
+-    // reached from inside a TabStripModel notification by a future caller, and
+-    // activating a tab there would trip the re-entrancy CHECK (design 2.2).
+-    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+-        FROM_HERE, base::BindOnce(&WorkspaceService::EnsureActiveTabVisible,
+-                                  weak_factory_.GetWeakPtr()));
++    // The active tab is very likely one of the ones that just became
++    // invisible.
++    PostEnsureActiveTabVisible();
+   }
+ 
+   workspace_list_changed_callbacks_.Notify();
+@@ -436,9 +450,13 @@ void WorkspaceService::OnEnabledChanged(
+   // reading "enabled -> false" for a switch the user had just turned ON is
+   // exactly the class of small lie LOCAL.md 22 is about. Both are printed, so
+   // the log tells "off" apart from "on, but not vertical in this window".
+-  LOG(INFO) << "[workspaces] enabled pref -> "
+-            << (prefs_->GetBoolean(prefs::kHeliumWorkspacesEnabled) ? "true"
+-                                                                    : "false")
++  //
++  // Read once and shared with the reconcile guard below, so the line that
++  // reports the pref and the branch that acts on it cannot come from two
++  // different reads.
++  const bool enabled = prefs_->GetBoolean(prefs::kHeliumWorkspacesEnabled);
++
++  LOG(INFO) << "[workspaces] enabled pref -> " << (enabled ? "true" : "false")
+             << ", feature " << (IsEnabled() ? "on" : "off")
+             << " in this window";
+ 
+@@ -450,20 +468,51 @@ void WorkspaceService::OnEnabledChanged(
+   // known_guids_ on the way through is a no-op, not a cost worth a branch.
+   OnWorkspaceListChanged();
+ 
++  // Switching the feature OFF is the moment the true order of the strip stops
++  // being hidden, and so the moment to tidy it (Reconcile()).
++  //
++  // Guarded on the layout rather than on IsEnabled(), which answers false for
++  // a flip in EITHER direction by the time it is asked here. What has to be
++  // known is whether this window was filtering a moment ago, and with the pref
++  // now false that is exactly "this window draws vertical tabs". Without the
++  // guard, clicking the toggle in one window would shuffle the strip of a
++  // classic-layout window on the same profile -- a window where nothing was
++  // ever hidden and where the click changed nothing visible.
++  const tabs::VerticalTabStripStateController* const vertical_tabs =
++      VerticalTabs();
++  if (!enabled && vertical_tabs && vertical_tabs->ShouldDisplayVerticalTabs()) {
++    PostReconcile();
++  }
++
+   // Switching the feature back ON can leave the active tab hidden. While it
+   // was off every tab was visible, so the user could select one belonging to
+   // some other workspace, and SetActiveWorkspace() is gated -- so active_guid_
+   // did not follow it. Nothing else re-checks afterwards: OnSelectionChanged()
+   // asks only at the moment of selection, which was while the gate was shut.
+   //
+-  // Posted rather than called, for the reason OnWorkspaceListChanged() gives
+-  // where it does the same thing: a pref observer can be reached from inside a
+-  // TabStripModel notification, and activating a tab there would trip the
+-  // re-entrancy CHECK (design 2.2). A no-op when the feature is off, when the
+-  // strip is empty, or when the active tab is already on screen.
+-  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+-      FROM_HERE, base::BindOnce(&WorkspaceService::EnsureActiveTabVisible,
+-                                weak_factory_.GetWeakPtr()));
++  // A no-op when the feature is off, when the strip is empty, or when the
++  // active tab is already on screen.
++  PostEnsureActiveTabVisible();
++}
++
++void WorkspaceService::OnLayoutModeChanged(
++    tabs::VerticalTabStripStateController* controller) {
++  // prefs_ is null-checked here and deliberately not in OnEnabledChanged. The
++  // asymmetry is a real difference in reachability rather than a slip: that
++  // one is reached only through pref_registrar_, which the constructor builds
++  // only when prefs_ exists, while this subscription is made unconditionally.
++  // Only the switch INTO classic is a moment this window stops filtering. On
++  // the way back to vertical the strip becomes filtered again, and that is
++  // precisely the entry-time occasion Reconcile() deliberately does not take.
++  //
++  // The pref is read rather than IsEnabled(), which already answers false here
++  // -- the mode has changed by the time this runs. What has to be known is
++  // whether this window WAS filtering a moment ago, and with the mode now
++  // classic that is exactly "the feature was wanted".
++  if (controller && !controller->ShouldDisplayVerticalTabs() && prefs_ &&
++      prefs_->GetBoolean(prefs::kHeliumWorkspacesEnabled)) {
++    PostReconcile();
++  }
+ }
+ 
+ int WorkspaceService::TargetTabIndexForActiveWorkspace() const {
+@@ -515,6 +564,200 @@ void WorkspaceService::EnsureActiveTabVi
+   tab_strip_->delegate()->AddTabAt(GURL(), /*index=*/-1, /*foreground=*/true);
+ }
+ 
++void WorkspaceService::PostEnsureActiveTabVisible() {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspaceService::EnsureActiveTabVisible,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void WorkspaceService::PostReconcile() {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&WorkspaceService::Reconcile, weak_factory_.GetWeakPtr()));
++}
++
++void WorkspaceService::Reconcile() {
++  // The precondition, re-checked rather than assumed. Both callers post this
++  // only when the window has just stopped filtering -- but POSTING IS NOT
++  // RUNNING, and an off-then-on inside a single message-loop turn would leave
++  // a queued pass that ran with the gate open again. The header's claim that
++  // the auto-switch in OnTabStripModelChanged is unreachable from here rests
++  // on the gate being shut for the whole pass, so it has to be true at the
++  // moment the pass runs, not at the moment it was scheduled.
++  //
++  // Returning is also the right answer on its own terms: the strip is filtered
++  // again, so nothing about the order is visible, and the next exit tidies it.
++  if (IsEnabled()) {
++    return;
++  }
++
++  const int count = tab_strip_->count();
++  const int first = tab_strip_->IndexOfFirstNonPinnedTab();
++  if (first >= count) {
++    return;
++  }
++
++  // True when `index` falls INSIDE a group or a split rather than between two
++  // of them, which is a destination none of the three mutators below survives
++  // -- and each fails differently. MoveWebContentsAt absorbs the moved tab
++  // into the group (GetGroupToAssign); MoveGroupTo silently DESTROYS the split
++  // it would break (RemoveSplitImpl); MoveSplitTo CHECKs, which on a release
++  // build is a browser crash.
++  //
++  // It cannot happen while every unit moves whole and `target` therefore
++  // always lands on a unit boundary, which is the invariant the move loop
++  // maintains from `first` upward. That is the argument; this is the check,
++  // and the argument being wrong is not a cosmetic failure: an absorbed tab
++  // fires TabGroupedStateChanged, which ends in ApplyCollectionGuid rewriting
++  // that tab's workspace tag, which SetTag then writes into the session file.
++  // A silent, persisted membership change is far worse than an untidy strip,
++  // so a bad destination abandons the pass rather than trusting the proof.
++  //
++  // CONSERVATIVE, NOT EXACT. Chromium's own MoveBreaksSplitContiguity() also
++  // weighs the gap the moving unit vacates, so this can pass where that would
++  // still refuse. It is the cheap half of the question; the unit invariant is
++  // what covers the rest.
++  const auto inside_a_collection = [&](int index) {
++    if (index <= 0) {
++      return false;
++    }
++    const std::optional<tab_groups::TabGroupId> group =
++        tab_strip_->GetTabGroupForTab(index);
++    if (group.has_value() &&
++        group == tab_strip_->GetTabGroupForTab(index - 1)) {
++      return true;
++    }
++    const std::optional<split_tabs::SplitTabId> split =
++        tab_strip_->GetSplitForTab(index);
++    return split.has_value() && split == tab_strip_->GetSplitForTab(index - 1);
++  };
++
++  // The pinned boundary has to be a unit boundary too, and that is the one
++  // place the move loop cannot establish for itself: it starts AT `first` and
++  // only ever looks forward, so a group or split straddling the boundary would
++  // be read as beginning there. MoveGroupTo would then move its pinned members
++  // as well, and ConstrainMoveIndex(to_index, /*pinned=*/false) would drop them
++  // into the unpinned region -- silently unpinning tabs the user pinned.
++  //
++  // Chromium does not appear to allow such a collection (a group is all-pinned
++  // or all-unpinned, and an all-pinned one sits entirely below `first`), so
++  // this is an assertion about that rather than a case being handled.
++  if (inside_a_collection(first)) {
++    LOG(ERROR) << "[workspaces] reconcile abandoned: a collection straddles "
++                  "the pinned boundary at index "
++               << first;
++    return;
++  }
++
++  // A unit is a clump of tabs that has to move as one. A group is tested
++  // before a split because a split can live INSIDE a group: taking the split
++  // as the unit there would move it out of its own group.
++  struct Unit {
++    tabs::TabHandle head;
++    int size = 0;
++    std::optional<tab_groups::TabGroupId> group;
++    std::optional<split_tabs::SplitTabId> split;
++  };
++
++  const auto continues_unit = [&](int index, const Unit& unit) {
++    if (unit.group) {
++      return tab_strip_->GetTabGroupForTab(index) == unit.group;
++    }
++    if (unit.split) {
++      return tab_strip_->GetSplitForTab(index) == unit.split;
++    }
++    return false;
++  };
++
++  std::vector<Unit> units;
++  std::vector<std::string> unit_guids;
++  for (int i = first; i < count;) {
++    Unit unit;
++    unit.group = tab_strip_->GetTabGroupForTab(i);
++    if (!unit.group) {
++      unit.split = tab_strip_->GetSplitForTab(i);
++    }
++
++    int end = i + 1;
++    while (end < count && continues_unit(end, unit)) {
++      ++end;
++    }
++
++    tabs::TabInterface* const head = tab_strip_->GetTabAtIndex(i);
++    if (!head) {
++      // Logged, not just returned. A silent abandon leaves a run log with no
++      // "reconcile:" line and no error either, which reads exactly like a pass
++      // that was never posted -- the distinction LOCAL.md 22 was written about,
++      // and the one every row of this chunk's test list keys off.
++      LOG(ERROR) << "[workspaces] reconcile abandoned: no tab at index " << i;
++      return;
++    }
++    unit.head = head->GetHandle();
++    unit.size = end - i;
++
++    // The unit's tag is its head tab's -- the same first-wins rule
++    // ResolveGuidForCollectionJoin applies, and for the same reason: members
++    // can only disagree if some earlier rule already broke the
++    // one-tag-per-collection invariant, and then every answer is equally
++    // arbitrary and a predictable one beats a clever one.
++    unit_guids.push_back(GuidOf(head));
++    units.push_back(std::move(unit));
++    i = end;
++  }
++
++  // known_guids_ rather than a fresh read, and it is the rail's order: it is
++  // refreshed straight from GetWorkspaceGuids(), which mirrors GetWorkspaces()
++  // entry for entry. So moving a workspace up the rail moves its tabs up the
++  // strip at the next exit, with no second ordering to keep in step.
++  const std::vector<size_t> order =
++      ReconciledUnitOrder(unit_guids, known_guids_);
++
++  int target = first;
++  int moves = 0;
++  for (const size_t position : order) {
++    const Unit& unit = units[position];
++
++    // Re-resolved through the handle every time rather than tracked, because
++    // each move renumbers everything between the unit's old place and its new
++    // one. An index taken when the list was built means nothing after the
++    // first move; a handle survives it.
++    tabs::TabInterface* const head = unit.head.Get();
++    if (!head) {
++      continue;
++    }
++    const int current = tab_strip_->GetIndexOfTab(head);
++    if (current == TabStripModel::kNoTab) {
++      continue;
++    }
++
++    if (current != target) {
++      if (inside_a_collection(target)) {
++        LOG(ERROR) << "[workspaces] reconcile abandoned at index " << target
++                   << ": not a unit boundary";
++        return;
++      }
++      if (unit.group) {
++        tab_strip_->MoveGroupTo(*unit.group, target);
++      } else if (unit.split) {
++        tab_strip_->MoveSplitTo(*unit.split, target, /*pinned=*/false,
++                                /*group_id=*/std::nullopt);
++      } else {
++        tab_strip_->MoveWebContentsAt(current, target,
++                                      /*select_after_move=*/false);
++      }
++      ++moves;
++    }
++    target += unit.size;
++  }
++
++  // Both numbers, and printed even when nothing moved. "0 move(s)" over a
++  // strip that was already in order is the only line that can tell a pass
++  // which found nothing to do apart from a pass that never ran -- and 22 was
++  // lost to exactly that distinction going unrecorded.
++  LOG(INFO) << "[workspaces] reconcile: " << units.size() << " unit(s), "
++            << moves << " move(s)";
++}
++
+ base::CallbackListSubscription
+ WorkspaceService::RegisterWorkspaceChangedCallback(
+     base::RepeatingClosure callback) {
+@@ -584,9 +827,7 @@ void WorkspaceService::OnTabStripModelCh
+     // closing, and IsTabOnScreen answers true for null so that also posts
+     // nothing.
+     if (IsEnabled() && !IsTabOnScreen(selection.new_tab)) {
+-      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+-          FROM_HERE, base::BindOnce(&WorkspaceService::EnsureActiveTabVisible,
+-                                    weak_factory_.GetWeakPtr()));
++      PostEnsureActiveTabVisible();
+     }
+     return;
+   }
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -33,6 +33,10 @@ namespace content {
+ class WebContents;
+ }
+ 
++namespace tabs {
++class VerticalTabStripStateController;
++}
++
+ namespace workspaces {
+ 
+ // One per browser window. Owns which workspace that window is showing, and
+@@ -345,6 +349,71 @@ class WorkspaceService : public TabStrip
+   // and can open one, both of which are TabStripModel mutations.
+   void EnsureActiveTabVisible();
+ 
++  // Puts the unpinned region back into workspace order: all of the first
++  // workspace's units, then the second's, down the list the rail draws, with
++  // each workspace's own order left alone. Pinned tabs are never touched --
++  // they are drawn in every workspace, so they belong to no part of the
++  // partition.
++  //
++  // WHEN THIS RUNS IS THE WHOLE DESIGN, AND IT IS NOT WHAT DESIGN 2.3 SAYS.
++  // 2.3 names three occasions -- enabling the feature, switching back to
++  // vertical, and an explicit reorder -- and all three are moments the strip
++  // becomes FILTERED, which is to say moments the order stops being visible.
++  // Every moment it IS visible is a moment 2.3 does not reconcile, so the
++  // tidy-up always lands one cycle behind the user's eyes; and because new
++  // tabs are appended at the tail whatever workspace they join, the drift
++  // between an enable and the next disable puts the mess straight back. The
++  // occasions are the EXITS, not the entries: this runs when this window stops
++  // filtering, which is the pref going false here or the layout going classic
++  // here (LOCAL.md 24).
++  //
++  // An explicit reorder needs no occasion of its own, and that is a
++  // consequence rather than an omission: the rail is only drawn while the
++  // strip is filtered, so a reorder is invisible when it happens and the next
++  // exit tidies with the new order already in place.
++  //
++  // One property is worth keeping deliberately. Because this only ever runs
++  // with IsEnabled() false, the auto-switch in OnTabStripModelChanged -- which
++  // the kMoved notifications OUR OWN moves fire would otherwise reach -- is
++  // gated off for the whole pass, and SetActiveWorkspace() with it. The
++  // re-entrancy hazard is unreachable here by construction rather than by
++  // care. An enable-time call would put it back.
++  //
++  // MUST BE POSTED, never called straight from a pref observer or a mode
++  // callback: it moves tabs, which design 2.2 forbids from inside a
++  // notification. Use PostReconcile().
++  void Reconcile();
++
++  // The two mutations above, posted onto the message loop.
++  //
++  // The idiom -- GetCurrentDefault()->PostTask, FROM_HERE, BindOnce, the weak
++  // pointer -- had been written out three times in the .cc before this chunk,
++  // each copy carrying its own version of the same paragraph about why a pref
++  // observer may not touch the model, and this chunk would have made it five.
++  // One door for posting a repair, the way SetTag() is one door for writing a
++  // tag (LOCAL.md 23 deferred this here).
++  void PostEnsureActiveTabVisible();
++  void PostReconcile();
++
++  // Reacts to this window's layout switching between vertical and classic,
++  // which is the other half of IsEnabled() and so the other way this window
++  // can stop filtering.
++  void OnLayoutModeChanged(tabs::VerticalTabStripStateController* controller);
++
++  // This window's vertical-tab state, or null when it has none -- which is
++  // when the vertical-tabs feature flag is off, because BrowserWindowFeatures
++  // builds the controller only in that case. That is exactly when IsEnabled()
++  // should answer false anyway, so every caller reads null as "off".
++  //
++  // Three callers ask this same question for three different reasons -- the
++  // gate, the layout subscription, and the disable path deciding whether this
++  // window was filtering a moment ago -- and two of them had repeated the null
++  // check on browser_window_ as well.
++  //
++  // Const because asking changes nothing here. The POINTEE is not const: the
++  // subscription in the constructor is a mutation of the controller.
++  tabs::VerticalTabStripStateController* VerticalTabs() const;
++
+   const raw_ref<TabStripModel> tab_strip_;
+ 
+   // The window this service belongs to and the profile prefs behind the gate.
+@@ -379,6 +448,11 @@ class WorkspaceService : public TabStrip
+ 
+   PrefChangeRegistrar pref_registrar_;
+ 
++  // Held for its lifetime: the layout switch is the non-pref half of
++  // IsEnabled(), and letting this subscription drop would leave the classic
++  // switch as the one exit from the filtered state that never tidies up.
++  base::CallbackListSubscription layout_mode_subscription_;
++
+   // The tab the user was last on in each workspace, so switching back returns
+   // them to what they were reading rather than to the top of the strip -- Arc
+   // and Zen both do this.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ 
++#include <cstddef>
++#include <numeric>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -13,6 +15,14 @@ namespace workspaces {
+ 
+ namespace {
+ 
++// "Leave every unit where it is", which is what both of ReconciledUnitOrder's
++// refusals return.
++std::vector<size_t> IdentityOrder(size_t size) {
++  std::vector<size_t> order(size);
++  std::iota(order.begin(), order.end(), size_t{0});
++  return order;
++}
++
+ // An empty guid means the implicit default workspace everywhere in this file,
+ // never "no workspace". Spelling that out once keeps the rules below from each
+ // having to remember it.
+@@ -147,4 +157,57 @@ int NextVisibleTabIndex(const std::vecto
+   return start;
+ }
+ 
++std::vector<size_t> ReconciledUnitOrder(
++    const std::vector<std::string>& unit_guids,
++    const std::vector<std::string>& workspace_order) {
++  // The same "with nothing to check against, check nothing" fallback
++  // ResolveTabGuid takes, and for the same reason: GetWorkspaceGuids() cannot
++  // return empty, so an empty list means the caller could not answer rather
++  // than that no workspaces exist. Reordering the user's tabs on a guess is
++  // the one direction this is not allowed to fail in.
++  if (workspace_order.empty()) {
++    return IdentityOrder(unit_guids.size());
++  }
++
++  // Resolved once per unit, not once per unit per workspace. The orphan rule
++  // is itself a linear scan of the list, so running it in the inner loop below
++  // would repeat that scan for every workspace that is not the answer.
++  //
++  // Safe to hold as views: ResolveTabGuid returns either its own argument or
++  // kDefaultWorkspaceGuid, and both outlive this call.
++  std::vector<std::string_view> resolved;
++  resolved.reserve(unit_guids.size());
++  for (const std::string& guid : unit_guids) {
++    resolved.push_back(ResolveTabGuid(guid, workspace_order));
++  }
++
++  std::vector<size_t> order;
++  order.reserve(unit_guids.size());
++
++  // One pass per workspace rather than a sort with a comparator. A strip holds
++  // tens of units and a profile holds a handful of workspaces, so the quadratic
++  // shape costs nothing measurable -- and it buys the stability guarantee
++  // outright instead of relying on std::stable_sort's: within a pass the units
++  // are visited in strip order and appended in strip order, so equal keys
++  // cannot swap.
++  for (const std::string& workspace : workspace_order) {
++    for (size_t i = 0; i < unit_guids.size(); ++i) {
++      if (resolved[i] == workspace) {
++        order.push_back(i);
++      }
++    }
++  }
++
++  // Every unit named exactly once, or nothing moves. A unit can only go missing
++  // if `workspace_order` does not contain the default workspace -- the one guid
++  // ResolveTabGuid can return that was not asked for -- and a duplicate entry
++  // in the list would name a unit twice. Neither is reachable through
++  // ParseWorkspaces(), so this guards a future caller rather than today's, and
++  // it fails by doing nothing rather than by shuffling a subset of the strip.
++  if (order.size() != unit_guids.size()) {
++    return IdentityOrder(unit_guids.size());
++  }
++  return order;
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+ #define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+ 
++#include <cstddef>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -220,6 +221,39 @@ int NextVisibleTabIndex(const std::vecto
+                         int start,
+                         int delta);
+ 
++// The order the unpinned region should sit in: a stable partition of the units
++// by workspace, following `workspace_order`. Returns a permutation of positions
++// into `unit_guids`, not tab indices.
++//
++// A UNIT IS NOT A TAB, and that correction is the whole reason this takes the
++// shape it does. MoveWebContentsAt's own contract says "EnsureGroupContiguity()
++// is called after the move ... though the moved tab's group may change", so
++// partitioning raw tab indices would quietly move tabs into and out of tab
++// groups. The caller therefore clumps the strip into things that must move
++// whole -- a tab group, else a split, else a single tab -- and passes one guid
++// per clump (LOCAL.md 24).
++//
++// The orphan rule is folded in rather than left to the caller: a guid absent
++// from `workspace_order` resolves to the default workspace, exactly as
++// ResolveTabGuid does it and exactly as the render predicate sees it. So
++// `workspace_order` is both the ordering and the known set, and there is no
++// second list to keep in step.
++//
++// STABLE WITHIN A WORKSPACE. Two units of the same workspace never change
++// places. That is what makes this safe to run on a strip the user has arranged
++// by hand: only the interleaving between workspaces goes, and the order they
++// dragged their own tabs into survives.
++//
++// Returns the identity permutation -- reorder nothing -- when `workspace_order`
++// is empty, and again if the partition would not name every unit exactly once.
++// The second is a guard against a caller whose list has lost the default
++// workspace, which ParseWorkspaces() guarantees cannot happen and which would
++// otherwise drop units silently, moving some tabs and abandoning the rest
++// wherever they happened to be.
++std::vector<size_t> ReconciledUnitOrder(
++    const std::vector<std::string>& unit_guids,
++    const std::vector<std::string>& workspace_order);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ 
++#include <cstddef>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -515,5 +516,115 @@ TEST(WorkspaceResolveTabGuidTest, Resolv
+   EXPECT_FALSE(ResolveTabGuid("deleted", known_guids).empty());
+ }
+ 
++// ReconciledUnitOrder -- E9e.4. The unit of work is a clump of tabs that has to
++// move together, so these read as lists of tags in strip order, one tag per
++// clump, and the expected value is where each clump ends up.
++
++// The list a profile actually has: the default workspace first, because
++// ParseWorkspaces() guarantees it is present, then the rest in rail order.
++std::vector<std::string> TwoWorkspaces() {
++  return {std::string(kDefaultWorkspaceGuid), "work"};
++}
++
++TEST(WorkspaceReconcileTest, PartitionsInterleavedUnitsIntoWorkspaceOrder) {
++  // The state the owner reported: turning the feature off revealed creation
++  // order, with the two workspaces interleaved.
++  const std::vector<std::string> units = {"default", "work", "default", "work",
++                                          "default"};
++
++  EXPECT_EQ(std::vector<size_t>({0, 2, 4, 1, 3}),
++            ReconciledUnitOrder(units, TwoWorkspaces()));
++}
++
++TEST(WorkspaceReconcileTest, PreservesOrderWithinAWorkspace) {
++  // Stability is the property that makes this safe to run on a strip somebody
++  // has arranged by hand, so it gets a test of its own rather than being read
++  // out of the case above. Reversing the tags does not reverse the units.
++  const std::vector<std::string> units = {"work", "work", "default", "default"};
++
++  EXPECT_EQ(std::vector<size_t>({2, 3, 0, 1}),
++            ReconciledUnitOrder(units, TwoWorkspaces()));
++}
++
++TEST(WorkspaceReconcileTest, LeavesAnAlreadyTidyStripAlone) {
++  const std::vector<std::string> units = {"default", "default", "work"};
++
++  EXPECT_EQ(std::vector<size_t>({0, 1, 2}),
++            ReconciledUnitOrder(units, TwoWorkspaces()));
++}
++
++TEST(WorkspaceReconcileTest, WorkspaceOrderIsTheListOrderNotTheTagOrder) {
++  // The rail draws the list in stored order and this has to agree with it, so
++  // the same units with the list the other way round come out the other way
++  // round. Moving a workspace up the rail is therefore enough to change this.
++  const std::vector<std::string> units = {"default", "work", "default"};
++  const std::vector<std::string> work_first = {
++      "work", std::string(kDefaultWorkspaceGuid)};
++
++  EXPECT_EQ(std::vector<size_t>({1, 0, 2}),
++            ReconciledUnitOrder(units, work_first));
++}
++
++TEST(WorkspaceReconcileTest, OrphanTagsLandInTheDefaultWorkspace) {
++  // A tab of a deleted workspace is drawn in the default one by the orphan
++  // rule, so it has to be PARTITIONED into the default one too -- otherwise it
++  // would be laid out among tabs it is not shown beside. An untagged tab is
++  // the same case, and both keep their order relative to real default tabs.
++  const std::vector<std::string> units = {"work", "deleted", "default", ""};
++
++  EXPECT_EQ(std::vector<size_t>({1, 2, 3, 0}),
++            ReconciledUnitOrder(units, TwoWorkspaces()));
++}
++
++TEST(WorkspaceReconcileTest, EmptyStripReordersNothing) {
++  EXPECT_TRUE(ReconciledUnitOrder({}, TwoWorkspaces()).empty());
++}
++
++TEST(WorkspaceReconcileTest, OneWorkspaceIsTheIdentity) {
++  const std::vector<std::string> units = {"default", "default", "default"};
++  const std::vector<std::string> one = {std::string(kDefaultWorkspaceGuid)};
++
++  EXPECT_EQ(std::vector<size_t>({0, 1, 2}), ReconciledUnitOrder(units, one));
++}
++
++TEST(WorkspaceReconcileTest, AnEmptyWorkspaceListReordersNothing) {
++  // "The workspaces are not known here", never "no workspaces exist" -- the
++  // same reading ResolveTabGuid gives it. Moving tabs on that would be acting
++  // on an answer nobody gave.
++  const std::vector<std::string> units = {"work", "default", "work"};
++
++  EXPECT_EQ(std::vector<size_t>({0, 1, 2}), ReconciledUnitOrder(units, {}));
++}
++
++TEST(WorkspaceReconcileTest, RefusesRatherThanDroppingAUnit) {
++  // A list with no default workspace cannot come out of ParseWorkspaces(), so
++  // this guards a future caller. The units tagged "default" resolve to a guid
++  // the list never asks for, and naming only some of the units would move some
++  // tabs and abandon the rest. Nothing moves instead.
++  const std::vector<std::string> units = {"work", "default", "work"};
++  const std::vector<std::string> no_default = {"work"};
++
++  EXPECT_EQ(std::vector<size_t>({0, 1, 2}),
++            ReconciledUnitOrder(units, no_default));
++}
++
++TEST(WorkspaceReconcileTest, AlwaysNamesEveryUnitExactlyOnce) {
++  // The invariant every caller leans on: the result is a permutation. A caller
++  // walks it placing one unit after another, so a repeated position would
++  // place one unit twice and a missing one would leave a gap in the strip.
++  const std::vector<std::string> units = {"work", "deleted", "", "default",
++                                          "work"};
++
++  const std::vector<size_t> order = ReconciledUnitOrder(units, TwoWorkspaces());
++  ASSERT_EQ(units.size(), order.size());
++
++  std::vector<bool> seen(units.size(), false);
++  for (const size_t position : order) {
++    ASSERT_LT(position, units.size());
++    EXPECT_FALSE(seen[position]);
++    seen[position] = true;
++  }
++}
++
+ }  // namespace
+ }  // namespace workspaces

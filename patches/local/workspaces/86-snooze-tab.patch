@@ -1,0 +1,1602 @@
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -166,6 +166,8 @@ if (!is_android) {
+       "existing_workspace_sub_menu_model.h",
+       "workspace_anchor_sub_menu_model.cc",
+       "workspace_anchor_sub_menu_model.h",
++      "workspace_snooze_sub_menu_model.cc",
++      "workspace_snooze_sub_menu_model.h",
+       "glic_tab_sub_menu_model.cc",
+       "tab_menu_model.cc",
+     ]
+@@ -192,6 +194,7 @@ if (!is_android) {
+       # is what lets the submenu talk to WorkspaceService directly instead of
+       # routing through TabStripModelDelegate the way E7a had to.
+       "//chrome/browser/ui/tabs/workspaces",
++      "//chrome/browser/ui/tabs/workspaces:archive",
+       "//chrome/browser/ui/tabs/workspaces:prefs",
+       "//chrome/browser/ui/tabs/workspaces:stamping",
+       "//chrome/browser/ui/tabs/workspaces:tab_data",
+--- a/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
+@@ -56,6 +56,9 @@ class ExistingBaseSubMenuModel : public
+   // Helium Workspaces: the anchor submenu (workspace_anchor_sub_menu_model.h),
+   // three fixed items.
+   static constexpr int kMinWorkspaceAnchorCommandId = 2201;
++  // Helium Workspaces (C33): the snooze submenu
++  // (workspace_snooze_sub_menu_model.h), its hours and Custom...
++  static constexpr int kMinWorkspaceSnoozeCommandId = 2301;
+ 
+   ExistingBaseSubMenuModel(const ExistingBaseSubMenuModel&) = delete;
+   ExistingBaseSubMenuModel& operator=(const ExistingBaseSubMenuModel&) = delete;
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/ui/tabs/existing_tab_group_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h"
++#include "chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/existing_window_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/glic_tab_sub_menu_model.h"
+@@ -444,6 +445,20 @@ void TabMenuModel::Build(int index) {
+                            move_to_workspace_submenu_.get());
+   }
+ 
++  // C33: "Snooze tab", right under the move -- both send the tab elsewhere,
++  // this one into the Archive until a time. Shown only when a tab it would
++  // act on can be snoozed.
++  if (WorkspaceSnoozeSubMenuModel::ShouldShowSubmenu(
++          tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
++          index)) {
++    snooze_submenu_ = std::make_unique<WorkspaceSnoozeSubMenuModel>(
++        tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
++        index);
++    AddSubMenuWithStringId(TabStripModel::CommandSnoozeTab,
++                           IDS_HELIUM_WORKSPACE_SNOOZE_SUBMENU,
++                           snooze_submenu_.get());
++  }
++
+   // Helium Workspaces (E11): rename, as a plain item where the owner looks
+   // for it. Shown under the same gate as the submenus below.
+   if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
+--- a/chrome/browser/ui/tabs/tab_menu_model.h
++++ b/chrome/browser/ui/tabs/tab_menu_model.h
+@@ -100,6 +100,7 @@ class TabMenuModel : public ui::SimpleMe
+   // this header needs no include and no forward declaration for it.
+   std::unique_ptr<ui::SimpleMenuModel> move_to_workspace_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> anchor_submenu_;
++  std::unique_ptr<ui::SimpleMenuModel> snooze_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_group_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_window_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel>
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2753,6 +2753,7 @@ bool TabStripModel::IsContextMenuCommand
+     case CommandMoveToWorkspace:
+     case CommandAnchorTab:
+     case CommandRenameTab:
++    case CommandSnoozeTab:
+       // Helium Workspaces. The submenu decides per item whether a destination
+       // makes sense; the parent is enabled whenever it exists at all, and
+       // ExistingWorkspaceSubMenuModel::ShouldShowSubmenu() is what decides
+@@ -2916,6 +2917,7 @@ void TabStripModel::ExecuteContextMenuCo
+     case CommandAnchorTab:
+     case CommandRenameTab:
+     case CommandPinToWorkspace:
++    case CommandSnoozeTab:
+       break;
+ 
+     case CommandNewTabToRight: {
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.cc
+@@ -0,0 +1,251 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.h"
++
++#include <algorithm>
++#include <iterator>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/i18n/time_formatting.h"
++#include "base/logging.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/existing_base_sub_menu_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/constrained_window/constrained_window_views.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/base/models/simple_combobox_model.h"
++
++namespace {
++
++using workspaces::archive::kSnoozeHours;
++using workspaces::archive::SnoozeUnit;
++
++// One item per hour of kSnoozeHours, then Custom..., in the registry range
++// ExistingBaseSubMenuModel keeps (LOCAL.md 21).
++constexpr int kFirstHours =
++    ExistingBaseSubMenuModel::kMinWorkspaceSnoozeCommandId;
++constexpr int kHourItems = static_cast<int>(std::size(kSnoozeHours));
++constexpr int kCustom = kFirstHours + kHourItems;
++
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSnoozeAmountFieldId);
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSnoozeUnitFieldId);
++
++// The tabs the menu acts on: the selection when the right-clicked tab is part
++// of it, else that tab alone -- Chromium's tab-menu rule, spelled out as
++// ExistingWorkspaceSubMenuModel spells it (GetIndicesForCommand is private).
++std::vector<tabs::TabInterface*> TargetTabs(TabStripModel* tab_strip,
++                                            int context_index) {
++  std::vector<tabs::TabInterface*> tabs;
++  if (!tab_strip->ContainsIndex(context_index)) {
++    return tabs;
++  }
++  if (tab_strip->IsTabSelected(context_index)) {
++    for (tabs::TabInterface* tab :
++         tab_strip->selection_model().selected_tabs()) {
++      if (tab) {
++        tabs.push_back(tab);
++      }
++    }
++  } else {
++    tabs.push_back(tab_strip->GetTabAtIndex(context_index));
++  }
++  return tabs;
++}
++
++// When a snooze of `delay` made now wakes -- or, with the hidden test switch,
++// that many seconds from now whatever was chosen.
++base::Time WakeTime(base::TimeDelta delay) {
++  int seconds = 0;
++  if (base::StringToInt(
++          base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++              workspaces::archive::kSnoozeTestSecondsSwitch),
++          &seconds) &&
++      seconds > 0) {
++    delay = base::Seconds(seconds);
++  }
++  return base::Time::Now() + delay;
++}
++
++// Snoozes the ones of `handles` still open, through their window's service.
++// They are one window's -- the menu's -- and one that moved to another window
++// meanwhile is skipped by its CloseTabs(), which looks for it in its own strip.
++void SnoozeLiveTabs(const std::vector<tabs::TabHandle>& handles,
++                    base::Time wake_at) {
++  std::vector<tabs::TabInterface*> tabs;
++  for (const tabs::TabHandle& handle : handles) {
++    if (tabs::TabInterface* const tab = handle.Get()) {
++      tabs.push_back(tab);
++    }
++  }
++  workspaces::WorkspaceService* const service =
++      tabs.empty() ? nullptr
++                   : workspaces::WorkspaceService::From(
++                         tabs.front()->GetBrowserWindowInterface());
++  if (service) {
++    service->SnoozeTabs(tabs, wake_at);
++  }
++}
++
++// Custom...'s box. Holds the tabs by handle: the menu that opened it is gone
++// by OK time, and a tab may have closed meanwhile.
++class SnoozeDialogDelegate : public ui::DialogModelDelegate {
++ public:
++  explicit SnoozeDialogDelegate(std::vector<tabs::TabHandle> tabs)
++      : tabs_(std::move(tabs)) {}
++
++  // OK: false -- the box stays open -- for a number SnoozeDelay refuses.
++  bool OnAccepted() {
++    const std::optional<base::TimeDelta> delay =
++        workspaces::archive::SnoozeDelay(
++            dialog_model()->GetTextfieldByUniqueId(kSnoozeAmountFieldId)->text(),
++            static_cast<SnoozeUnit>(
++                dialog_model()
++                    ->GetComboboxByUniqueId(kSnoozeUnitFieldId)
++                    ->selected_index()));
++    if (!delay) {
++      LOG(INFO) << "[workspaces] snooze: custom amount refused";
++      return false;
++    }
++    // What was typed, before WakeTime's test switch replaces it.
++    LOG(INFO) << "[workspaces] snooze: custom " << delay->InSeconds() << " s";
++    // Posted: the box can sit on one of the tabs this closes, and is still
++    // closing when this returns.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&SnoozeLiveTabs, tabs_, WakeTime(*delay)));
++    return true;
++  }
++
++ private:
++  const std::vector<tabs::TabHandle> tabs_;
++};
++
++// Custom...: the box on the tab in front, which is where a tab-modal box shows
++// (WebContentsModalDialogManager) -- not on the right-clicked tab, which would
++// have to be activated first and lose the selection. Its title counts the
++// tabs, so the box says what it acts on.
++void ShowCustomSnoozeDialog(TabStripModel* tab_strip,
++                            const std::vector<tabs::TabInterface*>& tabs) {
++  content::WebContents* const host = tab_strip->GetActiveWebContents();
++  if (!host || tabs.empty()) {
++    return;
++  }
++  std::vector<tabs::TabHandle> handles;
++  for (tabs::TabInterface* const tab : tabs) {
++    handles.push_back(tab->GetHandle());
++  }
++  // In SnoozeUnit's order: its index is the unit.
++  std::vector<ui::SimpleComboboxModel::Item> units;
++  for (const int id :
++       {IDS_HELIUM_WORKSPACE_SNOOZE_MINUTES, IDS_HELIUM_WORKSPACE_SNOOZE_HOURS,
++        IDS_HELIUM_WORKSPACE_SNOOZE_DAYS, IDS_HELIUM_WORKSPACE_SNOOZE_WEEKS}) {
++    units.emplace_back(l10n_util::GetStringUTF16(id));
++  }
++  auto delegate = std::make_unique<SnoozeDialogDelegate>(std::move(handles));
++  SnoozeDialogDelegate* const delegate_ptr = delegate.get();
++  constrained_window::ShowWebModal(
++      ui::DialogModel::Builder(std::move(delegate))
++          .SetTitle(l10n_util::GetPluralStringFUTF16(
++              IDS_HELIUM_WORKSPACE_SNOOZE_TITLE,
++              static_cast<int>(tabs.size())))
++          .AddParagraph(ui::DialogModelLabel(
++              IDS_HELIUM_WORKSPACE_SNOOZE_CUSTOM_HINT))
++          .AddOkButton(base::BindRepeating(&SnoozeDialogDelegate::OnAccepted,
++                                           base::Unretained(delegate_ptr)),
++                       ui::DialogModel::Button::Params().SetLabel(
++                           l10n_util::GetStringUTF16(
++                               IDS_HELIUM_WORKSPACE_SNOOZE_OK)))
++          .AddCancelButton(base::DoNothing())
++          .AddTextfield(kSnoozeAmountFieldId,
++                        l10n_util::GetStringUTF16(
++                            IDS_HELIUM_WORKSPACE_SNOOZE_AMOUNT),
++                        u"30", ui::DialogModelTextfield::Params())
++          .AddCombobox(
++              kSnoozeUnitFieldId,
++              l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_SNOOZE_UNIT),
++              std::make_unique<ui::SimpleComboboxModel>(std::move(units)))
++          .SetInitiallyFocusedField(kSnoozeAmountFieldId)
++          .Build(),
++      host);
++  LOG(INFO) << "[workspaces] snooze: custom box for " << tabs.size()
++            << " tab(s)";
++}
++
++}  // namespace
++
++WorkspaceSnoozeSubMenuModel::WorkspaceSnoozeSubMenuModel(
++    BrowserWindowInterface* browser,
++    TabStripModel* tab_strip,
++    int context_index)
++    : ui::SimpleMenuModel(this),
++      browser_(browser),
++      tab_strip_(tab_strip),
++      context_index_(context_index) {
++  // The time each choice wakes at, as the menu opens: "In 3 hours (5:40 PM)".
++  const base::Time now = base::Time::Now();
++  for (int i = 0; i < kHourItems; ++i) {
++    AddItem(kFirstHours + i,
++            base::StrCat({l10n_util::GetPluralStringFUTF16(
++                              IDS_HELIUM_WORKSPACE_SNOOZE_IN_HOURS,
++                              kSnoozeHours[i]),
++                          u" (",
++                          base::TimeFormatTimeOfDay(
++                              now + base::Hours(kSnoozeHours[i])),
++                          u")"}));
++  }
++  AddItemWithStringId(kCustom, IDS_HELIUM_WORKSPACE_SNOOZE_CUSTOM);
++}
++
++WorkspaceSnoozeSubMenuModel::~WorkspaceSnoozeSubMenuModel() = default;
++
++// static
++bool WorkspaceSnoozeSubMenuModel::ShouldShowSubmenu(
++    BrowserWindowInterface* browser,
++    TabStripModel* tab_strip,
++    int context_index) {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  if (!service) {
++    return false;
++  }
++  return std::ranges::any_of(
++      TargetTabs(tab_strip, context_index),
++      [service](tabs::TabInterface* tab) { return service->CanSnooze(tab); });
++}
++
++void WorkspaceSnoozeSubMenuModel::ExecuteCommand(int command_id,
++                                                 int event_flags) {
++  const std::vector<tabs::TabInterface*> tabs =
++      TargetTabs(tab_strip_, context_index_);
++  if (command_id == kCustom) {
++    ShowCustomSnoozeDialog(tab_strip_, tabs);
++    return;
++  }
++  const int i = command_id - kFirstHours;
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || i < 0 || i >= kHourItems) {
++    return;
++  }
++  // From the menu, outside every observer: the close is legal here.
++  service->SnoozeTabs(tabs, WakeTime(base::Hours(kSnoozeHours[i])));
++}
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACE_SNOOZE_SUB_MENU_MODEL_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACE_SNOOZE_SUB_MENU_MODEL_H_
++
++#include "base/memory/raw_ptr.h"
++#include "ui/menus/simple_menu_model.h"
++
++class BrowserWindowInterface;
++class TabStripModel;
++
++// C33 "Snooze tab" (c33-progress.md): the tab-menu submenu that files the
++// right-clicked tab -- or the selection it is part of -- in the Archive with a
++// wake time, and closes it (WorkspaceService::SnoozeTabs): "In 2 hours" ...
++// "In 11 hours" (the owner's primes 2, 3, 5, 7, 11), each with the time it
++// wakes, or Custom..., a tab-modal box with a whole number and a unit
++// (minutes, hours, days, weeks). The window used last wakes it at the top of
++// its workspace's Today (WorkspaceRailView). Its own delegate, like the anchor
++// submenu, so TabStripModel needs no command plumbing beyond the parent id.
++class WorkspaceSnoozeSubMenuModel : public ui::SimpleMenuModel,
++                                    public ui::SimpleMenuModel::Delegate {
++ public:
++  WorkspaceSnoozeSubMenuModel(BrowserWindowInterface* browser,
++                              TabStripModel* tab_strip,
++                              int context_index);
++  WorkspaceSnoozeSubMenuModel(const WorkspaceSnoozeSubMenuModel&) = delete;
++  WorkspaceSnoozeSubMenuModel& operator=(const WorkspaceSnoozeSubMenuModel&) =
++      delete;
++  ~WorkspaceSnoozeSubMenuModel() override;
++
++  // Shown only when a tab it would act on can be snoozed
++  // (WorkspaceService::CanSnooze): never on a favorite, a pinned page, an
++  // anchored tab or a split's half alone, and never with Workspaces off.
++  static bool ShouldShowSubmenu(BrowserWindowInterface* browser,
++                                TabStripModel* tab_strip,
++                                int context_index);
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override;
++
++ private:
++  const raw_ptr<BrowserWindowInterface> browser_;
++  const raw_ptr<TabStripModel> tab_strip_;
++  const int context_index_;
++};
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACE_SNOOZE_SUB_MENU_MODEL_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
+@@ -18,6 +18,7 @@
+ #include "base/no_destructor.h"
+ #include "base/notreached.h"
+ #include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -40,6 +41,7 @@ constexpr char kWorkspaceKey[] = "worksp
+ constexpr char kReasonKey[] = "reason";
+ constexpr char kArchivedAtKey[] = "archived_at";
+ constexpr char kLastActiveKey[] = "last_active";
++constexpr char kWakeAtKey[] = "wake_at";
+ 
+ // Its address is the store's key among its profile's user data.
+ constexpr char kUserDataKey[] = "helium_workspace_archive";
+@@ -58,6 +60,9 @@ base::DictValue EntryToValue(const Archi
+   if (!entry.last_active.is_null()) {
+     dict.Set(kLastActiveKey, base::TimeToValue(entry.last_active));
+   }
++  if (entry.snoozed()) {
++    dict.Set(kWakeAtKey, base::TimeToValue(entry.wake_at));
++  }
+   return dict;
+ }
+ 
+@@ -116,6 +121,13 @@ std::optional<ArchiveEntry> EntryFromVal
+     }
+     entry.last_active = *time;
+   }
++  if (const base::Value* wake_at = dict->Find(kWakeAtKey)) {
++    std::optional<base::Time> time = base::ValueToTime(*wake_at);
++    if (!time) {
++      return std::nullopt;
++    }
++    entry.wake_at = *time;
++  }
+   return entry;
+ }
+ 
+@@ -125,11 +137,11 @@ bool HasId(const std::vector<ArchiveEntr
+ }
+ 
+ // Drops every entry older than kKeepFor (design 5: at the load and before a
+-// write). True when one went.
++// write), a snoozed one counted from its wake (C33). True when one went.
+ bool Prune(std::vector<ArchiveEntry>& entries) {
+   const base::Time oldest = base::Time::Now() - kKeepFor;
+   return std::erase_if(entries, [oldest](const ArchiveEntry& entry) {
+-           return entry.archived_at < oldest;
++           return std::max(entry.archived_at, entry.wake_at) < oldest;
+          }) > 0;
+ }
+ 
+@@ -296,7 +308,7 @@ size_t ArchiveStore::RemoveSince(base::T
+   // base::Time() takes all: the load's prune leaves no time before it.
+   const size_t removed =
+       std::erase_if(entries_, [since](const ArchiveEntry& entry) {
+-        return entry.archived_at >= since;
++        return IsClearedBy(entry, since);
+       });
+   if (removed > 0) {
+     writer_.ScheduleWrite(this);
+@@ -447,6 +459,17 @@ ArchiveBucket BucketFor(base::Time archi
+   return {ArchiveBucketKind::kMonth, day.year, day.month};
+ }
+ 
++bool ListsBefore(const ArchiveEntry& a, const ArchiveEntry& b) {
++  if (a.snoozed() != b.snoozed()) {
++    return a.snoozed();
++  }
++  return a.snoozed() ? a.wake_at < b.wake_at : a.archived_at > b.archived_at;
++}
++
++bool IsClearedBy(const ArchiveEntry& entry, base::Time since) {
++  return !entry.snoozed() && entry.archived_at >= since;
++}
++
+ std::u16string SearchTextFor(const ArchiveEntry& entry) {
+   // Newlines, so a query word never matches across two fields: a word holds
+   // no whitespace.
+@@ -642,4 +665,51 @@ base::TimeDelta SweepInterval(base::Time
+   return std::max(std::min(kSweepEvery, after / 2), base::Seconds(30));
+ }
+ 
++std::optional<base::TimeDelta> SnoozeDelay(std::u16string_view amount,
++                                           SnoozeUnit unit) {
++  int count = 0;
++  if (!base::StringToInt(base::TrimWhitespace(amount, base::TRIM_ALL),
++                         &count) ||
++      count < 1) {
++    return std::nullopt;
++  }
++  base::TimeDelta one;
++  switch (unit) {
++    case SnoozeUnit::kMinutes:
++      one = base::Minutes(1);
++      break;
++    case SnoozeUnit::kHours:
++      one = base::Hours(1);
++      break;
++    case SnoozeUnit::kDays:
++      one = base::Days(1);
++      break;
++    case SnoozeUnit::kWeeks:
++      one = base::Days(7);
++      break;
++  }
++  // Checked before multiplying, so a huge number never becomes a huge span.
++  if (count > kLongestSnooze / one) {
++    return std::nullopt;
++  }
++  return one * count;
++}
++
++std::vector<std::string> DueToWake(const std::vector<ArchiveEntry>& entries,
++                                   base::Time now) {
++  std::vector<const ArchiveEntry*> due;
++  for (const ArchiveEntry& entry : entries) {
++    if (entry.snoozed() && entry.wake_at <= now) {
++      due.push_back(&entry);
++    }
++  }
++  std::ranges::stable_sort(due, {}, &ArchiveEntry::wake_at);
++  std::vector<std::string> ids;
++  ids.reserve(due.size());
++  for (const ArchiveEntry* const entry : due) {
++    ids.push_back(entry->id);
++  }
++  return ids;
++}
++
+ }  // namespace workspaces::archive
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.h
+@@ -64,11 +64,21 @@ struct ArchiveEntry {
+   base::Time archived_at;
+   // When the page was last shown; null when not known.
+   base::Time last_active;
++  // C33: when a snoozed tab comes back by itself, at the top of its
++  // workspace's Today (WorkspaceArchiveView::Wake); null for a tab only
++  // archived. Set by the user's snooze alone (WorkspaceService::SnoozeTabs),
++  // whose reason stays kManual, so an older build reads a snoozed entry as an
++  // ordinary archived page: the file's version stays 1.
++  base::Time wake_at;
++
++  bool snoozed() const { return !wake_at.is_null(); }
+ 
+   bool operator==(const ArchiveEntry&) const = default;
+ };
+ 
+-// How long an entry is kept (the owner: Arc's number).
++// How long an entry is kept (the owner: Arc's number), counted from the later
++// of archived_at and wake_at: a long snooze is never dropped before it wakes
++// (C33).
+ inline constexpr base::TimeDelta kKeepFor = base::Days(60);
+ 
+ // The file's and the log's word for a reason: "manual", "window", "auto".
+@@ -133,8 +143,8 @@ class ArchiveStore : public base::Suppor
+   // load when no entry has `id`.
+   bool Remove(std::string_view id);
+ 
+-  // Removes every entry archived at or after `since` -- base::Time() for all
+-  // of them: the Archive screen's Clear menu, All time (E14d.2's Clear all)
++  // Removes every entry IsClearedBy(`since`) -- base::Time() for all of
++  // them: the Archive screen's Clear menu, All time (E14d.2's Clear all)
+   // and its three time ranges (E14d.3). Answers how many went. 0, and
+   // nothing done, when read_only() or before the load: the screen draws
+   // nothing until then, so there is nothing it could have asked to clear.
+@@ -194,13 +204,15 @@ class ArchiveStore : public base::Suppor
+ int DaysAgo(base::Time archived_at, base::Time now);
+ 
+ // The Archive screen's headings (E17c): Today, Yesterday, Earlier this week,
+-// Last week, then one per local calendar month.
++// Last week, then one per local calendar month -- under Snoozed (C33), the
++// heading over every snoozed entry, at the top, which BucketFor never answers.
+ enum class ArchiveBucketKind {
+   kToday,
+   kYesterday,
+   kEarlierThisWeek,
+   kLastWeek,
+-  kMonth
++  kMonth,
++  kSnoozed
+ };
+ struct ArchiveBucket {
+   ArchiveBucketKind kind;
+@@ -214,6 +226,16 @@ struct ArchiveBucket {
+ // calendar month of `archived_at`. A time after `now` is kToday, as DaysAgo.
+ ArchiveBucket BucketFor(base::Time archived_at, base::Time now);
+ 
++// C33: whether the Archive screen lists `a` before `b`: the snoozed first,
++// the soonest wake first, then the rest newest first. For a stable sort,
++// which keeps the store's order between equals.
++bool ListsBefore(const ArchiveEntry& a, const ArchiveEntry& b);
++
++// Whether a Clear... range starting at `since` takes `entry`: archived at or
++// after it, and never a snoozed one -- a reminder the user set, which Delete
++// on its row takes (C33). RemoveSince's rule and the screen's count of it.
++bool IsClearedBy(const ArchiveEntry& entry, base::Time since);
++
+ // What the search box looks in for `entry`: its custom name, its title and its
+ // address, case-folded (base::i18n::FoldCase) and joined by newlines. The
+ // screen makes it once per row, not once per keystroke.
+@@ -376,6 +398,36 @@ SweepVerdict JudgeForSweep(const SweepFa
+ // timer -- for `after` <= 0 (Never).
+ base::TimeDelta SweepInterval(base::TimeDelta after);
+ 
++// Snooze (C33, c33-progress.md): the tab menu files a tab in the archive with
++// a wake time, and the window used last brings it back when that time comes.
++
++// The menu's choices, in hours -- the owner's: prime numbers -- above
++// Custom...
++inline constexpr int kSnoozeHours[] = {2, 3, 5, 7, 11};
++// Custom...'s units, in its list's order.
++enum class SnoozeUnit { kMinutes, kHours, kDays, kWeeks };
++// The longest snooze Custom... takes.
++inline constexpr base::TimeDelta kLongestSnooze = base::Days(365);
++// How often a window looks for snoozed tabs due to wake: often enough for a
++// snooze of minutes. The wall clock decides, so a PC asleep at the wake time
++// wakes the tab at the first look after.
++inline constexpr base::TimeDelta kWakeCheckEvery = base::Seconds(15);
++// Hidden, for the checks: every snooze wakes this many seconds after it is
++// made, whatever was chosen.
++inline constexpr char kSnoozeTestSecondsSwitch[] =
++    "helium-workspaces-snooze-test-seconds";
++
++// How long Custom...'s `amount` of `unit` lasts: the text trimmed, a whole
++// number of at least 1, and the span at most kLongestSnooze. std::nullopt
++// otherwise, and the box stays open.
++std::optional<base::TimeDelta> SnoozeDelay(std::u16string_view amount,
++                                           SnoozeUnit unit);
++
++// The ids of the snoozed entries due at `now` (wake_at at or before it),
++// the soonest first.
++std::vector<std::string> DueToWake(const std::vector<ArchiveEntry>& entries,
++                                   base::Time now);
++
+ }  // namespace workspaces::archive
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_ARCHIVE_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <optional>
+ #include <set>
+@@ -17,6 +18,7 @@
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/supports_user_data.h"
+ #include "base/task/thread_pool.h"
+ #include "base/test/bind.h"
+@@ -57,7 +59,8 @@ TEST(WorkspaceArchiveTest, JsonRoundTrip
+   full.workspace = "work";
+   full.reason = ArchiveEntry::Reason::kWindow;
+   full.last_active = base::Time::FromSecondsSinceUnixEpoch(1'759'000'000);
+-  // No name, no last-shown time, no title, no workspace.
++  full.wake_at = base::Time::FromSecondsSinceUnixEpoch(1'761'000'000);
++  // No name, no last-shown time, no title, no workspace, no wake.
+   ArchiveEntry bare =
+       Entry("b", "https://b.example/",
+             base::Time::FromSecondsSinceUnixEpoch(1'760'000'100));
+@@ -75,9 +78,17 @@ TEST(WorkspaceArchiveTest, JsonRoundTrip
+   const base::DictValue& written = (*list)[2].GetDict();
+   EXPECT_FALSE(written.Find("custom_title"));
+   EXPECT_FALSE(written.Find("last_active"));
++  EXPECT_FALSE(written.Find("wake_at"));
+   EXPECT_EQ(*written.FindString("reason"), "auto");
+ }
+ 
++// C33: a wake time is read as strictly as the other times.
++TEST(WorkspaceArchiveTest, AWakeTimeThatDoesNotParseRefusesTheFile) {
++  base::DictValue value = ArchiveToValue({Entry("a", "https://a.example/")});
++  (*value.FindList("entries"))[0].GetDict().Set("wake_at", "soon");
++  EXPECT_EQ(ArchiveFromValue(value), std::nullopt);
++}
++
+ TEST(WorkspaceArchiveTest, ReasonNames) {
+   EXPECT_EQ(ReasonName(ArchiveEntry::Reason::kManual), "manual");
+   EXPECT_EQ(ReasonName(ArchiveEntry::Reason::kWindow), "window");
+@@ -429,6 +440,38 @@ TEST_F(ArchiveStoreTest, RemoveSinceATim
+   EXPECT_EQ(Ids(Reloaded(std::move(store))), (IdList{"old"}));
+ }
+ 
++// C33: Clear... never takes a reminder the user set.
++TEST_F(ArchiveStoreTest, RemoveSinceLeavesSnoozedEntries) {
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  ArchiveEntry snoozed = Entry("snoozed", "https://s.example/");
++  snoozed.wake_at = base::Time::Now() + base::Hours(3);
++  ASSERT_TRUE(store->Add(Entry("a", "https://a.example/")));
++  ASSERT_TRUE(store->Add(snoozed));
++
++  EXPECT_EQ(store->RemoveSince(base::Time()), 1u);
++  EXPECT_EQ(Ids(store->entries()), (IdList{"snoozed"}));
++}
++
++// C33: a snooze longer than the keep is never dropped before it wakes; the
++// keep counts from the wake.
++TEST_F(ArchiveStoreTest, ASnoozedEntryIsKeptSixtyDaysFromItsWake) {
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  ArchiveEntry snoozed = Entry("snoozed", "https://s.example/");
++  snoozed.wake_at = base::Time::Now() + base::Days(10);
++  ASSERT_TRUE(store->Add(snoozed));
++  ASSERT_TRUE(store->Add(Entry("plain", "https://p.example/")));
++
++  // Archived 65 days ago, woke 55 days ago: kept; the plain one goes.
++  task_environment_.FastForwardBy(base::Days(65));
++  ASSERT_TRUE(store->Add(Entry("b", "https://b.example/")));
++  EXPECT_EQ(Ids(store->entries()), (IdList{"snoozed", "b"}));
++
++  // Woke 61 days ago: gone.
++  task_environment_.FastForwardBy(base::Days(6));
++  ASSERT_TRUE(store->Add(Entry("c", "https://c.example/")));
++  EXPECT_EQ(Ids(store->entries()), (IdList{"b", "c"}));
++}
++
+ // The screen draws nothing before the load, so a clear then is not one it
+ // asked for: the held close stays and joins the file.
+ TEST_F(ArchiveStoreTest, RemoveSinceBeforeTheLoadIsRefused) {
+@@ -551,6 +594,53 @@ TEST(WorkspaceArchiveTest, ASundayHasNoE
+             ArchiveBucket{ArchiveBucketKind::kLastWeek});
+ }
+ 
++// C33: the Snoozed heading's rows first, soonest wake first, then the rest
++// newest first.
++TEST(WorkspaceArchiveTest, SnoozedEntriesListFirstSoonestWakeFirst) {
++  const base::Time now = base::Time::FromSecondsSinceUnixEpoch(1'760'000'000);
++  ArchiveEntry later = Entry("later", "https://l/", now - base::Hours(5));
++  later.wake_at = now + base::Days(2);
++  ArchiveEntry sooner = Entry("sooner", "https://s/", now - base::Hours(1));
++  sooner.wake_at = now + base::Hours(1);
++  std::vector<ArchiveEntry> entries = {
++      Entry("old", "https://o/", now - base::Days(3)), later,
++      Entry("new", "https://n/", now), sooner};
++  std::ranges::stable_sort(entries, ListsBefore);
++  EXPECT_EQ(Ids(entries), (IdList{"sooner", "later", "new", "old"}));
++}
++
++TEST(WorkspaceArchiveTest, SnoozeDelayTakesAWholeNumberUpToAYear) {
++  EXPECT_EQ(SnoozeDelay(u"5", SnoozeUnit::kMinutes), base::Minutes(5));
++  EXPECT_EQ(SnoozeDelay(u" 3 ", SnoozeUnit::kHours), base::Hours(3));
++  EXPECT_EQ(SnoozeDelay(u"2", SnoozeUnit::kDays), base::Days(2));
++  EXPECT_EQ(SnoozeDelay(u"1", SnoozeUnit::kWeeks), base::Days(7));
++  EXPECT_EQ(SnoozeDelay(u"365", SnoozeUnit::kDays), base::Days(365));
++  EXPECT_EQ(SnoozeDelay(u"52", SnoozeUnit::kWeeks), base::Days(364));
++  // Not a whole number of at least 1, or past a year: the box stays open.
++  for (const std::u16string_view text :
++       {u"", u" ", u"0", u"-2", u"1.5", u"abc", u"3h", u"99999999999"}) {
++    EXPECT_EQ(SnoozeDelay(text, SnoozeUnit::kHours), std::nullopt)
++        << base::UTF16ToUTF8(text);
++  }
++  EXPECT_EQ(SnoozeDelay(u"366", SnoozeUnit::kDays), std::nullopt);
++  EXPECT_EQ(SnoozeDelay(u"53", SnoozeUnit::kWeeks), std::nullopt);
++}
++
++TEST(WorkspaceArchiveTest, DueToWakeTakesThePastWakesSoonestFirst) {
++  const base::Time now = base::Time::FromSecondsSinceUnixEpoch(1'760'000'000);
++  const auto snoozed = [](std::string id, base::Time wake_at) {
++    ArchiveEntry entry = Entry(std::move(id), "https://x/");
++    entry.wake_at = wake_at;
++    return entry;
++  };
++  const std::vector<ArchiveEntry> entries = {
++      snoozed("late", now - base::Minutes(1)), Entry("plain", "https://p/"),
++      snoozed("future", now + base::Seconds(1)), snoozed("exact", now),
++      snoozed("early", now - base::Days(1))};
++  EXPECT_EQ(DueToWake(entries, now), (IdList{"early", "late", "exact"}));
++  EXPECT_TRUE(DueToWake({}, now).empty());
++}
++
+ TEST(WorkspaceArchiveTest, SearchFindsEveryWordInAnyFieldAndCase) {
+   ArchiveEntry entry = Entry("a", "https://example.com/chromium");
+   entry.title = "GitHub Pull Requests";
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -163,6 +163,19 @@ bool IsUntouchedNewTabPage(content::WebC
+          contents->GetController().GetEntryCount() == 1;
+ }
+ 
++// Whether the archive could give `contents` back: a last committed address a
++// restore opens (http, https, file, chrome: -- never blob:, data:, about:,
++// filesystem:), and not an untouched New Tab page. The sweep's rule
++// (archive::SweepFacts::no_address), stricter than the door's, and what a
++// snooze needs, which must come back (C33).
++bool HasRestorableAddress(content::WebContents* contents) {
++  const GURL& url = contents->GetLastCommittedURL();
++  return url.is_valid() &&
++         (url.SchemeIsHTTPOrHTTPS() || url.SchemeIsFile() ||
++          url.SchemeIs(content::kChromeUIScheme)) &&
++         !IsUntouchedNewTabPage(contents);
++}
++
+ // Keeps `contents` in `window`'s profile archive with `reason`, and logs it:
+ // the door's entry and the sweep's are made here, one way (E14d.3). The last
+ // committed address, which a restored tab never loaded since has too (design
+@@ -182,7 +195,13 @@ bool AddToArchive(BrowserWindowInterface
+   entry.reason = reason;
+   entry.archived_at = base::Time::Now();
+   entry.last_active = contents->GetLastActiveTime();
++  // C33: a snooze's close carries its wake time (SnoozeTabs).
++  if (const WorkspaceTabData* const data =
++          WorkspaceTabData::FromWebContents(contents)) {
++    entry.wake_at = data->snooze_until();
++  }
+   const std::string workspace = entry.workspace;
++  const bool snoozed = entry.snoozed();
+   Profile* const profile = window->GetProfile();
+   const bool added =
+       archive::ArchiveStore::GetOrCreate(profile, profile->GetPath())
+@@ -190,7 +209,7 @@ bool AddToArchive(BrowserWindowInterface
+   // Never the address or the title: a log is pasted when asking for help.
+   LOG(INFO) << "[workspaces] archived a " << archive::ReasonName(reason)
+             << " close in '" << workspace << "'"
+-            << (added ? "" : " (refused)");
++            << (snoozed ? " (snoozed)" : "") << (added ? "" : " (refused)");
+   return added;
+ }
+ 
+@@ -651,6 +670,55 @@ int WorkspaceService::CloseTabs(std::vec
+   return closed;
+ }
+ 
++bool WorkspaceService::CanSnooze(tabs::TabInterface* tab) const {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  return IsEnabled() && contents && !tab->IsPinned() && !tab->IsSplit() &&
++         !IsAnchored(tab) && PinItemForTab(contents).empty() &&
++         HasRestorableAddress(contents);
++}
++
++int WorkspaceService::SnoozeTabs(const std::vector<tabs::TabInterface*>& tabs,
++                                 base::Time wake_at) {
++  // A read-only archive refuses every entry: the close would leave nothing to
++  // wake (review). Before the load it is not read-only, and Add() holds.
++  Profile* const profile = browser_window_->GetProfile();
++  if (archive::ArchiveStore::GetOrCreate(profile, profile->GetPath())
++          ->read_only()) {
++    LOG(INFO) << "[workspaces] snooze: refused, the archive is read-only";
++    return 0;
++  }
++  // Only this window's tabs: CloseTabs() closes none of another's, and a mark
++  // left on an open tab would file its next ordinary close as a snooze
++  // (review: a tab dragged away before Custom...'s posted task).
++  std::vector<tabs::TabHandle> snoozed;
++  for (tabs::TabInterface* const tab : tabs) {
++    if (CanSnooze(tab) &&
++        tab_strip_->GetIndexOfTab(tab) != TabStripModel::kNoTab) {
++      snoozed.push_back(tab->GetHandle());
++    }
++  }
++  if (snoozed.empty()) {
++    LOG(INFO) << "[workspaces] snooze: nothing that can be snoozed ("
++              << tabs.size() << " asked)";
++    return 0;
++  }
++  if (std::ssize(snoozed) >= tab_strip_->count()) {
++    LOG(INFO) << "[workspaces] snooze: refused, it would close every tab of "
++                 "the window";
++    return 0;
++  }
++  // Marked before any close: a close can show the next tab, and only the
++  // marked ones file a wake time (AddToArchive).
++  for (const tabs::TabHandle& handle : snoozed) {
++    WorkspaceTabData::GetOrCreateForWebContents(handle.Get()->GetContents())
++        ->set_snooze_until(wake_at);
++  }
++  LOG(INFO) << "[workspaces] snooze: " << snoozed.size() << " of "
++            << tabs.size() << " tab(s), waking in "
++            << (wake_at - base::Time::Now()).InSeconds() << " s";
++  return CloseTabs(std::move(snoozed));
++}
++
+ std::vector<tabs::TabHandle> WorkspaceService::DuplicateTabs(
+     std::string_view guid) const {
+   if (!IsEnabled()) {
+@@ -2438,17 +2506,13 @@ void WorkspaceService::SweepForAutoArchi
+         page ? performance_manager::PageLiveStateDecorator::Data::FromPageNode(
+                    page.get())
+              : nullptr;
+-    const GURL& url = contents->GetLastCommittedURL();
+     facts.active = tab == active;
+     facts.favorite = tab->IsPinned();
+     facts.pinned_item = data && !data->pin_item().empty();
+     facts.anchored = data && data->anchored();
+     facts.split = tab->IsSplit();
+     facts.grouped = tab->GetGroup().has_value();
+-    facts.no_address = !url.is_valid() ||
+-                       !(url.SchemeIsHTTPOrHTTPS() || url.SchemeIsFile() ||
+-                         url.SchemeIs(content::kChromeUIScheme)) ||
+-                       IsUntouchedNewTabPage(contents);
++    facts.no_address = !HasRestorableAddress(contents);
+     facts.audible =
+         contents->IsCurrentlyAudible() || WasRecentlyAudible(page.get());
+     facts.captured =
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -539,6 +539,38 @@ class WorkspaceService : public TabStrip
+   // "not archived: the auto-archive's own close" for it.
+   bool ArchiveClosingTab(content::WebContents* contents, bool quitting);
+ 
++  // C33: whether the tab menu's Snooze can take `tab`: Workspaces on, a Today
++  // tab -- not a favorite or a pinned page, which are never archived
++  // (ArchiveClosingTab), not an anchored tab, whose close resets it (E14a) and
++  // which this close would go round, not a split's half, which closes with its
++  // other half -- whose page the archive can give back (the sweep's address
++  // rule: the tab must come back).
++  bool CanSnooze(tabs::TabInterface* tab) const;
++
++  // C33: closes those of `tabs` that CanSnooze(), each marked to wake at
++  // `wake_at` (WorkspaceTabData::snooze_until), through CloseTabs(): the
++  // close is an ordinary one -- the archive keeps the page with the wake time
++  // (AddToArchive), Recently Closed keeps it too, so Ctrl+Shift+T undoes the
++  // snooze, and a "Leave site?" page still asks (Stay keeps it, unsnoozed).
++  // Only `tabs` of this window. Refuses (0) while the archive is read-only
++  // (it would keep nothing to wake) and when the snooze would close every
++  // tab of the window: the window would go, and the session, not the
++  // archive, keeps a last window's tabs. Answers the closes asked. Logs
++  //   "[workspaces] snooze: <N> of <M> tab(s), waking in <S> s"
++  //   "[workspaces] snooze: nothing that can be snoozed (<M> asked)"
++  //   "[workspaces] snooze: refused, the archive is read-only"
++  //   "[workspaces] snooze: refused, it would close every tab of the window"
++  // ONLY FROM A MENU OR COMMAND HANDLER, or a task one posted: it closes tabs.
++  int SnoozeTabs(const std::vector<tabs::TabInterface*>& tabs,
++                 base::Time wake_at);
++
++  // The model index of the first Today tab of `guid` -- not a favorite, not
++  // an open pinned page -- or -1 when it has none. Where a new tab of the
++  // workspace on screen goes (TopOfListIndex), where a moved tab goes in
++  // its new workspace (MoveTabsToWorkspace, C4), and where a snoozed tab
++  // wakes (C33, WorkspaceArchiveView::Wake).
++  int FirstTodayIndexOf(std::string_view guid) const;
++
+  private:
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+@@ -573,12 +605,6 @@ class WorkspaceService : public TabStrip
+   // would skip exactly the tabs the user can see (E11 review).
+   bool IsTabOfWorkspace(tabs::TabInterface* tab, std::string_view guid) const;
+ 
+-  // The model index of the first Today tab of `guid` -- not a favorite, not
+-  // an open pinned page -- or -1 when it has none. Where a new tab of the
+-  // workspace on screen goes (TopOfListIndex), and where a moved tab goes in
+-  // its new workspace (MoveTabsToWorkspace, C4).
+-  int FirstTodayIndexOf(std::string_view guid) const;
+-
+   // Whether model index `index` falls inside a group or a split rather than
+   // on a unit boundary: a destination no tab mover survives. Reconcile() asks
+   // it before every move, MoveTabsToWorkspace() of its anchor (the .cc says
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.cc
+@@ -23,6 +23,9 @@ void WorkspaceTabData::BeforeUnloadDialo
+   // a duplicate, and its next close is the user's, archived and kept in
+   // Recently Closed rather than dropped by the door (E14d.3).
+   auto_archived_ = false;
++  // A snooze answered Stay is off the same way: the tab stays, unsnoozed
++  // (C33).
++  snooze_until_ = base::Time();
+ }
+ 
+ // static
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -102,11 +102,20 @@ class WorkspaceTabData : public content:
+   bool auto_archived() const { return auto_archived_; }
+   void set_auto_archived() { auto_archived_ = true; }
+ 
++  // C33: when this tab, being snoozed, wakes -- set by
++  // WorkspaceService::SnoozeTabs just before its close, read by the close's
++  // archive entry (ArchiveClosingTab), cleared on Stay as auto_archived is.
++  // Null for an ordinary close. In memory only: the closed tab takes it no
++  // further than its entry.
++  base::Time snooze_until() const { return snooze_until_; }
++  void set_snooze_until(base::Time time) { snooze_until_ = time; }
++
+   // content::WebContentsObserver:
+   // "Leave site?" answered Stay: the close is off, but a group or split close
+   // may already have put the id in its Recently Closed entry, whose reopen
+   // would then remove this tab's next close. Its next close mints a new one
+-  // (review, LOCAL.md 52). It clears auto_archived too (E14d.3).
++  // (review, LOCAL.md 52). It clears auto_archived too (E14d.3), and
++  // snooze_until (C33).
+   void BeforeUnloadDialogCancelled() override;
+ 
+  private:
+@@ -123,6 +132,7 @@ class WorkspaceTabData : public content:
+   std::string archive_id_;
+   base::Time left_at_;
+   bool auto_archived_ = false;
++  base::Time snooze_until_;
+ };
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
+@@ -55,6 +55,7 @@
+ #include "components/sessions/core/serialized_user_agent_override.h"
+ #include "components/sessions/core/tab_restore_service.h"
+ #include "components/sessions/core/tab_restore_types.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "components/vector_icons/vector_icons.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "ui/accessibility/ax_enums.mojom.h"
+@@ -182,6 +183,8 @@ std::u16string HeadingText(const Archive
+       return l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_LAST_WEEK);
+     case ArchiveBucketKind::kMonth:
+       return base::TimeFormatMonthAndYear(time);
++    case ArchiveBucketKind::kSnoozed:
++      return l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_SNOOZED);
+   }
+   NOTREACHED();
+ }
+@@ -236,6 +239,15 @@ std::u16string RowTime(base::Time time,
+   return it->second;
+ }
+ 
++// C33: when a snoozed entry wakes, as its row's right end says it: the time
++// of day when that is today ("5:40 PM"), else the date and time. Few rows,
++// so not cached as RowTime is.
++std::u16string WakeTimeText(base::Time wake_at, base::Time now) {
++  return wake_at.LocalMidnight() == now.LocalMidnight()
++             ? base::TimeFormatTimeOfDay(wake_at)
++             : base::TimeFormatShortDateAndTime(wake_at);
++}
++
+ // When each window's screen last closed by losing the focus, for Show's
+ // 250 ms rule. A key is never dereferenced, and Show takes its window's out.
+ // ponytail: a window closed after its screen leaves one entry behind; prune
+@@ -254,12 +266,12 @@ base::Time ClearSince(const ClearRange&
+ }
+ 
+ // How many entries, of every workspace, Delete would clear for `range` now:
+-// RemoveSince()'s own test, at or after ClearSince().
++// RemoveSince()'s own test (IsClearedBy) from ClearSince().
+ size_t CountToClear(const ArchiveStore& store, const ClearRange& range) {
+   const base::Time since = ClearSince(range);
+   return static_cast<size_t>(std::ranges::count_if(
+       store.entries(), [since](const ArchiveEntry& entry) {
+-        return entry.archived_at >= since;
++        return workspaces::archive::IsClearedBy(entry, since);
+       }));
+ }
+ 
+@@ -908,8 +920,9 @@ void WorkspaceArchiveView::Rebuild() {
+         WorkspaceRailView::DisplayName(workspace_list[i]), colors[i]};
+   }
+ 
+-  // Newest first. The store keeps them in the order they were kept, which a
+-  // load's merge can leave out of time order.
++  // The snoozed first, then newest first (archive::ListsBefore). The store
++  // keeps them in the order they were kept, which a load's merge can leave
++  // out of time order.
+   std::vector<const ArchiveEntry*> sorted;
+   sorted.reserve(store_->entries().size());
+   for (const ArchiveEntry& entry : store_->entries()) {
+@@ -917,7 +930,7 @@ void WorkspaceArchiveView::Rebuild() {
+   }
+   std::ranges::stable_sort(
+       sorted, [](const ArchiveEntry* a, const ArchiveEntry* b) {
+-        return a->archived_at > b->archived_at;
++        return workspaces::archive::ListsBefore(*a, *b);
+       });
+ 
+   // Every row built off the widget and attached with ONE SetContents (E15b:
+@@ -947,7 +960,9 @@ void WorkspaceArchiveView::Rebuild() {
+   RowTimeCache times;
+   for (const ArchiveEntry* const entry : sorted) {
+     const ArchiveBucket bucket =
+-        workspaces::archive::BucketFor(entry->archived_at, now);
++        entry->snoozed()
++            ? ArchiveBucket{ArchiveBucketKind::kSnoozed}
++            : workspaces::archive::BucketFor(entry->archived_at, now);
+     if (!header || bucket != header_bucket) {
+       header = contents->AddChildView(MakeHeading(bucket, entry->archived_at));
+       header_bucket = bucket;
+@@ -971,7 +986,9 @@ void WorkspaceArchiveView::Rebuild() {
+         row.text,
+         base::StrCat({row.text, u"\n", base::UTF8ToUTF16(entry->url), u"\n",
+                       workspace_name}),
+-        RowTime(entry->archived_at, bucket.kind, times), color,
++        entry->snoozed() ? WakeTimeText(entry->wake_at, now)
++                         : RowTime(entry->archived_at, bucket.kind, times),
++        color,
+         GURL(entry->url), profile,
+         base::BindRepeating(&WorkspaceArchiveView::RestoreEntry,
+                             base::Unretained(this), entry->id));
+@@ -1107,9 +1124,14 @@ void WorkspaceArchiveView::OnArchiveChan
+                                 weak_factory_.GetWeakPtr()));
+ }
+ 
+-// static
+-bool WorkspaceArchiveView::Restore(BrowserWindowInterface* browser,
+-                                   const std::string& id) {
++namespace {
++
++// Restore()'s road and Wake()'s (C33): `wake` opens the entry `id` into its
++// workspace as it is, unselected, instead of entering that workspace and
++// selecting the page. Answers the page, or null when nothing opened.
++content::WebContents* Reopen(BrowserWindowInterface* browser,
++                             const std::string& id,
++                             bool wake) {
+   // Not with Workspaces switched off while the screen stays open: the rail,
+   // its door, is gone, and a restore would land at the strip's end with its
+   // entry spent (code review). Checked first, so a refusal never creates the
+@@ -1117,14 +1139,14 @@ bool WorkspaceArchiveView::Restore(Brows
+   workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser);
+   if (!service || !service->IsEnabled()) {
+-    return false;
++    return nullptr;
+   }
+   Profile* const profile = browser->GetProfile();
+   ArchiveStore* const store =
+       ArchiveStore::GetOrCreate(profile, profile->GetPath());
+   const auto it = std::ranges::find(store->entries(), id, &ArchiveEntry::id);
+   if (it == store->entries().end()) {
+-    return false;
++    return nullptr;
+   }
+   // A copy: the Remove() below changes the store's vector.
+   const ArchiveEntry entry = *it;
+@@ -1132,23 +1154,35 @@ bool WorkspaceArchiveView::Restore(Brows
+   if (!url.is_valid()) {
+     LOG(WARNING) << "[workspaces] archive: an entry has no address a tab can "
+                     "open";
+-    return false;
++    // The wake asks again at every look: let go of what no tab can open
++    // rather than warn of it forever. Nothing a restore could give is lost.
++    if (wake) {
++      store->Remove(id);
++    }
++    return nullptr;
+   }
+ 
+   // Home for a deleted workspace, as the list draws it (design 2.4).
+   const std::string guid(
+       workspaces::ResolveTabGuid(entry.workspace, service->known_guids()));
+-  // EnterWorkspaceForInsert, not SwitchToWorkspace: the switch activates a
+-  // tab of the workspace -- and spawns a New Tab into an empty one -- when the
+-  // page inserted below, selected, is the tab to show. This moves only the
+-  // bookkeeping, the tab being left included, so coming back by the rail
+-  // lands on it (E14d.2 review), and the top of the list below is then that
+-  // workspace's.
+-  service->EnterWorkspaceForInsert(guid);
+-  // At the top of the list, where a new tab opens (E15c.1); the end when the
+-  // workspace has no tab.
+   TabStripModel* const model = browser->GetTabStripModel();
+-  int index = service->TopOfListIndex(nullptr);
++  int index;
++  if (wake) {
++    // C33: the window stays where it is; the page goes to the top of its
++    // workspace's Today, where a tab moved there goes (C4).
++    index = service->FirstTodayIndexOf(guid);
++  } else {
++    // EnterWorkspaceForInsert, not SwitchToWorkspace: the switch activates a
++    // tab of the workspace -- and spawns a New Tab into an empty one -- when
++    // the page inserted below, selected, is the tab to show. This moves only
++    // the bookkeeping, the tab being left included, so coming back by the
++    // rail lands on it (E14d.2 review), and the top of the list below is then
++    // that workspace's.
++    service->EnterWorkspaceForInsert(guid);
++    // At the top of the list, where a new tab opens (E15c.1).
++    index = service->TopOfListIndex(nullptr);
++  }
++  // The end when the workspace has no tab.
+   if (index < 0) {
+     index = model->count();
+   }
+@@ -1165,10 +1199,12 @@ bool WorkspaceArchiveView::Restore(Brows
+   if (!entry.custom_title.empty()) {
+     extra_data[workspaces::kCustomTitleExtraDataKey] = entry.custom_title;
+   }
+-  chrome::AddRestoredTab(
++  // A woken page is not selected, so kLoadIfVisible leaves it asleep until
++  // it is clicked.
++  content::WebContents* const contents = chrome::AddRestoredTab(
+       browser, base::span_from_ref(navigation), index,
+       /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
+-      /*group=*/std::nullopt, /*select=*/true, /*pin=*/false,
++      /*group=*/std::nullopt, /*select=*/!wake, /*pin=*/false,
+       base::TimeTicks::Now(), base::Time::Now(),
+       /*storage_namespace=*/nullptr, sessions::SerializedUserAgentOverride(),
+       extra_data, /*from_session_restore=*/false,
+@@ -1177,9 +1213,26 @@ bool WorkspaceArchiveView::Restore(Brows
+   // The page lives in one place, as in Arc: out of the archive now, and out
+   // of Recently Closed.
+   store->Remove(id);
+-  LOG(INFO) << "[workspaces] archive: restored an entry into '" << guid << "'";
++  LOG(INFO) << "[workspaces] archive: " << (wake ? "woke" : "restored")
++            << " an entry into '" << guid << "'";
+   RemoveRecentlyClosedTab(profile, id);
+-  return true;
++  return contents;
++}
++
++}  // namespace
++
++// static
++bool WorkspaceArchiveView::Restore(BrowserWindowInterface* browser,
++                                   const std::string& id) {
++  return Reopen(browser, id, /*wake=*/false) != nullptr;
++}
++
++// static
++tabs::TabInterface* WorkspaceArchiveView::Wake(BrowserWindowInterface* browser,
++                                               const std::string& id) {
++  content::WebContents* const contents = Reopen(browser, id, /*wake=*/true);
++  return contents ? tabs::TabInterface::MaybeGetFromContents(contents)
++                  : nullptr;
+ }
+ 
+ void WorkspaceArchiveView::RestoreEntry(const std::string& id) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
+@@ -32,6 +32,10 @@ class ScrollView;
+ class Textfield;
+ }  // namespace views
+ 
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
+ namespace workspaces::archive {
+ class ArchiveStore;
+ }  // namespace workspaces::archive
+@@ -60,6 +64,10 @@ class Event;
+ //   Yesterday, Earlier this week, Last week, then one per month. The time on
+ //   a row is the time of day today and yesterday, the weekday earlier this
+ //   week, else the month and day.
++// - C33: above them all, "Snoozed": the tabs waiting to wake, the soonest
++//   first (archive::ListsBefore), each row's time the time it WAKES -- the
++//   time of day when that is today, else the date and time. A restore wakes
++//   it now; Delete drops it; Clear... leaves it (archive::IsClearedBy).
+ // - Shows the entries of this window's workspace (ResolveTabGuid: a deleted
+ //   workspace's entries are Home's, design 2.4); the switch's "All
+ //   workspaces", off at every open, shows every entry, each row then with a
+@@ -172,6 +180,14 @@ class WorkspaceArchiveView : public view
+   // address is not one a tab can open. The screen's rows and the quick search
+   // box (C1) both restore through it; neither closes anything here.
+   static bool Restore(BrowserWindowInterface* browser, const std::string& id);
++  // C33: wakes the snoozed entry `id` into `browser` by Restore()'s road, but
++  // into its workspace as it is -- the window stays where it is -- at the top
++  // of that workspace's Today, neither selected nor loaded until clicked.
++  // Answers the woken tab, or null when nothing opened; an entry no tab can
++  // open is let go, or every look would warn of it again. WorkspaceRailView's
++  // timer calls it, outside every observer: it inserts a tab.
++  static tabs::TabInterface* Wake(BrowserWindowInterface* browser,
++                                  const std::string& id);
+ 
+   WorkspaceArchiveView(const WorkspaceArchiveView&) = delete;
+   WorkspaceArchiveView& operator=(const WorkspaceArchiveView&) = delete;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -11,6 +11,7 @@
+ #include <iterator>
+ #include <memory>
+ #include <optional>
++#include <ranges>
+ #include <set>
+ #include <string>
+ #include <string_view>
+@@ -38,7 +39,10 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/desktop_browser_window_capabilities.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/recently_audible_helper.h"
+@@ -48,6 +52,7 @@
+ #include "chrome/browser/ui/tabs/tab_group_theme.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+@@ -172,6 +177,8 @@ constexpr SkAlpha kCurrentFillAlphaLight
+ // chip's bottom-right corner.
+ constexpr int kBadgeDiscSize = 14;
+ constexpr int kBadgeIconSize = 12;
++// C33: the woken tab's dot, inside the badge's disc.
++constexpr int kWokenDotSize = 8;
+ 
+ // C4: a drop's marks, as thick as the pinned section's -- the ring a chip
+ // draws while a drop on it would move there, and the line between two chips
+@@ -580,31 +587,36 @@ class WorkspaceChip : public WorkspaceRa
+ 
+   // C14: the badge (D9) for `alert`, and `line` -- "<alert> - <tab title>",
+   // for the tab behind it -- under the name in the tooltip (D11); nullopt
+-  // and an empty line for none. Returns whether the alert changed, for the
+-  // rail's log (D13). A changed line alone re-sets the text (B7) and paints
+-  // nothing.
+-  bool SetBadge(std::optional<tabs::TabAlert> alert, std::u16string line) {
+-    if (alert == badge_ && line == badge_line_) {
++  // and an empty line for none. C33: `woken`, with no alert, is the dot of a
++  // tab back from a snooze, its line "Back from snooze - <tab title>".
++  // Returns whether the badge changed, for the rail's log (D13). A changed
++  // line alone re-sets the text (B7) and paints nothing.
++  bool SetBadge(std::optional<tabs::TabAlert> alert,
++                bool woken,
++                std::u16string line) {
++    if (alert == badge_ && woken == woken_dot_ && line == badge_line_) {
+       return false;
+     }
+-    const bool alert_changed = alert != badge_;
++    const bool badge_changed = alert != badge_ || woken != woken_dot_;
+     badge_ = alert;
++    woken_dot_ = woken;
+     badge_line_ = std::move(line);
+-    SetTooltipText(badge_ ? base::StrCat({name_, u"\n", badge_line_}) : name_);
++    const bool badged = badge_ || woken_dot_;
++    SetTooltipText(badged ? base::StrCat({name_, u"\n", badge_line_}) : name_);
+     // A new tooltip renames a button whose name was its old tooltip
+     // (Button::OnTooltipTextChanged), and the hands-free scripts press a chip
+     // by its workspace's exact name (B6): the name is put back, and the line
+     // is the description, which a screen reader says after it.
+     GetViewAccessibility().SetName(name_);
+-    if (badge_) {
++    if (badged) {
+       GetViewAccessibility().SetDescription(badge_line_);
+     } else {
+       GetViewAccessibility().RemoveDescription();
+     }
+-    if (alert_changed) {
++    if (badge_changed) {
+       SchedulePaint();
+     }
+-    return alert_changed;
++    return badge_changed;
+   }
+ 
+   // Resolved here and never in the constructor: a view has no ColorProvider
+@@ -651,7 +663,7 @@ class WorkspaceChip : public WorkspaceRa
+   void PaintChildren(const views::PaintInfo& info) override {
+     WorkspaceRailButton::PaintChildren(info);
+     const ui::ColorProvider* const provider = GetColorProvider();
+-    if ((!badge_ && !drop_target_) || !provider) {
++    if ((!badge_ && !woken_dot_ && !drop_target_) || !provider) {
+       return;
+     }
+     ui::PaintRecorder recorder(info.context(), size());
+@@ -675,7 +687,7 @@ class WorkspaceChip : public WorkspaceRa
+           bounds, WorkspaceRailView::kChipRadius - kDropLineThickness / 2.0f,
+           ring);
+     }
+-    if (!badge_) {
++    if (!badge_ && !woken_dot_) {
+       return;
+     }
+     const gfx::Rect disc(width() - kBadgeDiscSize, height() - kBadgeDiscSize,
+@@ -686,6 +698,14 @@ class WorkspaceChip : public WorkspaceRa
+     flags.setAntiAlias(true);
+     flags.setColor(provider->GetColor(kColorToolbar));
+     canvas->DrawCircle(disc.CenterPoint(), kBadgeDiscSize / 2, flags);
++    if (!badge_) {
++      // C33: the woken tab's dot, in the workspace's own colour, as the C4
++      // ring is.
++      flags.setColor(
++          WorkspaceRailView::WorkspaceColor(*provider, color_, active_frame));
++      canvas->DrawCircle(disc.CenterPoint(), kWokenDotSize / 2, flags);
++      return;
++    }
+     // Chromium's own icon and colour for the alert, as an inactive tab draws
+     // them (D9).
+     const gfx::ImageSkia icon =
+@@ -707,6 +727,7 @@ class WorkspaceChip : public WorkspaceRa
+   bool drop_target_ = false;
+   std::u16string name_;
+   std::optional<tabs::TabAlert> badge_;
++  bool woken_dot_ = false;
+   std::u16string badge_line_;
+ };
+ 
+@@ -842,6 +863,11 @@ WorkspaceRailView::WorkspaceRailView(
+   // than starting shown and hiding later is what keeps a profile with
+   // Workspaces switched off from seeing the rail flash on at startup.
+   SetVisible(false);
++  // C33: the snoozed tabs' clock; every window keeps one, and only the one
++  // used last wakes (WakeSnoozedTabs).
++  wake_timer_.Start(FROM_HERE, workspaces::archive::kWakeCheckEvery,
++                    base::BindRepeating(&WorkspaceRailView::WakeSnoozedTabs,
++                                        base::Unretained(this)));
+   new_tab_button_.SetView(new_tab_button);
+   // How the pinned section's header finds this bar (E17b).
+   SetProperty(views::kElementIdentifierKey, kWorkspaceRailElementId);
+@@ -1235,6 +1261,7 @@ void WorkspaceRailView::OnTabStripModelC
+       for (const TabStripModelChange::RemovedTab& removed :
+            change.GetRemove()->contents) {
+         changed |= alerting_.erase(removed.tab->GetHandle()) > 0;
++        changed |= std::erase(woken_, removed.tab->GetHandle()) > 0;
+       }
+       break;
+     case TabStripModelChange::kReplaced:
+@@ -1284,29 +1311,122 @@ void WorkspaceRailView::UpdateBadges() {
+   if (!service || !service->IsEnabled()) {
+     return;
+   }
++  // C33: a woken tab now on screen has been seen, and one gone is gone.
++  std::erase_if(woken_, [service](const tabs::TabHandle& handle) {
++    tabs::TabInterface* const tab = handle.Get();
++    return !tab || service->IsTabOnScreen(tab);
++  });
++  // D11: the name the tab's row draws -- the user's, else the page's
++  // (TabUIHelper::GetTitle's rule).
++  const auto shown_title = [](tabs::TabInterface* tab) {
++    const std::string custom_title =
++        workspaces::CustomTitleForTab(tab->GetContents());
++    return custom_title.empty() ? tab->GetContents()->GetTitle()
++                                : base::UTF8ToUTF16(custom_title);
++  };
+   // ponytail: a badged chip scrolled out of the row gives the arrows no cue
+   // (D12); add one if workspaces ever outgrow the bar.
+   for (size_t i = 0; i < buttons_.size(); ++i) {
+     tabs::TabInterface* const tab = BadgedTab(guids_[i]);
+     const std::optional<tabs::TabAlert> alert =
+         tab ? BadgeAlertFor(tab) : std::nullopt;
+-    // D11: Chromium's own words for the alert, then the name the tab's row
+-    // draws -- the user's, else the page's (TabUIHelper::GetTitle's rule).
++    // C33: the dot only where no alert holds the corner.
++    tabs::TabInterface* const woken = alert ? nullptr : WokenTab(guids_[i]);
++    // D11: Chromium's own words for the alert, then the tab's name.
+     std::u16string line;
+     if (alert) {
+-      const std::string custom_title =
+-          workspaces::CustomTitleForTab(tab->GetContents());
+       line = base::StrCat(
+           {tabs::TabAlertController::GetTabAlertStateText(*alert), u" - ",
+-           custom_title.empty() ? tab->GetContents()->GetTitle()
+-                                : base::UTF8ToUTF16(custom_title)});
++           shown_title(tab)});
++    } else if (woken) {
++      line = base::StrCat(
++          {l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_WOKEN), u" - ",
++           shown_title(woken)});
+     }
+-    if (buttons_[i]->SetBadge(alert, std::move(line))) {
++    if (buttons_[i]->SetBadge(alert, woken != nullptr, std::move(line))) {
+       LOG(INFO) << "[workspaces] rail badge '" << guids_[i] << "' -> "
+-                << (alert ? base::NumberToString(static_cast<int>(*alert))
+-                          : std::string("none"));
++                << (alert   ? base::NumberToString(static_cast<int>(*alert))
++                    : woken ? std::string("woken")
++                            : std::string("none"));
++    }
++  }
++}
++
++tabs::TabInterface* WorkspaceRailView::WokenTab(std::string_view guid) const {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return nullptr;
++  }
++  // UpdateBadges, the one caller, has just let go of those on screen.
++  for (const tabs::TabHandle& handle : woken_) {
++    tabs::TabInterface* const tab = handle.Get();
++    // The workspace the strip draws it in (B8), as BadgedTab asks.
++    if (tab &&
++        workspaces::ResolveTabGuid(
++            workspaces::WorkspaceGuidForTab(tab->GetContents()),
++            service->known_guids()) == guid) {
++      return tab;
++    }
++  }
++  return nullptr;
++}
++
++void WorkspaceRailView::WakeSnoozedTabs() {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || !service->IsEnabled()) {
++    return;
++  }
++  // One window wakes: the profile's with Workspaces activated last -- the
++  // walk a new window takes for its workspace (InitialWorkspace, E15e).
++  BrowserWindowInterface* last_used = nullptr;
++  ProfileBrowserCollection::GetForProfile(browser_->GetProfile())
++      ->ForEach(
++          [&last_used](BrowserWindowInterface* other) {
++            if (!workspaces::WorkspaceService::From(other)) {
++              return true;
++            }
++            last_used = other;
++            return false;
++          },
++          BrowserCollection::Order::kActivation);
++  // Not while this window closes -- the page would close with it, its entry
++  // spent -- nor under a drag, whose tabs an insert would move: the
++  // auto-archive's two rules (review).
++  const DesktopBrowserWindowCapabilities* const capabilities =
++      browser_->capabilities();
++  TabStripModel* const model = browser_->GetTabStripModel();
++  if (last_used != browser_ || !capabilities ||
++      capabilities->IsAttemptingToCloseBrowser() ||
++      !model->delegate()->IsTabStripEditable()) {
++    return;
++  }
++  Profile* const profile = browser_->GetProfile();
++  const workspaces::archive::ArchiveStore* const store =
++      workspaces::archive::ArchiveStore::GetOrCreate(profile,
++                                                     profile->GetPath());
++  if (!store->loaded() || store->read_only()) {
++    return;
++  }
++  const std::vector<std::string> due =
++      workspaces::archive::DueToWake(store->entries(), base::Time::Now());
++  if (due.empty()) {
++    return;
++  }
++  size_t woke = 0;
++  // The latest first: each goes to the top, so the soonest ends there and
++  // Today reads in wake order, as the Archive's Snoozed rows do (review).
++  for (const std::string& id : std::views::reverse(due)) {
++    if (tabs::TabInterface* const tab =
++            WorkspaceArchiveView::Wake(browser_, id)) {
++      woken_.push_back(tab->GetHandle());
++      ++woke;
+     }
+   }
++  LOG(INFO) << "[workspaces] snooze: woke " << woke << " of " << due.size()
++            << " due tab(s)";
++  ScheduleUpdateBadges();
+ }
+ 
+ tabs::TabInterface* WorkspaceRailView::BadgedTab(std::string_view guid) const {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -16,6 +16,7 @@
+ #include "base/containers/flat_set.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_target.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h"
+@@ -109,7 +110,8 @@ DECLARE_ELEMENT_IDENTIFIER_VALUE(kWorksp
+ // and tells it what to do; everything else is the service's (design 3.1).
+ // Since C14 it watches its window's tab strip for one thing only: which tabs
+ // play sound or record, for the badge a chip shows while such a tab is not on
+-// screen.
++// screen. Since C33 it also keeps the clock that wakes snoozed tabs, and dots
++// the chip of a workspace a tab woke into until that tab is on screen.
+ class WorkspaceRailView : public views::FlexLayoutView,
+                           public views::ContextMenuController,
+                           public ui::SimpleMenuModel::Delegate,
+@@ -317,9 +319,24 @@ class WorkspaceRailView : public views::
+ 
+   // C14: gives every chip the badge of its workspace's alerting tabs that are
+   // not on screen (D7-D9), the tooltip line that says which tab (D11), and
+-  // logs each chip whose alert changed (D13).
++  // logs each chip whose alert changed (D13). C33: else the dot of a tab
++  // that woke from a snooze (WokenTab), first forgetting the woken tabs now
++  // on screen -- seen -- or gone.
+   void UpdateBadges();
+ 
++  // C33: a tab woken from a snooze into workspace `guid` and not yet on
++  // screen -- the one behind its chip's dot -- or null.
++  tabs::TabInterface* WokenTab(std::string_view guid) const;
++
++  // C33: run every archive::kWakeCheckEvery. In the profile's window with
++  // Workspaces activated last, and so in one window only, wakes every snoozed
++  // tab that is due (archive::DueToWake, WorkspaceArchiveView::Wake), and
++  // dots the chips, the latest wake inserted first so the soonest ends at the
++  // top. Not while the window closes, not under a drag, not before the
++  // archive's file has loaded, not while it is read-only. Logs
++  //   "[workspaces] snooze: woke <W> of <D> due tab(s)"
++  void WakeSnoozedTabs();
++
+   // C14: the tab behind workspace `guid`'s badge (D10, B9), or null when the
+   // chip has none. Worked out on every ask and never kept: the press asks
+   // again, and the strip can change in between (B2).
+@@ -418,6 +435,11 @@ class WorkspaceRailView : public views::
+   base::flat_set<tabs::TabHandle> alerting_;
+   bool badges_scheduled_ = false;
+ 
++  // C33: the tabs this window woke from a snooze that are not on screen yet,
++  // for the dots; a handful at most. In memory only: a restart forgets them.
++  std::vector<tabs::TabHandle> woken_;
++  base::RepeatingTimer wake_timer_;
++
+   // C4: the workspace whose chip is lit as a drop's target, empty for none.
+   // A guid, never a chip: Rebuild() deletes the chips, and lights the new one.
+   std::string drop_hover_guid_;
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -54,6 +54,9 @@ enum TabContextMenuCommand {
+   // E15d: run by TabStripCollectionController, as CommandRenameTab is --
+   // the pinned section, and its file, are views-side.
+   CommandPinToWorkspace,
++  // C33: the parent of the "Snooze tab" submenu, its own delegate
++  // (workspace_snooze_sub_menu_model.h), as CommandMoveToWorkspace is.
++  CommandSnoozeTab,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 

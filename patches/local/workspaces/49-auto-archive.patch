@@ -1,0 +1,1681 @@
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -237,11 +237,14 @@ std::optional<SessionID> BrowserTabStrip
+   // IsTryingToQuit() is also an Exit still waiting on "Leave site?", which the
+   // user can cancel, and a tab closed by hand meanwhile is a real close; an
+   // Exit that goes ahead shuts the session service down first, which the
+-  // service reads itself (review, LOCAL.md 52).
++  // service reads itself (review, LOCAL.md 52). The auto-archive's own close
++  // of a page with an unload handler comes back here too: the archive holds
++  // it, so Recently Closed does not (E14d.3).
+   if (workspaces::WorkspaceService* const service =
+-          workspaces::WorkspaceService::From(browser_)) {
+-    service->ArchiveClosingTab(contents,
+-                               browser_shutdown::HasShutdownStarted());
++          workspaces::WorkspaceService::From(browser_);
++      service && !service->ArchiveClosingTab(
++                     contents, browser_shutdown::HasShutdownStarted())) {
++    return std::nullopt;
+   }
+   if (!BrowserSupportsHistoricalEntries()) {
+     return std::nullopt;
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -182,6 +182,13 @@ source_set("workspaces") {
+     # not archived (E14d.1), Chromium's own test of one. Not :url_constants,
+     # which is visible only inside //chrome/common; this re-exports it.
+     "//chrome/common",
++    # "//components/performance_manager" for what the auto-archive asks a
++    # page before closing it (E14d.3): PageNode::HadFormInteraction() and
++    # HadUserEdits() (typed into), IsAudible() and
++    # GetTimeSinceLastAudibleChange() (recently audible), and
++    # PageLiveStateDecorator::Data (capture, devices). A component, so it
++    # cannot reach back into //chrome.
++    "//components/performance_manager",
+     "//components/prefs",
+     "//components/sessions",
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
+@@ -418,4 +418,92 @@ bool MatchesQuery(std::u16string_view se
+       });
+ }
+ 
++std::string_view SweepVerdictName(SweepVerdict verdict) {
++  switch (verdict) {
++    case SweepVerdict::kDue:
++      return "due";
++    case SweepVerdict::kNotDue:
++      return "not due";
++    case SweepVerdict::kActive:
++      return "active";
++    case SweepVerdict::kFavorite:
++      return "favorite";
++    case SweepVerdict::kPinnedItem:
++      return "pinned item";
++    case SweepVerdict::kAnchored:
++      return "anchored";
++    case SweepVerdict::kSplit:
++      return "split";
++    case SweepVerdict::kGrouped:
++      return "group";
++    case SweepVerdict::kNoAddress:
++      return "no address";
++    case SweepVerdict::kAudible:
++      return "audible";
++    case SweepVerdict::kCaptured:
++      return "captured";
++    case SweepVerdict::kDevice:
++      return "device";
++    case SweepVerdict::kDevTools:
++      return "devtools";
++    case SweepVerdict::kPictureInPicture:
++      return "picture-in-picture";
++    case SweepVerdict::kAsksBeforeLeaving:
++      return "leave site";
++    case SweepVerdict::kUnsavedWork:
++      return "unsaved work";
++  }
++  NOTREACHED();
++}
++
++base::Time SweepClock(const SweepFacts& facts) {
++  // A null time is the smallest, so the other one wins when only one is set.
++  const base::Time clock = std::max(facts.last_shown, facts.left_at);
++  return clock.is_null() ? clock : std::max(clock, facts.not_before);
++}
++
++bool IsDueForArchive(base::Time clock, base::Time now, base::TimeDelta after) {
++  // A clock after `now` is a negative age, under any positive `after`.
++  return after.is_positive() && !clock.is_null() && now - clock >= after;
++}
++
++SweepVerdict JudgeForSweep(const SweepFacts& facts,
++                           base::Time now,
++                           base::TimeDelta after) {
++  if (!IsDueForArchive(SweepClock(facts), now, after)) {
++    return SweepVerdict::kNotDue;
++  }
++  // The enum's order, so the first flag that holds names the verdict and the
++  // log's "kept" counts add up to the tabs kept (the header).
++  const std::pair<bool, SweepVerdict> never_list[] = {
++      {facts.active, SweepVerdict::kActive},
++      {facts.favorite, SweepVerdict::kFavorite},
++      {facts.pinned_item, SweepVerdict::kPinnedItem},
++      {facts.anchored, SweepVerdict::kAnchored},
++      {facts.split, SweepVerdict::kSplit},
++      {facts.grouped, SweepVerdict::kGrouped},
++      {facts.no_address, SweepVerdict::kNoAddress},
++      {facts.audible, SweepVerdict::kAudible},
++      {facts.captured, SweepVerdict::kCaptured},
++      {facts.device, SweepVerdict::kDevice},
++      {facts.devtools, SweepVerdict::kDevTools},
++      {facts.picture_in_picture, SweepVerdict::kPictureInPicture},
++      {facts.asks_before_leaving, SweepVerdict::kAsksBeforeLeaving},
++      {facts.unsaved_work, SweepVerdict::kUnsavedWork},
++  };
++  for (const auto& [holds, verdict] : never_list) {
++    if (holds) {
++      return verdict;
++    }
++  }
++  return SweepVerdict::kDue;
++}
++
++base::TimeDelta SweepInterval(base::TimeDelta after) {
++  if (!after.is_positive()) {
++    return base::TimeDelta();
++  }
++  return std::max(std::min(kSweepEvery, after / 2), base::Seconds(30));
++}
++
+ }  // namespace workspaces::archive
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.h
+@@ -130,10 +130,10 @@ class ArchiveStore : public base::Suppor
+   bool Remove(std::string_view id);
+ 
+   // Removes every entry archived at or after `since` -- base::Time() for all
+-  // of them: the screen's Clear all (E14d.2) and the setting's time ranges
+-  // (E14d.3, design 5). Answers how many went. 0, and nothing done, when
+-  // read_only() or before the load: the screen draws nothing until then, so
+-  // there is nothing it could have asked to clear.
++  // of them: the Archive screen's Clear menu, All time (E14d.2's Clear all)
++  // and its three time ranges (E14d.3). Answers how many went. 0, and
++  // nothing done, when read_only() or before the load: the screen draws
++  // nothing until then, so there is nothing it could have asked to clear.
+   size_t RemoveSince(base::Time since);
+ 
+   // Runs `callback` after every change to entries() -- an Add, a Remove, a
+@@ -193,6 +193,135 @@ std::u16string SearchTextFor(const Archi
+ // any order. An empty or all-space query matches every row.
+ bool MatchesQuery(std::u16string_view search_text, std::u16string_view query);
+ 
++// The auto-archive's rules (E14d.3, design 5 "Auto-archive"), free functions
++// over plain values so workspaces_unittests reaches them. The sweep itself --
++// the timer, the tabs, the close -- is WorkspaceService's.
++
++// The longest a window waits between sweeps. A shorter setting sweeps at
++// half its length (SweepInterval), so a test's 2 minutes is watched within 3.
++inline constexpr base::TimeDelta kSweepEvery = base::Minutes(5);
++// A tab that went quiet less than this long ago is still audible to the
++// sweep: a background music tab is silent for the seconds between two tracks
++// (SweepFacts::audible).
++inline constexpr base::TimeDelta kRecentlyAudibleFor = base::Minutes(1);
++// At most this many tabs leave one window per sweep: each close costs about
++// 3n session commands at n = 3,900 tabs (design 5, the E14 table).
++inline constexpr size_t kMaxPerSweep = 25;
++
++// One tab as the sweep sees it. The live signals (audible down to
++// unsaved_work) are false for a tab that is asleep -- discarded, or never
++// loaded since a restore: it has no document, and its age alone decides.
++struct SweepFacts {
++  // WebContents::GetLastActiveTime(): stamped when the tab is SHOWN, never
++  // when it is hidden (web_contents_impl.cc), and saved with the session.
++  base::Time last_shown;
++  // When the user last left the tab in this run (WorkspaceTabData::left_at);
++  // null when not since the start. A tab sat on for 13 hours is 13 hours old
++  // by last_shown the moment it is left, so the later of the two counts.
++  base::Time left_at;
++  // When the last Arc import started (kHeliumWorkspacesArcImportedAt); null
++  // when never. An imported tab's clock starts on its import day (the owner),
++  // and this also covers an import by an older build (36-48), whose tabs
++  // still carry Arc's last-used time. It can only ever delay an archive.
++  base::Time not_before;
++  // The window's active tab.
++  bool active = false;
++  // A Chromium-pinned tab (a favorite): never archived (E14d.2).
++  bool favorite = false;
++  // A pinned item's page (E15c). Judged before `anchored`, which every
++  // pinned item's page also is, so the log tells the two apart.
++  bool pinned_item = false;
++  // The anchor tag (WorkspaceTabData::anchored).
++  bool anchored = false;
++  // A split member (v1: a split closes as a unit).
++  bool split = false;
++  // In a tab group: closing a saved group's last tab deletes the saved group,
++  // which the archive cannot bring back.
++  bool grouped = false;
++  // Nothing the archive could give back: no last committed address, one a
++  // restore cannot open (anything but http, https, file and chrome: blob:,
++  // data:, about:, filesystem:), or an untouched New Tab page. Stricter than
++  // ArchiveClosingTab's rule, which the user's own close keeps.
++  bool no_address = false;
++  // Playing sound now, or stopped less than kRecentlyAudibleFor ago
++  // (WebContents::IsCurrentlyAudible; performance_manager's PageNode::
++  // IsAudible() and GetTimeSinceLastAudibleChange()).
++  bool audible = false;
++  // Being captured (WebContents::IsBeingCaptured), or capturing the camera,
++  // the microphone, a window or the display, or being mirrored
++  // (performance_manager's PageLiveStateDecorator).
++  bool captured = false;
++  // Connected to a USB, Bluetooth, HID or serial device
++  // (PageLiveStateDecorator).
++  bool device = false;
++  // DevTools attached to it.
++  bool devtools = false;
++  // Showing a picture-in-picture video or document.
++  bool picture_in_picture = false;
++  // A live frame has a beforeunload handler: a timer must never raise a
++  // "Leave site?" out of nowhere (design 5, the E14 table).
++  bool asks_before_leaving = false;
++  // The user typed into the page: performance_manager's
++  // PageNode::HadFormInteraction() or HadUserEdits(). The archive keeps the
++  // address, never what was typed.
++  bool unsaved_work = false;
++};
++
++// What the sweep decides for one tab. kDue is the only verdict that closes;
++// every verdict after kNotDue is a tab old enough that the sweep KEPT, so the
++// log's "kept" counts name only tabs the timer would otherwise have closed.
++// JudgeForSweep checks them, and the log lists them, in this order: the tab's
++// place (active down to a group), then what it can give back, then what it
++// is doing (audible down to unsaved work).
++enum class SweepVerdict {
++  kDue,
++  kNotDue,
++  kActive,
++  kFavorite,
++  kPinnedItem,
++  kAnchored,
++  kSplit,
++  kGrouped,
++  kNoAddress,
++  kAudible,
++  kCaptured,
++  kDevice,
++  kDevTools,
++  kPictureInPicture,
++  kAsksBeforeLeaving,
++  kUnsavedWork,
++  kMaxValue = kUnsavedWork,
++};
++
++// The log's word for a verdict: "due", "not due", "active", "favorite",
++// "pinned item", "anchored", "split", "group", "no address", "audible",
++// "captured", "device", "devtools", "picture-in-picture", "leave site",
++// "unsaved work".
++std::string_view SweepVerdictName(SweepVerdict verdict);
++
++// The time a tab's age counts from: the latest of last_shown, left_at and
++// not_before; null only when last_shown and left_at both are -- not_before
++// never gives a tab a clock it lacks.
++base::Time SweepClock(const SweepFacts& facts);
++
++// Whether a tab whose clock is `clock` has been left alone for at least
++// `after` at `now`. False for `after` <= 0 (Never), a null clock, and a clock
++// after `now` (the clock went back): the timer never guesses.
++bool IsDueForArchive(base::Time clock, base::Time now, base::TimeDelta after);
++
++// The verdict for one tab, checked in this order: its age first
++// (IsDueForArchive(SweepClock(facts), ...), else kNotDue), then the
++// never-list in the enum's order, active down to unsaved_work -- the first
++// that holds is the verdict -- else kDue.
++SweepVerdict JudgeForSweep(const SweepFacts& facts,
++                           base::Time now,
++                           base::TimeDelta after);
++
++// How often a window sweeps for the setting `after`: the smaller of
++// kSweepEvery and half of `after`, never under 30 seconds; TimeDelta() -- no
++// timer -- for `after` <= 0 (Never).
++base::TimeDelta SweepInterval(base::TimeDelta after);
++
+ }  // namespace workspaces::archive
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_ARCHIVE_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
+@@ -6,8 +6,10 @@
+ 
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/files/file_path.h"
+@@ -410,7 +412,8 @@ TEST_F(ArchiveStoreTest, RemoveSinceTheB
+   EXPECT_EQ(IdsOnDisk(), IdList());
+ }
+ 
+-// The setting's time ranges (E14d.3): "since" counts itself in.
++// The Archive screen's delete by time range (E14d.3): "since" counts itself
++// in.
+ TEST_F(ArchiveStoreTest, RemoveSinceATimeKeepsWhatIsOlder) {
+   const base::Time now = base::Time::Now();
+   std::unique_ptr<ArchiveStore> store = LoadedStore();
+@@ -530,5 +533,186 @@ TEST(WorkspaceArchiveTest, SearchFoldsCa
+   EXPECT_TRUE(MatchesQuery(text, u"\u00C4PFEL"));
+ }
+ 
++// ------------------------------------------------ the auto-archive (E14d.3)
++
++constexpr base::TimeDelta kDay = base::Days(1);
++
++base::Time SweepNow() {
++  return base::Time::FromSecondsSinceUnixEpoch(1'760'000'000);
++}
++
++// A tab shown `age` ago, with none of the never-list's flags.
++SweepFacts ShownAgo(base::TimeDelta age) {
++  SweepFacts facts;
++  facts.last_shown = SweepNow() - age;
++  return facts;
++}
++
++// Never is 0, and a hand-edited negative value is Never too: the timer never
++// guesses.
++TEST(WorkspaceAutoArchiveTest, NeverArchivesAtZeroOrBelow) {
++  const base::Time long_ago = SweepNow() - base::Days(365);
++  EXPECT_FALSE(IsDueForArchive(long_ago, SweepNow(), base::TimeDelta()));
++  EXPECT_FALSE(IsDueForArchive(long_ago, SweepNow(), -kDay));
++}
++
++TEST(WorkspaceAutoArchiveTest, ANullOrFutureClockIsNeverDue) {
++  EXPECT_FALSE(IsDueForArchive(base::Time(), SweepNow(), kDay));
++  // The clock went back.
++  EXPECT_FALSE(IsDueForArchive(SweepNow() + base::Minutes(1), SweepNow(),
++                               base::Minutes(1)));
++}
++
++// "At least": exactly `after` is due, a second less is not.
++TEST(WorkspaceAutoArchiveTest, DueAtExactlyTheSetting) {
++  EXPECT_TRUE(IsDueForArchive(SweepNow() - kDay, SweepNow(), kDay));
++  EXPECT_FALSE(IsDueForArchive(SweepNow() - kDay + base::Seconds(1),
++                               SweepNow(), kDay));
++  EXPECT_TRUE(IsDueForArchive(SweepNow() - kDay - base::Seconds(1),
++                              SweepNow(), kDay));
++}
++
++// A tab sat on for hours is as old as its last_shown the moment it is left:
++// the later of the two counts, whichever it is.
++TEST(WorkspaceAutoArchiveTest, TheClockIsTheLaterOfShownAndLeft) {
++  SweepFacts facts;
++  EXPECT_TRUE(SweepClock(facts).is_null());
++
++  facts.last_shown = SweepNow() - base::Hours(13);
++  EXPECT_EQ(SweepClock(facts), facts.last_shown);
++  facts.left_at = SweepNow() - base::Minutes(5);
++  EXPECT_EQ(SweepClock(facts), facts.left_at);
++
++  facts.last_shown = SweepNow() - base::Minutes(1);
++  EXPECT_EQ(SweepClock(facts), facts.last_shown);
++
++  facts.last_shown = base::Time();
++  EXPECT_EQ(SweepClock(facts), facts.left_at);
++}
++
++// The last Arc import only ever delays: a tab imported by an older build
++// still carries Arc's last-used time, and its clock starts at the import.
++TEST(WorkspaceAutoArchiveTest, NotBeforeOnlyEverDelays) {
++  SweepFacts facts = ShownAgo(base::Days(3));
++  facts.left_at = SweepNow() - base::Days(2);
++  EXPECT_EQ(JudgeForSweep(facts, SweepNow(), kDay), SweepVerdict::kDue);
++
++  facts.not_before = SweepNow() - base::Hours(1);
++  EXPECT_EQ(SweepClock(facts), facts.not_before);
++  EXPECT_EQ(JudgeForSweep(facts, SweepNow(), kDay), SweepVerdict::kNotDue);
++
++  facts.not_before = SweepNow() - base::Days(5);
++  EXPECT_EQ(SweepClock(facts), facts.left_at);
++  EXPECT_EQ(JudgeForSweep(facts, SweepNow(), kDay), SweepVerdict::kDue);
++
++  // Never a clock for a tab that has none of its own.
++  SweepFacts no_clock;
++  no_clock.not_before = SweepNow() - base::Days(5);
++  EXPECT_TRUE(SweepClock(no_clock).is_null());
++  EXPECT_EQ(JudgeForSweep(no_clock, SweepNow(), kDay), SweepVerdict::kNotDue);
++}
++
++// Age first: a tab not due is kNotDue whatever else holds, so the log's kept
++// counts name only tabs the timer would otherwise have closed.
++TEST(WorkspaceAutoArchiveTest, AgeIsJudgedBeforeTheNeverList) {
++  SweepFacts young = ShownAgo(base::Hours(1));
++  young.audible = true;
++  young.active = true;
++  EXPECT_EQ(JudgeForSweep(young, SweepNow(), kDay), SweepVerdict::kNotDue);
++
++  // Never, even for a tab with nothing to keep it.
++  EXPECT_EQ(JudgeForSweep(ShownAgo(base::Days(365)), SweepNow(),
++                          base::TimeDelta()),
++            SweepVerdict::kNotDue);
++}
++
++TEST(WorkspaceAutoArchiveTest, TheNeverListIsJudgedInTheEnumsOrder) {
++  SweepFacts facts = ShownAgo(base::Days(2));
++  facts.active = true;
++  facts.favorite = true;
++  EXPECT_EQ(JudgeForSweep(facts, SweepNow(), kDay), SweepVerdict::kActive);
++
++  // Every pinned item's page is anchored too: the log must say which.
++  SweepFacts pinned = ShownAgo(base::Days(2));
++  pinned.pinned_item = true;
++  pinned.anchored = true;
++  EXPECT_EQ(JudgeForSweep(pinned, SweepNow(), kDay),
++            SweepVerdict::kPinnedItem);
++
++  // The E14d.3 review's neighbours, each pair with the earlier one winning.
++  struct Neighbours {
++    bool SweepFacts::* first;
++    bool SweepFacts::* second;
++    SweepVerdict verdict;
++  };
++  const Neighbours neighbours[] = {
++      {&SweepFacts::split, &SweepFacts::grouped, SweepVerdict::kSplit},
++      {&SweepFacts::grouped, &SweepFacts::no_address, SweepVerdict::kGrouped},
++      {&SweepFacts::captured, &SweepFacts::device, SweepVerdict::kCaptured},
++      {&SweepFacts::device, &SweepFacts::devtools, SweepVerdict::kDevice},
++  };
++  for (const auto& [first, second, verdict] : neighbours) {
++    SCOPED_TRACE(SweepVerdictName(verdict));
++    SweepFacts both = ShownAgo(base::Days(2));
++    both.*first = true;
++    both.*second = true;
++    EXPECT_EQ(JudgeForSweep(both, SweepNow(), kDay), verdict);
++  }
++}
++
++// Each flag alone keeps a due tab, under its own verdict.
++TEST(WorkspaceAutoArchiveTest, EachNeverListFlagAloneKeepsADueTab) {
++  EXPECT_EQ(JudgeForSweep(ShownAgo(base::Days(2)), SweepNow(), kDay),
++            SweepVerdict::kDue);
++
++  const std::pair<bool SweepFacts::*, SweepVerdict> flags[] = {
++      {&SweepFacts::active, SweepVerdict::kActive},
++      {&SweepFacts::favorite, SweepVerdict::kFavorite},
++      {&SweepFacts::pinned_item, SweepVerdict::kPinnedItem},
++      {&SweepFacts::anchored, SweepVerdict::kAnchored},
++      {&SweepFacts::split, SweepVerdict::kSplit},
++      {&SweepFacts::grouped, SweepVerdict::kGrouped},
++      {&SweepFacts::no_address, SweepVerdict::kNoAddress},
++      {&SweepFacts::audible, SweepVerdict::kAudible},
++      {&SweepFacts::captured, SweepVerdict::kCaptured},
++      {&SweepFacts::device, SweepVerdict::kDevice},
++      {&SweepFacts::devtools, SweepVerdict::kDevTools},
++      {&SweepFacts::picture_in_picture, SweepVerdict::kPictureInPicture},
++      {&SweepFacts::asks_before_leaving, SweepVerdict::kAsksBeforeLeaving},
++      {&SweepFacts::unsaved_work, SweepVerdict::kUnsavedWork},
++  };
++  for (const auto& [flag, verdict] : flags) {
++    SCOPED_TRACE(SweepVerdictName(verdict));
++    SweepFacts facts = ShownAgo(base::Days(2));
++    facts.*flag = true;
++    EXPECT_EQ(JudgeForSweep(facts, SweepNow(), kDay), verdict);
++  }
++}
++
++// Half the setting, capped at kSweepEvery, floored at 30 seconds; no timer
++// for Never.
++TEST(WorkspaceAutoArchiveTest, SweepInterval) {
++  EXPECT_EQ(SweepInterval(base::Minutes(2)), base::Seconds(60));
++  EXPECT_EQ(SweepInterval(kDay), kSweepEvery);
++  EXPECT_EQ(SweepInterval(base::Seconds(40)), base::Seconds(30));
++  EXPECT_EQ(SweepInterval(base::TimeDelta()), base::TimeDelta());
++  EXPECT_EQ(SweepInterval(-kDay), base::TimeDelta());
++}
++
++// The log reads them back: each distinct, none empty.
++TEST(WorkspaceAutoArchiveTest, EveryVerdictHasItsOwnName) {
++  std::set<std::string_view> names;
++  for (int i = 0; i <= static_cast<int>(SweepVerdict::kMaxValue); ++i) {
++    const std::string_view name =
++        SweepVerdictName(static_cast<SweepVerdict>(i));
++    EXPECT_FALSE(name.empty()) << i;
++    EXPECT_TRUE(names.insert(name).second) << name;
++  }
++  EXPECT_EQ(SweepVerdictName(SweepVerdict::kDue), "due");
++  EXPECT_EQ(SweepVerdictName(SweepVerdict::kAsksBeforeLeaving), "leave site");
++  EXPECT_EQ(SweepVerdictName(SweepVerdict::kGrouped), "group");
++  EXPECT_EQ(SweepVerdictName(SweepVerdict::kDevice), "device");
++}
++
+ }  // namespace
+ }  // namespace workspaces::archive
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -50,6 +50,9 @@ void RegisterProfilePrefs(PrefRegistrySi
+ 
+   // Null until the first import, which therefore takes everything.
+   registry->RegisterTimePref(kHeliumWorkspacesArcImportedAt, base::Time());
++
++  // Never (the owner, design 5 "Auto-archive").
++  registry->RegisterIntegerPref(kHeliumWorkspacesArchiveAfterMinutes, 0);
+ }
+ 
+ base::DictValue DefaultWorkspacesDict() {
+@@ -251,4 +254,10 @@ std::vector<std::string> GetWorkspaceGui
+   return guids;
+ }
+ 
++base::TimeDelta ArchiveAfter(const PrefService* prefs) {
++  const int minutes =
++      prefs ? prefs->GetInteger(kHeliumWorkspacesArchiveAfterMinutes) : 0;
++  return minutes > 0 ? base::Minutes(minutes) : base::TimeDelta();
++}
++
+ }  // namespace workspaces::prefs
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -9,6 +9,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/time/time.h"
+ #include "base/values.h"
+ 
+ class PrefRegistrySimple;
+@@ -55,6 +56,15 @@ inline constexpr char kHeliumWorkspacesL
+ inline constexpr char kHeliumWorkspacesArcImportedAt[] =
+     "helium.workspaces.arc_imported_at";
+ 
++// How long a tab may go unlooked-at before the auto-archive moves it to the
++// Archive (E14d.3, design 5 "Auto-archive"): minutes, 0 = Never, the default
++// (the owner). The setting offers 1440, 10080 and 43200 (1, 7 and 30 days);
++// any other positive value is honoured too, so a test writes 2 and watches a
++// sweep. A sibling of the prefs above for the reason above, and pinned by the
++// same test.
++inline constexpr char kHeliumWorkspacesArchiveAfterMinutes[] =
++    "helium.workspaces.archive_after_minutes";
++
+ // Keys inside kHeliumWorkspacesList.
+ inline constexpr char kSchemaVersionKey[] = "schema_version";
+ inline constexpr char kItemsKey[] = "items";
+@@ -192,6 +202,10 @@ std::vector<WorkspaceEntry> GetWorkspace
+ // consumes.
+ std::vector<std::string> GetWorkspaceGuids(const PrefService* prefs);
+ 
++// kHeliumWorkspacesArchiveAfterMinutes as a duration: TimeDelta() -- Never --
++// for 0, a negative value, and a null `prefs`.
++base::TimeDelta ArchiveAfter(const PrefService* prefs);
++
+ }  // namespace workspaces::prefs
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -8,6 +8,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/time/time.h"
+ #include "base/values.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "components/prefs/pref_service.h"
+@@ -120,17 +121,56 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+   EXPECT_FALSE(enabled.starts_with(list + "."))
+       << enabled << " is stored inside " << list;
+ 
+-  // Every later pref too (E14c): a dotted path is a JSON node, so a pref named
+-  // inside another would be eaten by the first write of its parent (15).
++  // Every later pref too (E14c, E14d.3): a dotted path is a JSON node, so a
++  // pref named inside another would be eaten by the first write of its parent
++  // (15).
+   const std::string imported_at(kHeliumWorkspacesArcImportedAt);
+-  for (const std::string& other : {enabled, list}) {
+-    EXPECT_FALSE(imported_at.starts_with(other + "."))
+-        << imported_at << " is stored inside " << other;
+-    EXPECT_FALSE(other.starts_with(imported_at + "."))
+-        << other << " is stored inside " << imported_at;
++  const std::string archive_after(kHeliumWorkspacesArchiveAfterMinutes);
++  for (const std::string& later : {imported_at, archive_after}) {
++    for (const std::string& other :
++         {enabled, list, imported_at, archive_after}) {
++      if (other == later) {
++        continue;
++      }
++      EXPECT_FALSE(later.starts_with(other + "."))
++          << later << " is stored inside " << other;
++      EXPECT_FALSE(other.starts_with(later + "."))
++          << other << " is stored inside " << later;
++    }
+   }
+ }
+ 
++// ------------------------------------------------ archive after (E14d.3)
++
++TEST(WorkspacePrefsTest, ArchiveAfterPrefNameIsStable) {
++  EXPECT_STREQ("helium.workspaces.archive_after_minutes",
++               kHeliumWorkspacesArchiveAfterMinutes);
++}
++
++// Never is the default (the owner), and a null PrefService answers the same.
++TEST(WorkspacePrefsTest, ArchiveAfterDefaultsToNever) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  EXPECT_EQ(0, pref_service.GetInteger(kHeliumWorkspacesArchiveAfterMinutes));
++  EXPECT_EQ(base::TimeDelta(), ArchiveAfter(&pref_service));
++  EXPECT_EQ(base::TimeDelta(), ArchiveAfter(nullptr));
++}
++
++// Any positive value is honoured, so a test can set 2 and watch a sweep; a
++// negative one is Never, never a guess.
++TEST(WorkspacePrefsTest, ArchiveAfterReadsMinutes) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  pref_service.SetInteger(kHeliumWorkspacesArchiveAfterMinutes, 2);
++  EXPECT_EQ(base::Minutes(2), ArchiveAfter(&pref_service));
++  pref_service.SetInteger(kHeliumWorkspacesArchiveAfterMinutes, 43200);
++  EXPECT_EQ(base::Days(30), ArchiveAfter(&pref_service));
++  pref_service.SetInteger(kHeliumWorkspacesArchiveAfterMinutes, -5);
++  EXPECT_EQ(base::TimeDelta(), ArchiveAfter(&pref_service));
++}
++
+ // ------------------------------------------------------- registered default
+ 
+ TEST(WorkspacePrefsTest, RegistersWorkspacesPref) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -5,8 +5,10 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cstddef>
+ #include <optional>
++#include <sstream>
+ #include <string>
+ #include <string_view>
+ #include <utility>
+@@ -38,11 +40,15 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/common/webui_url_constants.h"
++#include "components/performance_manager/public/decorators/page_live_state_decorator.h"
++#include "components/performance_manager/public/graph/page_node.h"
++#include "components/performance_manager/public/performance_manager.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/devtools_agent_host.h"
+ #include "content/public/browser/invalidate_type.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+@@ -142,6 +148,72 @@ bool AnotherSessionWindowStays(BrowserWi
+   return stays;
+ }
+ 
++// Chromium's own test of an untouched New Tab page
++// (TabStripModel::IsNewTabAtEndOfTabStrip): nothing to go back to. The door's
++// rule and the sweep's (E14d.3).
++bool IsUntouchedNewTabPage(content::WebContents* contents) {
++  const GURL& url = contents->GetLastCommittedURL();
++  return url.SchemeIs(content::kChromeUIScheme) &&
++         url.host() == chrome::kChromeUINewTabHost &&
++         contents->GetController().GetEntryCount() == 1;
++}
++
++// Keeps `contents` in `window`'s profile archive with `reason`, and logs it:
++// the door's entry and the sweep's are made here, one way (E14d.3). The last
++// committed address, which a restored tab never loaded since has too (design
++// 5): a sleeping import is archived at its page. True when the store took it.
++bool AddToArchive(BrowserWindowInterface* window,
++                  content::WebContents* contents,
++                  archive::ArchiveEntry::Reason reason) {
++  archive::ArchiveEntry entry;
++  entry.id = ArchiveIdForTab(contents);
++  entry.url = contents->GetLastCommittedURL().spec();
++  entry.title = base::UTF16ToUTF8(contents->GetTitle());
++  entry.custom_title = CustomTitleForTab(contents);
++  entry.workspace = WorkspaceGuidForTab(contents);
++  if (entry.workspace.empty()) {
++    entry.workspace = kDefaultWorkspaceGuid;
++  }
++  entry.reason = reason;
++  entry.archived_at = base::Time::Now();
++  entry.last_active = contents->GetLastActiveTime();
++  const std::string workspace = entry.workspace;
++  Profile* const profile = window->GetProfile();
++  const bool added =
++      archive::ArchiveStore::GetOrCreate(profile, profile->GetPath())
++          ->Add(std::move(entry));
++  // Never the address or the title: a log is pasted when asking for help.
++  LOG(INFO) << "[workspaces] archived a " << archive::ReasonName(reason)
++            << " close in '" << workspace << "'"
++            << (added ? "" : " (refused)");
++  return added;
++}
++
++// `contents`'s page as performance_manager sees it, or null without the
++// performance manager.
++base::WeakPtr<performance_manager::PageNode> PageNodeFor(
++    content::WebContents* contents) {
++  if (!performance_manager::PerformanceManager::IsAvailable()) {
++    return nullptr;
++  }
++  return performance_manager::PerformanceManager::
++      GetPrimaryPageNodeForWebContents(contents);
++}
++
++// Whether `page` is audible, or stopped being audible less than
++// archive::kRecentlyAudibleFor ago: the node times its last change either
++// way, so while it is not audible that change was the stop. False with no
++// page node, and for a page never audible (no change time).
++bool WasRecentlyAudible(const performance_manager::PageNode* page) {
++  if (!page) {
++    return false;
++  }
++  const std::optional<base::TimeDelta> since =
++      page->GetTimeSinceLastAudibleChange();
++  return page->IsAudible() ||
++         (since.has_value() && *since < archive::kRecentlyAudibleFor);
++}
++
+ }  // namespace
+ 
+ DEFINE_USER_DATA(WorkspaceService);
+@@ -176,6 +248,11 @@ WorkspaceService::WorkspaceService(
+         prefs::kHeliumWorkspacesEnabled,
+         base::BindRepeating(&WorkspaceService::OnEnabledChanged,
+                             base::Unretained(this)));
++    pref_registrar_.Add(
++        prefs::kHeliumWorkspacesArchiveAfterMinutes,
++        base::BindRepeating(&WorkspaceService::UpdateAutoArchiveTimer,
++                            base::Unretained(this)));
++    UpdateAutoArchiveTimer();
+   }
+ 
+   // The layout half of the gate. The pref above says whether the feature is
+@@ -1078,6 +1155,18 @@ void WorkspaceService::OnTabStripModelCh
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+     const TabStripSelectionChange& selection) {
++  // The auto-archive's clock (E14d.3): the tab the user just left. Not a
++  // discard, which swaps the contents under the SAME tab. Bookkeeping, legal
++  // here (design 2.2), and not gated, so the clock is right when the feature
++  // comes back. The old contents is alive here even for a close: a closed
++  // tab's is destroyed only after the observers ran
++  // (TabStripModel::SendDetachWebContentsNotifications).
++  if (selection.active_tab_changed() &&
++      selection.old_tab != selection.new_tab && selection.old_contents) {
++    WorkspaceTabData::GetOrCreateForWebContents(selection.old_contents.get())
++        ->set_left_at(base::Time::Now());
++  }
++
+   // Stamping is deliberately NOT behind IsEnabled(). A tab opened while the
+   // gate is shut still joins whichever workspace was last active, so it
+   // reappears where the user would expect on the way back to vertical.
+@@ -1282,6 +1371,16 @@ void WorkspaceService::CarryTagAcrossRep
+   if (!replace || !replace->old_contents || !replace->new_contents) {
+     return;
+   }
++  // The auto-archive's clock, before the early return below: the SAME tab.
++  // The new contents gets only the old one's last-shown time
++  // (tab_lifecycle_unit.cc), older than the leave for a tab sat on, so
++  // without it the tab would be archived early (E14d.3).
++  if (const WorkspaceTabData* const old_data =
++          WorkspaceTabData::FromWebContents(replace->old_contents);
++      old_data && !old_data->left_at().is_null()) {
++    WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
++        ->set_left_at(old_data->left_at());
++  }
+   const std::string old_guid = WorkspaceGuidForTab(replace->old_contents);
+   const std::string old_anchor = AnchorUrlForTab(replace->old_contents);
+   const std::string old_title = CustomTitleForTab(replace->old_contents);
+@@ -1642,11 +1741,26 @@ bool WorkspaceService::ClosePinItemPage(
+   return true;
+ }
+ 
+-void WorkspaceService::ArchiveClosingTab(content::WebContents* contents,
++bool WorkspaceService::ArchiveClosingTab(content::WebContents* contents,
+                                          bool quitting) {
++  if (!contents) {
++    return true;
++  }
++  // The auto-archive's own close, before every gate, feature off included:
++  // the sweep kept the entry and closed with CLOSE_NONE, and only a page with
++  // an unload-type handler comes back here, its close deferred until the
++  // renderer answers, with CLOSE_CREATE_HISTORICAL_TAB added
++  // (browser_tabstrip.cc). The archive holds it, so no Recently Closed entry
++  // either (E14d.3).
++  if (const WorkspaceTabData* const data =
++          WorkspaceTabData::FromWebContents(contents);
++      data && data->auto_archived()) {
++    LOG(INFO) << "[workspaces] not archived: the auto-archive's own close";
++    return false;
++  }
+   // IsEnabled() is false without a window too: the file's fail-open rule.
+-  if (!contents || !IsEnabled()) {
+-    return;
++  if (!IsEnabled()) {
++    return true;
+   }
+   // A pinned item's page is never archived (Arc; design 5): the item stays in
+   // the section. Here, in the shared door, not only in ClosePinItemPage: a page
+@@ -1657,7 +1771,7 @@ void WorkspaceService::ArchiveClosingTab
+   // CLOSE_CREATE_HISTORICAL_TAB (review, LOCAL.md 52).
+   if (!PinItemForTab(contents).empty()) {
+     LOG(INFO) << "[workspaces] not archived: a pinned item's page";
+-    return;
++    return true;
+   }
+   // Nor a favorite, a pinned tab (E14c imports Arc's favorites as these): it
+   // belongs to no workspace (design 2.5), so an entry would be filed under
+@@ -1671,14 +1785,14 @@ void WorkspaceService::ArchiveClosingTab
+           tabs::TabInterface::MaybeGetFromContents(contents);
+       tab && tab->IsPinned()) {
+     LOG(INFO) << "[workspaces] not archived: a favorite (a pinned tab)";
+-    return;
++    return true;
+   }
+   // Before the window rule: a quit that skips unload handlers (a silent exit,
+   // log-off) marks no window closing, so every tab would pass as `manual`
+   // (review, LOCAL.md 52).
+   if (quitting) {
+     LOG(INFO) << "[workspaces] not archived: the browser is quitting";
+-    return;
++    return true;
+   }
+   archive::ArchiveEntry::Reason reason = archive::ArchiveEntry::Reason::kManual;
+   if (IsCloseCommitted(browser_window_)) {
+@@ -1695,48 +1809,221 @@ void WorkspaceService::ArchiveClosingTab
+         !AnotherSessionWindowStays(browser_window_)) {
+       LOG(INFO) << "[workspaces] not archived: the session keeps the last "
+                    "window's tabs";
+-      return;
++      return true;
+     }
+     reason = archive::ArchiveEntry::Reason::kWindow;
+   }
+ 
++  // The door's rule; the sweep's no_address is stricter (archive::SweepFacts).
+   const GURL& url = contents->GetLastCommittedURL();
+   if (!url.is_valid()) {
+     LOG(INFO) << "[workspaces] not archived: no address";
+-    return;
++    return true;
+   }
+-  // Chromium's own test of an untouched New Tab page
+-  // (TabStripModel::IsNewTabAtEndOfTabStrip): nothing to go back to.
+-  if (url.SchemeIs(content::kChromeUIScheme) &&
+-      url.host() == chrome::kChromeUINewTabHost &&
+-      contents->GetController().GetEntryCount() == 1) {
++  if (IsUntouchedNewTabPage(contents)) {
+     LOG(INFO) << "[workspaces] not archived: an untouched New Tab page";
++    return true;
++  }
++  AddToArchive(browser_window_, contents, reason);
++  return true;
++}
++
++void WorkspaceService::UpdateAutoArchiveTimer() {
++  const base::TimeDelta after = prefs::ArchiveAfter(prefs_);
++  const base::TimeDelta interval = archive::SweepInterval(after);
++  if (!interval.is_positive()) {
++    if (auto_archive_timer_.IsRunning()) {
++      auto_archive_timer_.Stop();
++      LOG(INFO) << "[workspaces] auto-archive: off";
++    }
+     return;
+   }
++  // (Re)started on every call with a setting: the pref observer runs only on
++  // a real change, so each call is a new setting, and the line names it even
++  // where the interval stays (7 and 30 days both sweep every kSweepEvery).
++  // The receiver form binds base::Unretained(this): the timer is a member, so
++  // it cannot fire after this is gone.
++  auto_archive_timer_.Start(FROM_HERE, interval, this,
++                            &WorkspaceService::SweepForAutoArchive);
++  LOG(INFO) << "[workspaces] auto-archive: after " << after.InMinutes()
++            << " min, sweeping every " << interval.InSeconds() << " s";
++}
+ 
+-  // The last committed address, which a restored tab never loaded since has
+-  // too (design 5): a sleeping import is archived at its page.
+-  archive::ArchiveEntry entry;
+-  entry.id = ArchiveIdForTab(contents);
+-  entry.url = url.spec();
+-  entry.title = base::UTF16ToUTF8(contents->GetTitle());
+-  entry.custom_title = CustomTitleForTab(contents);
+-  entry.workspace = WorkspaceGuidForTab(contents);
+-  if (entry.workspace.empty()) {
+-    entry.workspace = kDefaultWorkspaceGuid;
++void WorkspaceService::SweepForAutoArchive() {
++  if (!IsEnabled()) {
++    return;
+   }
+-  entry.reason = reason;
+-  entry.archived_at = base::Time::Now();
+-  entry.last_active = contents->GetLastActiveTime();
+-  const std::string workspace = entry.workspace;
++  // A closing window's tabs are the session's to keep or the door's to
++  // archive (`window`), and it is asked first: its capabilities, and then its
++  // BrowserWindow, go in the teardown. A drag must not have tabs closed under
++  // it. And with the session service gone an Exit is under way, whose tabs
++  // come back at the next start -- an archived one would come back twice.
++  const DesktopBrowserWindowCapabilities* const capabilities =
++      browser_window_->capabilities();
+   Profile* const profile = browser_window_->GetProfile();
+-  const bool added =
+-      archive::ArchiveStore::GetOrCreate(profile, profile->GetPath())
+-          ->Add(std::move(entry));
+-  // Never the address or the title: a log is pasted when asking for help.
+-  LOG(INFO) << "[workspaces] archived a " << archive::ReasonName(reason)
+-            << " close in '" << workspace << "'"
+-            << (added ? "" : " (refused)");
++  const char* skipped = nullptr;
++  if (!capabilities || capabilities->IsAttemptingToCloseBrowser()) {
++    skipped = "the window is closing";
++  } else if (!tab_strip_->delegate()->IsTabStripEditable()) {
++    skipped = "the strip is not editable";
++  } else if (!SessionServiceFactory::GetForProfileIfExisting(profile)) {
++    skipped = "the session service is gone";
++  } else {
++    // No tab leaves before the archive's file is read: a close held until
++    // then is dropped if the file proves read-only, and a read-only file
++    // refuses every entry. GetOrCreate starts the read if nothing has.
++    const archive::ArchiveStore* const store =
++        archive::ArchiveStore::GetOrCreate(profile, profile->GetPath());
++    if (!store->loaded()) {
++      skipped = "the archive is not loaded yet";
++    } else if (store->read_only()) {
++      skipped = "the archive is read-only";
++    }
++  }
++  if (skipped) {
++    LOG(INFO) << "[workspaces] auto-archive sweep: skipped (" << skipped
++              << ")";
++    return;
++  }
++
++  const base::Time now = base::Time::Now();
++  const base::TimeDelta after = prefs::ArchiveAfter(prefs_);
++  const base::Time not_before =
++      prefs_->GetTime(prefs::kHeliumWorkspacesArcImportedAt);
++  const tabs::TabInterface* const active = tab_strip_->GetActiveTab();
++  std::array<int,
++             static_cast<size_t>(archive::SweepVerdict::kMaxValue) + 1>
++      verdicts{};
++  struct Due {
++    base::Time clock;
++    tabs::TabHandle tab;
++  };
++  std::vector<Due> due;
++  int total = 0;
++  // The strip's own iterator, not GetTabAtIndex(): an index lookup walks the
++  // collection tree, n walks per sweep at 3,900 tabs (LOCAL.md 37).
++  for (tabs::TabInterface* const tab : *tab_strip_) {
++    content::WebContents* const contents = tab->GetContents();
++    if (!contents) {
++      continue;
++    }
++    ++total;
++    // Read off the tab's data directly: the sweep returned above while the
++    // feature is off, and a pinned tab is judged a favorite first.
++    const WorkspaceTabData* const data =
++        WorkspaceTabData::FromWebContents(contents);
++    // A close of this sweep's still waiting on its unload handler: its entry
++    // is kept, and judging it again would log it refused (/code-review).
++    if (data && data->auto_archived()) {
++      continue;
++    }
++    archive::SweepFacts facts;
++    facts.last_shown = contents->GetLastActiveTime();
++    facts.left_at = data ? data->left_at() : base::Time();
++    facts.not_before = not_before;
++    // The age first: most tabs are young, and the live signals below cost a
++    // page lookup and a frame walk each, for every tab (/code-review).
++    if (!archive::IsDueForArchive(archive::SweepClock(facts), now, after)) {
++      ++verdicts[static_cast<size_t>(archive::SweepVerdict::kNotDue)];
++      continue;
++    }
++    // performance_manager's page, and the live state its
++    // PageLiveStateDecorator keeps (added to the graph and fed by
++    // chrome/browser/performance_manager), looked up once; null for none.
++    const base::WeakPtr<performance_manager::PageNode> page =
++        PageNodeFor(contents);
++    const performance_manager::PageLiveStateDecorator::Data* const live =
++        page ? performance_manager::PageLiveStateDecorator::Data::FromPageNode(
++                   page.get())
++             : nullptr;
++    const GURL& url = contents->GetLastCommittedURL();
++    facts.active = tab == active;
++    facts.favorite = tab->IsPinned();
++    facts.pinned_item = data && !data->pin_item().empty();
++    facts.anchored = data && data->anchored();
++    facts.split = tab->IsSplit();
++    facts.grouped = tab->GetGroup().has_value();
++    facts.no_address = !url.is_valid() ||
++                       !(url.SchemeIsHTTPOrHTTPS() || url.SchemeIsFile() ||
++                         url.SchemeIs(content::kChromeUIScheme)) ||
++                       IsUntouchedNewTabPage(contents);
++    facts.audible =
++        contents->IsCurrentlyAudible() || WasRecentlyAudible(page.get());
++    facts.captured =
++        contents->IsBeingCaptured() ||
++        (live && (live->IsCapturingVideo() || live->IsCapturingAudio() ||
++                  live->IsCapturingWindow() || live->IsCapturingDisplay() ||
++                  live->IsBeingMirrored()));
++    facts.device = live && (live->IsConnectedToUSBDevice() ||
++                            live->IsConnectedToBluetoothDevice() ||
++                            live->IsConnectedToHidDevice() ||
++                            live->IsConnectedToSerialPort());
++    facts.devtools = content::DevToolsAgentHost::IsDebuggerAttached(contents);
++    facts.picture_in_picture = contents->HasPictureInPictureVideo() ||
++                               contents->HasPictureInPictureDocument();
++    facts.asks_before_leaving = AsksBeforeLeaving(contents);
++    facts.unsaved_work =
++        page && (page->HadFormInteraction() || page->HadUserEdits());
++    const archive::SweepVerdict verdict =
++        archive::JudgeForSweep(facts, now, after);
++    ++verdicts[static_cast<size_t>(verdict)];
++    if (verdict == archive::SweepVerdict::kDue) {
++      due.push_back({archive::SweepClock(facts), tab->GetHandle()});
++    }
++  }
++
++  // Oldest clock first, and at most kMaxPerSweep: the rest wait a sweep.
++  std::ranges::sort(
++      due, [](const Due& a, const Due& b) { return a.clock < b.clock; });
++  const size_t taken = std::min(due.size(), archive::kMaxPerSweep);
++  int archived = 0;
++  int refused = 0;
++  for (size_t i = 0; i < taken; ++i) {
++    // Handles, re-resolved per close, as CloseWorkspaceTabs() does: every
++    // close renumbers the strip. Add() never touches it (its callbacks post),
++    // so `index` still holds at the close.
++    tabs::TabInterface* const tab = due[i].tab.Get();
++    const int index =
++        tab ? tab_strip_->GetIndexOfTab(tab) : TabStripModel::kNoTab;
++    if (index == TabStripModel::kNoTab) {
++      continue;
++    }
++    content::WebContents* const contents = tab->GetContents();
++    if (!AddToArchive(browser_window_, contents,
++                      archive::ArchiveEntry::Reason::kAuto)) {
++      ++refused;
++      continue;
++    }
++    // Marked before the close, which may come back through the door later
++    // (ArchiveClosingTab). CLOSE_NONE: no Recently Closed entry -- the
++    // archive holds it, and Recently Closed keeps the user's own closes.
++    // From the timer, outside every observer (design 2.2).
++    WorkspaceTabData::GetOrCreateForWebContents(contents)->set_auto_archived();
++    tab_strip_->CloseWebContentsAt(index, TabCloseTypes::CLOSE_NONE);
++    ++archived;
++  }
++
++  // Counts only: never an address or a title (47's rule).
++  std::ostringstream line;
++  line << "[workspaces] auto-archive sweep: " << total << " tab(s), "
++       << due.size() << " due, " << archived << " archived";
++  if (refused) {
++    line << ", " << refused << " refused";
++  }
++  const char* separator = ", kept: ";
++  for (size_t v = static_cast<size_t>(archive::SweepVerdict::kActive);
++       v < verdicts.size(); ++v) {
++    if (verdicts[v]) {
++      line << separator
++           << archive::SweepVerdictName(static_cast<archive::SweepVerdict>(v))
++           << " " << verdicts[v];
++      separator = ", ";
++    }
++  }
++  if (due.size() > taken) {
++    line << ", " << due.size() - taken << " left for the next sweep";
++  }
++  LOG(INFO) << line.str();
+ }
+ 
+ bool WorkspaceService::ShouldDivertTypedNavigation(
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -17,6 +17,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ref.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "components/prefs/pref_change_registrar.h"
+@@ -431,7 +432,14 @@ class WorkspaceService : public TabStrip
+   // cannot ask (a GN cycle), so the caller passes it. Called from the
+   // delegate's CreateHistoricalTab, INSIDE TabStripModel's close: it reads the
+   // tab and writes the store, never the model (design 2.2).
+-  void ArchiveClosingTab(content::WebContents* contents, bool quitting);
++  //
++  // Answers whether Chromium may keep its Recently Closed entry: false only
++  // for the auto-archive's own close (WorkspaceTabData::auto_archived), asked
++  // BEFORE every gate above, feature off included -- the sweep closes with
++  // CLOSE_NONE, but a page with an unload-type handler comes back here with
++  // CLOSE_CREATE_HISTORICAL_TAB (E14d.3). Logs
++  // "not archived: the auto-archive's own close" for it.
++  bool ArchiveClosingTab(content::WebContents* contents, bool quitting);
+ 
+  private:
+   // TabStripModelObserver:
+@@ -522,7 +530,8 @@ class WorkspaceService : public TabStrip
+   // arrive here as kReplaced. Without this the tag is left on the discarded
+   // contents and the tab silently rejoins the default workspace, minutes after
+   // the user last touched it and with nothing on screen tying it to
+-  // Workspaces.
++  // Workspaces. The anchor, the custom title, the pinned item and the
++  // auto-archive's left_at ride along the same way.
+   void CarryTagAcrossReplacement(const TabStripModelChange::Replace* replace);
+ 
+   // The index this window should activate to show the active workspace, or
+@@ -627,6 +636,47 @@ class WorkspaceService : public TabStrip
+   // rather than at the next rebuild of the view tree (LOCAL.md 12).
+   void OnEnabledChanged();
+ 
++  // The auto-archive (E14d.3, design 5 "Auto-archive"). The timer follows the
++  // setting alone -- (re)started at construction and whenever
++  // kHeliumWorkspacesArchiveAfterMinutes changes, every
++  // archive::SweepInterval(setting), stopped for Never -- and each sweep asks
++  // the feature gate itself, so the layout switch and the enabled toggle need
++  // no hook here. Logs at every (re)start -- construction and each change to a
++  // positive setting, even where the interval stays -- and "off" only when
++  // it stops a running timer:
++  //   "[workspaces] auto-archive: after <M> min, sweeping every <S> s"
++  //   "[workspaces] auto-archive: off"
++  void UpdateAutoArchiveTimer();
++
++  // One sweep of this window's tabs, from the timer, so outside every
++  // observer (design 2.2). Returns at once while IsEnabled() is false;
++  // otherwise skips, checked in this order, and logs
++  //   "[workspaces] auto-archive sweep: skipped (<why>)"
++  // while this window's close is under way ("the window is closing"), while
++  // the strip is not editable (a drag: TabStripModelDelegate::
++  // IsTabStripEditable; "the strip is not editable"), when the profile's
++  // session service is gone (an Exit shuts it down first,
++  // browser_close_manager.cc; "the session service is gone"), until the
++  // archive's file has loaded ("the archive is not loaded yet": a close held
++  // before the load is dropped if the file proves read-only; getting the
++  // store starts its load), and while that file is read-only ("the archive
++  // is read-only": it would refuse every entry).
++  // Otherwise builds each tab's archive::SweepFacts, judges it
++  // (archive::JudgeForSweep), and takes the due tabs oldest clock first, at
++  // most archive::kMaxPerSweep: for each, the entry (reason kAuto, made as
++  // ArchiveClosingTab makes one and logged as it logs one,
++  //   "[workspaces] archived a auto close in '<guid>'" (+ " (refused)"))
++  // is added to the store, and ONLY when the store took it is the tab marked
++  // WorkspaceTabData::set_auto_archived() and closed with CLOSE_NONE -- no
++  // Recently Closed entry: the archive holds it. Then one line per sweep,
++  //   "[workspaces] auto-archive sweep: <T> tab(s), <D> due, <A> archived"
++  // followed, each only when non-zero, by ", <R> refused", ", kept: <verdict>
++  // <n>, <verdict> <n>" (archive::SweepVerdictName, enum order) and ", <L>
++  // left for the next sweep". Never an address or a title (47's rule).
++  void SweepForAutoArchive();
++
++  base::RepeatingTimer auto_archive_timer_;
++
+   std::string active_guid_;
+ 
+   // The guids that exist, cached because IsTabVisible() consults them once per
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.cc
+@@ -18,6 +18,11 @@ WorkspaceTabData::~WorkspaceTabData() =
+ 
+ void WorkspaceTabData::BeforeUnloadDialogCancelled() {
+   archive_id_.clear();
++  // And an auto-archive close answered Stay -- a "Leave site?" handler the
++  // sweep could not see yet -- is off too: the tab lives on, its sweep entry
++  // a duplicate, and its next close is the user's, archived and kept in
++  // Recently Closed rather than dropped by the door (E14d.3).
++  auto_archived_ = false;
+ }
+ 
+ // static
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -7,6 +7,7 @@
+ 
+ #include <string>
+ 
++#include "base/time/time.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ 
+@@ -81,11 +82,31 @@ class WorkspaceTabData : public content:
+   const std::string& archive_id() const { return archive_id_; }
+   void set_archive_id(std::string id) { archive_id_ = std::move(id); }
+ 
++  // When the user last left this tab -- another tab of its window became
++  // active -- for the auto-archive's clock (E14d.3, archive::SweepFacts). Null
++  // until the tab is first left. ponytail: in memory only; after a restart
++  // the tab counts from its saved last-shown time, which is earlier, so at
++  // worst it is archived early -- into the archive, never lost. Persist it
++  // through the session's extra data if the owner meets that.
++  base::Time left_at() const { return left_at_; }
++  void set_left_at(base::Time time) { left_at_ = time; }
++
++  // Set by the auto-archive after the archive took this tab's entry, just
++  // before its close. A page with an unload-type handler closes later,
++  // through CloseContents, which adds CLOSE_CREATE_HISTORICAL_TAB
++  // (browser_tabstrip.cc) and so reaches the delegate's door: the door then
++  // neither archives it again nor lets Chromium keep a Recently Closed entry
++  // (WorkspaceService::ArchiveClosingTab). Cleared, with the archive id,
++  // when "Leave site?" is answered Stay: the close is off, and the tab's
++  // next close is the user's.
++  bool auto_archived() const { return auto_archived_; }
++  void set_auto_archived() { auto_archived_ = true; }
++
+   // content::WebContentsObserver:
+   // "Leave site?" answered Stay: the close is off, but a group or split close
+   // may already have put the id in its Recently Closed entry, whose reopen
+   // would then remove this tab's next close. Its next close mints a new one
+-  // (review, LOCAL.md 52).
++  // (review, LOCAL.md 52). It clears auto_archived too (E14d.3).
+   void BeforeUnloadDialogCancelled() override;
+ 
+  private:
+@@ -100,6 +121,8 @@ class WorkspaceTabData : public content:
+   std::string custom_title_;
+   std::string pin_item_;
+   std::string archive_id_;
++  base::Time left_at_;
++  bool auto_archived_ = false;
+ };
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
+@@ -127,24 +127,21 @@ content::WebContents* AddSleepingTab(Bro
+     extra_data[workspaces::kCustomTitleExtraDataKey] = tab.custom_title;
+   }
+ 
+-  // Only a Today tab carries its age: it is what auto-archive will count
+-  // from (E14d). The session service persists it from here on. The ticks
+-  // formula is session restore's own.
+-  base::Time last_active;
+-  base::TimeTicks last_active_ticks;
+-  const base::Time now = base::Time::Now();
+-  if (!pin && !tab.last_active.is_null() &&
+-      tab.last_active <= now) {
+-    last_active = tab.last_active;
+-    last_active_ticks = base::TimeTicks::Now() - (now - last_active);
+-  }
+-
++  // No age from Arc: an imported tab's clock starts at its import (the owner,
++  // E14d.3), so nothing imported is auto-archived before the chosen time has
++  // passed since. Null last-active times leave the WebContents its own
++  // construction time -- this moment -- as its last-shown time:
++  // WebContentsImpl::Init takes a CreateParams time only when it is not null,
++  // as ReplaceRestoredTab relies on too (browser_tabrestore.cc), and a tab
++  // added hidden is not stamped again until it is shown. The session service
++  // persists that time from here on.
+   TabStripModel* const model = window->GetTabStripModel();
+   return chrome::AddRestoredTab(
+       window, base::span_from_ref(navigation),
+       pin ? model->IndexOfFirstNonPinnedTab() : model->count(),
+       /*selected_navigation=*/0, /*extension_app_id=*/std::string(), group,
+-      /*select=*/false, pin, last_active_ticks, last_active,
++      /*select=*/false, pin, /*last_active_time_ticks=*/base::TimeTicks(),
++      /*last_active_time=*/base::Time(),
+       /*storage_namespace=*/nullptr, sessions::SerializedUserAgentOverride(),
+       extra_data, /*from_session_restore=*/false,
+       /*is_active_browser=*/std::nullopt,
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
+ 
+ #include <algorithm>
++#include <iterator>
+ #include <map>
+ #include <memory>
+ #include <optional>
+@@ -51,6 +52,7 @@
+ #include "ui/accessibility/ax_enums.mojom.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/l10n/l10n_util.h"
++#include "ui/base/menu_source_utils.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/models/dialog_model.h"
+ #include "ui/base/models/image_model.h"
+@@ -68,6 +70,7 @@
+ #include "ui/views/controls/button/checkbox.h"
+ #include "ui/views/controls/button/label_button.h"
+ #include "ui/views/controls/button/md_text_button.h"
++#include "ui/views/controls/button/menu_button_controller.h"
+ #include "ui/views/controls/focus_ring.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/controls/menu/menu_runner.h"
+@@ -82,6 +85,7 @@
+ namespace {
+ 
+ using workspaces::archive::ArchiveEntry;
++using workspaces::archive::ArchiveStore;
+ 
+ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kArchiveSearchFieldId);
+ 
+@@ -98,6 +102,29 @@ constexpr int kSpacing = 8;
+ constexpr int kCommandRestore = 1;
+ constexpr int kCommandDelete = 2;
+ 
++// The Clear… menu's ranges, in its order, each item's command id
++// kCommandClearFirst + its index (E14d.3). Chromium's own words for Clear
++// browsing data's ranges; a zero span is All time.
++struct ClearRange {
++  int label;
++  // An ICU plural over the entries the range would clear.
++  int question;
++  base::TimeDelta span;
++  // Its name in the log.
++  const char* log_name;
++};
++constexpr ClearRange kClearRanges[] = {
++    {IDS_SETTINGS_CLEAR_PERIOD_HOUR, IDS_HELIUM_ARCHIVE_CLEAR_HOUR_CONFIRM,
++     base::Hours(1), "last hour"},
++    {IDS_SETTINGS_CLEAR_PERIOD_24_HOURS, IDS_HELIUM_ARCHIVE_CLEAR_DAY_CONFIRM,
++     base::Hours(24), "last 24 hours"},
++    {IDS_SETTINGS_CLEAR_PERIOD_7_DAYS, IDS_HELIUM_ARCHIVE_CLEAR_WEEK_CONFIRM,
++     base::Days(7), "last 7 days"},
++    {IDS_SETTINGS_CLEAR_PERIOD_EVERYTHING,
++     IDS_HELIUM_ARCHIVE_CLEAR_ALL_CONFIRM, base::TimeDelta(), "all time"},
++};
++constexpr int kCommandClearFirst = 10;
++
+ // What a row says: the name the user gave the tab, else its title, else its
+ // address -- the pinned section's rule (RowText there).
+ std::u16string EntryText(const ArchiveEntry& entry) {
+@@ -120,10 +147,20 @@ std::unique_ptr<views::Label> MakeDayHea
+   return header;
+ }
+ 
+-// Clear all's question, over the `count` entries Delete all would clear.
+-std::u16string ClearAllQuestion(size_t count) {
+-  return l10n_util::GetPluralStringFUTF16(IDS_HELIUM_ARCHIVE_CLEAR_ALL_CONFIRM,
+-                                          static_cast<int>(count));
++// Where `range` starts, from a now taken at each call: RemoveSince() of it
++// takes the range. base::Time() for All time.
++base::Time ClearSince(const ClearRange& range) {
++  return range.span.is_zero() ? base::Time() : base::Time::Now() - range.span;
++}
++
++// How many entries, of every workspace, Delete would clear for `range` now:
++// RemoveSince()'s own test, at or after ClearSince().
++size_t CountToClear(const ArchiveStore& store, const ClearRange& range) {
++  const base::Time since = ClearSince(range);
++  return static_cast<size_t>(std::ranges::count_if(
++      store.entries(), [since](const ArchiveEntry& entry) {
++        return entry.archived_at >= since;
++      }));
+ }
+ 
+ // Takes the Recently Closed tab of the restored entry `id` away too, or
+@@ -327,7 +364,7 @@ void WorkspaceArchiveView::Show(BrowserW
+                    profile, profile->GetPath())));
+   WorkspaceArchiveView* const screen = view.get();
+ 
+-  // No buttons: the rows, Clear all and the close button are the screen's.
++  // No buttons: the rows, Clear… and the close button are the screen's.
+   // The search box takes the focus, so typing filters at once.
+   std::unique_ptr<ui::DialogModel> model =
+       ui::DialogModel::Builder()
+@@ -416,16 +453,26 @@ WorkspaceArchiveView::WorkspaceArchiveVi
+       views::ScrollView::ScrollBarMode::kDisabled);
+   scroll_view_->ClipHeightTo(0, kListMaxHeight);
+ 
+-  // The footer: "Clear all", or in its place the question. Both built now and
++  // The footer: "Clear…", or in its place the question. Both built now and
+   // swapped by visibility. A second dialog would take the focus and close
+   // this bubble, so the confirm is inside it.
+-  auto* const clear_all_row = AddChildView(std::make_unique<views::View>());
+-  clear_all_row->SetLayoutManager(std::make_unique<views::BoxLayout>());
+-  clear_all_ =
+-      clear_all_row->AddChildView(std::make_unique<views::MdTextButton>(
+-          base::BindRepeating(&WorkspaceArchiveView::OnClearAllPressed,
+-                              base::Unretained(this)),
+-          l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_CLEAR_ALL)));
++  auto* const clear_row = AddChildView(std::make_unique<views::View>());
++  clear_row->SetLayoutManager(std::make_unique<views::BoxLayout>());
++  // Its menu through a MenuButtonController, as the rail's "+" (E13 review):
++  // held pressed while the menu is up, the click that closes the menu not
++  // reopening it, and a menu button to MSAA.
++  auto clear = std::make_unique<views::MdTextButton>(
++      views::Button::PressedCallback(),
++      l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_CLEAR));
++  auto clear_menu_controller = std::make_unique<views::MenuButtonController>(
++      clear.get(),
++      base::BindRepeating(&WorkspaceArchiveView::OnClearPressed,
++                          base::Unretained(this)),
++      std::make_unique<views::Button::DefaultButtonControllerDelegate>(
++          clear.get()));
++  clear_menu_controller_ = clear_menu_controller.get();
++  clear->SetButtonController(std::move(clear_menu_controller));
++  clear_ = clear_row->AddChildView(std::move(clear));
+ 
+   confirm_ = AddChildView(std::make_unique<views::View>());
+   confirm_->SetLayoutManager(std::make_unique<views::BoxLayout>(
+@@ -441,12 +488,12 @@ WorkspaceArchiveView::WorkspaceArchiveVi
+       ->set_main_axis_alignment(views::BoxLayout::MainAxisAlignment::kEnd);
+   confirm_buttons
+       ->AddChildView(std::make_unique<views::MdTextButton>(
+-          base::BindRepeating(&WorkspaceArchiveView::OnClearAllConfirmed,
++          base::BindRepeating(&WorkspaceArchiveView::OnClearConfirmed,
+                               base::Unretained(this)),
+-          l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_CLEAR_ALL_OK)))
++          l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_CLEAR_OK)))
+       ->SetStyle(ui::ButtonStyle::kProminent);
+   cancel_ = confirm_buttons->AddChildView(std::make_unique<views::MdTextButton>(
+-      base::BindRepeating(&WorkspaceArchiveView::OnClearAllCancelled,
++      base::BindRepeating(&WorkspaceArchiveView::OnClearCancelled,
+                           base::Unretained(this)),
+       l10n_util::GetStringUTF16(IDS_APP_CANCEL)));
+   confirm_->SetVisible(false);
+@@ -500,6 +547,20 @@ void WorkspaceArchiveView::ShowContextMe
+       views::MenuAnchorPosition::kTopLeft, source_type);
+ }
+ 
++bool WorkspaceArchiveView::IsCommandIdEnabled(int command_id) const {
++  // A range with nothing in it is disabled, or it would ask "Delete 0
++  // archived tabs": E14d.2's disabled Clear… on an empty store, per range
++  // (E14d.3 review). Counted as the menu builds its items (a range emptied
++  // while it is open asks nothing, OnClearRangeChosen). The row menu's
++  // commands are always on.
++  if (command_id < kCommandClearFirst) {
++    return true;
++  }
++  const size_t range = static_cast<size_t>(command_id - kCommandClearFirst);
++  return range >= std::size(kClearRanges) ||
++         CountToClear(*store_, kClearRanges[range]) > 0;
++}
++
+ void WorkspaceArchiveView::ExecuteCommand(int command_id, int event_flags) {
+   // By id, not by row: a rebuild can replace the rows while the menu is open,
+   // and an id the store no longer has does nothing.
+@@ -507,6 +568,11 @@ void WorkspaceArchiveView::ExecuteComman
+     RestoreEntry(context_menu_id_);
+   } else if (command_id == kCommandDelete) {
+     DeleteEntry(context_menu_id_);
++  } else if (command_id >= kCommandClearFirst) {
++    const size_t range = static_cast<size_t>(command_id - kCommandClearFirst);
++    if (range < std::size(kClearRanges)) {
++      OnClearRangeChosen(range);
++    }
+   }
+ }
+ 
+@@ -611,13 +677,15 @@ void WorkspaceArchiveView::Rebuild() {
+   }
+   scroll_view_->SetContents(std::move(contents));
+   ApplyFilter();
+-  clear_all_->SetEnabled(store_->loaded() && !store_->read_only() &&
+-                         !store_->entries().empty());
+-  // An open Clear all question counts what Delete all would clear NOW: a
++  clear_->SetEnabled(store_->loaded() && !store_->read_only() &&
++                     !store_->entries().empty());
++  // An open question counts what Delete would clear NOW, from a fresh now: a
+   // close in another window, or a row's Delete, can land while it waits
+   // (E14d.2 review). Said again, as it was when it appeared.
+   if (confirm_->GetVisible()) {
+-    const std::u16string question = ClearAllQuestion(store_->entries().size());
++    const ClearRange& range = kClearRanges[clear_range_];
++    const std::u16string question = l10n_util::GetPluralStringFUTF16(
++        range.question, static_cast<int>(CountToClear(*store_, range)));
+     if (question != confirm_label_->GetText()) {
+       confirm_label_->SetText(question);
+       GetViewAccessibility().AnnouncePolitely(question);
+@@ -787,34 +855,64 @@ void WorkspaceArchiveView::DeleteEntry(c
+             << (removed ? "" : " (refused)");
+ }
+ 
+-void WorkspaceArchiveView::OnClearAllPressed() {
+-  const size_t count = store_->entries().size();
+-  confirm_label_->SetText(ClearAllQuestion(count));
+-  clear_all_->parent()->SetVisible(false);
++void WorkspaceArchiveView::OnClearPressed(const ui::Event& event) {
++  // The row menu's model, runner and delegate; ExecuteCommand tells the two
++  // menus apart by command id.
++  context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  for (size_t i = 0; i < std::size(kClearRanges); ++i) {
++    context_menu_model_->AddItemWithStringId(
++        kCommandClearFirst + static_cast<int>(i), kClearRanges[i].label);
++  }
++  context_menu_runner_ = std::make_unique<views::MenuRunner>(
++      context_menu_model_.get(), views::MenuRunner::HAS_MNEMONICS);
++  // The event's source type, so a keyboard press opens the menu with its
++  // first item highlighted (the rail's "+").
++  context_menu_runner_->RunMenuAt(
++      GetWidget(), clear_menu_controller_, clear_->GetBoundsInScreen(),
++      views::MenuAnchorPosition::kTopLeft,
++      ui::GetMenuSourceTypeForEvent(event));
++}
++
++void WorkspaceArchiveView::OnClearRangeChosen(size_t range) {
++  const size_t count = CountToClear(*store_, kClearRanges[range]);
++  // The menu counted when it opened; the range's last entry can age out
++  // while it stays open (E14d.3 fix check). Nothing to ask then.
++  if (count == 0) {
++    LOG(INFO) << "[workspaces] archive screen: clear asked, "
++              << kClearRanges[range].log_name << " (0), nothing to clear";
++    return;
++  }
++  clear_range_ = range;
++  confirm_label_->SetText(l10n_util::GetPluralStringFUTF16(
++      kClearRanges[range].question, static_cast<int>(count)));
++  clear_->parent()->SetVisible(false);
+   confirm_->SetVisible(true);
+-  // Cancel, not Delete all, under the keyboard: Enter must not clear.
++  // Cancel, not Delete, under the keyboard: Enter must not clear.
+   cancel_->RequestFocus();
+   // Said aloud: the focus on Cancel reads only "Cancel", never that this
+   // clears every workspace's entries (E14d.2 review).
+   GetViewAccessibility().AnnounceAlert(confirm_label_->GetText());
+-  LOG(INFO) << "[workspaces] archive screen: clear all asked (" << count
+-            << ")";
++  LOG(INFO) << "[workspaces] archive screen: clear asked, "
++            << kClearRanges[range].log_name << " (" << count << ")";
+ }
+ 
+-void WorkspaceArchiveView::OnClearAllConfirmed() {
+-  // Every workspace's entries, whatever the switch shows (the class comment).
+-  const size_t cleared = store_->RemoveSince(base::Time());
++void WorkspaceArchiveView::OnClearConfirmed() {
++  // Every workspace's entries in the range, whatever the switch shows (the
++  // class comment), from a now taken at the press: one that aged out of the
++  // range while the question waited stays (the log says how many went).
++  const size_t cleared =
++      store_->RemoveSince(ClearSince(kClearRanges[clear_range_]));
+   LOG(INFO) << "[workspaces] archive: cleared " << cleared << " entr(ies)";
+   confirm_->SetVisible(false);
+-  clear_all_->parent()->SetVisible(true);
++  clear_->parent()->SetVisible(true);
+   search_->RequestFocus();
+ }
+ 
+-void WorkspaceArchiveView::OnClearAllCancelled() {
+-  LOG(INFO) << "[workspaces] archive screen: clear all cancelled";
++void WorkspaceArchiveView::OnClearCancelled() {
++  LOG(INFO) << "[workspaces] archive screen: clear cancelled";
+   confirm_->SetVisible(false);
+-  clear_all_->parent()->SetVisible(true);
+-  clear_all_->RequestFocus();
++  clear_->parent()->SetVisible(true);
++  clear_->RequestFocus();
+ }
+ 
+ BEGIN_METADATA(WorkspaceArchiveView)
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
+@@ -24,6 +24,7 @@ namespace views {
+ class Checkbox;
+ class Label;
+ class MdTextButton;
++class MenuButtonController;
+ class MenuRunner;
+ class ScrollView;
+ class Textfield;
+@@ -33,6 +34,10 @@ namespace workspaces::archive {
+ class ArchiveStore;
+ }  // namespace workspaces::archive
+ 
++namespace ui {
++class Event;
++}  // namespace ui
++
+ // The Archive screen (E14d.2, design 5 "E14d spec"): the tabs this profile
+ // closed, newest first, under a header per day (Today, Yesterday, then dates),
+ // each row the page's icon and its name. Opened from "Archive" on the rail's
+@@ -45,7 +50,7 @@ class ArchiveStore;
+ //   Yesterday
+ //     (icon) Another page
+ //   ...
+-//   [ Clear all ]
++//   [ Clear… ]  -> Last hour / Last 24 hours / Last 7 days / All time
+ //
+ // - Shows the entries of this window's workspace (ResolveTabGuid: a deleted
+ //   workspace's entries are Home's, design 2.4); "All workspaces", off at every
+@@ -69,11 +74,17 @@ class ArchiveStore;
+ //   split's tab inside a window or group), so Ctrl+Shift+T does not open the
+ //   page twice, not even after a restart.
+ // - Delete on a row's menu removes that entry; the screen stays open.
+-// - Clear all asks first, inside the screen (a second dialog would take the
+-//   focus and close this bubble): "Delete N archived tabs, from every
+-//   workspace?" with Delete all / Cancel, said aloud as it appears, its N
+-//   kept current while it waits. It clears EVERY workspace's entries
+-//   (ArchiveStore::RemoveSince(base::Time())), whatever the switch shows.
++// - "Clear…" is a menu button (the rail's "+" pattern) of four ranges, Chrome's
++//   Clear browsing data ones (E14d.3: the owner put them here, not on the
++//   settings page). A range asks first, inside the screen (a second dialog
++//   would take the focus and close this bubble): "Delete N archived tabs from
++//   the last hour, from every workspace?" (24 hours, 7 days; All time keeps
++//   E14d.2's "Delete N archived tabs, from every workspace?") with Delete /
++//   Cancel, said aloud as it appears, its N kept current while it waits. It
++//   clears EVERY workspace's entries archived at or after now minus the range
++//   (ArchiveStore::RemoveSince, base::Time() for All time, now taken again at
++//   Delete), whatever the switch shows. A range with nothing in it is
++//   disabled on the menu.
+ //
+ // Every row of the store is built once, off the widget, and attached with one
+ // SetContents (E15b: adding children under a layered ancestor walks the whole
+@@ -95,14 +106,18 @@ class ArchiveStore;
+ //   "[workspaces] archive: an entry has no address a tab can open" (a
+ //   WARNING: nothing restored)
+ //   "[workspaces] archive: deleted an entry" (+ " (refused)")
+-//   "[workspaces] archive screen: clear all asked (N)" / "clear all cancelled"
++//   "[workspaces] archive screen: clear asked, <range> (N)", <range> one of
++//   "last hour" / "last 24 hours" / "last 7 days" / "all time"
++//   "[workspaces] archive screen: clear cancelled"
+ //   "[workspaces] archive: cleared N entr(ies)"
+ //
+ // Accessible names the hands-free test presses by (MSAA): the bubble's title
+ // "Archive", the text field "Search archive", the check box "All workspaces",
+ // each row its shown text, the headers "Today" / "Yesterday" / a date, the
+-// buttons "Clear all", "Delete all", "Cancel", and the row menu's "Restore" and
+-// "Delete". Empty lists say "No archived tabs" or "No matches".
++// menu button "Clear…" (U+2026) and its items "Last hour", "Last 24 hours",
++// "Last 7 days", "All time", the buttons "Delete" and "Cancel", and the row
++// menu's "Restore" and "Delete". Empty lists say "No archived tabs" or "No
++// matches".
+ //
+ // A plain view inside the rail's kind of bubble (a ui::DialogModel in a
+ // views::BubbleDialogModelHost, its one custom field), not a
+@@ -135,6 +150,7 @@ class WorkspaceArchiveView : public view
+       ui::mojom::MenuSourceType source_type) override;
+ 
+   // ui::SimpleMenuModel::Delegate:
++  bool IsCommandIdEnabled(int command_id) const override;
+   void ExecuteCommand(int command_id, int event_flags) override;
+ 
+  private:
+@@ -162,10 +178,12 @@ class WorkspaceArchiveView : public view
+   // Removes the entry `id`; the store's callback redraws.
+   void DeleteEntry(const std::string& id);
+ 
+-  // The footer's two states: "Clear all", and its confirm.
+-  void OnClearAllPressed();
+-  void OnClearAllConfirmed();
+-  void OnClearAllCancelled();
++  // The footer's two states: "Clear…" with its menu of ranges, and the
++  // confirm of the range chosen (an index into the .cc's kClearRanges).
++  void OnClearPressed(const ui::Event& event);
++  void OnClearRangeChosen(size_t range);
++  void OnClearConfirmed();
++  void OnClearCancelled();
+ 
+   const raw_ptr<BrowserWindowInterface> browser_;
+   const raw_ptr<workspaces::archive::ArchiveStore> store_;
+@@ -180,9 +198,13 @@ class WorkspaceArchiveView : public view
+   // The tallest the list has been laid out while the screen is open: its
+   // floor, so it only grows (ApplyFilter).
+   int list_height_ = 0;
+-  // The footer's two children, one shown at a time: "Clear all", and its
+-  // confirm (the question, Delete all, Cancel).
+-  raw_ptr<views::MdTextButton> clear_all_ = nullptr;
++  // The footer's two children, one shown at a time: "Clear…", and its
++  // confirm (the question, Delete, Cancel).
++  raw_ptr<views::MdTextButton> clear_ = nullptr;
++  // Owned by `clear_`: holds it pressed while its menu is up (the rail's "+").
++  raw_ptr<views::MenuButtonController> clear_menu_controller_ = nullptr;
++  // The range the confirm asks about, while it shows.
++  size_t clear_range_ = 0;
+   raw_ptr<views::View> confirm_ = nullptr;
+   raw_ptr<views::Label> confirm_label_ = nullptr;
+   raw_ptr<views::MdTextButton> cancel_ = nullptr;
+@@ -192,7 +214,8 @@ class WorkspaceArchiveView : public view
+   std::vector<Row> rows_;
+ 
+   // The entry id the open row menu belongs to (the rail's pattern: the menu
+-  // runs, ExecuteCommand arrives later with a command id only).
++  // runs, ExecuteCommand arrives later with a command id only). The model and
++  // runner below serve the Clear… menu too; its command ids are its own.
+   std::string context_menu_id_;
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
+   std::unique_ptr<views::MenuRunner> context_menu_runner_;

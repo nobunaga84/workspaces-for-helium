@@ -1,0 +1,56 @@
+--- a/chrome/browser/glic/browser_ui/tab_underline_view.cc
++++ b/chrome/browser/glic/browser_ui/tab_underline_view.cc
+@@ -156,8 +156,8 @@ void TabUnderlineView::PopulateShaderUni
+ 
+ void TabUnderlineView::OnThemeChanged() {
+   View::OnThemeChanged();
+-  colors_ = GetEffectColors();
+-  SchedulePaint();
++  colors_for_active_tab_.reset();  // a theme change recolours every underline
++  OnActiveTabChanged(nullptr);
+ }
+ 
+ void TabUnderlineView::AddedToWidget() {
+@@ -260,6 +260,15 @@ void TabUnderlineView::DrawEffect(gfx::C
+ 
+ void TabUnderlineView::OnActiveTabChanged(
+     BrowserWindowInterface* browser_window_interface) {
++  // Helium Workspaces (I1): GetEffectColors() differs only by whether this tab
++  // is the active one, so a switch recolours two underlines, the tab left and
++  // the tab shown. Every tab view has one: recolouring them all on every switch
++  // was ~37 ms at 3,240 tabs.
++  const bool active = tab_handle_.Get() && tab_handle_.Get()->IsActivated();
++  if (colors_for_active_tab_ == active) {
++    return;
++  }
++  colors_for_active_tab_ = active;
+   colors_ = GetEffectColors();
+   SchedulePaint();
+ }
+--- a/chrome/browser/glic/browser_ui/tab_underline_view.h
++++ b/chrome/browser/glic/browser_ui/tab_underline_view.h
+@@ -121,6 +121,9 @@ class TabUnderlineView : public Animated
+   std::optional<gfx::Insets> insets_;
+ 
+   base::CallbackListSubscription active_tab_subscription_;
++
++  // Whether `colors_` were made for the active tab; unset until made (I1).
++  std::optional<bool> colors_for_active_tab_;
+ };
+ 
+ BEGIN_VIEW_BUILDER(, TabUnderlineView, AnimatedEffectView)
+--- a/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
+@@ -197,6 +197,12 @@ std::optional<int> BaseTabStripRegionVie
+   if (!focused_view) {
+     return std::nullopt;
+   }
++  // Helium Workspaces (I1): focus outside the tab strip -- in the page, after
++  // every tab switch -- is no tab; the loop below searches the whole tab tree
++  // once per tab, ~30 ms per switch at 3,240 tabs.
++  if (tab_strip_view_ && !tab_strip_view_->Contains(focused_view)) {
++    return std::nullopt;
++  }
+ 
+   for (int i = 0; i < tab_strip_model_->count(); ++i) {
+     tabs::TabInterface* tab = tab_strip_model_->GetTabAtIndex(i);

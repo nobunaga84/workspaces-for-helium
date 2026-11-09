@@ -1,0 +1,23 @@
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+@@ -103,6 +103,20 @@ UnpinnedTabContainerView::UnpinnedTabCon
+   collection_node->set_attach_child_to_node(base::BindRepeating(
+       &TabCollectionAnimatingLayoutManager::AnimateAndReparentView,
+       base::Unretained(&layout_manager_.get())));
++  // Helium Workspaces (E19.1): a row of this list moved into a split or a
++  // group (TabCollectionNode::MoveChild, the only caller) is given back the
++  // visibility the workspace rule took. UnpinnedTabContainerViewLayout hides
++  // the list's OWN rows; SplitTabView and TabGroupViewLayout draw a child with
++  // the visibility it brings (GetVisible()). "Add tab to new split view" adds
++  // a tab and joins it at once, before the tab is stamped with this window's
++  // workspace: hidden as a row for that moment, it stayed an empty half.
++  // TabGroupView::DetachChildView does the same for a collapsed group's tabs.
++  collection_node->set_detach_child_from_node(base::BindRepeating(
++      [](views::View* host, views::View* child) {
++        child->SetVisible(true);
++        return host->RemoveChildViewT(child);
++      },
++      base::Unretained(this)));
+ 
+   node_destroyed_subscription_ = collection_node_->RegisterWillDestroyCallback(
+       base::BindOnce(&UnpinnedTabContainerView::ResetCollectionNode,

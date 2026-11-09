@@ -1,0 +1,366 @@
+--- a/chrome/browser/ui/browser_window/internal/browser_window_features.cc
++++ b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+@@ -535,12 +535,6 @@ void BrowserWindowFeatures::Init(Browser
+   tab_list_bridge_ = std::make_unique<TabListBridge>(
+       *tab_strip_model_, browser->GetUnownedUserDataHost());
+ 
+-  // Helium Workspaces. Created unconditionally for now; the IsEnabled gate
+-  // (TYPE_NORMAL, not off-the-record, vertical layout, pref) lands with the
+-  // rendering hook that first has something to hide.
+-  workspace_service_ = std::make_unique<workspaces::WorkspaceService>(
+-      *tab_strip_model_, browser->GetUnownedUserDataHost());
+-
+   signin_view_controller_ =
+       GetUserDataFactory().CreateInstance<SigninViewController>(
+           *browser, browser, profile, tab_strip_model_);
+@@ -674,6 +668,25 @@ void BrowserWindowFeatures::Init(Browser
+           GetUserDataFactory().CreateInstance<OrganizerPanelController>(
+               *browser, *browser, browser_actions_->root_action_item());
+     }
++
++    // Helium Workspaces. Two of the four conditions in the feature gate
++    // (design 2.8) are paid for by where this stands rather than by a
++    // predicate: inside the TYPE_NORMAL block, so a popup or an app window
++    // never has a service, and behind IsRegularProfile(), so an incognito or
++    // guest window never has one either. That is what Arc does, and it also
++    // keeps workspace edits out of the regular profile prefs and away from a
++    // null SessionService. Every caller already reads a missing service as
++    // show everything, do nothing.
++    //
++    // Must be after vertical_tab_strip_state_controller_: WorkspaceService
++    // asks that controller whether the strip is vertical, and a service built
++    // before it would find nothing there and report the feature permanently
++    // off.
++    if (profile->IsRegularProfile()) {
++      workspace_service_ = std::make_unique<workspaces::WorkspaceService>(
++          *tab_strip_model_, browser->GetUnownedUserDataHost(), browser,
++          profile->GetPrefs());
++    }
+   }
+ 
+   // Constructed last, out of alphabetical order:
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -55,10 +55,18 @@ source_set("workspaces") {
+   ]
+ 
+   deps = [
++    # ":prefs" for the enabled pref and "//chrome/browser/ui/tabs:tabs" for
++    # VerticalTabStripStateController, both read by the feature gate. The
++    # second is already reachable through the public_deps of :tab_strip; it is
++    # listed anyway because this target includes its header directly, and a
++    # public_deps edge in an upstream file is not ours to rely on.
++    ":prefs",
+     ":stamping",
+     "//base",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/tabs:tab_strip",
++    "//chrome/browser/ui/tabs:tabs",
++    "//components/prefs",
+     "//components/tabs:public",
+     "//content/public/browser",
+     "//ui/base/unowned_user_data",
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -12,8 +12,11 @@
+ #include "base/logging.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
++#include "components/prefs/pref_service.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ 
+@@ -32,8 +35,12 @@ DEFINE_USER_DATA(WorkspaceService);
+ 
+ WorkspaceService::WorkspaceService(
+     TabStripModel& tab_strip_model,
+-    ui::UnownedUserDataHost& unowned_user_data_host)
++    ui::UnownedUserDataHost& unowned_user_data_host,
++    BrowserWindowInterface* browser_window,
++    PrefService* prefs)
+     : tab_strip_(tab_strip_model),
++      browser_window_(browser_window),
++      prefs_(prefs),
+       active_guid_(kDefaultWorkspaceGuid),
+       workspaces_({std::string(kDefaultWorkspaceGuid),
+                    std::string(kTemporarySecondWorkspaceGuid)}),
+@@ -50,7 +57,41 @@ WorkspaceService* WorkspaceService::From
+   return browser ? Get(browser->GetUnownedUserDataHost()) : nullptr;
+ }
+ 
++bool WorkspaceService::IsEnabled() const {
++  if (!browser_window_ || !prefs_) {
++    return false;
++  }
++  if (!prefs_->GetBoolean(prefs::kHeliumWorkspacesEnabled)) {
++    return false;
++  }
++
++  // Ask Helium what it already knows, instead of reading prefs::kHeliumLayout
++  // a second time. Three reasons, in order of what a second reading would
++  // have cost: this is the same value the strip lays itself out from, so the
++  // two can never disagree; it folds in the vertical-tabs feature flag, which
++  // a raw pref read does not; and it copies neither the pref name nor the
++  // HeliumLayoutType enum value into this fork, where a rebase could drift
++  // them apart without a word.
++  //
++  // Null when the vertical-tabs feature is off, because BrowserWindowFeatures
++  // builds the controller only in that case -- which is exactly when this
++  // should answer false anyway.
++  const tabs::VerticalTabStripStateController* vertical_tabs =
++      tabs::VerticalTabStripStateController::From(browser_window_);
++  return vertical_tabs && vertical_tabs->ShouldDisplayVerticalTabs();
++}
++
+ void WorkspaceService::SetActiveWorkspace(std::string_view guid) {
++  // Checked here rather than in the command handler because this is the one
++  // funnel every switch goes through, now and later. Without it the shortcut
++  // still fired in classic layout, where nothing is hidden and so nothing
++  // visibly happens -- and then the tabs of whichever workspace it had
++  // wandered off to were missing on the next switch back to vertical, a long
++  // way from the keypress that caused it.
++  if (!IsEnabled()) {
++    return;
++  }
++
+   const std::string_view effective_guid =
+       guid.empty() ? kDefaultWorkspaceGuid : guid;
+   if (std::string_view(active_guid_) == effective_guid) {
+@@ -85,7 +126,7 @@ bool WorkspaceService::IsTabVisible(cons
+       WorkspaceTabData::FromWebContents(contents);
+   return IsVisibleInWorkspace(
+       tab_data ? std::string_view(tab_data->guid()) : std::string_view(),
+-      active_guid_);
++      active_guid_, IsEnabled());
+ }
+ 
+ void WorkspaceService::OnTabStripModelChanged(
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -11,11 +11,13 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/callback_forward.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ref.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ 
+ class BrowserWindowInterface;
++class PrefService;
+ class TabStripModel;
+ 
+ namespace tabs {
+@@ -44,7 +46,9 @@ class WorkspaceService : public TabStrip
+   DECLARE_USER_DATA(WorkspaceService);
+ 
+   WorkspaceService(TabStripModel& tab_strip_model,
+-                   ui::UnownedUserDataHost& unowned_user_data_host);
++                   ui::UnownedUserDataHost& unowned_user_data_host,
++                   BrowserWindowInterface* browser_window,
++                   PrefService* prefs);
+   WorkspaceService(const WorkspaceService&) = delete;
+   WorkspaceService& operator=(const WorkspaceService&) = delete;
+   ~WorkspaceService() override;
+@@ -53,6 +57,21 @@ class WorkspaceService : public TabStrip
+   // does not apply to).
+   static WorkspaceService* From(BrowserWindowInterface* browser);
+ 
++  // Whether Workspaces is live in this window right now (design 2.8).
++  //
++  // Two of the four conditions in the design are paid for at construction
++  // rather than here: BrowserWindowFeatures only builds this service for a
++  // TYPE_NORMAL window on a regular profile, so a popup, an app window, an
++  // incognito window and a guest window simply have no service, and every
++  // caller already reads a missing service as "show everything, do nothing".
++  // What is left are the two that change while the browser runs: the pref,
++  // and whether the tab strip is currently vertical.
++  //
++  // Answers false when it cannot tell. That is the safe direction on both
++  // paths at once: rendering treats "off" as "hide nothing", and the commands
++  // treat it as "do nothing".
++  bool IsEnabled() const;
++
+   // The workspace this window is currently showing. Per window and in memory
+   // only: two windows can show different workspaces, and nothing per-window is
+   // ever written to a pref (design 2.4).
+@@ -89,8 +108,9 @@ class WorkspaceService : public TabStrip
+ 
+   // Whether `tab` is drawn in this window, for the rendering predicate.
+   //
+-  // Fails open: a null tab, a tab with no WebContents, or a tab that has never
+-  // been stamped all return true. Getting this wrong in the other direction
++  // Fails open: a null tab, a tab with no WebContents, a tab that has never
++  // been stamped, and any tab at all while IsEnabled() is false, all return
++  // true. Getting this wrong in the other direction
+   // makes tabs disappear with no way for the user to get them back, so when
+   // this cannot answer, it shows the tab.
+   //
+@@ -107,6 +127,14 @@ class WorkspaceService : public TabStrip
+       const TabStripSelectionChange& selection) override;
+ 
+   const raw_ref<TabStripModel> tab_strip_;
++
++  // The window this service belongs to and the profile prefs behind the gate.
++  // Held rather than looked up because IsEnabled() is called once per tab per
++  // layout pass. Never null in production; IsEnabled() checks anyway rather
++  // than trusting a caller it cannot see.
++  const raw_ptr<BrowserWindowInterface> browser_window_;
++  const raw_ptr<PrefService> prefs_;
++
+   std::string active_guid_;
+ 
+   // Temporary scaffolding, in cycling order. The real list is per profile,
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -26,7 +26,12 @@ std::string ResolveGuidForInsertedTab(st
+ }
+ 
+ bool IsVisibleInWorkspace(std::string_view tab_guid,
+-                          std::string_view active_guid) {
++                          std::string_view active_guid,
++                          bool workspaces_enabled) {
++  if (!workspaces_enabled) {
++    return true;
++  }
++
+   const std::string_view effective_tab =
+       tab_guid.empty() ? kDefaultWorkspaceGuid : tab_guid;
+   const std::string_view effective_active =
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -44,8 +44,17 @@ std::string ResolveGuidForInsertedTab(st
+                                       std::string_view opener_guid,
+                                       std::string_view active_guid);
+ 
+-// Whether a tab is drawn, given the workspace it belongs to and the workspace
+-// its window is currently showing (design 2.7).
++// Whether a tab is drawn, given the workspace it belongs to, the workspace its
++// window is currently showing, and whether Workspaces is switched on at all
++// (design 2.7 and 2.8).
++//
++// `workspaces_enabled` false means every tab is drawn, whatever the guids say,
++// and that direction is not negotiable: with the feature off there is no rail,
++// no shortcut and no menu entry that could bring a hidden tab back, so "off"
++// has to mean "hides nothing" rather than "keeps hiding whatever it last hid".
++// The check lives here rather than in the caller precisely so a test can pin
++// it -- the service that computes the flag cannot be unit-tested in this fork
++// (LOCAL.md 8), but this can.
+ //
+ // An empty guid means the implicit default workspace, not "no workspace", on
+ // both sides. So an unstamped tab is visible exactly when the default workspace
+@@ -56,7 +65,8 @@ std::string ResolveGuidForInsertedTab(st
+ // absent: index -> tab -> handle -> view still resolves, so Ctrl+N, drag math,
+ // context menus and accessibility keep working on hidden tabs.
+ bool IsVisibleInWorkspace(std::string_view tab_guid,
+-                          std::string_view active_guid);
++                          std::string_view active_guid,
++                          bool workspaces_enabled);
+ 
+ // The workspace `offset` positions away from `active_guid` in
+ // `workspaces`, wrapping at both ends: next-from-last is the first, and
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ 
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -12,6 +13,14 @@
+ namespace workspaces {
+ namespace {
+ 
++// Most of these tests are about which guid wins, not about the feature gate,
++// so they say the gate is open once here instead of on every line.
++bool IsVisibleWhenEnabled(std::string_view tab_guid,
++                          std::string_view active_guid) {
++  return IsVisibleInWorkspace(tab_guid, active_guid,
++                              /*workspaces_enabled=*/true);
++}
++
+ // Rule 1 -- an existing tag always wins. This is the rule that makes dragging a
+ // tab between windows and restoring a session work: the tag travels on the tab,
+ // so the receiving window must not restamp it with its own active workspace.
+@@ -45,27 +54,50 @@ TEST(WorkspaceStampingTest, PrecedenceIs
+ }
+ 
+ TEST(WorkspaceVisibilityTest, TabInActiveWorkspaceIsVisible) {
+-  EXPECT_TRUE(IsVisibleInWorkspace("work", "work"));
++  EXPECT_TRUE(IsVisibleWhenEnabled("work", "work"));
+ }
+ 
+ TEST(WorkspaceVisibilityTest, TabInAnotherWorkspaceIsHidden) {
+-  EXPECT_FALSE(IsVisibleInWorkspace("work", "personal"));
++  EXPECT_FALSE(IsVisibleWhenEnabled("work", "personal"));
+ }
+ 
+ // The case that decides whether turning the feature on for the first time is
+ // pleasant or catastrophic: every existing tab is unstamped, and they must all
+ // stay visible while the default workspace is active rather than vanishing.
+ TEST(WorkspaceVisibilityTest, UnstampedTabBelongsToDefaultWorkspace) {
+-  EXPECT_TRUE(IsVisibleInWorkspace("", kDefaultWorkspaceGuid));
+-  EXPECT_FALSE(IsVisibleInWorkspace("", "personal"));
++  EXPECT_TRUE(IsVisibleWhenEnabled("", kDefaultWorkspaceGuid));
++  EXPECT_FALSE(IsVisibleWhenEnabled("", "personal"));
+ }
+ 
+ // Symmetry: an empty active guid means the default workspace too, so a service
+ // that has not been told otherwise shows exactly the unstamped tabs.
+ TEST(WorkspaceVisibilityTest, EmptyActiveGuidMeansDefaultWorkspace) {
+-  EXPECT_TRUE(IsVisibleInWorkspace("", ""));
+-  EXPECT_TRUE(IsVisibleInWorkspace(kDefaultWorkspaceGuid, ""));
+-  EXPECT_FALSE(IsVisibleInWorkspace("work", ""));
++  EXPECT_TRUE(IsVisibleWhenEnabled("", ""));
++  EXPECT_TRUE(IsVisibleWhenEnabled(kDefaultWorkspaceGuid, ""));
++  EXPECT_FALSE(IsVisibleWhenEnabled("work", ""));
++}
++
++// The feature gate, and the direction it has to fail in. With Workspaces off
++// there is no rail, no shortcut and no menu entry that could bring a hidden tab
++// back, so off must mean hides nothing -- not keeps hiding whatever it was
++// hiding when it was switched off.
++TEST(WorkspaceVisibilityTest, DisabledShowsEveryTab) {
++  EXPECT_TRUE(
++      IsVisibleInWorkspace("work", "personal", /*workspaces_enabled=*/false));
++  EXPECT_TRUE(
++      IsVisibleInWorkspace("", "personal", /*workspaces_enabled=*/false));
++  EXPECT_TRUE(IsVisibleInWorkspace(kDefaultWorkspaceGuid, "work",
++                                   /*workspaces_enabled=*/false));
++}
++
++// The other half of the same rule: turning the gate on is what starts hiding
++// tabs. A gate that never changed the answer would pass the test above while
++// doing nothing at all.
++TEST(WorkspaceVisibilityTest, EnablingIsWhatStartsHiding) {
++  EXPECT_TRUE(
++      IsVisibleInWorkspace("work", "personal", /*workspaces_enabled=*/false));
++  EXPECT_FALSE(
++      IsVisibleInWorkspace("work", "personal", /*workspaces_enabled=*/true));
+ }
+ 
+ // A freshly inserted tab is always visible in the window that received it:
+@@ -78,7 +110,7 @@ TEST(WorkspaceStampingTest, NewlyStamped
+                                       kDefaultWorkspaceGuid};
+   for (std::string_view active : actives) {
+     const std::string stamped = ResolveGuidForInsertedTab("", "", active);
+-    EXPECT_TRUE(IsVisibleInWorkspace(stamped, active))
++    EXPECT_TRUE(IsVisibleWhenEnabled(stamped, active))
+         << "stamped '" << stamped << "' but hidden in active '" << active
+         << "'";
+   }
+@@ -151,7 +183,7 @@ TEST(WorkspaceRelativeTest, LandedWorksp
+                                          "work"};
+   for (int offset : {1, -1}) {
+     const std::string landed = RelativeWorkspaceGuid(list, "", offset);
+-    EXPECT_TRUE(IsVisibleInWorkspace(landed, landed))
++    EXPECT_TRUE(IsVisibleWhenEnabled(landed, landed))
+         << "landed on '" << landed << "' with offset " << offset;
+   }
+ }

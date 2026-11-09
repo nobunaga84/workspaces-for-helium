@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "E18.1 reopen-group test fixture",
+  "version": "1",
+  "description": "Test only (LOCAL.md 66): groups three pages, closes their window and reopens it from Recently Closed by id, the path History > Recently closed takes.",
+  "permissions": ["tabs", "tabGroups", "sessions"],
+  "background": { "service_worker": "background.js" }
+}

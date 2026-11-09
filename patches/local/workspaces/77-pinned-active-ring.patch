@@ -1,0 +1,52 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -129,6 +129,7 @@
+ #include "ui/views/interaction/element_tracker_views.h"
+ #include "ui/views/layout/box_layout.h"
+ #include "ui/views/layout/proposed_layout.h"
++#include "ui/views/painter.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_tracker.h"
+ #include "ui/views/view_utils.h"
+@@ -1561,6 +1562,11 @@ class PinRow : public views::LabelButton
+     views::LabelButton::OnThemeChanged();
+     // After the x's own (a view's children hear first): it sets its colours.
+     UpdateCloseImages();
++    // The ring round the page in front is painted in colours (C35.1); only
++    // that row has one -- a list of 1,313 rows is attached at once.
++    if (RowState() == ItemState::kActive) {
++      UpdateColors();
++    }
+   }
+   // From the cursor: entered through a child (the x), the event comes in the
+   // root view's coordinates (RootView::NotifyEnterExitOfDescendant; review).
+@@ -1730,9 +1736,26 @@ class PinRow : public views::LabelButton
+     const ui::ColorId background = frame_active_
+                                        ? kColorTabBackgroundActiveFrameActive
+                                        : kColorTabBackgroundActiveFrameInactive;
+-    SetBackground(active ? views::CreateRoundedRectBackground(background,
+-                                                              kActiveRowRadius)
+-                         : nullptr);
++    // C35.1 (the owner's try): the page in front ringed in its workspace's
++    // colour, as its chip on the bar is -- the highlight alone was 8 levels
++    // over C35's stronger card. A row's colour is its workspace's unless it
++    // is a folder, and a folder is never the page in front. Painted, not a
++    // border: the border holds the row's insets. Colours, not ids: resolved
++    // again on a theme change (OnThemeChanged).
++    const ui::ColorProvider* const provider = GetColorProvider();
++    if (!active) {
++      SetBackground(nullptr);
++    } else if (!provider) {
++      SetBackground(
++          views::CreateRoundedRectBackground(background, kActiveRowRadius));
++    } else {
++      SetBackground(views::CreateBackgroundFromPainter(
++          views::Painter::CreateRoundRectWith1PxBorderPainter(
++              provider->GetColor(background),
++              WorkspaceRailView::WorkspaceColor(*provider, color_,
++                                                frame_active_),
++              kActiveRowRadius)));
++    }
+   }
+ 
+   const std::string id_;

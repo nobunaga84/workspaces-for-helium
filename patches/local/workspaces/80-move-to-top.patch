@@ -1,0 +1,348 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -49,6 +49,7 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/split_tabs/split_tab_id.h"
++#include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/devtools_agent_host.h"
+@@ -906,6 +907,11 @@ int WorkspaceService::MoveTabsToWorkspac
+   if (ResolveTabGuid(guid, known_guids_) != guid) {
+     return 0;
+   }
++  // Nor the workspace on screen (C4): the tabs are already there, and the
++  // move would still take them out of a group that is not moving whole.
++  if (guid == active_guid_) {
++    return 0;
++  }
+ 
+   // Through MovableTabs() again, because the tab context menu comes in here
+   // with its own set: pinned tabs out, split partners in.
+@@ -943,13 +949,128 @@ int WorkspaceService::MoveTabsToWorkspac
+     tab_strip_->RemoveFromGroup(leaving);
+   }
+ 
++  // C4, the owner's rule for every door (the drop on a chip, the chip's "Move
++  // tab here", the tab menu): the tabs go to the TOP of the other workspace's
++  // Today, in their order. Placed BEFORE the retag: every moving tab is still
++  // on screen here, so no move can switch the window, and the anchor -- the
++  // target's first Today tab -- is found by its tag, which no moving tab
++  // carries yet.
++  //
++  // Reconcile's units: a group (still grouped, so every member is moving:
++  // the others' movers just left theirs), else a split, else the tab. Heads
++  // and sizes from the strip, never from a count of the moving tabs: a split
++  // with an open pinned page in it moves only its Today half, and placing it
++  // by that half would carry the page off too -- or CHECK in MoveSplitTo.
++  // Such a split is retagged where it is, as every move was before C4.
++  struct Unit {
++    tabs::TabHandle head;
++    int size = 1;
++    std::optional<tab_groups::TabGroupId> group;
++    std::optional<split_tabs::SplitTabId> split;
++  };
++  std::vector<Unit> units;
++  std::vector<tab_groups::TabGroupId> unit_groups;
++  std::vector<split_tabs::SplitTabId> unit_splits;
++  int splits_left = 0;
++  for (tabs::TabInterface* tab : moving) {
++    if (const std::optional<tab_groups::TabGroupId> group = tab->GetGroup()) {
++      if (!std::ranges::contains(unit_groups, *group)) {
++        unit_groups.push_back(*group);
++        const TabGroup* const tab_group =
++            tab_strip_->group_model()->GetTabGroup(*group);
++        units.push_back({tab_group->GetFirstTab()->GetHandle(),
++                         static_cast<int>(tab_group->ListTabs().length()),
++                         group, std::nullopt});
++      }
++    } else if (const std::optional<split_tabs::SplitTabId> split =
++                   tab->GetSplit()) {
++      if (!std::ranges::contains(unit_splits, *split)) {
++        unit_splits.push_back(*split);
++        const std::vector<tabs::TabInterface*> halves =
++            tab_strip_->GetSplitData(*split)->ListTabs();
++        if (std::ranges::all_of(halves, [&](tabs::TabInterface* half) {
++              return std::ranges::contains(moving, half);
++            })) {
++          units.push_back({halves.front()->GetHandle(),
++                           static_cast<int>(halves.size()), std::nullopt,
++                           split});
++        } else {
++          ++splits_left;
++        }
++      }
++    } else {
++      units.push_back({tab->GetHandle()});
++    }
++  }
++
++  // The anchor: the target's first Today tab, -1 when it has none (nothing
++  // to place before: the moved tabs are its only ones). Inside a collection
++  // -- a split or group headed by an open pinned page, which the list hides
++  // with it -- it goes back to that collection's start; one still inside
++  // after that straddles the pinned boundary, and nothing is placed.
++  int at = FirstTodayIndexOf(guid);
++  while (at > tab_strip_->IndexOfFirstNonPinnedTab() && InsideACollection(at)) {
++    --at;
++  }
++  int from_above = 0;
++  int from_below = 0;
++  if (InsideACollection(at)) {
++    LOG(WARNING) << "[workspaces] move: not placed, index " << at
++                 << " is inside a collection";
++  } else if (at >= 0) {
++    const tabs::TabHandle anchor = tab_strip_->GetTabAtIndex(at)->GetHandle();
++    for (const Unit& unit : units) {
++      // Both re-found for each unit: every move renumbers the tabs between.
++      tabs::TabInterface* const head = unit.head.Get();
++      tabs::TabInterface* const anchor_tab = anchor.Get();
++      if (!head || !anchor_tab) {
++        continue;
++      }
++      const int cur = tab_strip_->GetIndexOfTab(head);
++      const int before = tab_strip_->GetIndexOfTab(anchor_tab);
++      // Each mover counts its destination with the unit taken out.
++      const int to = cur < before ? before - unit.size : before;
++      if (cur < before) {
++        ++from_above;
++      } else {
++        ++from_below;
++      }
++      if (cur == to) {
++        continue;
++      }
++      // Legal for the reason RemoveFromGroup is above. A move changes no
++      // active tab, so the observer neither switches nor stamps a left tab.
++      if (unit.group) {
++        tab_strip_->MoveGroupTo(*unit.group, to);
++      } else if (unit.split) {
++        tab_strip_->MoveSplitTo(*unit.split, to, /*pinned=*/false,
++                                /*group_id=*/std::nullopt);
++      } else {
++        tab_strip_->MoveWebContentsAt(cur, to, /*select_after_move=*/false);
++      }
++    }
++  }
++
+   for (tabs::TabInterface* tab : moving) {
+     SetTag(tab->GetContents(), std::string(guid));
+   }
+ 
+-  LOG(INFO) << "[workspaces] moved " << moving.size()
+-            << " tab(s) -> workspace '" << guid << "', " << leaving.size()
+-            << " left their group";
++  // The prefix is check-e13's. The rest tells a check which side each unit
++  // came from -- a unit already just above the anchor counts as from above
++  // -- so both branches of `to` can be shown to have run.
++  std::ostringstream line;
++  line << "[workspaces] moved " << moving.size() << " tab(s) -> workspace '"
++       << guid << "', " << leaving.size() << " left their group";
++  if (at < 0) {
++    line << ", none placed: no Today tab there";
++  } else {
++    line << ", " << from_above + from_below << " unit(s) to the top ("
++         << from_above << " from above, " << from_below << " from below)";
++  }
++  if (splits_left) {
++    line << ", " << splits_left << " split(s) with a pinned page left in place";
++  }
++  LOG(INFO) << line.str();
+ 
+   // The repaint that used to be here is gone, and this is the one place that
+   // proves the move: SetTag() now notifies on every tag change, so the tabs
+@@ -1255,6 +1376,40 @@ void WorkspaceService::PostReconcile() {
+       base::BindOnce(&WorkspaceService::Reconcile, weak_factory_.GetWeakPtr()));
+ }
+ 
++bool WorkspaceService::InsideACollection(int index) const {
++  // True when `index` falls INSIDE a group or a split rather than between two
++  // of them, which is a destination none of the three mutators Reconcile()
++  // and MoveTabsToWorkspace() use survives -- and each fails differently.
++  // MoveWebContentsAt absorbs the moved tab into the group (GetGroupToAssign);
++  // MoveGroupTo silently DESTROYS the split it would break (RemoveSplitImpl);
++  // MoveSplitTo CHECKs, which on a release build is a browser crash.
++  //
++  // It cannot happen while every unit moves whole and its destination
++  // therefore always lands on a unit boundary, which is the invariant both
++  // move loops maintain. That is the argument; this is the check, and the
++  // argument being wrong is not a cosmetic failure: an absorbed tab fires
++  // TabGroupedStateChanged, which ends in ApplyCollectionGuid rewriting that
++  // tab's workspace tag, which SetTag then writes into the session file. A
++  // silent, persisted membership change is far worse than an untidy strip, so
++  // a bad destination abandons the move rather than trusting the proof.
++  //
++  // CONSERVATIVE, NOT EXACT. Chromium's own MoveBreaksSplitContiguity() also
++  // weighs the gap the moving unit vacates, so this can pass where that would
++  // still refuse. It is the cheap half of the question; the unit invariant is
++  // what covers the rest.
++  if (index <= 0) {
++    return false;
++  }
++  const std::optional<tab_groups::TabGroupId> group =
++      tab_strip_->GetTabGroupForTab(index);
++  if (group.has_value() && group == tab_strip_->GetTabGroupForTab(index - 1)) {
++    return true;
++  }
++  const std::optional<split_tabs::SplitTabId> split =
++      tab_strip_->GetSplitForTab(index);
++  return split.has_value() && split == tab_strip_->GetSplitForTab(index - 1);
++}
++
+ void WorkspaceService::Reconcile() {
+   // The precondition, re-checked rather than assumed. Both callers post this
+   // only when the window has just stopped filtering -- but POSTING IS NOT
+@@ -1276,41 +1431,6 @@ void WorkspaceService::Reconcile() {
+     return;
+   }
+ 
+-  // True when `index` falls INSIDE a group or a split rather than between two
+-  // of them, which is a destination none of the three mutators below survives
+-  // -- and each fails differently. MoveWebContentsAt absorbs the moved tab
+-  // into the group (GetGroupToAssign); MoveGroupTo silently DESTROYS the split
+-  // it would break (RemoveSplitImpl); MoveSplitTo CHECKs, which on a release
+-  // build is a browser crash.
+-  //
+-  // It cannot happen while every unit moves whole and `target` therefore
+-  // always lands on a unit boundary, which is the invariant the move loop
+-  // maintains from `first` upward. That is the argument; this is the check,
+-  // and the argument being wrong is not a cosmetic failure: an absorbed tab
+-  // fires TabGroupedStateChanged, which ends in ApplyCollectionGuid rewriting
+-  // that tab's workspace tag, which SetTag then writes into the session file.
+-  // A silent, persisted membership change is far worse than an untidy strip,
+-  // so a bad destination abandons the pass rather than trusting the proof.
+-  //
+-  // CONSERVATIVE, NOT EXACT. Chromium's own MoveBreaksSplitContiguity() also
+-  // weighs the gap the moving unit vacates, so this can pass where that would
+-  // still refuse. It is the cheap half of the question; the unit invariant is
+-  // what covers the rest.
+-  const auto inside_a_collection = [&](int index) {
+-    if (index <= 0) {
+-      return false;
+-    }
+-    const std::optional<tab_groups::TabGroupId> group =
+-        tab_strip_->GetTabGroupForTab(index);
+-    if (group.has_value() &&
+-        group == tab_strip_->GetTabGroupForTab(index - 1)) {
+-      return true;
+-    }
+-    const std::optional<split_tabs::SplitTabId> split =
+-        tab_strip_->GetSplitForTab(index);
+-    return split.has_value() && split == tab_strip_->GetSplitForTab(index - 1);
+-  };
+-
+   // The pinned boundary has to be a unit boundary too, and that is the one
+   // place the move loop cannot establish for itself: it starts AT `first` and
+   // only ever looks forward, so a group or split straddling the boundary would
+@@ -1321,7 +1441,7 @@ void WorkspaceService::Reconcile() {
+   // Chromium does not appear to allow such a collection (a group is all-pinned
+   // or all-unpinned, and an all-pinned one sits entirely below `first`), so
+   // this is an assertion about that rather than a case being handled.
+-  if (inside_a_collection(first)) {
++  if (InsideACollection(first)) {
+     LOG(ERROR) << "[workspaces] reconcile abandoned: a collection straddles "
+                   "the pinned boundary at index "
+                << first;
+@@ -1410,7 +1530,7 @@ void WorkspaceService::Reconcile() {
+     }
+ 
+     if (current != target) {
+-      if (inside_a_collection(target)) {
++      if (InsideACollection(target)) {
+         LOG(ERROR) << "[workspaces] reconcile abandoned at index " << target
+                    << ": not a unit boundary";
+         return;
+@@ -1982,14 +2102,8 @@ int WorkspaceService::TopOfListIndex(con
+   }
+   // The first tab the list draws. Model index 0 would not do: other
+   // workspaces' tabs and open pinned pages share the model.
+-  int index = tab_strip_->IndexOfFirstNonPinnedTab();
+-  for (; index < tab_strip_->count(); ++index) {
+-    const tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(index);
+-    if (IsTabVisible(tab) && !IsDrawnAsPinnedRow(tab)) {
+-      break;
+-    }
+-  }
+-  if (index == tab_strip_->count()) {
++  int index = FirstTodayIndexOf(active_guid_);
++  if (index < 0) {
+     return -1;
+   }
+   // After the pinned page's earlier links, in the order they were opened.
+@@ -2000,6 +2114,21 @@ int WorkspaceService::TopOfListIndex(con
+   return index;
+ }
+ 
++int WorkspaceService::FirstTodayIndexOf(std::string_view guid) const {
++  // The strip's own iterator and a counter, never GetTabAtIndex(i): an index
++  // lookup walks the collection tree, and every new tab asks this through
++  // TopOfListIndex, in a window that may hold 3,862 tabs (LOCAL.md 37, C2).
++  const int first = tab_strip_->IndexOfFirstNonPinnedTab();
++  int index = 0;
++  for (tabs::TabInterface* const tab : *tab_strip_) {
++    const int i = index++;
++    if (i >= first && IsTabOfWorkspace(tab, guid) && !IsDrawnAsPinnedRow(tab)) {
++      return i;
++    }
++  }
++  return -1;
++}
++
+ bool WorkspaceService::IsTabAtTopOfList(const tabs::TabInterface* tab) const {
+   const int top = TopOfListIndex(/*opener=*/nullptr);
+   return top >= 0 && tab_strip_->GetTabAtIndex(top) == tab;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -272,13 +272,20 @@ class WorkspaceService : public TabStrip
+   // tracks the set. A window with nothing multi-selected has exactly one
+   // selected tab, the active one, so the single-tab case needs no branch.
+   //
++  // They go to the TOP of `guid`'s Today, in their order, just before its
++  // first Today tab (C4, the owner's rule for every door: the tab menu, the
++  // chip's "Move tab here", a drop on a chip). When it has no Today tab they
++  // stay where they are in the model: they are its only ones.
++  //
+   // THE WINDOW DOES NOT FOLLOW THEM. Arc moves the tab and leaves you where you
+   // are, which is also the only behaviour that makes moving several tabs
+   // coherent -- following would mean following the last one. The consequence is
+   // that the active tab can be one of the ones that just left, so this repairs
+-  // that afterwards, the same way a removal does.
++  // that afterwards, the same way a removal does. And so the workspace on
++  // screen is refused (0): the tabs are already there.
+   //
+-  // ONLY CALL FROM A MENU OR COMMAND HANDLER: it activates a tab when the tab
++  // ONLY CALL FROM A MENU OR COMMAND HANDLER (or a task one posted, as the
++  // drop on a chip does): it moves tabs, and it activates a tab when the tab
+   // the user was on is one of the ones that moved.
+   int MoveSelectedTabsToWorkspace(std::string_view guid);
+ 
+@@ -289,7 +296,8 @@ class WorkspaceService : public TabStrip
+   //
+   // Pinned tabs in `tabs` are skipped, not refused, for the reason above. A
+   // split moves whole; a grouped tab leaves its group unless the whole group
+-  // is moving (E13).
++  // is moving (E13). A split holding an open pinned page moves only its Today
++  // half, so it is retagged where it stands rather than placed at the top.
+   int MoveTabsToWorkspace(const std::vector<tabs::TabInterface*>& tabs,
+                           std::string_view guid);
+ 
+@@ -565,6 +573,18 @@ class WorkspaceService : public TabStrip
+   // would skip exactly the tabs the user can see (E11 review).
+   bool IsTabOfWorkspace(tabs::TabInterface* tab, std::string_view guid) const;
+ 
++  // The model index of the first Today tab of `guid` -- not a favorite, not
++  // an open pinned page -- or -1 when it has none. Where a new tab of the
++  // workspace on screen goes (TopOfListIndex), and where a moved tab goes in
++  // its new workspace (MoveTabsToWorkspace, C4).
++  int FirstTodayIndexOf(std::string_view guid) const;
++
++  // Whether model index `index` falls inside a group or a split rather than
++  // on a unit boundary: a destination no tab mover survives. Reconcile() asks
++  // it before every move, MoveTabsToWorkspace() of its anchor (the .cc says
++  // why it is conservative, not exact).
++  bool InsideACollection(int index) const;
++
+   // The tabs CloseWorkspaceTabs(guid) closes, as handles: the workspace's own,
+   // never a pinned one. `pinned_kept`, when given, counts the pinned tabs that
+   // would otherwise have matched. One collector, so the confirm's count and the

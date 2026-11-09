@@ -1,0 +1,981 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -373,6 +373,7 @@
+ #define IDC_CONTENT_CONTEXT_OPENLINKSPLITVIEW 50111
+ #define IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST 50112
+ #define IDC_CONTENT_CONTEXT_OPENLINK_ISOLATED 50113
++#define IDC_CONTENT_CONTEXT_PREVIEW_LINK 50114
+ // Image items.
+ #define IDC_CONTENT_CONTEXT_SAVEIMAGEAS 50120
+ #define IDC_CONTENT_CONTEXT_COPYIMAGELOCATION 50121
+--- a/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
++++ b/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
+@@ -42,6 +42,7 @@
+ #include "chrome/browser/ui/login/login_navigation_throttle.h"
+ #include "chrome/browser/ui/passwords/password_manager_navigation_throttle.h"
+ #include "chrome/browser/ui/passwords/well_known_change_password_navigation_throttle.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_link_preview.h"
+ #include "chrome/browser/ui/web_applications/navigation_capturing_redirection_throttle.h"
+ #include "chrome/common/chrome_features.h"
+ #include "chrome/common/chrome_switches.h"
+@@ -417,6 +418,9 @@ void CreateAndAddChromeThrottlesForNavig
+ #endif  // BUILDFLAG(ENABLE_PDF)
+ 
+   TabUnderNavigationThrottle::MaybeCreateAndAdd(registry);
++  // Helium Workspaces (C20): a pinned page's link to another site opens in
++  // the link preview (Arc's rule).
++  workspaces::MaybeAddLinkPreviewThrottle(registry);
+ 
+   WellKnownChangePasswordNavigationThrottle::MaybeCreateAndAdd(registry);
+ 
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -379,6 +379,7 @@
+ #include "chrome/browser/ui/toasts/toast_controller.h"
+ #include "chrome/browser/ui/toasts/toast_features.h"
+ #include "chrome/browser/ui/views/context_hub/save_to_memory_bank_bubble_controller.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_link_preview.h"
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/split_tab_data.h"
+@@ -499,6 +500,9 @@ int UmaEnumForCommand(int key, UmaEnumId
+        // ContextMenuMatcher::IsExtensionsCustomCommandId()
+        {IDC_CONTENT_CONTEXT_PROTOCOL_HANDLER_FIRST, 2},
+        {IDC_CONTENT_CONTEXT_OPENLINKNEWTAB, 3},
++       // Helium Workspaces (C20): an unmapped command is NOTREACHED; counted
++       // as "Open link in new tab" (Helium uploads no metrics).
++       {IDC_CONTENT_CONTEXT_PREVIEW_LINK, 3},
+        {IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW, 4},
+        {IDC_CONTENT_CONTEXT_OPENLINKOFFTHERECORD, 5},
+        {IDC_CONTENT_CONTEXT_SAVELINKAS, 6},
+@@ -1960,6 +1964,12 @@ void RenderViewContextMenu::AppendLinkIt
+           in_app ? IDS_CONTENT_CONTEXT_OPENLINKNEWTAB_INAPP
+                  : IDS_CONTENT_CONTEXT_OPENLINKNEWTAB);
+     }
++    // Helium Workspaces (C20): on a tab's page only, so never in the preview.
++    if (show_open_in_new_tab &&
++        tabs::TabInterface::MaybeGetFromContents(GetWebContents())) {
++      menu_model_.AddItemWithStringId(IDC_CONTENT_CONTEXT_PREVIEW_LINK,
++                                      IDS_HELIUM_PREVIEW_LINK);
++    }
+ 
+     if (show_open_in_new_window) {
+       AddItemWithOptionalIcon(IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW,
+@@ -3396,6 +3406,8 @@ bool RenderViewContextMenu::IsCommandIdE
+     case IDC_CONTENT_CONTEXT_OPENLINKINPROFILE:
+     case IDC_CONTENT_CONTEXT_OPENLINKNEWTAB:
+     case IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW:
++    // Helium Workspaces (C20): enabled as "Open link in new tab" is.
++    case IDC_CONTENT_CONTEXT_PREVIEW_LINK:
+       return navigation_allowed && params_.link_url.is_valid() &&
+              IsOpenLinkAllowedByDlp(params_.link_url);
+ 
+@@ -3750,6 +3762,17 @@ void RenderViewContextMenu::ExecuteComma
+       break;
+     }
+ 
++    // Helium Workspaces (C20): or a new tab where no preview can show.
++    case IDC_CONTENT_CONTEXT_PREVIEW_LINK:
++      workspaces::PreviewLinkFromMenu(
++          source_web_contents_,
++          GetOpenURLParamsWithExtraHeaders(
++              params_.link_url, params_.frame_url, params_.frame_origin,
++              WindowOpenDisposition::NEW_FOREGROUND_TAB,
++              ui::PAGE_TRANSITION_LINK, /*extra_headers=*/std::string(),
++              /*started_from_context_menu=*/true));
++      break;
++
+     case IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW:
+       DCHECK(!IsInProgressiveWebApp());
+       OpenURLWithExtraHeaders(
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -242,4 +242,13 @@ std::vector<size_t> DuplicatesToClose(
+   return doomed;
+ }
+ 
++bool ShouldPreviewPinnedLink(const PinnedLinkFacts& facts) {
++  // D8: a click on a pinned page's link that leaves its site. Not a typed
++  // address, a script without a click (a page's own redirects), a form sent
++  // with POST (it would be sent twice) or a link within the site.
++  return facts.pinned_page && facts.renderer_initiated && facts.user_gesture &&
++         facts.link_click && !facts.post && facts.http_or_https &&
++         !facts.same_site;
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -290,6 +290,22 @@ std::vector<size_t> DuplicatesToClose(
+     const std::vector<DuplicateCandidate>& today,
+     const std::set<std::string>& kept);
+ 
++// C20, Arc's rule: what the navigation throttle knows about a navigation that
++// starts in a tab's main frame. Plain values, so the rule below is tested here.
++struct PinnedLinkFacts {
++  bool pinned_page = false;         // the tab is an open pinned page
++  bool renderer_initiated = false;  // the page asked, not the address bar
++  bool user_gesture = false;        // a click or key, not a timer or script
++  bool link_click = false;          // Blink marked it a link click
++  bool post = false;                // a form sent with POST
++  bool http_or_https = false;       // both the page and the target
++  bool same_site = false;           // same registrable domain (or host)
++};
++
++// C20: whether this navigation opens in the link preview instead of taking
++// the pinned page away from its address.
++bool ShouldPreviewPinnedLink(const PinnedLinkFacts& facts);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -689,5 +689,32 @@ TEST(WorkspaceDuplicatesTest, UniqueAddr
+   EXPECT_TRUE(DuplicatesToClose(today, {"d"}).empty());
+ }
+ 
++// C20: a pinned page's clicked link to another site.
++constexpr PinnedLinkFacts kPreviewedLink = {.pinned_page = true,
++                                            .renderer_initiated = true,
++                                            .user_gesture = true,
++                                            .link_click = true,
++                                            .post = false,
++                                            .http_or_https = true,
++                                            .same_site = false};
++
++TEST(WorkspacePinnedLinkTest, AClickedLinkToAnotherSitePreviews) {
++  EXPECT_TRUE(ShouldPreviewPinnedLink(kPreviewedLink));
++}
++
++TEST(WorkspacePinnedLinkTest, EachConditionAloneStopsThePreview) {
++  // Each flipped alone: a dropped check would preview a pinned page's own
++  // redirects, sign-in hops within a site, or send a form twice.
++  for (bool PinnedLinkFacts::*field :
++       {&PinnedLinkFacts::pinned_page, &PinnedLinkFacts::renderer_initiated,
++        &PinnedLinkFacts::user_gesture, &PinnedLinkFacts::link_click,
++        &PinnedLinkFacts::post, &PinnedLinkFacts::http_or_https,
++        &PinnedLinkFacts::same_site}) {
++    PinnedLinkFacts facts = kPreviewedLink;
++    facts.*field = !(facts.*field);
++    EXPECT_FALSE(ShouldPreviewPinnedLink(facts));
++  }
++}
++
+ }  // namespace
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -16,6 +16,7 @@ source_set("vertical") {
+     "vertical_tab_strip_top_container.h",
+     "workspace_arc_importer.h",
+     "workspace_archive_view.h",
++    "workspace_link_preview.h",
+     "workspace_pinned_section_view.h",
+     "workspace_quick_search_view.h",
+     "workspace_rail_view.h",
+@@ -61,6 +62,7 @@ source_set("impl") {
+     "vertical_tab_strip_top_container.cc",
+     "workspace_arc_importer.cc",
+     "workspace_archive_view.cc",
++    "workspace_link_preview.cc",
+     "workspace_pinned_section_view.cc",
+     "workspace_quick_search_view.cc",
+     "workspace_rail_view.cc",
+@@ -96,6 +98,15 @@ source_set("impl") {
+     "//chrome/browser/ui/select_file_policy",
+     "//chrome/browser/ui/tabs/workspaces:transfer",
+ 
++    # The link preview (C20): its card's page, the origin as its title, the
++    # different-site test of Arc's rule, and the rule itself. The renderer
++    # preferences target is a header only, like the favicon one below.
++    "//chrome/browser:renderer_preferences_util",
++    "//chrome/browser/ui/tabs/workspaces:stamping",
++    "//components/url_formatter",
++    "//net",
++    "//ui/views/controls/webview",
++
+     # For workspace_arc_importer.cc (E14c), workspace_pinned_section_view.cc
+     # (E15b), workspace_archive_view.cc (E14d.2) and the bar's and the edit
+     # bubble's chrome/app icons (E17a: //chrome/app/vector_icons generates
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_link_preview.cc
+@@ -0,0 +1,695 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/workspace_link_preview.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/callback_list.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/logging.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/renderer_preferences_util.h"
++#include "chrome/browser/sessions/session_service_base.h"
++#include "chrome/browser/sessions/session_service_lookup.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/public/tab_dialog_manager.h"
++#include "chrome/browser/ui/tabs/public/tab_features.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/favicon/content/content_favicon_driver.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/url_formatter/elide_url.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/navigation_throttle.h"
++#include "content/public/browser/navigation_throttle_registry.h"
++#include "content/public/browser/page_navigator.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_delegate.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/common/referrer.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
++#include "third_party/blink/public/mojom/favicon/favicon_url.mojom.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/mojom/dialog_button.mojom.h"
++#include "ui/base/mojom/ui_base_types.mojom-shared.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "ui/content_accelerators/accelerator_util.h"
++#include "ui/events/event.h"
++#include "ui/events/event_observer.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/views/controls/webview/unhandled_keyboard_event_handler.h"
++#include "ui/views/controls/webview/webview.h"
++#include "ui/views/event_monitor.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/window/dialog_delegate.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace workspaces {
++
++namespace {
++
++// The card's inset from each edge of the page area, in 40ths: 3 a side leaves
++// 85% of the width and of the height, centred (Arc's look).
++constexpr int kInsetFortieths = 3;
++
++// Why no card can show over `source` for `url` now, for the logs; null when
++// one can.
++const char* CannotShowReason(content::WebContents* source, const GURL& url) {
++  tabs::TabInterface* const tab =
++      source ? tabs::TabInterface::MaybeGetFromContents(source) : nullptr;
++  if (!tab) {
++    return "not a tab";
++  }
++  // "Open as tab" adds a tab to the window, which an app's or a popup's
++  // window must not get.
++  if (tab->GetBrowserWindowInterface()->GetType() !=
++      BrowserWindowInterface::TYPE_NORMAL) {
++    return "not a normal window";
++  }
++  if (!tab->IsActivated()) {
++    return "background tab";
++  }
++  if (!tab->CanShowModalUI()) {
++    return "a dialog is up";
++  }
++  if (!tab->GetTabFeatures() || !tab->GetTabFeatures()->tab_dialog_manager()) {
++    return "no dialog manager";
++  }
++  // The card's load is browser-initiated, so the renderer's own checks of the
++  // address never ran: the web only, or a file from a file.
++  if (!url.SchemeIsHTTPOrHTTPS() &&
++      !(url.SchemeIsFile() && source->GetLastCommittedURL().SchemeIsFile())) {
++    return "scheme";
++  }
++  return nullptr;
++}
++
++// "Open as tab", posted from the card's button: never inside a tab strip
++// notification, and the window may have closed in between -- a Browser
++// scheduled for deletion must not take a tab (browser.cc OnTabInsertedAt).
++void InsertAsTab(base::WeakPtr<BrowserWindowInterface> browser,
++                 std::unique_ptr<content::WebContents> contents) {
++  if (!browser || browser->IsDeleteScheduled()) {
++    LOG(INFO) << "[workspaces] link preview: its window closed first";
++    return;
++  }
++  content::WebContents* const raw = contents.get();
++  // The tab's model attaches the tab helpers the card's page went without.
++  const int index = InsertMovedPage(browser.get(), std::move(contents));
++  // The favicon driver, new with the helpers, takes icons only for a page it
++  // was told to fetch for (a navigation's commit tells it; this page committed
++  // before it existed): start that fetch, then hand it the icons the page
++  // reported already, which a loaded page never reports again. No fetch for
++  // an error page, as the commit's own path skips it. The override is
++  // private; the base's is not.
++  if (favicon::ContentFaviconDriver* const favicons =
++          favicon::ContentFaviconDriver::FromWebContents(raw)) {
++    if (!raw->GetPrimaryMainFrame()->IsErrorDocument()) {
++      favicons->FetchFavicon(raw->GetLastCommittedURL(),
++                             /*is_same_document=*/false);
++    }
++    static_cast<content::WebContentsObserver*>(favicons)->DidUpdateFaviconURL(
++        raw->GetPrimaryMainFrame(), raw->GetFaviconURLs(),
++        blink::mojom::FaviconUpdateReason::kPageLoad);
++  }
++  LOG(INFO) << "[workspaces] link preview: opened as tab at index " << index
++            << ", "
++            << raw->GetController().GetEntryCount() << " entries, loading "
++            << (raw->IsLoading() ? 1 : 0);
++}
++
++// The card: a dialog shown by the tab's TabDialogManager, holding a WebView
++// of a page of its own. Owns itself, and is deleted soon after its widget
++// closes, whichever way it closes (OnClose).
++class WorkspaceLinkPreview : public views::DialogDelegate,
++                             public content::WebContentsDelegate,
++                             public content::WebContentsObserver,
++                             public ui::EventObserver {
++ public:
++  WorkspaceLinkPreview(tabs::TabInterface* tab,
++                       const GURL& url,
++                       const content::Referrer& referrer,
++                       const std::optional<url::Origin>& initiator,
++                       const char* trigger);
++  WorkspaceLinkPreview(const WorkspaceLinkPreview&) = delete;
++  WorkspaceLinkPreview& operator=(const WorkspaceLinkPreview&) = delete;
++  ~WorkspaceLinkPreview() override = default;
++
++  // views::DialogDelegate:
++  views::View* GetInitiallyFocusedView() override;
++
++  // content::WebContentsDelegate:
++  content::WebContents* OpenURLFromTab(
++      content::WebContents* source,
++      const content::OpenURLParams& params,
++      base::OnceCallback<void(content::NavigationHandle&)>
++          navigation_handle_callback) override;
++  content::WebContents* AddNewContents(
++      content::WebContents* source,
++      std::unique_ptr<content::WebContents> new_contents,
++      const GURL& target_url,
++      WindowOpenDisposition disposition,
++      const blink::mojom::WindowFeatures& window_features,
++      bool user_gesture,
++      bool* was_blocked) override;
++  bool HandleKeyboardEvent(content::WebContents* source,
++                           const input::NativeWebKeyboardEvent& event) override;
++  void CanDownload(const GURL& url,
++                   const std::string& request_method,
++                   base::OnceCallback<void(bool)> callback) override;
++  void CloseContents(content::WebContents* source) override;
++  bool CanEnterFullscreenModeForTab(
++      content::RenderFrameHost* requesting_frame) override;
++
++  // content::WebContentsObserver:
++  void DidFinishNavigation(content::NavigationHandle* handle) override;
++
++  // ui::EventObserver: a click outside the card.
++  void OnEvent(const ui::Event& event) override;
++
++ private:
++  // TabDialogManager's get_dialog_bounds: the page area in the window's
++  // coordinates, as TabModalDialogHost measures it (a tab-modal dialog is a
++  // CHILD widget on Windows), less the inset.
++  gfx::Rect DialogBounds();
++
++  void OnTabWillDeactivate(tabs::TabInterface* tab);
++  // Closes the card from a task of its own: never inside an event's dispatch
++  // or a tab strip's activation change.
++  void PostClose(const char* cause);
++  void CloseWithCause(const char* cause);
++  // The single way out (Widget::MakeCloseSynchronous): logs, hands the page
++  // to a tab on "Open as tab", destroys the widget, deletes this soon.
++  void OnClose(views::Widget::ClosedReason reason);
++
++  // Null once closed; the card closes before the tab goes (close_on_detach,
++  // and kDelete always closes).
++  raw_ptr<tabs::TabInterface> tab_;
++  // Ours until "Open as tab" moves it to a tab; outlives the widget, so a
++  // close from inside one of its own callbacks never deletes it under them.
++  std::unique_ptr<content::WebContents> contents_;
++  raw_ptr<views::WebView> web_view_ = nullptr;
++  std::unique_ptr<views::Widget> widget_;
++  std::unique_ptr<views::EventMonitor> monitor_;
++  base::CallbackListSubscription deactivate_subscription_;
++  views::UnhandledKeyboardEventHandler unhandled_keys_;
++  // Set by CloseWithCause() for a close the widget's reason cannot tell.
++  const char* cause_ = nullptr;
++  // The link's referrer, for a download the card's first page turns out to be
++  // (CanDownload).
++  const content::Referrer referrer_;
++  // The first commit takes the keyboard back once; later ones leave it where
++  // the user put it (DidFinishNavigation).
++  bool focused_at_commit_ = false;
++  base::WeakPtrFactory<WorkspaceLinkPreview> weak_factory_{this};
++};
++
++WorkspaceLinkPreview::WorkspaceLinkPreview(
++    tabs::TabInterface* tab,
++    const GURL& url,
++    const content::Referrer& referrer,
++    const std::optional<url::Origin>& initiator,
++    const char* trigger)
++    : tab_(tab), referrer_(referrer) {
++  Profile* const profile =
++      Profile::FromBrowserContext(tab->GetContents()->GetBrowserContext());
++
++  // Bare, as the payment handler's page is (see the header).
++  contents_ =
++      content::WebContents::Create(content::WebContents::CreateParams(profile));
++  contents_->SetDelegate(this);
++  Observe(contents_.get());
++  // Helium's WebRTC address policy and the accept-languages: every page gets
++  // them, a tab's through its helpers (constrained_web_dialog_delegate_views).
++  renderer_preferences_util::UpdateFromSystemSettings(
++      contents_->GetMutableRendererPrefs(), profile);
++  contents_->SyncRendererPrefs();
++
++  SetOwnershipOfNewWidget(views::Widget::InitParams::CLIENT_OWNS_WIDGET);
++  SetModalType(ui::mojom::ModalType::kChild);
++  SetButtons(static_cast<int>(ui::mojom::DialogButton::kOk));
++  SetButtonLabel(
++      ui::mojom::DialogButton::kOk,
++      l10n_util::GetStringUTF16(IDS_HELIUM_LINK_PREVIEW_OPEN_AS_TAB));
++  // An Enter the page leaves alone must never promote the page.
++  SetDefaultButton(static_cast<int>(ui::mojom::DialogButton::kNone));
++  SetShowCloseButton(true);
++  SetAccessibleTitle(l10n_util::GetStringUTF16(IDS_HELIUM_LINK_PREVIEW));
++  SetTitle(url_formatter::FormatOriginForSecurityDisplay(
++      url::Origin::Create(url),
++      url_formatter::SchemeDisplay::OMIT_CRYPTOGRAPHIC));
++  set_margins(gfx::Insets());
++
++  // No browser context: a WebView with one makes a WebContents of its own
++  // whenever asked for one it has not got -- as after "Open as tab".
++  web_view_ = SetContentsView(std::make_unique<views::WebView>());
++  web_view_->SetWebContents(contents_.get());
++  // Widget::Init needs a size; the real one is DialogBounds()
++  // (chrome_webui_dialog.cc does the same).
++  web_view_->SetPreferredSize(gfx::Size(1, 1));
++
++  tabs::TabDialogManager* const manager =
++      tab->GetTabFeatures()->tab_dialog_manager();
++  widget_ = manager->CreateTabScopedDialog(this);
++  widget_->MakeCloseSynchronous(base::BindOnce(&WorkspaceLinkPreview::OnClose,
++                                               base::Unretained(this)));
++  // The rest of Params stays the default: the page behind is dimmed and
++  // takes no input, no other dialog opens over it, and a different-site
++  // navigation of the tab behind or its detach closes the card. Unretained:
++  // the manager drops the params with our widget, which goes before us.
++  auto params = std::make_unique<tabs::TabDialogManager::Params>();
++  params->get_dialog_bounds = base::BindRepeating(
++      &WorkspaceLinkPreview::DialogBounds, base::Unretained(this));
++  manager->ShowDialog(widget_.get(), std::move(params));
++  // The keyboard is the card's from the start (the owner's try): ShowDialog
++  // only shows it, and the page behind, blocked, drops every key -- Escape
++  // and Ctrl+Tab too.
++  web_view_->RequestFocus();
++
++  // The dim behind takes no events (scrim_view.cc), and the page ignores
++  // input while blocked, so a click outside is only seen this way.
++  monitor_ = views::EventMonitor::CreateWindowMonitor(
++      this, manager->GetHostWidget()->GetNativeWindow(),
++      {ui::EventType::kMousePressed});
++  // TabDialogManager would only hide the card with its tab; a hidden live
++  // page would keep playing.
++  deactivate_subscription_ = tab->RegisterWillDeactivate(base::BindRepeating(
++      &WorkspaceLinkPreview::OnTabWillDeactivate, base::Unretained(this)));
++
++  // Browser-initiated, with no opener: the page cannot reach the tab behind.
++  content::NavigationController::LoadURLParams load(url);
++  load.referrer = referrer;
++  load.initiator_origin = initiator;
++  load.transition_type = ui::PAGE_TRANSITION_LINK;
++  load.has_user_gesture = true;
++  contents_->GetController().LoadURLWithParams(load);
++
++  LOG(INFO) << "[workspaces] link preview: shown (" << trigger
++            << ") over tab " << tab->GetHandle().raw_value();
++}
++
++views::View* WorkspaceLinkPreview::GetInitiallyFocusedView() {
++  return web_view_;
++}
++
++content::WebContents* WorkspaceLinkPreview::OpenURLFromTab(
++    content::WebContents* source,
++    const content::OpenURLParams& params,
++    base::OnceCallback<void(content::NavigationHandle&)>
++        navigation_handle_callback) {
++  // The page's own navigations stay in the card.
++  if (params.disposition == WindowOpenDisposition::CURRENT_TAB) {
++    base::WeakPtr<content::NavigationHandle> handle =
++        source->GetController().LoadURLWithParams(
++            content::NavigationController::LoadURLParams(params));
++    if (handle && navigation_handle_callback) {
++      std::move(navigation_handle_callback).Run(*handle);
++    }
++    return source;
++  }
++  // A new tab or window (a middle click, the link menu): the window opens
++  // it, as from the tab behind.
++  if (!tab_) {
++    return nullptr;
++  }
++  return tab_->GetBrowserWindowInterface()->OpenURL(
++      params, std::move(navigation_handle_callback));
++}
++
++content::WebContents* WorkspaceLinkPreview::AddNewContents(
++    content::WebContents* source,
++    std::unique_ptr<content::WebContents> new_contents,
++    const GURL& target_url,
++    WindowOpenDisposition disposition,
++    const blink::mojom::WindowFeatures& window_features,
++    bool user_gesture,
++    bool* was_blocked) {
++  // target=_blank and window.open(): into the window after a click; without
++  // one, dropped -- there is no popup blocker here to ask (the payment
++  // handler does the same).
++  if (user_gesture && tab_) {
++    chrome::AddWebContents(tab_->GetBrowserWindowInterface(), source,
++                           std::move(new_contents), target_url, disposition,
++                           window_features);
++  }
++  return nullptr;
++}
++
++bool WorkspaceLinkPreview::HandleKeyboardEvent(
++    content::WebContents* source,
++    const input::NativeWebKeyboardEvent& event) {
++  // The window's shortcuts act on its active tab, the one behind the card:
++  // closing, going back or reloading means the card here. Back, forward and
++  // reload are taken even when the card cannot do them, so they never reach
++  // the tab behind.
++  if (event.GetType() == blink::WebInputEvent::Type::kRawKeyDown) {
++    const ui::Accelerator key =
++        ui::GetAcceleratorFromNativeWebKeyboardEvent(event);
++    const int mods = key.modifiers();
++    const ui::KeyboardCode code = key.key_code();
++    content::NavigationController& nav = source->GetController();
++    if (mods == ui::EF_CONTROL_DOWN &&
++        (code == ui::VKEY_W || code == ui::VKEY_F4)) {
++      PostClose("ctrl+w");
++      return true;
++    }
++    if ((mods == ui::EF_ALT_DOWN && code == ui::VKEY_LEFT) ||
++        code == ui::VKEY_BROWSER_BACK) {
++      if (nav.CanGoBack()) {
++        nav.GoBack();
++      }
++      return true;
++    }
++    if ((mods == ui::EF_ALT_DOWN && code == ui::VKEY_RIGHT) ||
++        code == ui::VKEY_BROWSER_FORWARD) {
++      if (nav.CanGoForward()) {
++        nav.GoForward();
++      }
++      return true;
++    }
++    if ((mods == ui::EF_NONE && code == ui::VKEY_F5) ||
++        (mods == ui::EF_CONTROL_DOWN && code == ui::VKEY_R)) {
++      nav.Reload(content::ReloadType::NORMAL, /*check_for_repost=*/true);
++      return true;
++    }
++  }
++  // Keys the page left alone go to the window's focus manager: Escape reaches
++  // the card, and the browser's shortcuts keep working. It is null while the
++  // widget has no top level, and the handler CHECKs it
++  // (chrome_webui_dialog.cc).
++  views::FocusManager* const focus_manager =
++      widget_ ? widget_->GetFocusManager() : nullptr;
++  return focus_manager &&
++         unhandled_keys_.HandleKeyboardEvent(event, focus_manager);
++}
++
++void WorkspaceLinkPreview::CanDownload(
++    const GURL& url,
++    const std::string& request_method,
++    base::OnceCallback<void(bool)> callback) {
++  // Never in the card: its page is no tab, which the download's own UI and
++  // helpers expect. A GET goes to a new tab of the window instead, where it
++  // downloads as any link does (the tab switch closes the card).
++  std::move(callback).Run(false);
++  const bool to_tab = request_method == "GET" && tab_;
++  LOG(INFO) << "[workspaces] link preview: a download -> "
++            << (to_tab ? "new tab" : "refused");
++  if (to_tab) {
++    // From the card's page, as the request was; the link's own when the
++    // download is the card's first page. The default policy: an origin only
++    // across sites.
++    const GURL& page = contents_->GetLastCommittedURL();
++    tab_->GetBrowserWindowInterface()->OpenURL(
++        content::OpenURLParams(
++            url,
++            page.is_valid() ? content::Referrer(
++                                  page, network::mojom::ReferrerPolicy::kDefault)
++                            : referrer_,
++            WindowOpenDisposition::NEW_FOREGROUND_TAB,
++            ui::PAGE_TRANSITION_LINK, /*is_renderer_initiated=*/false),
++        /*navigation_handle_callback=*/{});
++  }
++}
++
++void WorkspaceLinkPreview::CloseContents(content::WebContents* source) {
++  CloseWithCause("page closed it");
++}
++
++bool WorkspaceLinkPreview::CanEnterFullscreenModeForTab(
++    content::RenderFrameHost* requesting_frame) {
++  return false;
++}
++
++void WorkspaceLinkPreview::DidFinishNavigation(
++    content::NavigationHandle* handle) {
++  // The card has no address bar: its title is where the page is.
++  if (handle->IsInPrimaryMainFrame() && handle->HasCommitted()) {
++    SetTitle(url_formatter::FormatOriginForSecurityDisplay(
++        web_contents()->GetPrimaryMainFrame()->GetLastCommittedOrigin(),
++        url_formatter::SchemeDisplay::OMIT_CRYPTOGRAPHIC));
++    // Again once the page is in: a context menu closing after the card showed
++    // hands the focus back to the tab behind. Only the first commit: later
++    // ones leave the keyboard where the user put it.
++    if (web_view_ && !std::exchange(focused_at_commit_, true)) {
++      web_view_->RequestFocus();
++    }
++  }
++}
++
++void WorkspaceLinkPreview::OnEvent(const ui::Event& event) {
++  // Every press in the window comes here, the card's own too; the location
++  // is in screen coordinates (EventObserver).
++  if (widget_ && event.IsLocatedEvent() &&
++      !widget_->GetWindowBoundsInScreen().Contains(
++          event.AsLocatedEvent()->root_location())) {
++    PostClose("outside");
++  }
++}
++
++gfx::Rect WorkspaceLinkPreview::DialogBounds() {
++  // Over the tab's own pane: in a split, the other pane stays clear.
++  BrowserView* const browser_view =
++      BrowserView::GetBrowserViewForBrowser(tab_->GetBrowserWindowInterface());
++  views::View* area =
++      browser_view->GetContentsContainerViewFor(tab_->GetContents());
++  if (!area) {
++    area = browser_view->contents_container();
++  }
++  gfx::Rect bounds = area->ConvertRectToWidget(area->GetLocalBounds());
++  bounds.Inset(gfx::Insets::VH(bounds.height() * kInsetFortieths / 40,
++                               bounds.width() * kInsetFortieths / 40));
++  return bounds;
++}
++
++void WorkspaceLinkPreview::OnTabWillDeactivate(tabs::TabInterface* tab) {
++  PostClose("tab switch");
++}
++
++void WorkspaceLinkPreview::PostClose(const char* cause) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspaceLinkPreview::CloseWithCause,
++                                weak_factory_.GetWeakPtr(), cause));
++}
++
++void WorkspaceLinkPreview::CloseWithCause(const char* cause) {
++  cause_ = cause;
++  OnClose(views::Widget::ClosedReason::kUnspecified);
++}
++
++void WorkspaceLinkPreview::OnClose(views::Widget::ClosedReason reason) {
++  // A second way out arriving after the first (a posted close, a press
++  // while the widget goes) finds nothing left to close.
++  if (!widget_) {
++    return;
++  }
++  const char* cause = cause_;
++  if (!cause) {
++    switch (reason) {
++      case views::Widget::ClosedReason::kEscKeyPressed:
++        cause = "escape";
++        break;
++      case views::Widget::ClosedReason::kCloseButtonClicked:
++        cause = "x";
++        break;
++      case views::Widget::ClosedReason::kAcceptButtonClicked:
++        cause = "open as tab";
++        break;
++      case views::Widget::ClosedReason::kUnspecified:
++        // TabDialogManager's own close: the tab behind went to another site,
++        // or left the window.
++        cause = "tab behind";
++        break;
++      default:
++        cause = "other";
++        break;
++    }
++  }
++  LOG(INFO) << "[workspaces] link preview: closed (" << cause << ")";
++
++  monitor_.reset();
++  deactivate_subscription_ = {};
++  Observe(nullptr);
++  contents_->SetDelegate(nullptr);
++  // Out of the WebView before it goes, and before a tab strip takes it.
++  web_view_->SetWebContents(nullptr);
++  web_view_ = nullptr;
++  if (reason == views::Widget::ClosedReason::kAcceptButtonClicked) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&InsertAsTab,
++                       tab_->GetBrowserWindowInterface()->GetWeakPtr(),
++                       std::move(contents_)));
++  }
++  widget_.reset();
++  tab_ = nullptr;
++  base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(FROM_HERE, this);
++}
++
++// Shows the card a task after it was asked for: out of the context menu's
++// command and out of the throttle's navigation. Things may have changed in
++// between, so the gates are asked again.
++void ShowNow(base::WeakPtr<content::WebContents> source,
++             const GURL& url,
++             const content::Referrer& referrer,
++             const std::optional<url::Origin>& initiator,
++             const char* trigger) {
++  if (const char* const why = CannotShowReason(source.get(), url)) {
++    LOG(INFO) << "[workspaces] link preview: dropped (" << why << ")";
++    // The link still opens, as it would have without the card: a pinned
++    // page's in place (browser-initiated, so the throttle lets it go), the
++    // menu's in a new tab. The scheme gate passed when it was asked.
++    if (source) {
++      source->OpenURL(
++          content::OpenURLParams(
++              url, referrer,
++              std::string_view(trigger) == "pinned page"
++                  ? WindowOpenDisposition::CURRENT_TAB
++                  : WindowOpenDisposition::NEW_FOREGROUND_TAB,
++              ui::PAGE_TRANSITION_LINK, /*is_renderer_initiated=*/false),
++          /*navigation_handle_callback=*/{});
++    }
++    return;
++  }
++  // Owns itself (OnClose).
++  new WorkspaceLinkPreview(tabs::TabInterface::GetFromContents(source.get()),
++                           url, referrer, initiator, trigger);
++}
++
++// Whether a card will show for `url` over `source`'s tab; it shows a task
++// later. `trigger` names the way in, for the logs.
++bool ShowLinkPreview(content::WebContents* source,
++                     const GURL& url,
++                     const content::Referrer& referrer,
++                     const std::optional<url::Origin>& initiator,
++                     const char* trigger) {
++  if (const char* const why = CannotShowReason(source, url)) {
++    LOG(INFO) << "[workspaces] link preview: cannot show (" << why << "), "
++              << trigger;
++    return false;
++  }
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&ShowNow, source->GetWeakPtr(), url, referrer,
++                                initiator, trigger));
++  return true;
++}
++
++// Arc's rule. Redirects are never judged: only WillStartRequest is here.
++class LinkPreviewThrottle : public content::NavigationThrottle {
++ public:
++  using content::NavigationThrottle::NavigationThrottle;
++
++  ThrottleCheckResult WillStartRequest() override {
++    content::NavigationHandle* const handle = navigation_handle();
++    content::WebContents* const contents = handle->GetWebContents();
++    tabs::TabInterface* const tab =
++        tabs::TabInterface::MaybeGetFromContents(contents);
++    WorkspaceService* const service =
++        tab ? WorkspaceService::From(tab->GetBrowserWindowInterface())
++            : nullptr;
++    // The rule's first condition (gated on IsEnabled(); open pinned pages
++    // only, never favorites), asked first: every other navigation of every
++    // tab stops here, before the domain test.
++    const bool pinned_page = service && service->IsPinItemTab(tab);
++    if (!pinned_page) {
++      return PROCEED;
++    }
++    const GURL& from = contents->GetLastCommittedURL();
++    const GURL& to = handle->GetURL();
++    PinnedLinkFacts facts;
++    facts.pinned_page = pinned_page;
++    facts.renderer_initiated = handle->IsRendererInitiated();
++    facts.user_gesture = handle->HasUserGesture();
++    facts.link_click = handle->WasInitiatedByLinkClick();
++    facts.post = handle->IsPost();
++    facts.http_or_https =
++        from.SchemeIsHTTPOrHTTPS() && to.SchemeIsHTTPOrHTTPS();
++    // TabDialogManager's own test of a different site.
++    facts.same_site = net::registry_controlled_domains::SameDomainOrHost(
++        from, to,
++        net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++    if (!ShouldPreviewPinnedLink(facts)) {
++      return PROCEED;
++    }
++    LOG(INFO) << "[workspaces] link preview: a pinned page's link to another "
++                 "site";
++    // Cancelled only once a card is sure to show; else the link goes on in
++    // place, as without this.
++    return ShowLinkPreview(contents, to,
++                           content::Referrer(handle->GetReferrer()),
++                           handle->GetInitiatorOrigin(), "pinned page")
++               ? CANCEL_AND_IGNORE
++               : PROCEED;
++  }
++
++  const char* GetNameForLogging() override {
++    return "WorkspaceLinkPreviewThrottle";
++  }
++};
++
++}  // namespace
++
++void PreviewLinkFromMenu(content::WebContents* source,
++                         const content::OpenURLParams& params) {
++  if (!source || ShowLinkPreview(source, params.url, params.referrer,
++                                 params.initiator_origin, "menu")) {
++    return;
++  }
++  // The link still opens, in a new foreground tab (the owner's choice), with
++  // the menu's own params: they carry the frame's SiteInstance, which a data:
++  // or about: address needs (OpenURLParams::Valid, a DCHECK).
++  LOG(INFO) << "[workspaces] link preview: cannot show -> new tab";
++  source->OpenURL(params, /*navigation_handle_callback=*/{});
++}
++
++void MaybeAddLinkPreviewThrottle(
++    content::NavigationThrottleRegistry& registry) {
++  if (registry.GetNavigationHandle().IsInPrimaryMainFrame()) {
++    registry.AddThrottle(std::make_unique<LinkPreviewThrottle>(registry));
++  }
++}
++
++int InsertMovedPage(BrowserWindowInterface* browser,
++                    std::unique_ptr<content::WebContents> contents) {
++  content::WebContents* const raw = contents.get();
++  TabStripModel* const model = browser->GetTabStripModel();
++  // Where the archive's restore puts a tab; the insert stamps it with the
++  // workspace on screen (StampInsertedTab).
++  const WorkspaceService* const service = WorkspaceService::From(browser);
++  int index = service ? service->TopOfListIndex(nullptr) : -1;
++  if (index < 0) {
++    index = model->count();
++  }
++  index = model->InsertWebContentsAt(index, std::move(contents),
++                                     AddTabTypes::ADD_ACTIVE);
++  // An insert writes no navigations (session_service_base.cc TabInserted):
++  // without this the page's history is lost at a restart, as
++  // browser_tabrestore.cc does for a reopened tab.
++  if (SessionServiceBase* const session =
++          GetAppropriateSessionServiceIfExisting(browser)) {
++    session->TabRestored(raw, /*pinned=*/false);
++  }
++  return index;
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_link_preview.h
+@@ -0,0 +1,80 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_LINK_PREVIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_LINK_PREVIEW_H_
++
++#include <memory>
++
++class BrowserWindowInterface;
++
++namespace content {
++class NavigationThrottleRegistry;
++struct OpenURLParams;
++class WebContents;
++}  // namespace content
++
++// Link preview (C20, Arc's Peek): a link opens in a card over its tab -- 85%
++// of the page area, centred, the page behind dimmed -- instead of in the tab.
++//
++//   ( example.org                                   x )
++//   |                                                 |
++//   |               the linked page, live             |
++//   |                                                 |
++//   (                                    [Open as tab] )
++//
++// - The card has no address bar: its title, the page's origin, is the sign of
++//   where the page is, as in the payment handler's window.
++// - "Open as tab" moves the SAME page -- its history, its state, no reload --
++//   to the top of Today in the workspace on screen.
++// - Escape, the x, a click outside the card and a switch of tab close it; so
++//   does a different-site navigation of the tab behind, and that tab leaving
++//   the window (TabDialogManager's own rules).
++// - While in the card the page is a bare WebContents, no tab helpers: no JS
++//   dialogs, no permission prompts, no history visit. It becomes a full tab
++//   only on "Open as tab".
++//
++// Two ways in, each one line in an upstream file:
++// - "Preview link" on a link's context menu (render_view_context_menu.cc).
++//   Where no card can show, the link opens in a new foreground tab instead.
++// - Arc's rule: a link click on an open pinned page to another site
++//   (workspaces::ShouldPreviewPinnedLink), caught by a navigation throttle
++//   (chrome_content_browser_client_navigation_throttles.cc). Where no card
++//   can show, the link goes on in place, as it would without this.
++//
++// Logs, ids and numbers only, never a title or an address:
++//   "[workspaces] link preview: shown (menu|pinned page) over tab <handle>"
++//   "[workspaces] link preview: cannot show (<why>), <trigger>"
++//   "[workspaces] link preview: cannot show -> new tab"
++//   "[workspaces] link preview: dropped (<why>)" -- the link then opens as
++//   without the card
++//   "[workspaces] link preview: a download -> new tab|refused"
++//   "[workspaces] link preview: a pinned page's link to another site"
++//   "[workspaces] link preview: closed (escape|x|outside|tab switch|page
++//   closed it|open as tab|tab behind|other)"
++//   "[workspaces] link preview: opened as tab at index <i>, <n> entries,
++//   loading <0|1>"
++//
++// Forward declarations only: two upstream files include this.
++namespace workspaces {
++
++// "Preview link" on the context menu of a link in `source`'s page. `params`
++// are the ones "Open link in new tab" builds, in the foreground: the card
++// takes its address, referrer and initiator from them, and where no card can
++// show, the link opens with them as they are.
++void PreviewLinkFromMenu(content::WebContents* source,
++                         const content::OpenURLParams& params);
++
++// Adds Arc's rule's throttle to a primary main-frame navigation.
++void MaybeAddLinkPreviewThrottle(content::NavigationThrottleRegistry& registry);
++// A page that was no tab of `browser` -- the card's, a pop-up's (C6) --
++// becomes its active tab at the top of Today in the workspace on screen (the
++// end without Workspaces), its history saved as a reopened tab's. Returns
++// its index.
++int InsertMovedPage(BrowserWindowInterface* browser,
++                    std::unique_ptr<content::WebContents> contents);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_LINK_PREVIEW_H_

@@ -1,0 +1,188 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -543,6 +543,27 @@ bool PinStore::Rename(std::string_view i
+   return false;
+ }
+ 
++bool PinStore::SetUrl(std::string_view id, std::string url, std::string title) {
++  if (!loaded_ || read_only_ || url.empty()) {
++    return false;
++  }
++  for (auto& [guid, roots] : tree_) {
++    if (PinNode* node = FindNode(roots, id)) {
++      if (node->type != PinNode::Type::kItem) {
++        return false;
++      }
++      node->url = std::move(url);
++      // A page that set no title keeps the one the row already shows (C31).
++      if (!title.empty()) {
++        node->title = std::move(title);
++      }
++      Changed();
++      return true;
++    }
++  }
++  return false;
++}
++
+ bool PinStore::SortFolder(
+     std::string_view id,
+     base::FunctionRef<bool(const PinNode&, const PinNode&)> less) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -223,6 +223,13 @@ class PinStore : public base::SupportsUs
+   // A folder's name, or an item's own (`custom_title`: empty shows the page's
+   // title again). False for Remove's reasons.
+   bool Rename(std::string_view id, std::string name);
++  // C31, "Replace pinned URL with current": an item's address -- a split's
++  // page is an item -- and its page title when `title` is not empty. The
++  // user's own name and last_active stay. False, and nothing changes, for
++  // Remove's reasons, for a folder or a split row, and for an empty `url`,
++  // which the next load would refuse. Whether `url` is a page worth keeping
++  // is the caller's question: the store is //base only.
++  bool SetUrl(std::string_view id, std::string url, std::string title);
+   // Puts the rows of folder `id` in `less`'s order (C17, "Sort by name"), one
+   // level: what a sub-folder holds keeps its own order. Stable, so rows
+   // `less` cannot tell apart keep theirs. False for Remove's reasons and for
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -664,6 +664,50 @@ TEST_F(PinStoreTest, RenameNamesAFolderO
+   EXPECT_EQ(again->Find("c")->title, "C page");
+ }
+ 
++// C31, "Replace pinned URL with current": an item -- a split's page too --
++// takes the address and title of the page in front; the user's own name and
++// last_active stay, and a page with no title keeps the old one. A folder, a
++// split row, an unknown id or an empty url change nothing.
++TEST_F(PinStoreTest, SetUrlGivesAnItemTheAddressShown) {
++  const PinTree tree = SampleTree();
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", tree.at("default")));
++  ASSERT_TRUE(store->SetRoots(
++      "work", {Split("s", {Item("l", "https://l.example/"),
++                           Item("r", "https://r.example/")})}));
++  CountingObserver observer;
++  store->AddObserver(&observer);
++
++  EXPECT_TRUE(store->SetUrl("c", "https://new.example/", "New page"));
++  EXPECT_EQ(observer.calls, 1);
++  EXPECT_TRUE(store->SetUrl("c", "https://newer.example/", ""));
++  EXPECT_TRUE(store->SetUrl("r", "https://r2.example/", "R2"));
++  EXPECT_FALSE(store->SetUrl("s", "https://x.example/", "X"));
++  EXPECT_FALSE(store->SetUrl("f1", "https://x.example/", "X"));
++  EXPECT_FALSE(store->SetUrl("nope", "https://x.example/", "X"));
++  EXPECT_FALSE(store->SetUrl("b", "", "X"));
++  EXPECT_EQ(observer.calls, 3);
++  store->RemoveObserver(&observer);
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  // Not before the reload's load has finished.
++  const std::unique_ptr<PinStore> again = NewStore();
++  EXPECT_FALSE(again->SetUrl("a", "https://x.example/", "X"));
++  task_environment_.RunUntilIdle();
++  const PinNode* const c = again->Find("c");
++  ASSERT_TRUE(c && again->Find("r") && again->Find("b") && again->Find("a"));
++  EXPECT_EQ(c->url, "https://newer.example/");
++  EXPECT_EQ(c->title, "New page");
++  EXPECT_EQ(c->custom_title, "Renamed C");
++  EXPECT_EQ(c->last_active,
++            base::Time::FromSecondsSinceUnixEpoch(1'758'000'000));
++  EXPECT_EQ(again->Find("r")->url, "https://r2.example/");
++  EXPECT_EQ(again->Find("r")->title, "R2");
++  EXPECT_EQ(again->Find("b")->url, "https://b.example/");
++  EXPECT_EQ(again->Find("a")->url, "https://a.example/");
++}
++
+ // C17: Sort by name orders ONE folder's own rows, stably; a sub-folder's
+ // inside keeps its order. The order itself is the caller's (here: by id).
+ TEST_F(PinStoreTest, SortFolderOrdersOneLevelStably) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -76,6 +76,7 @@
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/vector_icons/vector_icons.h"
+ #include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/web_contents.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "third_party/skia/include/core/SkColor.h"
+@@ -269,6 +270,8 @@ constexpr int kCommandCloseAll = 10;
+ constexpr int kCommandSort = 11;
+ constexpr int kCommandUndoSort = 12;
+ constexpr int kCommandCopyLinks = 13;
++// An open page away from its home makes where it is its address (C31).
++constexpr int kCommandReplaceUrl = 14;
+ constexpr int kCommandFirstColor = 20;
+ // The Move to workspace submenu (C3): one item per workspace, in the bar's
+ // order. ponytail: a 61st workspace is left out of the menu; a range of its
+@@ -434,6 +437,28 @@ tabs::TabInterface* LinkedTab(TabStripMo
+   return nullptr;
+ }
+ 
++// C31: the tab of item `id` in `browser` when "Replace pinned URL with
++// current" can give the item the page that tab shows -- an item's page, not a
++// favorite's, away from its home and on a web page; null otherwise. Asked as
++// the menu is built and again when it is pressed: the page can load elsewhere,
++// or back home, while the menu is open.
++tabs::TabInterface* ReplaceUrlTab(BrowserWindowInterface* browser,
++                                  std::string_view id) {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  tabs::TabInterface* const tab =
++      service ? LinkedTab(browser->GetTabStripModel(), id) : nullptr;
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents || !service->IsPinItemTab(tab) ||
++      !workspaces::HasDrifted(contents)) {
++    return nullptr;
++  }
++  return workspaces::WorkspaceTabData::IsAnchorableUrl(
++             contents->GetLastCommittedURL())
++             ? tab
++             : nullptr;
++}
++
+ // Whether a page of `split` is open in `window` (E19).
+ bool HasPageOf(BrowserWindowInterface* window, const PinNode& split) {
+   return std::ranges::any_of(split.children, [window](const PinNode& page) {
+@@ -4160,6 +4185,12 @@ void WorkspacePinnedSectionView::ShowCon
+           kCommandClose, row->page_count() == 2 ? IDS_APP_CLOSE
+                                                 : IDS_HELIUM_PINNED_ITEM_CLOSE);
+     }
++    // C31, Arc's item on a pinned page that moved: for the page the menu was
++    // opened on, a split's half alone.
++    if (ReplaceUrlTab(browser_, context_menu_page_id_)) {
++      context_menu_model_->AddItemWithStringId(
++          kCommandReplaceUrl, IDS_HELIUM_PINNED_ITEM_REPLACE_URL);
++    }
+     if (!row->folder()) {
+       context_menu_model_->AddItemWithStringId(kCommandUnpin,
+                                                IDS_HELIUM_PINNED_ITEM_UNPIN);
+@@ -4323,6 +4354,27 @@ void WorkspacePinnedSectionView::Execute
+     case kCommandRename:
+       ShowRenameBubble(context_menu_page_id_);
+       break;
++    case kCommandReplaceUrl: {
++      tabs::TabInterface* const tab =
++          ReplaceUrlTab(browser_, context_menu_page_id_);
++      if (!tab || !store_) {
++        break;
++      }
++      content::WebContents* const contents = tab->GetContents();
++      // The entry's own title, empty when the page set none: the contents'
++      // falls back to the address, which the row would then show as a name.
++      if (store_->SetUrl(context_menu_page_id_,
++                         contents->GetLastCommittedURL().spec(),
++                         base::UTF16ToUTF8(contents->GetController()
++                                               .GetLastCommittedEntry()
++                                               ->GetTitle()))) {
++        // Home is now the page shown, as the store has it: no back arrow.
++        workspaces::WorkspaceService::From(browser_)->SetAnchored(tab, true);
++        LOG(INFO) << "[workspaces] pins: '" << context_menu_page_id_
++                  << "' takes the page in front as its address";
++      }
++      break;
++    }
+     case kCommandNewFolder: {
+       // Just below the row, at its level (the owner's choice, E15d), and
+       // named at once: the name box opens on its row once it is drawn.

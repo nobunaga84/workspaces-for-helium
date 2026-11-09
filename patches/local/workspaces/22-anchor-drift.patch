@@ -1,0 +1,293 @@
+--- a/chrome/browser/ui/navigator/BUILD.gn
++++ b/chrome/browser/ui/navigator/BUILD.gn
+@@ -94,6 +94,10 @@ source_set("impl") {
+       "//chrome/browser/ui/browser_window",
+       "//chrome/browser/ui/location_bar",
+       "//chrome/browser/ui/tabs:tab_strip",
++
++      # The omnibox rule in NormalizeDisposition asks WorkspaceService one
++      # question; the answer depends on the feature gate, so not the leaf.
++      "//chrome/browser/ui/tabs/workspaces",
+       "//chrome/browser/ui/web_applications",
+       "//chrome/browser/ui/web_applications:launch_utils",
+       "//chrome/browser/ui/window_feature_controller",
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -46,6 +46,7 @@
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/toasts/api/toast_id.h"
+ #include "chrome/browser/ui/toasts/toast_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -500,6 +501,29 @@ void NormalizeDisposition(NavigateParams
+     params->disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+   }
+ 
++  // Helium Workspaces: an address typed into an anchored tab opens a new tab
++  // rather than taking that tab off its anchor (design 5, E10b). The
++  // FROM_ADDRESS_BAR qualifier is the whole rule -- deliberately narrower than
++  // PR #1578's, which diverted link clicks too: a page that navigates itself
++  // while signing in would otherwise spray tabs. It is the same qualifier this
++  // function's caller reads for `user_initiated` a few lines below.
++  //
++  // Typing the anchor itself is not drift, so going home still lands in place.
++  // The service lookup sits inside the branch because this runs for every
++  // navigation in the browser and only address-bar ones can be diverted.
++  if (params->disposition == WindowOpenDisposition::CURRENT_TAB &&
++      (params->transition & ui::PAGE_TRANSITION_FROM_ADDRESS_BAR)) {
++    const workspaces::WorkspaceService* const workspace_service =
++        workspaces::WorkspaceService::From(params->browser);
++    if (workspace_service && workspace_service->ShouldDivertTypedNavigation(
++                                 params->source_contents, params->url)) {
++      params->disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++      LOG(INFO)
++          << "[workspaces] typed url diverted off anchored tab -> new tab: "
++          << params->url.spec();
++    }
++  }
++
+   switch (params->disposition) {
+     case WindowOpenDisposition::NEW_BACKGROUND_TAB:
+       // Disposition trumps add types. ADD_ACTIVE is a default, so we need to
+--- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
+@@ -4,15 +4,12 @@
+ 
+ #include "chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h"
+ 
+-#include <string>
+-
+ #include "chrome/browser/ui/tabs/existing_base_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tabs/public/tab_interface.h"
+-#include "content/public/browser/web_contents.h"
+ 
+ namespace {
+ 
+@@ -23,17 +20,6 @@ constexpr int kToggleAnchor =
+ constexpr int kResetToAnchor = kToggleAnchor + 1;
+ constexpr int kReplaceAnchor = kToggleAnchor + 2;
+ 
+-// Whether the tab has wandered off its anchor -- the only state in which
+-// "go back" and "move anchor here" do anything.
+-bool HasDrifted(const tabs::TabInterface* tab) {
+-  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
+-  if (!contents) {
+-    return false;
+-  }
+-  const std::string anchor = workspaces::AnchorUrlForTab(contents);
+-  return !anchor.empty() && contents->GetLastCommittedURL().spec() != anchor;
+-}
+-
+ }  // namespace
+ 
+ WorkspaceAnchorSubMenuModel::WorkspaceAnchorSubMenuModel(
+@@ -84,7 +70,9 @@ bool WorkspaceAnchorSubMenuModel::IsComm
+       return service->IsAnchored(tab) || !tab->IsSplit();
+     case kResetToAnchor:
+     case kReplaceAnchor:
+-      return HasDrifted(tab);
++      // Drifted is the only state in which "go back" and "move anchor here"
++      // do anything.
++      return workspaces::HasDrifted(tab->GetContents());
+     default:
+       return false;
+   }
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -76,6 +76,11 @@ source_set("tab_data") {
+   deps = [
+     "//base",
+     "//content/public/browser",
++
++    # "//url" for GURL, which HasDriftedFrom compares against. Reachable
++    # through //content/public/browser already; listed because this target
++    # includes the header directly.
++    "//url",
+   ]
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -15,6 +15,7 @@
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+ #include "base/logging.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/uuid.h"
+ #include "chrome/browser/sessions/session_service.h"
+@@ -33,6 +34,7 @@
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/invalidate_type.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/web_contents.h"
+@@ -1148,6 +1150,12 @@ bool WorkspaceService::IsAnchored(const
+   return tab && !AnchorUrlForTab(tab->GetContents()).empty();
+ }
+ 
++bool WorkspaceService::ShouldDivertTypedNavigation(
++    content::WebContents* contents,
++    const GURL& url) const {
++  return IsEnabled() && HasDriftedFrom(contents, url);
++}
++
+ void WorkspaceService::SetAnchored(tabs::TabInterface* tab, bool anchored) {
+   content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
+   if (!contents) {
+@@ -1168,7 +1176,7 @@ void WorkspaceService::ResetToAnchor(tab
+     return;
+   }
+   const GURL anchor(AnchorUrlForTab(contents));
+-  if (!anchor.is_valid() || contents->GetLastCommittedURL() == anchor) {
++  if (!anchor.is_valid() || !HasDrifted(contents)) {
+     return;
+   }
+   contents->GetController().LoadURL(anchor, content::Referrer(),
+@@ -1178,7 +1186,8 @@ void WorkspaceService::ResetToAnchor(tab
+ 
+ bool WorkspaceService::HibernateAnchoredTab(tabs::TabInterface* tab,
+                                             DiscardFn discard) {
+-  if (!tab || !IsAnchored(tab) || tab->IsSplit()) {
++  // !IsEnabled() first: feature off means Ctrl+W closes like any other tab.
++  if (!IsEnabled() || !tab || !IsAnchored(tab) || tab->IsSplit()) {
+     return false;
+   }
+   content::WebContents* const contents = tab->GetContents();
+@@ -1200,8 +1209,12 @@ bool WorkspaceService::HibernateAnchored
+     std::vector<bool> selectable;
+     selectable.reserve(static_cast<size_t>(tab_strip_->count()));
+     for (int i = 0; i < tab_strip_->count(); ++i) {
++      // IsTabOnScreen, not IsTabVisible: the latter judges by tag, and a
++      // pinned tab has no tag, so a workspace holding one anchor and one
++      // pinned tab would find no fallback and spawn a blank tab beside a
++      // perfectly good neighbour (E10b).
+       selectable.push_back(i != index && !tab_strip_->IsTabCollapsed(i) &&
+-                           IsTabVisible(tab_strip_->GetTabAtIndex(i)));
++                           IsTabOnScreen(tab_strip_->GetTabAtIndex(i)));
+     }
+     const int fallback = NextVisibleTabIndex(selectable, index, 1);
+     if (fallback == index) {
+@@ -1232,9 +1245,20 @@ bool WorkspaceService::HibernateAnchored
+       entry && anchor.is_valid()) {
+     entry->SetURL(anchor);
+     entry->SetVirtualURL(anchor);
++    // And the title, or the sleeping tab goes on reading as the page it
++    // drifted to while pointing at the anchor. Empty is not a blank label:
++    // GetTitleForDisplay falls back to the entry's URL, which is now the
++    // anchor. Rewriting an entry notifies nothing on its own, so the strip is
++    // told separately -- without that the stale title survives until some
++    // unrelated event repaints the tab (E10b).
++    entry->SetTitle(std::u16string());
++    discarded->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_ALL);
+   }
++  // The label is logged, not just the URL, because the label is the whole
++  // point of the title reset above and is otherwise only checkable by eye.
+   LOG(INFO) << "[workspaces] hibernated anchored tab at index " << index
+-            << " -> '" << anchor.spec() << "'";
++            << " -> '" << anchor.spec() << "', label now '"
++            << base::UTF16ToUTF8(discarded->GetTitle()) << "'";
+   return true;
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -27,6 +27,7 @@
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ 
+ class BrowserWindowInterface;
++class GURL;
+ class PrefService;
+ class TabStripModel;
+ 
+@@ -259,6 +260,13 @@ class WorkspaceService : public TabStrip
+ 
+   // Stage 5 anchors (design 5, E10 spec). An anchored tab remembers a home
+   // URL; Ctrl+W puts it to sleep there instead of closing it.
++  //
++  // EVERY ANCHOR BEHAVIOUR IS GATED ON IsEnabled(), not just the menu that
++  // sets it. Anchoring is reached through the workspace submenu, which
++  // disappears with the feature -- so an anchor that kept acting after the
++  // toggle went off would be a tab that refuses Ctrl+W, diverts everything
++  // typed into it, and offers no way back. The tag itself survives, exactly
++  // as a workspace tag does, so re-enabling restores the anchor.
+   bool IsAnchored(const tabs::TabInterface* tab) const;
+ 
+   // Anchors `tab` at the page it is showing, or clears its anchor. Persisted
+@@ -268,6 +276,12 @@ class WorkspaceService : public TabStrip
+   // Navigates an anchored tab back to its anchor. No-op when it is there.
+   void ResetToAnchor(tabs::TabInterface* tab);
+ 
++  // Whether an address typed into `contents` should open a new tab instead of
++  // taking that tab off its anchor (E10b): enabled, anchored, and `url` is not
++  // the anchor. The one question browser_navigator.cc asks.
++  bool ShouldDivertTypedNavigation(content::WebContents* contents,
++                                   const GURL& url) const;
++
+   // The Ctrl+W behaviour for an anchored tab: move activation to another tab
+   // of the active workspace first (spawning one when there is no other),
+   // discard the tab through `discard`, and point the discarded entry at the
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "content/public/browser/web_contents.h"
++#include "url/gurl.h"
+ 
+ namespace workspaces {
+ 
+@@ -30,6 +31,15 @@ std::string AnchorUrlForTab(content::Web
+   return tab_data ? tab_data->anchor_url() : std::string();
+ }
+ 
++bool HasDriftedFrom(content::WebContents* contents, const GURL& url) {
++  const std::string anchor = AnchorUrlForTab(contents);
++  return !anchor.empty() && anchor != url.spec();
++}
++
++bool HasDrifted(content::WebContents* contents) {
++  return contents && HasDriftedFrom(contents, contents->GetLastCommittedURL());
++}
++
+ void PopulateWorkspaceExtraData(
+     content::WebContents* contents,
+     std::map<std::string, std::string>* extra_data) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
+@@ -12,6 +12,8 @@ namespace content {
+ class WebContents;
+ }
+ 
++class GURL;
++
+ // How a workspace tag survives a restart, and how it gets back onto the tab
+ // afterwards (design 2.6).
+ //
+@@ -61,6 +63,18 @@ std::string WorkspaceGuidForTab(content:
+ // The anchor URL stored on `contents`, or empty when it is not anchored.
+ std::string AnchorUrlForTab(content::WebContents* contents);
+ 
++// Whether an anchored `contents` would be away from home at `url`. False for a
++// tab that is not anchored: a tab with no home cannot be away from it.
++//
++// This is the one test behind all three anchor questions -- "is 'go back to
++// anchor' enabled", "is there anything to go back to", and E10b's "should this
++// typed address open a new tab instead" -- which is why it lives here in the
++// leaf target rather than three times over in the three callers.
++bool HasDriftedFrom(content::WebContents* contents, const GURL& url);
++
++// The same test asked of where the tab is right now.
++bool HasDrifted(content::WebContents* contents);
++
+ // Adds the tag to the map the tab-restore service captures when a tab is
+ // closed, so reopening it with Ctrl+Shift+T puts it back in its workspace.
+ //

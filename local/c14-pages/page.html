@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>c14 page</title>
+<!-- check-c14.ps1's one page, told what to be by its query: ?c14-tone plays a faint tone (C14a-c), ?c14-cam takes
+     the fake camera and microphone (C14d), ?c34-links holds two links (C34b); any other ?name is a plain page. Its
+     title is the name with a space for each dash ("c14 tone"), so DevTools, the tab and the chip's description say
+     which page is which; c14state says how the tone or the camera went. -->
+<style>
+  body { font: 20px sans-serif; }
+  a { display: block; width: 240px; margin: 24px; padding: 24px; border: 1px solid; }
+</style>
+<h1 id="title"></h1>
+<script>
+const page = location.search.slice(1) || "c14-page";
+document.title = page.replaceAll("-", " ");
+document.getElementById("title").textContent = document.title;
+var c14state = "loaded";
+if (page.endsWith("-tone")) {
+  // Gain 0.005: a 440 Hz sine at about -49 dBFS (its power, amplitude^2 / 2),
+  // 23 dB above the audio service's silence threshold (kSilenceThresholdDBFS,
+  // -72.25, services/audio/output_stream.cc) -- so the tab counts as playing --
+  // and faint on the owner's speakers. The launch's
+  // --autoplay-policy=no-user-gesture-required lets it start with no click.
+  const ctx = new AudioContext();
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  gain.gain.value = 0.005;
+  osc.connect(gain).connect(ctx.destination);
+  osc.start();
+  c14state = ctx.state;
+  ctx.onstatechange = () => { c14state = ctx.state; };
+} else if (page.endsWith("-cam")) {
+  // --use-fake-device-for-media-stream: a fake camera and microphone, allowed
+  // with no prompt by the copy's content settings (check-c14.ps1). Both, so
+  // the tab's alert is kMediaRecording.
+  navigator.mediaDevices.getUserMedia({video: true, audio: true}).then(
+      (stream) => { window.stream = stream; c14state = "capturing"; },
+      (e) => { c14state = "failed: " + e.name; });
+} else if (page.endsWith("-links")) {
+  for (const id of ["l1", "l2"]) {
+    const a = document.body.appendChild(document.createElement("a"));
+    a.id = id;
+    a.href = "?c34-" + id;
+    a.textContent = "c34 " + id;
+  }
+}
+</script>

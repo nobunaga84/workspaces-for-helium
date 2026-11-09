@@ -1,0 +1,846 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -55,7 +55,9 @@ source_set("transfer") {
+     ":archive",
+     ":pins",
+   ]
++  # ":prefs" for the workspace list's schema version (transfer F9).
+   deps = [
++    ":prefs",
+     "//base",
+     "//crypto",
+   ]
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -94,13 +94,16 @@ base::DictValue ExportableValues(const P
+ ImportedValues ApplyImportedValues(PrefService* prefs,
+                                    const base::DictValue& values) {
+   constexpr std::string_view kPrefix = "helium.workspaces.";
+-  // State, not content, and this PC's settings, not the workspaces' (#54: the
+-  // confirm names only workspaces, pinned pages and the Archive): an import
+-  // leaves the profile's own.
++  // State, not content, and this PC's settings, not the workspaces' (#54,
++  // transfer F2: the confirm names only workspaces, pinned pages and the
++  // Archive, and says the open tabs stay open): an import leaves the
++  // profile's own. local/workspaces-transfer.py's KEPT_PREFS is this list.
+   const auto kept = [](std::string_view key) {
+     return key == "enabled" || key == "arc_imported_at" ||
+            key == "arc_imported_ids" || key == "toolbar_order" ||
+-           key == "little_window";
++           key == "little_window" || key == "archive_after_minutes" ||
++           key == "tab_row_height" || key == "smooth_scrolling" ||
++           key == "wide_sidebar";
+   };
+   const base::DictValue current = ExportableValues(*prefs);
+   ImportedValues result;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -1128,12 +1128,12 @@ TEST(WorkspacePrefsTest, AnImportSetsCle
+   TestingPrefServiceSimple pref_service;
+   RegisterProfilePrefs(pref_service.registry());
+   pref_service.SetBoolean(kHeliumWorkspacesEnabled, false);
+-  pref_service.SetInteger(kHeliumWorkspacesTabRowHeight, 42);
+-  pref_service.SetInteger(kHeliumWorkspacesArchiveAfterMinutes, 5);
++  base::ListValue folded;
++  folded.Append("old");
++  pref_service.SetList(kHeliumWorkspacesPinsFolded, std::move(folded));
+ 
+   base::DictValue file;
+-  file.Set("tab_row_height", 40);
+-  file.Set("smooth_scrolling", false);
++  file.Set("list", DefaultWorkspacesDict());
+   // The state flags are the profile's own.
+   file.Set("enabled", true);
+   file.Set("arc_imported_at", "13435442523223578");
+@@ -1145,16 +1145,15 @@ TEST(WorkspacePrefsTest, AnImportSetsCle
+   file.Set("wide_sidebar", "not a bool");
+ 
+   const ImportedValues result = ApplyImportedValues(&pref_service, file);
+-  EXPECT_EQ(result.set, 2);
++  EXPECT_EQ(result.set, 1);
+   EXPECT_EQ(result.cleared, 1);
+-  EXPECT_EQ(result.skipped, 2);
+-  EXPECT_EQ(pref_service.GetInteger(kHeliumWorkspacesTabRowHeight), 40);
+-  EXPECT_FALSE(pref_service.GetBoolean(kHeliumWorkspacesSmoothScrolling));
++  EXPECT_EQ(result.skipped, 1);
++  EXPECT_FALSE(pref_service.FindPreference(kHeliumWorkspacesList)
++                   ->IsDefaultValue());
+   // Not in the file: back to its default.
+-  EXPECT_TRUE(
+-      pref_service.FindPreference(kHeliumWorkspacesArchiveAfterMinutes)
+-          ->IsDefaultValue());
+-  // Kept, and a refused value left as it was.
++  EXPECT_TRUE(pref_service.FindPreference(kHeliumWorkspacesPinsFolded)
++                  ->IsDefaultValue());
++  // Kept, and a value of the wrong type for a kept key never even read.
+   EXPECT_FALSE(pref_service.GetBoolean(kHeliumWorkspacesEnabled));
+   EXPECT_TRUE(pref_service.FindPreference(kHeliumWorkspacesArcImportedAt)
+                   ->IsDefaultValue());
+@@ -1163,6 +1162,32 @@ TEST(WorkspacePrefsTest, AnImportSetsCle
+   EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesWideSidebar));
+ }
+ 
++// Transfer F2: the tab style, the scrolling, the sidebar's width and the
++// auto-archive time are this PC's too. The confirm names only workspaces,
++// pinned pages and the Archive and says the open tabs stay open, yet a time
++// from the file would start archiving them.
++TEST(WorkspacePrefsTest, AnImportKeepsThisPCsDisplayAndArchiveSettings) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++  pref_service.SetInteger(kHeliumWorkspacesTabRowHeight, 42);
++  pref_service.SetInteger(kHeliumWorkspacesArchiveAfterMinutes, 10080);
++  pref_service.SetBoolean(kHeliumWorkspacesWideSidebar, false);
++
++  base::DictValue file;
++  file.Set("tab_row_height", 36);
++  file.Set("archive_after_minutes", 1440);
++  file.Set("smooth_scrolling", false);
++  // No wide_sidebar in the file: kept, not cleared.
++  const ImportedValues result = ApplyImportedValues(&pref_service, file);
++  EXPECT_EQ(result.set, 0);
++  EXPECT_EQ(result.cleared, 0);
++  EXPECT_EQ(pref_service.GetInteger(kHeliumWorkspacesTabRowHeight), 42);
++  EXPECT_EQ(pref_service.GetInteger(kHeliumWorkspacesArchiveAfterMinutes),
++            10080);
++  EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesSmoothScrolling));
++  EXPECT_FALSE(pref_service.GetBoolean(kHeliumWorkspacesWideSidebar));
++}
++
+ // #54: the toolbar's order and the little window are this PC's. An import
+ // neither clears them (a file without them) nor sets them (a file with them).
+ TEST(WorkspacePrefsTest, AnImportKeepsThisPCsToolbarOrderAndLittleWindow) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -859,9 +859,11 @@ int WorkspaceService::CloseTabs(std::vec
+ 
+ bool WorkspaceService::CanSnooze(tabs::TabInterface* tab) const {
+   content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  // Not a grouped tab, which the auto-archive refuses too: the group's last
++  // would dissolve it, and the page wake ungrouped (review #36).
+   return IsEnabled() && contents && !tab->IsPinned() && !tab->IsSplit() &&
+-         !IsAnchored(tab) && PinItemForTab(contents).empty() &&
+-         HasRestorableAddress(contents);
++         !tab->GetGroup().has_value() && !IsAnchored(tab) &&
++         PinItemForTab(contents).empty() && HasRestorableAddress(contents);
+ }
+ 
+ int WorkspaceService::SnoozeTabs(const std::vector<tabs::TabInterface*>& tabs,
+@@ -1659,8 +1661,12 @@ void WorkspaceService::EnsureActiveTabVi
+   }
+ 
+   // An empty strip means this window is on its way out. Adding a tab here
+-  // would resurrect a window the user just closed.
+-  if (tab_strip_->empty()) {
++  // would resurrect a window the user just closed. Nor while it closes: a
++  // tab that asks "Leave site?" keeps the strip from emptying (review #30).
++  const DesktopBrowserWindowCapabilities* const capabilities =
++      browser_window_->capabilities();
++  if (tab_strip_->empty() ||
++      (capabilities && capabilities->IsAttemptingToCloseBrowser())) {
+     return;
+   }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_transfer.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_transfer.cc
+@@ -22,6 +22,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/time/time.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "crypto/hash.h"
+ 
+ namespace workspaces::transfer {
+@@ -86,6 +87,35 @@ void AppendCsvField(std::string& out, st
+   out.push_back('"');
+ }
+ 
++// Transfer F8: a script, or a file on another computer -- Windows would
++// connect to it. Every other address is one this browser keeps itself (the
++// Archive takes any valid address, Replace pinned URL any page), so a file
++// it exported always comes back in.
++bool IsForeignAddress(std::string_view url) {
++  constexpr auto kInsensitive = base::CompareCase::INSENSITIVE_ASCII;
++  return base::StartsWith(url, "javascript:", kInsensitive) ||
++         (base::StartsWith(url, "file://", kInsensitive) &&
++          !base::StartsWith(url, "file:///", kInsensitive));
++}
++
++// The first address in `nodes`, at any depth, IsForeignAddress names.
++const std::string* ForeignAddress(const std::vector<PinNode>& nodes) {
++  for (const PinNode& node : nodes) {
++    if (node.type == PinNode::Type::kItem && IsForeignAddress(node.url)) {
++      return &node.url;
++    }
++    if (const std::string* inner = ForeignAddress(node.children)) {
++      return inner;
++    }
++  }
++  return nullptr;
++}
++
++std::string ForeignAddressError(std::string_view url) {
++  return "The file holds an address this browser does not import: " +
++         std::string(url.substr(0, 40));
++}
++
+ struct CsvRow {
+   std::string workspace;
+   std::string folder;
+@@ -219,7 +249,10 @@ ParseResult ParseExport(std::string_view
+     return fail("The file is not a Helium workspaces export.");
+   }
+   const std::optional<int> version = doc->FindInt("version");
+-  if (!version || *version < 1 || *version > kVersion) {
++  if (!version || *version < 1) {
++    return fail("The file's export version is not one this browser knows.");
++  }
++  if (*version > kVersion) {
+     return fail(
+         "The file is from a newer version of this export than this browser "
+         "reads.");
+@@ -266,6 +299,21 @@ ParseResult ParseExport(std::string_view
+       if (!prefs) {
+         return fail("The settings in the file hold no workspaces.");
+       }
++      // Transfer F9: a list of another schema reads as Home alone
++      // (ParseWorkspaces), and the next list edit would save that. A list
++      // without one is read as before. Read as ParseWorkspaces reads it: an
++      // int, so a 1.0 is not 1 there either.
++      const base::DictValue* list = prefs->FindDict("list");
++      const base::Value* schema =
++          list ? list->Find(workspaces::prefs::kSchemaVersionKey) : nullptr;
++      if (schema && schema->GetIfInt() != workspaces::prefs::kSchemaVersion) {
++        return fail(schema->GetIfDouble().value_or(0) >
++                            workspaces::prefs::kSchemaVersion
++                        ? "The workspace list in the file is from a newer "
++                          "version of this browser."
++                        : "The workspace list in the file is in a form this "
++                          "browser cannot read.");
++      }
+       parsed.prefs = prefs->Clone();
+       have_prefs = true;
+     } else if (name == kPinsMember) {
+@@ -275,12 +323,22 @@ ParseResult ParseExport(std::string_view
+             "The pinned pages in the file are in a form this browser cannot "
+             "read.");
+       }
++      for (const auto& [guid, rows] : *parsed.pins) {
++        if (const std::string* url = ForeignAddress(rows)) {
++          return fail(ForeignAddressError(*url));
++        }
++      }
+     } else {
+       parsed.archive = archive::ArchiveFromValue(*value);
+       if (!parsed.archive) {
+         return fail(
+             "The Archive in the file is in a form this browser cannot read.");
+       }
++      for (const archive::ArchiveEntry& entry : *parsed.archive) {
++        if (IsForeignAddress(entry.url)) {
++          return fail(ForeignAddressError(entry.url));
++        }
++      }
+     }
+   }
+   if (!have_prefs) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_transfer.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_transfer.h
+@@ -41,7 +41,7 @@
+ // needs the other's way of writing json. "prefs.json" is
+ // {"helium": {"workspaces": {...}}}; the other two are the store files' own
+ // values (PinTreeToValue, ArchiveToValue). A member may be missing except
+-// prefs.json.
++// prefs.json; an import reads a missing one as empty (transfer F5).
+ namespace workspaces::transfer {
+ 
+ inline constexpr char kFormat[] = "helium-workspaces-export";
+@@ -103,7 +103,9 @@ struct ParseResult {
+   std::string error;
+ };
+ 
+-// Checks and reads an export file's text. Nothing is applied.
++// Checks and reads an export file's text. Nothing is applied. Refused too: a
++// workspace list of another schema (F9), a script's address or a file on
++// another computer (F8).
+ ParseResult ParseExport(std::string_view json);
+ 
+ // The pinned pages as a table a spreadsheet opens (UTF-8 with a byte-order
+@@ -117,7 +119,7 @@ std::string BuildPinsCsv(const base::Dic
+                          const pins::PinTree& pins);
+ 
+ // The copies an import keeps of what it replaces (C19.1): in this folder of
+-// the profile, named "before-import-<YYYYMMDD-HHMMSS>.json".
++// the profile, named "before-import-<YYYYMMDD-HHMMSS-mmm>.json".
+ inline constexpr char kBackupFolder[] = "Workspace Backups";
+ inline constexpr base::FilePath::CharType kBackupPattern[] =
+     FILE_PATH_LITERAL("before-import-*.json");
+--- a/chrome/browser/ui/tabs/workspaces/workspace_transfer_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_transfer_unittest.cc
+@@ -14,6 +14,7 @@
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
++#include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/time/time.h"
+@@ -363,5 +364,94 @@ TEST(WorkspaceTransferTest, ACsvWithNoPi
+             "workspace,folder,kind,title,url,last_used\r\n");
+ }
+ 
++// Transfer F8: a script, or a file on another computer (Windows connects to
++// it), refuses the whole file -- in a pinned page at any depth or in the
++// Archive. Every address this browser keeps itself comes back in: the Archive
++// takes any valid address (an extension's page, about:, data:).
++TEST(WorkspaceTransferTest, AScriptOrAFileOnAnotherComputerIsRefused) {
++  const auto pins = [](std::string_view row) {
++    return Craft({{kPrefsMember, kPrefsText},
++                  {kPinsMember,
++                   base::StrCat({R"({"version":2,"workspaces":{"default":[)",
++                                 row, "]}}"})}});
++  };
++  const auto item = [](std::string_view url) {
++    return base::StrCat(
++        {R"({"type":"item","id":"a","title":"A","url":")", url, R"("})"});
++  };
++  const auto archive = [](std::string_view url) {
++    return Craft(
++        {{kPrefsMember, kPrefsText},
++         {kArchiveMember,
++          base::StrCat({R"({"version":1,"entries":[{"id":"x","url":")", url,
++                        R"(","title":"t","workspace":"default","reason":"manual",)"
++                        R"("archived_at":"13437074330809987",)"
++                        R"("last_active":"13437074330809987"}]})"})}});
++  };
++  for (const std::string_view ok :
++       {"https://a.example/", "http://a.example/", "chrome://settings/",
++        "file:///C:/Docs/a.pdf", "HTTPS://A.EXAMPLE/",
++        "chrome-extension://abc/dashboard.html", "about:blank",
++        "data:text/html,x", "view-source:https://a.example/",
++        "ftp://a.example/"}) {
++    EXPECT_TRUE(ParseExport(pins(item(ok))).value) << ok;
++    EXPECT_TRUE(ParseExport(archive(ok)).value) << ok;
++  }
++  for (const std::string_view bad :
++       {"javascript:alert(1)", "JavaScript:x", "file://host/share/x.html",
++        "FILE://host/x"}) {
++    const ParseResult result = ParseExport(pins(item(bad)));
++    EXPECT_FALSE(result.value) << bad;
++    EXPECT_NE(result.error.find("address"), std::string::npos) << result.error;
++    EXPECT_FALSE(ParseExport(archive(bad)).value) << bad;
++  }
++  // Inside a folder, and one half of a split.
++  EXPECT_FALSE(ParseExport(pins(base::StrCat(
++                               {R"({"type":"folder","id":"f","title":"F",)"
++                                R"("children":[)",
++                                item("javascript:x"), "]}"})))
++                   .value);
++  EXPECT_FALSE(
++      ParseExport(pins(base::StrCat(
++                      {R"({"type":"split","id":"s","title":"","children":[)",
++                       R"({"type":"item","id":"l","title":"L",)"
++                       R"("url":"https://l.example/"},)"
++                       R"({"type":"item","id":"r","title":"R",)"
++                       R"("url":"file://host/r"}]})"})))
++          .value);
++}
++
++// Transfer F9: a workspace list of another schema would import, then read as
++// Home alone (ParseWorkspaces) -- and the next list edit would save that. A
++// list without a version is read as before (the fixtures above, the script's).
++TEST(WorkspaceTransferTest, AWorkspaceListOfAnotherVersionIsRefused) {
++  const auto with = [](std::string_view list) {
++    return Craft({{kPrefsMember,
++                   base::StrCat(
++                       {R"({"helium":{"workspaces":{"list":)", list, "}}}"})}});
++  };
++  EXPECT_TRUE(ParseExport(with(R"({"schema_version":1,"items":[]})")).value);
++  EXPECT_TRUE(ParseExport(with(R"({"items":[]})")).value);
++  const ParseResult newer =
++      ParseExport(with(R"({"schema_version":2,"items":[]})"));
++  EXPECT_FALSE(newer.value);
++  EXPECT_NE(newer.error.find("newer"), std::string::npos) << newer.error;
++  const ParseResult zero =
++      ParseExport(with(R"({"schema_version":0,"items":[]})"));
++  EXPECT_FALSE(zero.value);
++  EXPECT_EQ(zero.error.find("newer"), std::string::npos) << zero.error;
++  // ParseWorkspaces reads an int: a 1.0 or a "1" is no version to it.
++  EXPECT_FALSE(ParseExport(with(R"({"schema_version":1.0,"items":[]})")).value);
++  EXPECT_FALSE(ParseExport(with(R"({"schema_version":"1","items":[]})")).value);
++}
++
++// Transfer F10: a version below 1 is not "from a newer version".
++TEST(WorkspaceTransferTest, AVersionBelowOneIsNotCalledNewer) {
++  const ParseResult zero =
++      ParseExport(Craft({{kPrefsMember, kPrefsText}}, kFormat, 0));
++  EXPECT_FALSE(zero.value);
++  EXPECT_EQ(zero.error.find("newer"), std::string::npos) << zero.error;
++}
++
+ }  // namespace
+ }  // namespace workspaces::transfer
+--- a/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
++++ b/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
+@@ -342,6 +342,15 @@
+   <message name="IDS_HELIUM_WORKSPACE_TRANSFER_PARTLY" desc="Reason shown when the pinned pages or Archive of an import were refused after the settings were already applied.">
+     The settings were imported, but the pinned pages or Archive could not be replaced.
+   </message>
++  <message name="IDS_HELIUM_WORKSPACE_EXPORT_READONLY" desc="Reason shown when an export is refused because the pinned pages or Archive file could not be read when the browser started, so the file would leave them out.">
++    Your pinned pages or Archive file could not be read when the browser started, so an export now would leave them out.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_BACKUP_FAILED" desc="Reason shown when an import is refused because the copy of the current workspaces, kept before anything is replaced, could not be saved.">
++    A copy of what you have now could not be saved first, so nothing was replaced.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_TRANSFER_TOO_LARGE" desc="Reason shown when the file chosen for an import is larger than any workspaces export (128 MB).">
++    The file is too large to be a workspaces export (over 128 MB).
++  </message>
+   <message name="IDS_HELIUM_PINNED_SELECTION_CONFIRM_DELETE" desc="Title of the confirmation shown before several selected rows of the pinned section (pinned pages and folders) are deleted together.">
+     {NUM_ROWS, plural,
+      =1 {Delete the selected row?}
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_little_window.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_little_window.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ // InsertMovedPage, C20's "Open as tab" shared: C6's move needs C20's patch.
+@@ -56,10 +57,21 @@ bool MaybeOpenLittleWindow(Profile* prof
+   // Asked of the window that would take the tab, not of the pref: rules do
+   // nothing with Workspaces off OR in a classic layout (D5, IsEnabled), and
+   // then the small window stays (the review's #8).
++  // With no main window (data-files F9: only a little or an app window) there
++  // is no service to ask, so the rules come from the profile's list.
++  // ponytail: the layout is not known without a window, so in the classic
++  // layout such a link opens a main window rather than the little one; a
++  // layout pref read would copy Helium's enum into this file (IsEnabled).
+   const WorkspaceService* const service = WorkspaceService::From(
+       ProfileBrowserCollection::GetForProfile(profile)->FindTabbedBrowser());
+-  if (service && service->IsEnabled() &&
+-      !service->RuleWorkspaceForHost(url.host()).empty()) {
++  PrefService* const profile_prefs = profile->GetPrefs();
++  if (service ? service->IsEnabled() &&
++                    !service->RuleWorkspaceForHost(url.host()).empty()
++              : profile_prefs->GetBoolean(prefs::kHeliumWorkspacesEnabled) &&
++                    !WorkspaceForHost(url.host(),
++                                      prefs::SiteRules(
++                                          prefs::GetWorkspaces(profile_prefs)))
++                         .empty()) {
+     // It names the site: only when LogsAddresses() (privacy F6).
+     LOG_IF(INFO, workspaces::LogsAddresses())
+         << "[workspaces] little window: skipped, site rule for '" << url.host()
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -3255,13 +3255,14 @@ void WorkspacePinnedSectionView::ShowDel
+                   IDS_HELIUM_PINNED_SELECTION_CONFIRM_BODY),
+               l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_ITEM_DELETE),
+               base::BindOnce(&WorkspacePinnedSectionView::DeleteSelection,
+-                             weak_factory_.GetWeakPtr(), ids));
++                             weak_factory_.GetWeakPtr(), ids, drawn_guid_));
+ }
+ 
+ void WorkspacePinnedSectionView::DeleteSelection(
+-    const std::vector<std::string>& ids) {
++    const std::vector<std::string>& ids,
++    const std::string& workspace) {
+   for (const std::string& id : ids) {
+-    DeleteRow(id);
++    DeleteRow(id, workspace);
+   }
+   LOG(INFO) << "[workspaces] pins: deleted " << ids.size()
+             << " selected row(s)";
+@@ -3543,7 +3544,8 @@ void WorkspacePinnedSectionView::UnpinIt
+   UnlinkItem(browser_, *store_, id, index, group);
+ }
+ 
+-void WorkspacePinnedSectionView::DeleteRow(const std::string& id) {
++void WorkspacePinnedSectionView::DeleteRow(const std::string& id,
++                                           const std::string& workspace) {
+   const PinNode* const row = store_ ? store_->Find(id) : nullptr;
+   if (!row) {
+     return;
+@@ -3601,7 +3603,7 @@ void WorkspacePinnedSectionView::DeleteR
+     }
+     workspaces::archive::ArchiveEntry& entry = entries[i];
+     entry.id = NewRowId();
+-    entry.workspace = drawn_guid_;
++    entry.workspace = workspace;
+     entry.reason = workspaces::archive::ArchiveEntry::Reason::kManual;
+     entry.archived_at = base::Time::Now();
+     archived += archive->Add(std::move(entry)) ? 1 : 0;
+@@ -3643,7 +3645,7 @@ void WorkspacePinnedSectionView::ShowDel
+               l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_FOLDER_CONFIRM_BODY),
+               l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_FOLDER_DELETE),
+               base::BindOnce(&WorkspacePinnedSectionView::DeleteRow,
+-                             weak_factory_.GetWeakPtr(), id));
++                             weak_factory_.GetWeakPtr(), id, drawn_guid_));
+ }
+ 
+ void WorkspacePinnedSectionView::MoveRow(const std::string& id,
+@@ -3677,13 +3679,10 @@ void WorkspacePinnedSectionView::MoveRow
+       pages.emplace_back(window, std::move(tabs));
+     }
+   }
+-  // Last in the target, after its last row DRAWN -- PinTabs' end, below a
+-  // deleted workspace's rows in Home (B8, D1). The target stays as it is,
+-  // folded or not.
+-  const std::vector<const PinNode*> roots = workspaces::pins::RootsForWorkspace(
+-      store_->tree(), guid, service->known_guids());
+-  const std::string after = roots.empty() ? std::string() : roots.back()->id;
+-  if (!store_->Move(id, guid, after, Where::kAfter)) {
++  // Last of the target's OWN rows (an empty `to`): placed after a deleted
++  // workspace's row drawn in Home, it would be kept under that workspace's
++  // key (review #50). The target stays as it is, folded or not.
++  if (!store_->Move(id, guid, std::string(), Where::kAfter)) {
+     LOG(WARNING) << "[workspaces] pins: could not move '" << id
+                  << "' to workspace '" << guid << "'";
+     return;
+@@ -5021,7 +5020,7 @@ void WorkspacePinnedSectionView::Execute
+       }
+       break;
+     case kCommandDelete:
+-      DeleteRow(id);
++      DeleteRow(id, drawn_guid_);
+       break;
+     case kCommandRename:
+       ShowRenameBubble(context_menu_page_id_);
+@@ -5100,7 +5099,7 @@ void WorkspacePinnedSectionView::Execute
+       if (items > 0) {
+         ShowDeleteFolderConfirm(id, items);
+       } else {
+-        DeleteRow(id);
++        DeleteRow(id, drawn_guid_);
+       }
+       break;
+     }
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -309,7 +309,8 @@ class WorkspacePinnedSectionView
+   void AddMoveToWorkspaceMenu();
+   void ExecuteSelectionCommand(int command_id);
+   void ShowDeleteSelectionConfirm(const std::vector<std::string>& ids);
+-  void DeleteSelection(const std::vector<std::string>& ids);
++  void DeleteSelection(const std::vector<std::string>& ids,
++                       const std::string& workspace);
+   void OnFolderPressed(const std::string& id);
+   // Collapsed, a folder's press: a menu of every page under it, by title,
+   // each opened as its row would be (E17b).
+@@ -353,8 +354,10 @@ class WorkspacePinnedSectionView
+                  int index = -1,
+                  std::optional<tab_groups::TabGroupId> group = std::nullopt,
+                  bool select = true);
+-  // Removes an item, or a folder with all it holds, closing their pages.
+-  void DeleteRow(const std::string& id);
++  // Removes an item, or a folder with all it holds, closing their pages; its
++  // pages go to `workspace`'s Archive -- the one shown when it was asked,
++  // never the one shown when a confirm is accepted (review #49).
++  void DeleteRow(const std::string& id, const std::string& workspace);
+   void ShowDeleteFolderConfirm(const std::string& id, int items);
+   // The confirmation bubble the three confirms share (Delete folder, Open all,
+   // Delete selection): `on_ok` runs on the OK button; Cancel only logs.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -2187,8 +2187,12 @@ void WorkspaceRailView::ShowWorkspaceMen
+ bool WorkspaceRailView::IsCommandIdEnabled(int command_id) const {
+   // Arc's file is read off-thread, so a second click could arrive before the
+   // first import has inserted anything -- here or in another window of the
+-  // profile (the negative review's arc-import F3).
+-  if (command_id == kMenuCommandImportArc) {
++  // profile (the negative review's arc-import F3). Export and Import too
++  // (review #52): an Import's list would leave the arriving tabs under
++  // workspaces it no longer has, and an Export would miss them.
++  if (command_id == kMenuCommandImportArc ||
++      command_id == kMenuCommandExportWorkspaces ||
++      command_id == kMenuCommandImportWorkspaces) {
+     return !WorkspaceArcImporter::IsRunning(browser_->GetProfile());
+   }
+ 
+@@ -2306,10 +2310,21 @@ void WorkspaceRailView::ExecuteCommand(i
+       // The custom emoji is the editor's own button, which reuses
+       // ShowNameBubble with the old "Change icon" strings.
+       LOG(INFO) << "[workspaces] rail menu: edit";
++      // The rename is the window's, not this bar's: a layout switch remakes
++      // the bar while the bubble is open (review #48).
+       WorkspaceEditBubbleView::Show(
+           browser_, this, guid,
+-          base::BindOnce(&WorkspaceRailView::RenameFromEditor,
+-                         weak_factory_.GetWeakPtr(), guid));
++          base::BindOnce(
++              [](base::WeakPtr<BrowserWindowInterface> browser,
++                 const std::string& guid, const std::u16string& name) {
++                if (workspaces::WorkspaceService* const service =
++                        browser ? workspaces::WorkspaceService::From(
++                                      browser.get())
++                                : nullptr) {
++                  service->RenameWorkspace(guid, base::UTF16ToUTF8(name));
++                }
++              },
++              browser_->GetWeakPtr(), guid));
+       break;
+     case kMenuCommandSaveAsBookmarks:
+       SaveAsBookmarks(browser_, guid);
+@@ -2356,14 +2371,6 @@ void WorkspaceRailView::ExecuteCommand(i
+   }
+ }
+ 
+-void WorkspaceRailView::RenameFromEditor(const std::string& guid,
+-                                         const std::u16string& name) {
+-  if (workspaces::WorkspaceService* const service =
+-          workspaces::WorkspaceService::From(browser_)) {
+-    service->RenameWorkspace(guid, base::UTF16ToUTF8(name));
+-  }
+-}
+-
+ void WorkspaceRailView::ShowCloseConfirmBubble(const std::string& guid,
+                                                int count,
+                                                bool deleting) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -357,10 +357,6 @@ class WorkspaceRailView : public views::
+   // arrows and every chip (E17a).
+   void UpdateFrameColors();
+ 
+-  // The "Edit workspace..." bubble's name (E17a). The bubble passes only a
+-  // changed, non-empty name.
+-  void RenameFromEditor(const std::string& guid, const std::u16string& name);
+-
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+ 
+   // Packs the parent's column at its end while the strip is collapsed and the
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_transfer_ui.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_transfer_ui.cc
+@@ -53,6 +53,7 @@ namespace transfer = workspaces::transfe
+ 
+ constexpr char kAutoSwitch[] = "helium-workspaces-transfer-auto";
+ // The most an import file may weigh: a 3,400-page profile is about 2 MB.
++// IDS_HELIUM_WORKSPACE_TRANSFER_TOO_LARGE names it.
+ constexpr int64_t kMaxImportBytes = 128 * 1024 * 1024;
+ constexpr size_t kKeepBackups = 5;
+ 
+@@ -70,8 +71,11 @@ std::string LocalDay() {
+ std::string LocalStamp() {
+   base::Time::Exploded e;
+   base::Time::Now().LocalExplode(&e);
+-  return base::StringPrintf("%04d%02d%02d-%02d%02d%02d", e.year, e.month,
+-                            e.day_of_month, e.hour, e.minute, e.second);
++  // The milliseconds too: two imports in one second (two windows) would
++  // otherwise write one copy over the other (transfer F3).
++  return base::StringPrintf("%04d%02d%02d-%02d%02d%02d-%03d", e.year, e.month,
++                            e.day_of_month, e.hour, e.minute, e.second,
++                            e.millisecond);
+ }
+ 
+ std::string ExportedAt() {
+@@ -84,15 +88,18 @@ bool WriteExport(const base::FilePath& p
+                                                         "WorkspaceTransfer");
+ }
+ 
+-// Off the UI thread: the safety copy, then only the newest kKeepBackups kept.
+-void WriteBackup(const base::FilePath& folder,
++// Off the UI thread: the safety copy, then only the oldest and the newest
++// kKeepBackups kept. False when the copy could not be written.
++bool WriteBackup(const base::FilePath& folder,
+                  const std::string& name,
+                  std::string text) {
+   if (!base::CreateDirectory(folder) ||
+       !base::ImportantFileWriter::WriteFileAtomically(folder.AppendASCII(name),
+                                                       text,
+                                                       "WorkspaceTransfer")) {
+-    return;
++    LOG(WARNING) << "[workspaces] import: could not write the copy in "
++                 << folder;
++    return false;
+   }
+   std::vector<base::FilePath> copies;
+   base::FileEnumerator files(folder, /*recursive=*/false,
+@@ -101,18 +108,24 @@ void WriteBackup(const base::FilePath& f
+   for (base::FilePath f = files.Next(); !f.empty(); f = files.Next()) {
+     copies.push_back(f);
+   }
+-  // The names carry their time, so name order is time order.
++  // The names carry their time, so name order is time order. The oldest
++  // stays: the profile before its first import, which the newest few alone
++  // would rotate out once a user tries several files (transfer F3).
+   std::ranges::sort(copies);
+-  while (copies.size() > kKeepBackups) {
+-    base::DeleteFile(copies.front());
+-    copies.erase(copies.begin());
++  while (copies.size() > kKeepBackups + 1) {
++    base::DeleteFile(copies[1]);
++    copies.erase(copies.begin() + 1);
+   }
++  return true;
+ }
+ 
+-std::optional<std::string> ReadImport(const base::FilePath& path) {
++base::expected<std::string, int> ReadImport(const base::FilePath& path) {
++  if (base::GetFileSize(path).value_or(0) > kMaxImportBytes) {
++    return base::unexpected(IDS_HELIUM_WORKSPACE_TRANSFER_TOO_LARGE);
++  }
+   std::string text;
+   if (!base::ReadFileToStringWithMaxSize(path, &text, kMaxImportBytes)) {
+-    return std::nullopt;
++    return base::unexpected(IDS_HELIUM_WORKSPACE_TRANSFER_READ_FAILED);
+   }
+   return text;
+ }
+@@ -268,9 +281,19 @@ void WorkspaceTransferUi::ExportTo(const
+   if (path.Extension().empty()) {
+     target = path.AddExtensionASCII(csv ? "csv" : "json");
+   }
++  // Transfer F1: a store that could not be read at start-up holds nothing, so
++  // the file would look whole and lack every row. A csv needs the pins only.
++  Profile* const profile = browser_->GetProfile();
++  if (PinsOf(profile)->read_only() ||
++      (!csv && ArchiveOf(profile)->read_only())) {
++    LOG(WARNING) << "[workspaces] export: refused, a store is read-only";
++    ShowMessage(l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_EXPORT_FAILED),
++                l10n_util::GetStringUTF16(
++                    IDS_HELIUM_WORKSPACE_EXPORT_READONLY));
++    return;
++  }
+   transfer::Counts counts;
+-  std::optional<std::string> text =
+-      BuildFromProfile(browser_->GetProfile(), csv, &counts);
++  std::optional<std::string> text = BuildFromProfile(profile, csv, &counts);
+   if (!text) {
+     LOG(WARNING) << "[workspaces] export: the stores have not loaded yet";
+     ShowMessage(l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_EXPORT_FAILED),
+@@ -322,14 +345,14 @@ void WorkspaceTransferUi::ImportFrom(con
+                      weak_factory_.GetWeakPtr()));
+ }
+ 
+-void WorkspaceTransferUi::OnImportRead(std::optional<std::string> text) {
++void WorkspaceTransferUi::OnImportRead(base::expected<std::string, int> text) {
+   const auto fail = [this](const std::u16string& reason) {
+     LOG(WARNING) << "[workspaces] import: refused: " << reason;
+     ShowMessage(l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_IMPORT_FAILED),
+                 reason);
+   };
+-  if (!text) {
+-    fail(l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_TRANSFER_READ_FAILED));
++  if (!text.has_value()) {
++    fail(l10n_util::GetStringUTF16(text.error()));
+     return;
+   }
+   transfer::ParseResult parsed = transfer::ParseExport(*text);
+@@ -411,31 +434,49 @@ void WorkspaceTransferUi::Apply() {
+     return;
+   }
+   Profile* const profile = browser_->GetProfile();
+-  // The profile as it is, kept first: built here, written off the UI thread.
+-  if (std::optional<std::string> before =
+-          BuildFromProfile(profile, /*csv=*/false, nullptr)) {
+-    const std::string stamp = LocalStamp();
+-    transfer::BackupSequence()->PostTask(
+-        FROM_HERE,
+-        base::BindOnce(&WriteBackup,
+-                       profile->GetPath().AppendASCII(transfer::kBackupFolder),
+-                       "before-import-" + stamp + ".json", std::move(*before)));
++  // Transfer F3: the profile as it is, kept first -- built here, written off
++  // the UI thread -- and nothing replaced until it is on disk. StoresReady():
++  // both stores have loaded, so there is a text; an empty copy would be no copy.
++  std::optional<std::string> before =
++      BuildFromProfile(profile, /*csv=*/false, nullptr);
++  CHECK(before);
++  transfer::BackupSequence()->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(&WriteBackup,
++                     profile->GetPath().AppendASCII(transfer::kBackupFolder),
++                     "before-import-" + LocalStamp() + ".json",
++                     std::move(*before)),
++      base::BindOnce(&WorkspaceTransferUi::ApplyAfterBackup,
++                     weak_factory_.GetWeakPtr(), std::move(pending)));
++}
++
++void WorkspaceTransferUi::ApplyAfterBackup(
++    std::unique_ptr<PendingImport> pending,
++    bool backed_up) {
++  std::u16string reason =
++      backed_up ? std::u16string()
++                : l10n_util::GetStringUTF16(
++                      IDS_HELIUM_WORKSPACE_IMPORT_BACKUP_FAILED);
++  // The stores may have changed state while the copy was written.
++  if (!backed_up || !StoresReady(&reason)) {
++    LOG(WARNING) << "[workspaces] import: refused: " << reason;
++    ShowMessage(l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_IMPORT_FAILED),
++                reason);
++    return;
+   }
++  Profile* const profile = browser_->GetProfile();
+   // Settings first, so the rail knows the workspaces the rows are kept under;
+-  // then the rows and the Archive. Each tells its observers.
++  // then the rows and the Archive. Each tells its observers. Transfer F5: a
++  // file without its pins or Archive has none -- the confirm said 0 -- rather
++  // than leave this profile's beside a list they no longer match.
+   const workspaces::prefs::ImportedValues settings =
+       workspaces::prefs::ApplyImportedValues(profile->GetPrefs(),
+                                              pending->imported.prefs);
+   const transfer::Counts counts = pending->imported.counts;
+-  bool pins_ok = true;
+-  bool archive_ok = true;
+-  if (pending->imported.pins) {
+-    pins_ok = PinsOf(profile)->ReplaceAll(std::move(*pending->imported.pins));
+-  }
+-  if (pending->imported.archive) {
+-    archive_ok =
+-        ArchiveOf(profile)->ReplaceAll(std::move(*pending->imported.archive));
+-  }
++  const bool pins_ok = PinsOf(profile)->ReplaceAll(
++      std::move(pending->imported.pins).value_or(PinTree()));
++  const bool archive_ok = ArchiveOf(profile)->ReplaceAll(
++      std::move(pending->imported.archive).value_or(std::vector<ArchiveEntry>()));
+   LOG(INFO) << "[workspaces] import: applied " << counts.workspaces
+             << " workspace(s), " << counts.pinned_pages << " pinned page(s), "
+             << counts.folders << " folder(s), " << counts.archive_entries
+@@ -449,12 +490,20 @@ void WorkspaceTransferUi::Apply() {
+                     IDS_HELIUM_WORKSPACE_TRANSFER_PARTLY));
+     return;
+   }
++  // Transfer F5: what the profile holds now, which the Archive's 60 days may
++  // have cut below the file's count.
++  const transfer::Counts now = transfer::CountsOf(
++      workspaces::prefs::ExportableValues(*profile->GetPrefs()),
++      &PinsOf(profile)->tree(), &ArchiveOf(profile)->entries());
++  LOG(INFO) << "[workspaces] import: now " << now.workspaces
++            << " workspace(s), " << now.pinned_pages << " pinned page(s), "
++            << now.archive_entries << " archive entr(ies)";
+   ShowMessage(
+       l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_IMPORT_DONE),
+       l10n_util::GetStringFUTF16(IDS_HELIUM_WORKSPACE_IMPORT_DONE_BODY,
+-                                 base::FormatNumber(counts.workspaces),
+-                                 base::FormatNumber(counts.pinned_pages),
+-                                 base::FormatNumber(counts.archive_entries)));
++                                 base::FormatNumber(now.workspaces),
++                                 base::FormatNumber(now.pinned_pages),
++                                 base::FormatNumber(now.archive_entries)));
+ }
+ 
+ void WorkspaceTransferUi::ShowMessage(const std::u16string& title,
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_transfer_ui.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_transfer_ui.h
+@@ -13,6 +13,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/types/expected.h"
+ #include "ui/shell_dialogs/select_file_dialog.h"
+ #include "ui/views/view_tracker.h"
+ 
+@@ -67,9 +68,13 @@ class WorkspaceTransferUi : public ui::S
+                        int pages,
+                        bool ok);
+   void ImportFrom(const base::FilePath& path);
+-  void OnImportRead(std::optional<std::string> text);
++  // The file's text, or the message id of the reason it could not be read.
++  void OnImportRead(base::expected<std::string, int> text);
+   void AskToReplace();
+   void Apply();
++  // The import itself, once the copy of the profile is on disk (transfer F3).
++  void ApplyAfterBackup(std::unique_ptr<PendingImport> pending,
++                        bool backed_up);
+   // A short message under the anchor: `title`, then `body` when not empty.
+   void ShowMessage(const std::u16string& title, const std::u16string& body);
+   // Whether the pinned pages and the Archive can be read and replaced now:

@@ -1,0 +1,26 @@
+// Copyright 2026 The Helium Authors
+// You can use, redistribute, and/or modify this source code under
+// the terms of the GPL-3.0 license that can be found in the LICENSE file.
+// Workspaces for Helium: made by local/make-branding.py from local/branding/*.svg.
+
+CANVAS_DIMENSIONS, 256,
+ROUND_RECT, 84, 20, 152, 118, 28,
+NEW_PATH,
+PATH_MODE_CLEAR,
+ROUND_RECT, 38, 48, 184, 150, 44,
+NEW_PATH,
+ROUND_RECT, 54, 64, 152, 118, 28,
+NEW_PATH,
+PATH_MODE_CLEAR,
+ROUND_RECT, 8, 92, 184, 150, 44,
+NEW_PATH,
+ROUND_RECT, 24, 108, 152, 118, 28,
+NEW_PATH,
+PATH_MODE_CLEAR,
+ROUND_RECT, 46, 130, 108, 74, 6,
+NEW_PATH,
+CIRCLE, 57, 145, 11,
+NEW_PATH,
+CIRCLE, 57, 167, 11,
+NEW_PATH,
+CIRCLE, 57, 189, 11,

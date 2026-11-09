@@ -1,0 +1,424 @@
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -4047,6 +4047,10 @@ bool TabStripModel::HasIndicesClosedByCo
+           : gfx::Range(index, index + 1);
+ 
+   std::optional<tab_groups::TabGroupId> focused_group = GetFocusedGroup();
++  // Workspaces: the tabs read once, at the first ask (R2-8). GetTabAtIndex(i)
++  // walks the collection tree from the start, and the check below asks of
++  // every tab; a loop that asks of none reads none.
++  std::vector<tabs::TabInterface*> all_tabs;
+   for (int i = count() - 1; i > last_unclosed_tab; --i) {
+     if (id == CommandCloseTabsToLeft && i >= first_unclosed_tab) {
+       continue;
+@@ -4061,8 +4065,11 @@ bool TabStripModel::HasIndicesClosedByCo
+     // close. Without this, "Close other tabs" in one workspace silently closes
+     // every tab of all the others, and Recently Closed is the only way back.
+     // Nor an anchored one: it is skipped the way a pinned tab is (E14a).
+-    if (!delegate_->IsTabVisibleInActiveWorkspace(GetTabAtIndex(i)) ||
+-        delegate_->IsTabAnchored(GetTabAtIndex(i))) {
++    if (all_tabs.empty()) {
++      all_tabs = contents_data_->GetTabsRecursive();
++    }
++    if (!delegate_->IsTabVisibleInActiveWorkspace(all_tabs[i]) ||
++        delegate_->IsTabAnchored(all_tabs[i])) {
+       continue;
+     }
+     if (!indices_to_exclude.Contains(gfx::Range(i, i + 1)) && !IsTabPinned(i) &&
+@@ -4649,19 +4656,30 @@ void TabStripModel::SelectRelativeTab(Ta
+   const int delta = direction == TabRelativeDirection::kNext ? 1 : -1;
+   int index = (start_index + count() + delta) % count();
+ 
+-  auto is_tab_invalid = [this, &focused_group](int i) {
+-    // Do not select the tab if it is in a collapsed group.
+-    if (IsTabCollapsed(i)) {
+-      return true;
++  // Workspaces: the tabs read once the walk passes the next tab (R2-8).
++  // GetTabAtIndex(i) walks the collection tree from the start, and a wrap
++  // round another workspace's tabs asks of each of them; the next tab, the
++  // usual landing place, stays one lookup.
++  const int next_index = index;
++  std::vector<tabs::TabInterface*> all_tabs;
++  auto is_tab_invalid = [this, &focused_group, next_index, &all_tabs](int i) {
++    if (i != next_index && all_tabs.empty()) {
++      all_tabs = contents_data_->GetTabsRecursive();
+     }
+-
+     // Workspaces: a tab the user cannot see is not a landing place either.
+     // Asked through delegate_, never WorkspaceService directly (no GN cycle).
+     // The loop below stops at start_index, so a workspace with nothing
+     // selectable falls through to "activate nothing" rather than spinning.
+     // IsTabCycleStop, not IsTabVisibleInActiveWorkspace: an open pinned page
+     // of this workspace is a landing place for Ctrl+Tab, as in Arc (C2).
+-    if (!delegate_->IsTabCycleStop(GetTabAtIndex(i))) {
++    // Asked first, so a hidden tab never reaches the index lookups below.
++    if (!delegate_->IsTabCycleStop(all_tabs.empty() ? GetTabAtIndex(i)
++                                                    : all_tabs[i])) {
++      return true;
++    }
++
++    // Do not select the tab if it is in a collapsed group.
++    if (IsTabCollapsed(i)) {
+       return true;
+     }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -1146,10 +1146,11 @@ std::vector<tabs::TabInterface*> Workspa
+     }
+   }
+ 
+-  // Walked in strip order, which also drops a tab picked twice.
++  // Walked in strip order, which also drops a tab picked twice -- with the
++  // strip's own iterator, never GetTabAtIndex(i): an index lookup walks the
++  // collection tree from the start, and a chip's menu asks as it opens (R2-8).
+   std::vector<tabs::TabInterface*> movable;
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
+-    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
++  for (tabs::TabInterface* const tab : *tab_strip_) {
+     // A pinned tab has no workspace -- it is drawn in all of them (design 2.5)
+     // -- so moving one would give it a guid and hide it everywhere but the
+     // destination. Skipped rather than refusing the whole move: a selection
+@@ -1252,10 +1253,8 @@ int WorkspaceService::MoveTabsToWorkspac
+   // moved middle tab went on being drawn where it no longer belonged, and a
+   // moved first tab carried the rest of its group off with it.
+   std::vector<tab_groups::TabGroupId> staying;
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
+-    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
+-    const std::optional<tab_groups::TabGroupId> group =
+-        tab ? tab->GetGroup() : std::nullopt;
++  for (tabs::TabInterface* const tab : *tab_strip_) {
++    const std::optional<tab_groups::TabGroupId> group = tab->GetGroup();
+     if (group && !std::ranges::contains(moving, tab) &&
+         !std::ranges::contains(staying, *group)) {
+       staying.push_back(*group);
+@@ -1434,9 +1433,8 @@ int WorkspaceService::RetagPinItemPages(
+     }
+   }
+   std::vector<tabs::TabInterface*> moving;
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
+-    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
+-    if (!tab || !tab->GetContents() || tab->IsPinned()) {
++  for (tabs::TabInterface* const tab : *tab_strip_) {
++    if (!tab->GetContents() || tab->IsPinned()) {
+       continue;
+     }
+     const std::optional<split_tabs::SplitTabId> split = tab->GetSplit();
+@@ -2715,15 +2713,19 @@ int WorkspaceService::IndexForNewTab(boo
+ int WorkspaceService::ListTabNear(int index, int delta) const {
+   std::vector<bool> selectable;
+   selectable.reserve(static_cast<size_t>(tab_strip_->count()));
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
++  // The strip's own iterator and a counter, never GetTabAtIndex(i) (R2-8).
++  int i = 0;
++  for (tabs::TabInterface* const tab : *tab_strip_) {
++    const bool here = i++ == index;
+     // IsTabOnScreen, not IsTabVisible: the latter judges by tag, and a
+     // pinned tab has no tag, so a workspace holding one anchor and one
+     // pinned tab would find no fallback and spawn a blank tab beside a
+     // perfectly good neighbour (E10b). Not an open pinned page: it is not in
+     // the list, and landing there leaves the user on a page the list does not
+-    // show (E15c review #3).
+-    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
+-    selectable.push_back(i != index && !tab_strip_->IsTabCollapsed(i) &&
++    // show (E15c review #3). Nor one folded away (IsTabCollapsed's rule).
++    const std::optional<tab_groups::TabGroupId> group = tab->GetGroup();
++    selectable.push_back(!here &&
++                         !(group && tab_strip_->IsGroupCollapsed(*group)) &&
+                          IsTabOnScreen(tab) && !IsDrawnAsPinnedRow(tab));
+   }
+   return NextVisibleTabIndex(selectable, index, delta);
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -431,10 +431,14 @@ int FolderColor(const PinNode& folder, i
+   return folder.color >= 0 ? folder.color : workspace_color;
+ }
+ 
+-// The tab of `model` that is the page of item `id`, or null.
++// The tab of `model` that is the page of item `id`, or null. The strip's own
++// iterator, never GetTabAtIndex(i): an index lookup walks the collection tree
++// from the start, so a loop of them is ~n^2/2 steps (R2-6).
+ tabs::TabInterface* LinkedTab(TabStripModel* model, std::string_view id) {
+-  for (int i = 0; model && i < model->count(); ++i) {
+-    tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++  if (!model) {
++    return nullptr;
++  }
++  for (tabs::TabInterface* const tab : *model) {
+     if (workspaces::PinItemForTab(tab->GetContents()) == id) {
+       return tab;
+     }
+@@ -645,15 +649,15 @@ using ItemIds = std::set<std::string, st
+ 
+ // The items with a page open in `windows`: one walk of their tabs, never
+ // LinkedTab per item -- a folder holds up to 1,159, a window 5,000 tabs (M6).
+-ItemIds OpenItemIds(const std::vector<BrowserWindowInterface*>& windows) {
++// `favorites_too`: a favorite's link counts as well, as LinkedTab's does.
++ItemIds OpenItemIds(const std::vector<BrowserWindowInterface*>& windows,
++                    bool favorites_too = false) {
+   ItemIds ids;
+   for (BrowserWindowInterface* const window : windows) {
+-    TabStripModel* const model = window->GetTabStripModel();
+-    for (int i = 0; i < model->count(); ++i) {
+-      tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++    for (tabs::TabInterface* const tab : *window->GetTabStripModel()) {
+       // A favorite keeps a link made while Workspaces was off, unjudged: its
+       // row is drawn closed, so it is no open page here (ReadLinks' rule).
+-      if (tab->IsPinned()) {
++      if (tab->IsPinned() && !favorites_too) {
+         continue;
+       }
+       std::string id = workspaces::PinItemForTab(tab->GetContents());
+@@ -682,8 +686,7 @@ ItemIds ItemIdsUnder(const PinNode& row)
+ std::vector<tabs::TabInterface*> PagesOf(TabStripModel* model,
+                                          const ItemIds& ids) {
+   std::vector<tabs::TabInterface*> pages;
+-  for (int i = 0; i < model->count(); ++i) {
+-    tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++  for (tabs::TabInterface* const tab : *model) {
+     if (!tab->IsPinned() &&
+         ids.contains(workspaces::PinItemForTab(tab->GetContents()))) {
+       pages.push_back(tab);
+@@ -692,6 +695,51 @@ std::vector<tabs::TabInterface*> PagesOf
+   return pages;
+ }
+ 
++// Closes the page of each of `ids` open in `browser` -- the first, never a
++// favorite (PagesOf) nor a second page of it that ReadLinks has yet to unlink
++// -- the page in front LAST, as Close all closes them (R2-11).
++void ClosePages(BrowserWindowInterface* browser,
++                const ItemIds& ids,
++                const char* via) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  if (!service) {
++    return;
++  }
++  TabStripModel* const model = browser->GetTabStripModel();
++  std::vector<tabs::TabInterface*> pages = PagesOf(model, ids);
++  ItemIds seen;
++  std::erase_if(pages, [&seen](tabs::TabInterface* tab) {
++    return !seen.insert(workspaces::PinItemForTab(tab->GetContents())).second;
++  });
++  workspaces::PutLast(pages, model->GetActiveTab());
++  for (tabs::TabInterface* const tab : pages) {
++    service->ClosePinItemPage(tab, via);
++  }
++}
++
++// Marks in `is_item` each of its ids that `row` is or holds as an item; `left`
++// counts those not found yet, and the walk stops at none, as a Find does
++// (R2-12).
++void MarkItems(const PinNode& row,
++               std::map<std::string_view, bool>& is_item,
++               size_t& left) {
++  if (left == 0) {
++    return;
++  }
++  if (row.type == PinNode::Type::kItem) {
++    if (const auto it = is_item.find(row.id);
++        it != is_item.end() && !it->second) {
++      it->second = true;
++      --left;
++    }
++    return;
++  }
++  for (const PinNode& child : row.children) {
++    MarkItems(child, is_item, left);
++  }
++}
++
+ // What Open all opens under `row` (C17), in the order the rows draw it: each
+ // item, and each split as one -- its pages open as one split view (E19) --
+ // with no page in `open`, a page open in any window (B4: one place).
+@@ -2698,9 +2746,11 @@ WorkspacePinnedSectionView::Links Worksp
+   // Not while the file is read-only: its rows are not in the tree then, but
+   // they are not gone, and a drop is persisted (E15c review #1).
+   const bool judge = !store_->read_only();
+-  std::vector<tabs::TabInterface*> unlinked;
+-  for (int i = 0; i < model->count(); ++i) {
+-    tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++  // One walk of the tabs, then one pass over the tree, never a Find per open
++  // page: this runs on every tab change, in a window that may hold thousands
++  // of tabs and pages (R2-12).
++  std::vector<std::pair<std::string, tabs::TabInterface*>> pages;
++  for (tabs::TabInterface* const tab : *model) {
+     // The header's Today and anchored counts (E18) ride this walk. A Today
+     // tab is one the list draws -- its own rule,
+     // TabStripCollectionController::IsTabVisibleForWorkspace -- and not a
+@@ -2717,15 +2767,30 @@ WorkspacePinnedSectionView::Links Worksp
+     std::string id = workspaces::PinItemForTab(tab->GetContents());
+     // A favorite pinned while Workspaces was off keeps its link, unjudged:
+     // it is drawn at the top, not as its row (IsPinItemTab, review #6).
+-    if (id.empty() || tab->IsPinned()) {
+-      continue;
++    if (!id.empty() && !tab->IsPinned()) {
++      pages.emplace_back(std::move(id), tab);
+     }
+-    const PinNode* const item = store_->Find(id);
+-    if ((!item || item->type != PinNode::Type::kItem) && !judge) {
+-      continue;
++  }
++  // Which of those ids name an item of the tree (a split's pages are items; a
++  // folder or a split itself is not one).
++  std::map<std::string_view, bool> is_item;
++  for (const auto& [id, tab] : pages) {
++    is_item.emplace(id, false);
++  }
++  size_t left = is_item.size();
++  for (const auto& [workspace, roots] : store_->tree()) {
++    for (const PinNode& root : roots) {
++      MarkItems(root, is_item, left);
+     }
+-    if (!item || item->type != PinNode::Type::kItem ||
+-        !links.open.emplace(std::move(id), tab).second) {
++  }
++  // Copied, not moved: `is_item`'s keys look into these strings.
++  std::vector<tabs::TabInterface*> unlinked;
++  for (const auto& [id, tab] : pages) {
++    if (!is_item.at(id)) {
++      if (judge) {
++        unlinked.push_back(tab);
++      }
++    } else if (!links.open.emplace(id, tab).second) {
+       unlinked.push_back(tab);
+     }
+   }
+@@ -3145,10 +3210,12 @@ bool WorkspacePinnedSectionView::BuildSe
+     const PinNode* const row = store_->Find(id);
+     return row && row->type != PinNode::Type::kFolder;
+   });
++  // One walk of the tabs, never LinkedTab per page: a folder holds up to
++  // 1,159 (R2-6).
++  const ItemIds open = OpenItemIds({browser_.get()});
+   const bool any_open = std::ranges::any_of(
+-      ItemIdsOfRows(*store_, ids), [this](const std::string& page) {
+-        return LinkedTab(browser_->GetTabStripModel(), page) != nullptr;
+-      });
++      ItemIdsOfRows(*store_, ids),
++      [&open](const std::string& page) { return open.contains(page); });
+   context_menu_selection_ = std::move(ids);
+   context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+   // What the whole selection can do. Rename, New folder, Colour and a folder's
+@@ -3223,13 +3290,15 @@ void WorkspacePinnedSectionView::Execute
+     return;
+   }
+   switch (command_id) {
+-    case kCommandClose:
+-      for (const std::string& page : ItemIdsOfRows(*store_, ids)) {
+-        OnItemClosePressed(page);
+-      }
++    case kCommandClose: {
++      // This window's pages, as the row's x closes this window's (D4).
++      const std::vector<std::string> page_ids = ItemIdsOfRows(*store_, ids);
++      ClosePages(browser_, ItemIds(page_ids.begin(), page_ids.end()),
++                 "the selection's Close");
+       LOG(INFO) << "[workspaces] pins: closed the open pages of " << ids.size()
+                 << " selected row(s)";
+       break;
++    }
+     case kCommandUnpin:
+       // Each goes to the top of Today, so the last first: the top row ends on
+       // top. A folder is not unpinned.
+@@ -3265,7 +3334,19 @@ void WorkspacePinnedSectionView::ShowDel
+ void WorkspacePinnedSectionView::DeleteSelection(
+     const std::vector<std::string>& ids,
+     const std::string& workspace) {
+-  for (const std::string& id : ids) {
++  // The row holding the page in front LAST, so no row's close lands on a
++  // later row's page (R2-11's rule, across rows).
++  std::vector<std::string> order = ids;
++  if (tabs::TabInterface* const active =
++          browser_->GetTabStripModel()->GetActiveTab();
++      active && store_) {
++    const std::string front = workspaces::PinItemForTab(active->GetContents());
++    std::ranges::stable_partition(order, [&](const std::string& id) {
++      return front.empty() ||
++             !std::ranges::contains(ItemIdsOfRows(*store_, {id}), front);
++    });
++  }
++  for (const std::string& id : order) {
+     DeleteRow(id, workspace);
+   }
+   LOG(INFO) << "[workspaces] pins: deleted " << ids.size()
+@@ -3287,13 +3368,7 @@ void WorkspacePinnedSectionView::OnItemP
+ }
+ 
+ void WorkspacePinnedSectionView::OnItemClosePressed(const std::string& id) {
+-  workspaces::WorkspaceService* const service =
+-      workspaces::WorkspaceService::From(browser_);
+-  if (tabs::TabInterface* const tab =
+-          LinkedTab(browser_->GetTabStripModel(), id);
+-      tab && service) {
+-    service->ClosePinItemPage(tab, "the row's close button");
+-  }
++  ClosePages(browser_, ItemIds{id}, "the row's close button");
+ }
+ 
+ void WorkspacePinnedSectionView::OnItemResetPressed(const std::string& id) {
+@@ -3569,22 +3644,22 @@ void WorkspacePinnedSectionView::DeleteR
+     entry.last_active = item->last_active;
+     entries.push_back(std::move(entry));
+   }
+-  // Their open pages close with them. A page that asks "Leave site?" and is
+-  // kept loses its link with the row, and joins the list (ReadLinks).
++  // Their open pages close with them, the page in front LAST, as Close all
++  // closes them (R2-11). A page that asks "Leave site?" and is kept loses its
++  // link with the row, and joins the list (ReadLinks).
++  const ItemIds doomed(ids.begin(), ids.end());
+   int closed = 0;
+   for (BrowserWindowInterface* const window :
+        WindowsOf(browser_->GetProfile())) {
+     workspaces::WorkspaceService* const service =
+         workspaces::WorkspaceService::From(window);
+-    TabStripModel* const model = window->GetTabStripModel();
+-    std::vector<tabs::TabInterface*> pages;
+-    for (int i = 0; service && i < model->count(); ++i) {
+-      tabs::TabInterface* const tab = model->GetTabAtIndex(i);
+-      if (std::ranges::contains(ids,
+-                                workspaces::PinItemForTab(tab->GetContents()))) {
+-        pages.push_back(tab);
+-      }
++    if (!service) {
++      continue;
+     }
++    TabStripModel* const model = window->GetTabStripModel();
++    std::vector<tabs::TabInterface*> pages = PagesOf(model, doomed);
++    workspaces::PutLast(pages, model->GetActiveTab());
++    workspaces::ScopedBulkLayout bulk;
+     for (tabs::TabInterface* const tab : pages) {
+       closed += service->ClosePinItemPage(tab, "Delete") ? 1 : 0;
+     }
+@@ -3597,12 +3672,13 @@ void WorkspacePinnedSectionView::DeleteR
+   workspaces::archive::ArchiveStore* const archive =
+       workspaces::archive::ArchiveStore::GetOrCreate(profile,
+                                                      profile->GetPath());
+-  const std::vector<BrowserWindowInterface*> windows = WindowsOf(profile);
++  // One walk of each window's tabs, never LinkedTab per page (R2-6); a
++  // favorite still holding the link keeps its page out too, as LinkedTab did.
++  const ItemIds still_open =
++      OpenItemIds(WindowsOf(profile), /*favorites_too=*/true);
+   int archived = 0;
+   for (size_t i = 0; i < ids.size(); ++i) {
+-    if (std::ranges::any_of(windows, [&](BrowserWindowInterface* window) {
+-          return LinkedTab(window->GetTabStripModel(), ids[i]) != nullptr;
+-        })) {
++    if (still_open.contains(ids[i])) {
+       continue;
+     }
+     workspaces::archive::ArchiveEntry& entry = entries[i];
+@@ -5032,10 +5108,11 @@ void WorkspacePinnedSectionView::Execute
+       UnpinItem(id);
+       break;
+     case kCommandClose:
++      // A split's two pages together, so the one in front closes last.
+       if (const PinNode* const row = store_ ? store_->Find(id) : nullptr) {
+-        for (const std::string& page : PageIds(*row)) {
+-          OnItemClosePressed(page);
+-        }
++        const std::vector<std::string> pages = PageIds(*row);
++        ClosePages(browser_, ItemIds(pages.begin(), pages.end()),
++                   "the row's close button");
+       }
+       break;
+     case kCommandDelete:

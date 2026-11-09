@@ -1,0 +1,185 @@
+--- a/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.cc
+@@ -10,6 +10,7 @@
+ #include "base/check_deref.h"
+ #include "base/containers/flat_map.h"
+ #include "base/containers/flat_set.h"
++#include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
+ #include "third_party/abseil-cpp/absl/container/inlined_vector.h"
+ #include "ui/base/class_property.h"
+ #include "ui/compositor/layer.h"
+@@ -231,9 +232,14 @@ TabCollectionAnimatingLayoutManager::~Ta
+ 
+ bool TabCollectionAnimatingLayoutManager::OnViewAdded(views::View* host,
+                                                       views::View* view) {
++  // Helium Workspaces (E14c.1): no fade-in during a bulk change. The layer
++  // each added view gets below is what View::ReorderChildLayers walks on
++  // every later add -- a second whole-strip walk per inserted tab -- and
++  // nobody sees thousands of tabs fade in at once.
+   // Do not attempt to animate opacity for views reparented from another
+   // collection.
+-  if (!view->GetProperty(kPreviousCollectionBounds) &&
++  if (!workspaces::IsBulkLayoutInProgress() &&
++      !view->GetProperty(kPreviousCollectionBounds) &&
+       !delegate_->IsViewDragging(*view) &&
+       delegate_->ShouldAnimateOpacityForAddAndRemove(*view)) {
+     // Added views should animate opacity from invisible to fully opaque.
+@@ -260,7 +266,8 @@ gfx::Size TabCollectionAnimatingLayoutMa
+   // layout manager.
+   gfx::Size target_preferred_size =
+       target_layout_manager_->GetPreferredSize(host);
+-  if (animate_host_size_ && is_animating_ && !delegate_->IsDragging()) {
++  if (animate_host_size_ && is_animating_ && !delegate_->IsDragging() &&
++      !target_stale_) {
+     if (IsVerticalOrWrappingVertically()) {
+       target_preferred_size.set_height(current_layout_content_size_);
+     } else {
+@@ -281,7 +288,8 @@ gfx::Size TabCollectionAnimatingLayoutMa
+   // layout manager.
+   gfx::Size target_preferred_size =
+       target_layout_manager_->GetPreferredSize(host, available_size);
+-  if (animate_host_size_ && is_animating_ && !delegate_->IsDragging()) {
++  if (animate_host_size_ && is_animating_ && !delegate_->IsDragging() &&
++      !target_stale_) {
+     if (IsVerticalOrWrappingVertically()) {
+       target_preferred_size.set_height(current_layout_content_size_);
+     } else {
+@@ -315,6 +323,19 @@ int TabCollectionAnimatingLayoutManager:
+ }
+ 
+ void TabCollectionAnimatingLayoutManager::OnLayoutChanged() {
++  // Helium Workspaces (E14c.1): during a bulk change, dirty only. The
++  // recompute this function would do per changed view is done once by
++  // LayoutImpl() at the next layout pass -- it calls RecalculateTarget()
++  // first thing, and it is the only caller of ApplyLayout(). Until then
++  // target_layout_ is the previous one: GetPreferredSize() stops using the
++  // interpolated size while `target_stale_`, drag code recomputes first
++  // (ResetViewsToTargetLayout), and tab_strip_utils falls back to a view's
++  // own bounds for a view the target does not know yet.
++  if (workspaces::IsBulkLayoutInProgress()) {
++    target_stale_ = true;
++    LayoutManagerBase::OnLayoutChanged();
++    return;
++  }
+   // If a new layout target was computed ensure we recalculate and update the
+   // current layout to ensure layout metadata is available for preferred size
+   // calculations. Running this once to compute metadata is more efficient than
+@@ -468,6 +489,7 @@ bool TabCollectionAnimatingLayoutManager
+   if (!host_view()) {
+     return false;
+   }
++  target_stale_ = false;  // Helium Workspaces (E14c.1)
+ 
+   // Calculate the target layout with unbounded height for vertical or
+   // horizontal-wrapping-vertically axes, or bounded by available parent width
+--- a/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h
++++ b/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h
+@@ -324,6 +324,10 @@ class TabCollectionAnimatingLayoutManage
+   // to its target size. In such cases animating the host's preferred size
+   // avoids clipping close / fade-out animations.
+   const bool animate_host_size_ = false;
++
++  // Helium Workspaces (E14c.1): a bulk change marked the layout dirty without
++  // recomputing `target_layout_`; the next RecalculateTarget() clears it.
++  bool target_stale_ = false;
+ };
+ 
+ extern const ui::ClassProperty<bool>* const kHasAnimatingLayoutManagerKey;
+--- a/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
+@@ -6,6 +6,12 @@
+ 
+ #include <variant>
+ 
++#include "base/check_op.h"
++#include "base/dcheck_is_on.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/sessions/session_restore.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ 
+@@ -41,6 +47,13 @@ const tabs::TabInterface* FirstDescendan
+   return nullptr;
+ }
+ 
++// How many ScopedBulkLayouts are alive. One counter for every strip in the
++// process is safe because a scope only ever lives inside one task (an import
++// slice): a strip in another window at most defers a recompute to its own
++// next layout pass. Holding a scope across a posted task or a nested run loop
++// would stall every strip; the constructor checks that in DCHECK builds.
++int g_bulk_layout_depth = 0;
++
+ }  // namespace
+ 
+ bool IsChildDrawnForWorkspace(const TabCollectionNode* parent,
+@@ -56,4 +69,21 @@ bool IsChildDrawnForWorkspace(const TabC
+   return !tab || parent->GetController()->IsTabVisibleForWorkspace(tab);
+ }
+ 
++ScopedBulkLayout::ScopedBulkLayout() {
++  ++g_bulk_layout_depth;
++#if DCHECK_IS_ON()
++  // Runs after the current task; every scope must be gone by then.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce([] { DCHECK_EQ(g_bulk_layout_depth, 0); }));
++#endif
++}
++
++ScopedBulkLayout::~ScopedBulkLayout() {
++  --g_bulk_layout_depth;
++}
++
++bool IsBulkLayoutInProgress() {
++  return g_bulk_layout_depth > 0 || SessionRestore::IsRestoringSynchronously();
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/common/workspace_view_hooks.h
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.h
+@@ -25,6 +25,24 @@ namespace workspaces {
+ bool IsChildDrawnForWorkspace(const TabCollectionNode* parent,
+                               size_t child_index);
+ 
++// TabCollectionAnimatingLayoutManager (E14c.1). While a bulk change of the
++// strip is in progress, OnLayoutChanged() only marks the layout dirty instead
++// of recomputing the target for every changed view; LayoutImpl() computes it
++// once at the next layout pass, as it already does. Session restore inserts
++// thousands of views in one synchronous loop and an Arc import in slices;
++// each per-view recompute walks every child, which made a 3,875-tab restart
++// take minutes (LOCAL.md 40). Hold a ScopedBulkLayout for the duration of a
++// bulk change, inside ONE task -- never across a posted task or a nested run
++// loop; a synchronous session restore counts on its own.
++class ScopedBulkLayout {
++ public:
++  ScopedBulkLayout();
++  ScopedBulkLayout(const ScopedBulkLayout&) = delete;
++  ScopedBulkLayout& operator=(const ScopedBulkLayout&) = delete;
++  ~ScopedBulkLayout();
++};
++bool IsBulkLayoutInProgress();
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_WORKSPACE_VIEW_HOOKS_H_
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
+@@ -35,6 +35,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+@@ -277,6 +278,9 @@ void WorkspaceArcImporter::ImportSlice()
+     return;
+   }
+ 
++  // The strip's layout is recomputed once after this slice, not once per
++  // inserted view (E14c.1).
++  workspaces::ScopedBulkLayout bulk;
+   base::ElapsedTimer timer;
+   bool first = true;
+   while (next_item_ < items_.size() &&

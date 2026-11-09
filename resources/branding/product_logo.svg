@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Workspaces for Helium: the master icon (48 px and up). Three workspaces stacked like cards; the front one
+       has the sidebar with one dot per workspace. 16 and 32 px have their own pixel-aligned drawings. -->
+  <rect x="84" y="20" width="152" height="118" rx="28" fill="#7D84FB"/>
+  <rect x="54" y="64" width="152" height="118" rx="28" fill="#4FC1E5"/>
+  <rect x="24" y="108" width="152" height="118" rx="28" fill="#FFFFFF" stroke="#3A4566" stroke-width="10"/>
+  <rect x="40" y="124" width="34" height="86" rx="12" fill="#3A4566" fill-opacity=".14"/>
+  <circle cx="57" cy="145" r="8" fill="#E2457A"/>
+  <circle cx="57" cy="167" r="8" fill="#4FC1E5"/>
+  <circle cx="57" cy="189" r="8" fill="#7D84FB"/>
+</svg>

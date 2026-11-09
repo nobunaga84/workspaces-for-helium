@@ -1,0 +1,108 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -398,11 +398,12 @@ int WorkspaceService::MoveTabsToWorkspac
+   LOG(INFO) << "[workspaces] moved " << moved << " tab(s) -> workspace '"
+             << guid << "'";
+ 
+-  // Nothing else would repaint. SetTag writes the tag and persists it, and the
+-  // only thing that fires workspace_changed_callbacks_ is a change of ACTIVE
+-  // workspace -- so without this a tab moved out of the workspace on screen
+-  // stays drawn until something unrelated invalidates the layout.
+-  workspace_changed_callbacks_.Notify();
++  // The repaint that used to be here is gone, and this is the one place that
++  // proves the move: SetTag() now notifies on every tag change, so the tabs
++  // this loop just re-tagged have already asked the strip to lay out again.
++  // 19 added the call here with a comment saying nothing else would repaint,
++  // which was true and was exactly the problem -- it made "remember to
++  // repaint" a thing every future caller had to know (24).
+ 
+   // The user may have just sent away the tab they were looking at. Legal to
+   // call directly rather than posted: this runs from a menu handler, outside
+@@ -984,9 +985,69 @@ void WorkspaceService::SetTag(content::W
+   if (!contents) {
+     return;
+   }
+-  WorkspaceTabData::GetOrCreateForWebContents(contents)->set_guid(
+-      std::move(guid));
++  WorkspaceTabData* const data =
++      WorkspaceTabData::GetOrCreateForWebContents(contents);
++  const std::string previous = data->guid();
++  data->set_guid(std::move(guid));
++
++  // ABOVE THE EARLY RETURN ON PURPOSE. Persisting an UNCHANGED tag looks like
++  // pure waste and is not: StampInsertedTab re-persists a restored tab's tag,
++  // which has not changed, against that tab's NEW session id -- and E8's rule
++  // is that an empty guid is written rather than skipped, so that an older
++  // non-empty command is not left as the last word on replay. Move this below
++  // the return and a tab pinned just before quitting comes back tagged, with
++  // nothing to connect the symptom to the edit.
+   PersistTag(contents);
++
++  if (previous == data->guid()) {
++    return;
++  }
++
++  // A TAG WRITE CAN CHANGE WHAT IS DRAWN, SO ASKING FOR A REPAINT BELONGS HERE.
++  //
++  // The visibility predicate is answered from a LayoutManager, so it is re-read
++  // on every layout and never cached -- which means a membership change shows
++  // up only when something asks the strip to lay out again. Nothing else does:
++  // the only other thing that fires these callbacks is a change of ACTIVE
++  // workspace.
++  //
++  // 19 wrote that down as a rule each caller had to remember, and 24 found the
++  // caller that did not. Switching into an EMPTY workspace spawns a tab
++  // (SwitchToWorkspace), and the strip can lay that tab out before this
++  // function has stamped it -- an untagged tab means the DEFAULT workspace, so
++  // in any other workspace it is correctly judged invisible and put away, and
++  // nothing ever looked again. The tab was real, focused and showing its page
++  // the whole time; only its row was missing, until an unrelated event forced a
++  // layout. It shipped in E9b and was in every build up to here, hidden by the
++  // fact that the next click usually reveals it.
++  //
++  // Doing it here rather than at that call site is what makes it stay fixed:
++  // EnsureActiveTabVisible() spawns a tab the same way, and a rule enforced at
++  // one of two call sites is a rule waiting for the third. It is also order
++  // independent -- if the strip lays out first it is told to look again, and if
++  // this runs first the tag is already on -- which matters, because the
++  // observer order between this service and the tab strip view is not
++  // something this code should have to know.
++  //
++  // NOT POSTED, and that is deliberate rather than an oversight: the two
++  // subscribers are views::View::InvalidateLayout and the rail's
++  // UpdateHighlight. Neither touches TabStripModel, so design 2.2's
++  // re-entrancy rule is not in play even when this runs from inside an
++  // observer notification, which is where most tag writes come from.
++  //
++  // That covers the MODEL. The VIEW side is a second question, because the
++  // container subscribes with avoid_propagate_during_layout=false, so a tag
++  // written from inside a views layout pass would propagate an invalidation
++  // during layout. It cannot happen: the only thing layout calls into here is
++  // the visibility predicate, which is const and writes no tag. If that ever
++  // stops being true, this notify is the line to revisit.
++  //
++  // Gated on an actual change so a no-op write -- a restored tab keeping the
++  // tag it arrived with, which is rule 1 of ResolveGuidForInsertedTab -- costs
++  // nothing.
++  LOG(INFO) << "[workspaces] tag '" << previous << "' -> '" << data->guid()
++            << "', relayout requested";
++  workspace_changed_callbacks_.Notify();
+ }
+ 
+ void WorkspaceService::PersistTag(content::WebContents* contents) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -300,6 +300,13 @@ class WorkspaceService : public TabStrip
+   // "membership changed" and "membership was written down" cannot drift apart.
+   // Before E8 there were four `set_guid` call sites and adding persistence
+   // would have meant remembering all four, plus every one a later stage adds.
++  //
++  // It is also where a tag change ASKS THE STRIP TO LAY OUT AGAIN, for the
++  // same reason and with the same payoff. The visibility predicate is answered
++  // from a LayoutManager, so a membership change is invisible until something
++  // requests a layout, and nothing else does. Keeping that here rather than at
++  // the call sites is what fixed the spawned tab that E9b left undrawn -- see
++  // the comment on the implementation, and do not move it back out.
+   void SetTag(content::WebContents* contents, std::string guid);
+ 
+   // Writes the tag into the session file, so it survives a restart (design

@@ -1,0 +1,106 @@
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -251,6 +251,12 @@ const AcceleratorMapping kAcceleratorMap
+      IDC_HELIUM_WORKSPACE_PREV},
+     {ui::VKEY_RIGHT, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
+      IDC_HELIUM_WORKSPACE_NEXT},
++    // S because W is taken (IDC_CLOSE_TAB_GROUP) and so is N
++    // (IDC_NEW_SPLIT_TAB, appended conditionally further down this file, which
++    // is why it does not show up in the map above). S for Space, Arc's name
++    // for the same thing. Shift+Alt+Up and Shift+Alt+Down are deliberately
++    // left free: reordering wants them next.
++    {ui::VKEY_S, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_NEW},
+     {ui::VKEY_HOME, ui::EF_ALT_DOWN, IDC_HOME},
+     {ui::VKEY_E, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+     {ui::VKEY_F, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -196,6 +196,16 @@ void WorkspaceService::ActivateRelativeW
+ }
+ 
+ std::string WorkspaceService::CreateWorkspace(const std::string& title) {
++  // Guarded here rather than at the call sites, because there are two now --
++  // the rail's "+" and IDC_HELIUM_WORKSPACE_NEW -- and only one of them can
++  // know whether the rail is even on screen. Without it the shortcut would add
++  // workspaces to the list while the feature is off, where nothing draws them
++  // and SwitchToWorkspace() refuses to move: a list quietly growing entries
++  // the user never sees.
++  if (!IsEnabled()) {
++    return std::string();
++  }
++
+   std::string guid = base::Uuid::GenerateRandomV4().AsLowercaseString();
+ 
+   prefs::WriteWorkspaces(
+--- a/chrome/browser/ui/views/tabs/shared/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/shared/BUILD.gn
+@@ -53,6 +53,8 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs/organizer",
+     "//chrome/browser/ui/tabs/saved_tab_groups",
++    # Helium Workspaces: the "New workspace" item (15).
++    "//chrome/browser/ui/tabs/workspaces",
+     "//chrome/browser/ui/toolbar/pinned_toolbar",
+     "//chrome/browser/ui/user_education",
+     "//chrome/browser/ui/views:tab_search_bubble_host",
+--- a/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.cc
++++ b/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.cc
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_group.h"
+@@ -46,6 +47,22 @@ NewTabButtonMenuModel::NewTabButtonMenuM
+ 
+   AddSeparator(ui::NORMAL_SEPARATOR);
+   AddNewSplitTabItem();
++
++  // Helium Workspaces, and the owner request recorded in design 5 on
++  // 2026-09-10: a right-click on the new tab button reaches "add a workspace".
++  // Deliberately NOT a change to what clicking the button does -- it is the
++  // most-used control in the strip, and an accidental workspace is expensive
++  // to undo because deleting one closes its tabs. Arc and Zen both keep their
++  // space "+" as a separate control for the same reason.
++  //
++  // No id of our own is needed: ExecuteCommand() below ends in
++  // chrome::ExecuteCommand(browser_, command_id), so a real IDC routes itself.
++  if (const workspaces::WorkspaceService* service =
++          workspaces::WorkspaceService::From(browser_);
++      service && service->IsEnabled()) {
++    AddSeparator(ui::NORMAL_SEPARATOR);
++    AddItemWithStringId(IDC_HELIUM_WORKSPACE_NEW, IDS_HELIUM_WORKSPACE_NEW);
++  }
+ }
+ 
+ NewTabButtonMenuModel::~NewTabButtonMenuModel() = default;
+--- a/chrome/browser/ui/workspace_command_hooks.cc
++++ b/chrome/browser/ui/workspace_command_hooks.cc
+@@ -42,6 +42,16 @@ bool ExecuteWorkspaceCommand(BrowserWind
+       }
+       break;
+     }
++    case IDC_HELIUM_WORKSPACE_NEW:
++      // Creates an UNTITLED workspace and switches into it. The rail's "+"
++      // prompts for a name and this deliberately does not: a shortcut is for
++      // speed, an untitled workspace shows its position in the rail rather
++      // than nothing, and renaming is one right-click away. The IsEnabled
++      // check lives inside CreateWorkspace(), so every caller gets it.
++      if (WorkspaceService* service = WorkspaceService::From(browser)) {
++        service->CreateWorkspace(std::string());
++      }
++      break;
+     default:
+       return false;
+   }
+@@ -66,6 +76,8 @@ WorkspaceShortcutLabel(int id) {
+       return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_NEXT};
+     case IDC_HELIUM_WORKSPACE_PREV:
+       return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_PREVIOUS};
++    case IDC_HELIUM_WORKSPACE_NEW:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_NEW};
+     default:
+       return std::nullopt;
+   }

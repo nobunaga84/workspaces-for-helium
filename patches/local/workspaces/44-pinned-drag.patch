@@ -1,0 +1,706 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <memory>
+ #include <string>
+ #include <utility>
+@@ -29,12 +30,17 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/views/frame/browser_root_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+@@ -57,6 +63,8 @@
+ #include "ui/base/models/dialog_model.h"
+ #include "ui/base/models/image_model.h"
+ #include "ui/base/mojom/menu_source_type.mojom-shared.h"
++#include "ui/color/color_id.h"
++#include "ui/compositor/layer.h"
+ #include "ui/events/event.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
+ #include "ui/gfx/codec/png_codec.h"
+@@ -72,10 +80,12 @@
+ #include "ui/views/controls/button/label_button.h"
+ #include "ui/views/controls/focus_ring.h"
+ #include "ui/views/controls/menu/menu_runner.h"
++#include "ui/views/controls/scroll_view.h"
+ #include "ui/views/controls/separator.h"
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/layout/box_layout.h"
+ #include "ui/views/layout/proposed_layout.h"
++#include "ui/views/view_class_properties.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+ #include "url/gurl.h"
+@@ -84,6 +94,35 @@ namespace {
+ 
+ using workspaces::pins::PinNode;
+ using workspaces::pins::Where;
++using DragStep = WorkspacePinnedSectionView::DragStep;
++using DragCallback =
++    base::RepeatingCallback<void(DragStep, const gfx::Point& point_in_screen)>;
++
++// Where a dragged row would go: a line this thick, or a frame round a folder,
++// in the focus ring's colour.
++constexpr int kDropLineThickness = 2;
++constexpr ui::ColorId kDropColor = ui::kColorFocusableBorderFocused;
++
++// The tops and bottoms of the tabs `view` draws, in `container`'s coordinates
++// -- the places a dragged item can go between them. A tab the list hides sits
++// in a zero-height slot (02) and has none.
++void CollectTabEdges(const views::View& view,
++                     const views::View& container,
++                     std::vector<int>& edges) {
++  for (const views::View* const child : view.children()) {
++    if (!child->GetVisible() || child->height() == 0) {
++      continue;
++    }
++    if (!views::IsViewClass<TabView>(child)) {
++      CollectTabEdges(*child, container, edges);
++      continue;
++    }
++    const gfx::Rect bounds =
++        views::View::ConvertRectToTarget(&view, &container, child->bounds());
++    edges.push_back(bounds.y());
++    edges.push_back(bounds.bottom());
++  }
++}
+ 
+ // Per nesting level, and on each side of a row.
+ constexpr int kIndent = 16;
+@@ -161,14 +200,17 @@ class PinRow : public views::LabelButton
+          bool frame_active,
+          views::Button::PressedCallback callback,
+          base::RepeatingClosure on_close,
+-         base::RepeatingClosure on_reset)
++         base::RepeatingClosure on_reset,
++         DragCallback on_drag)
+       : views::LabelButton(std::move(callback), RowText(node)),
+         id_(node.id),
+         folder_(node.type == PinNode::Type::kFolder),
+         open_(node.open),
++        level_(level),
+         frame_active_(frame_active),
+         on_close_(std::move(on_close)),
+-        on_reset_(std::move(on_reset)) {
++        on_reset_(std::move(on_reset)),
++        on_drag_(std::move(on_drag)) {
+     SetTooltipText(folder_ ? RowText(node)
+                            : base::StrCat({RowText(node), u"\n",
+                                            base::UTF8ToUTF16(node.url)}));
+@@ -219,6 +261,8 @@ class PinRow : public views::LabelButton
+ 
+   const std::string& id() const { return id_; }
+   bool folder() const { return folder_; }
++  // How deep in folders: 0 at the top level.
++  int level() const { return level_; }
+ 
+   // Tabs dim in a window that is not the active one, and so do the rows.
+   void SetFrameActive(bool active) {
+@@ -332,7 +376,51 @@ class PinRow : public views::LabelButton
+            views::LabelButton::SkipDefaultKeyEventProcessing(event);
+   }
+ 
++  // Past the drag threshold, a left drag moves the row (E15d) instead of
++  // pressing it: the section is told each step, and the release is a drop,
++  // not a click. The pressed row keeps the mouse, so the drag reaches it
++  // wherever the pointer goes.
++  bool OnMousePressed(const ui::MouseEvent& event) override {
++    press_point_ = event.location();
++    return views::LabelButton::OnMousePressed(event);
++  }
++  bool OnMouseDragged(const ui::MouseEvent& event) override {
++    if (!dragging_ && event.IsOnlyLeftMouseButton() &&
++        ExceededDragThreshold(event.location() - press_point_)) {
++      dragging_ = true;
++    }
++    if (!dragging_) {
++      return views::LabelButton::OnMouseDragged(event);
++    }
++    on_drag_.Run(DragStep::kMove, ScreenPoint(event));
++    return true;
++  }
++  void OnMouseReleased(const ui::MouseEvent& event) override {
++    if (dragging_) {
++      on_drag_.Run(DragStep::kDrop, ScreenPoint(event));
++    }
++    // Still dragging_ here, so the release clicks nothing (IsTriggerableEvent)
++    // and only restores the button's look.
++    views::LabelButton::OnMouseReleased(event);
++    dragging_ = false;
++  }
++  void OnMouseCaptureLost() override {
++    if (std::exchange(dragging_, false)) {
++      on_drag_.Run(DragStep::kCancel, gfx::Point());
++    }
++    views::LabelButton::OnMouseCaptureLost();
++  }
++  bool IsTriggerableEvent(const ui::Event& event) override {
++    return !dragging_ && views::LabelButton::IsTriggerableEvent(event);
++  }
++
+  private:
++  gfx::Point ScreenPoint(const ui::MouseEvent& event) const {
++    gfx::Point point = event.location();
++    views::View::ConvertPointToScreen(this, &point);
++    return point;
++  }
++
+   // Asked for at twice the icon size, so it is crisp at 200 %.
+   void OnFavicon(const favicon_base::FaviconRawBitmapResult& result) {
+     if (!result.is_valid()) {
+@@ -377,11 +465,15 @@ class PinRow : public views::LabelButton
+   const std::string id_;
+   const bool folder_;
+   const bool open_;
++  const int level_;
+   bool frame_active_;
+   ItemState state_ = ItemState::kSleeping;
+   bool drifted_ = false;
+   const base::RepeatingClosure on_close_;
+   const base::RepeatingClosure on_reset_;
++  const DragCallback on_drag_;
++  gfx::Point press_point_;
++  bool dragging_ = false;
+   raw_ptr<views::ImageButton> close_ = nullptr;
+   raw_ptr<views::ImageButton> reset_ = nullptr;
+   // The icon drawn in the text color; null once the page's own icon arrived.
+@@ -533,6 +625,9 @@ void WorkspacePinnedSectionView::Schedul
+ 
+ void WorkspacePinnedSectionView::Rebuild() {
+   rebuild_scheduled_ = false;
++  // The dragged row is about to go, and with it the mouse release that would
++  // end its drag: another window changed the pins, or the workspace changed.
++  EndDrag();
+   // Taken now, so a folder that is not drawn this time is not renamed later.
+   const std::string rename_id = std::exchange(rename_after_rebuild_, {});
+   // Whatever the rows turn out to be -- none included -- the tabs are judged
+@@ -760,7 +855,9 @@ size_t WorkspacePinnedSectionView::AddRo
+   }
+   views::View* const added = list.AddChildView(std::make_unique<PinRow>(
+       row, level, browser_->GetProfile(), frame_active, std::move(callback),
+-      std::move(on_close), std::move(on_reset)));
++      std::move(on_close), std::move(on_reset),
++      base::BindRepeating(&WorkspacePinnedSectionView::OnRowDrag,
++                          base::Unretained(this), row.id)));
+   added->set_context_menu_controller(this);
+   size_t count = 1;
+   if (folder && row.open) {
+@@ -865,22 +962,44 @@ void WorkspacePinnedSectionView::OpenIte
+   LOG(INFO) << "[workspaces] pins: opened item '" << item.id << "'";
+ }
+ 
+-void WorkspacePinnedSectionView::UnpinItem(const std::string& id) {
++void WorkspacePinnedSectionView::UnpinItem(
++    const std::string& id,
++    int index,
++    std::optional<tab_groups::TabGroupId> group) {
+   const PinNode* const found = store_ ? store_->Find(id) : nullptr;
+   if (!found || found->type != PinNode::Type::kItem) {
+     return;
+   }
+   // The page first, the row after, so that nothing is lost in between: an open
+   // page joins the list at its top, where new tabs open (E15c.1; the owner's
+-  // choice, E15d). A sleeping item is opened first, STILL LINKED, and then
+-  // goes the way an open page goes: an unlinked tab opened active made the
+-  // list scroll to it (E15d review).
+-  const auto has_page = [&id](BrowserWindowInterface* window) {
+-    return LinkedTab(window->GetTabStripModel(), id) != nullptr;
+-  };
+-  if (std::ranges::none_of(WindowsOf(browser_->GetProfile()), has_page)) {
+-    const PinNode item = *found;
+-    OpenItem(item);
++  // choice, E15d). With no page here, a page open in another window comes
++  // here when it was dropped in this list (the owner's choice, E15d review) --
++  // the other window closes if that was its last tab, as when a tab is dragged
++  // out of it -- and with no page anywhere, one is opened here. Both STILL
++  // LINKED, then they go the way a page of this window goes, below: an
++  // unlinked tab opened active made the list scroll to it (E15d review).
++  TabStripModel* const here = browser_->GetTabStripModel();
++  if (!LinkedTab(here, id)) {
++    TabStripModel* there = nullptr;
++    tabs::TabInterface* page = nullptr;
++    for (BrowserWindowInterface* const window :
++         WindowsOf(browser_->GetProfile())) {
++      there = window->GetTabStripModel();
++      if ((page = LinkedTab(there, id))) {
++        break;
++      }
++    }
++    if (!page) {
++      const PinNode item = *found;
++      OpenItem(item);
++    } else if (index >= 0) {
++      here->InsertDetachedTabAt(
++          here->count(),
++          there->DetachTabAtForInsertion(there->GetIndexOfTab(page)),
++          AddTabTypes::ADD_ACTIVE);
++      LOG(INFO) << "[workspaces] pins: brought the page of '" << id
++                << "' from another window";
++    }
+   }
+   for (BrowserWindowInterface* const window :
+        WindowsOf(browser_->GetProfile())) {
+@@ -892,11 +1011,19 @@ void WorkspacePinnedSectionView::UnpinIt
+       // tab that moves, but not to a pinned page's (TabStripView::OnTabChanged,
+       // E15c), so it stays where it is (the owner, E15d). A page's tab never
+       // sits in a group, and the top of the list is the first tab of a unit,
+-      // so the move joins no group (GetGroupToAssign looks at the neighbours).
++      // so that move joins no group (GetGroupToAssign looks at the new
++      // neighbours). A drop into a group is told which group: the drop's
++      // place is inside it or at its first tab, so the group stays whole.
++      const bool dropped_here = window == browser_ && index >= 0;
+       const int from = model->GetIndexOfTab(tab);
+-      const int top = service->TopOfListIndex(/*opener=*/nullptr);
+-      if (top >= 0 && top != from) {
+-        model->MoveWebContentsAt(from, from < top ? top - 1 : top,
++      const int to =
++          dropped_here ? index : service->TopOfListIndex(/*opener=*/nullptr);
++      const int final_index = from < to ? to - 1 : to;
++      if (dropped_here && group) {
++        model->MoveWebContentsAt(from, final_index,
++                                 /*select_after_move=*/false, group);
++      } else if (to >= 0 && final_index != from) {
++        model->MoveWebContentsAt(from, final_index,
+                                  /*select_after_move=*/false);
+       }
+       service->SetPinItem(tab, std::string());
+@@ -904,7 +1031,8 @@ void WorkspacePinnedSectionView::UnpinIt
+     }
+   }
+   store_->Remove(id);
+-  LOG(INFO) << "[workspaces] pins: unpinned item '" << id << "'";
++  LOG(INFO) << "[workspaces] pins: unpinned item '" << id << "'"
++            << (index >= 0 ? " (dropped in the list)" : "");
+ }
+ 
+ void WorkspacePinnedSectionView::DeleteRow(const std::string& id) {
+@@ -1092,6 +1220,283 @@ void WorkspacePinnedSectionView::PinTabs
+   }
+ }
+ 
++WorkspacePinnedSectionView::DropTarget::DropTarget() = default;
++WorkspacePinnedSectionView::DropTarget::DropTarget(const DropTarget&) = default;
++WorkspacePinnedSectionView::DropTarget&
++WorkspacePinnedSectionView::DropTarget::operator=(const DropTarget&) = default;
++WorkspacePinnedSectionView::DropTarget::~DropTarget() = default;
++
++void WorkspacePinnedSectionView::OnRowDrag(const std::string& id,
++                                           DragStep step,
++                                           const gfx::Point& point_in_screen) {
++  if (step == DragStep::kMove) {
++    if (drag_id_.empty()) {
++      drag_id_ = id;
++      if (views::ScrollView* const scroll_view = GetScrollView()) {
++        drag_scrolled_subscription_ =
++            scroll_view->AddContentsScrolledCallback(base::BindRepeating(
++                &WorkspacePinnedSectionView::UpdateDrag,
++                base::Unretained(this)));
++      }
++    }
++    drag_point_ = point_in_screen;
++    UpdateDrag();
++    return;
++  }
++  // A drag ended by a rebuild (EndDrag) has nothing left to drop.
++  const DropTarget target = step == DragStep::kDrop && drag_id_ == id
++                                ? TargetAt(point_in_screen)
++                                : DropTarget();
++  EndDrag();
++  if (!target.to.empty()) {
++    if (store_ && store_->Move(id, drawn_guid_, target.to, target.where)) {
++      LOG(INFO) << "[workspaces] pins: moved '" << id << "' "
++                << (target.where == Where::kInto    ? "into"
++                    : target.where == Where::kAfter ? "after"
++                                                    : "before")
++                << " '" << target.to << "'";
++    }
++  } else if (target.list_index) {
++    UnpinItem(id, *target.list_index, target.list_group);
++  }
++}
++
++void WorkspacePinnedSectionView::UpdateDrag() {
++  views::View* const indicator = DropIndicator();
++  if (!indicator || drag_id_.empty()) {
++    return;
++  }
++  // Held near the top or bottom edge, the list scrolls, as for a dragged tab.
++  // Asked again after every scroll step too: that is where it stops at the
++  // end (TabDragScrollHandler stops only when told the position again).
++  if (views::ScrollView* const scroll_view = GetScrollView()) {
++    const int y =
++        views::View::ConvertPointFromScreen(scroll_view, drag_point_).y();
++    const int height = GetLayoutConstant(LayoutConstant::kVerticalTabHeight);
++    drag_scroll_.OnDraggedTabPositionUpdated(
++        *scroll_view,
++        gfx::Rect(0, y - height / 2, scroll_view->width(), height));
++  }
++  const DropTarget target = TargetAt(drag_point_);
++  indicator->SetVisible(!target.indicator.IsEmpty());
++  if (target.indicator.IsEmpty()) {
++    return;
++  }
++  indicator->SetBoundsRect(target.indicator);
++  if (target.where == Where::kInto) {
++    indicator->SetBackground(nullptr);
++    indicator->SetBorder(views::CreateRoundedRectBorder(
++        kDropLineThickness, kActiveRowRadius, kDropColor));
++  } else {
++    indicator->SetBorder(nullptr);
++    indicator->SetBackground(views::CreateSolidBackground(kDropColor));
++  }
++}
++
++void WorkspacePinnedSectionView::EndDrag() {
++  if (drag_id_.empty()) {
++    return;
++  }
++  drag_id_.clear();
++  drag_scrolled_subscription_ = {};
++  if (views::ScrollView* const scroll_view = GetScrollView()) {
++    drag_scroll_.StopScrolling(*scroll_view);
++  }
++  if (views::View* const indicator = drop_indicator_.view()) {
++    indicator->SetVisible(false);
++  }
++}
++
++WorkspacePinnedSectionView::DropTarget WorkspacePinnedSectionView::TargetAt(
++    const gfx::Point& point_in_screen) {
++  // Only where the list is on screen: not over the favorites above it, the
++  // rail below it, or the page.
++  views::ScrollView* const scroll_view = GetScrollView();
++  if (drag_id_.empty() || !list_ || !scroll_view ||
++      !scroll_view->GetLocalBounds().Contains(
++          views::View::ConvertPointFromScreen(scroll_view, point_in_screen))) {
++    return DropTarget();
++  }
++  // The section is the top of what scrolls: whatever is not in it is the list.
++  const gfx::Point in_section =
++      views::View::ConvertPointFromScreen(this, point_in_screen);
++  if (in_section.y() < height()) {
++    return RowTargetAt(
++        views::View::ConvertPointToTarget(this, list_, in_section).y());
++  }
++  return ListTargetAt(point_in_screen);
++}
++
++WorkspacePinnedSectionView::DropTarget WorkspacePinnedSectionView::RowTargetAt(
++    int y) {
++  const views::View::Views& rows = list_->children();
++  const auto row_at = [&rows](size_t i) {
++    return views::AsViewClass<PinRow>(rows[i].get());
++  };
++  // The dragged row and, when it is an open folder, the rows drawn inside it:
++  // nowhere there can it go.
++  size_t first = rows.size();
++  for (size_t i = 0; i < rows.size(); ++i) {
++    if (row_at(i)->id() == drag_id_) {
++      first = i;
++      break;
++    }
++  }
++  size_t past = first;
++  if (first < rows.size()) {
++    past = first + 1;
++    while (past < rows.size() &&
++           row_at(past)->level() > row_at(first)->level()) {
++      ++past;
++    }
++  }
++  size_t r = 0;
++  while (r < rows.size() && rows[r]->bounds().bottom() <= y) {
++    ++r;
++  }
++  if (r >= first && r < past) {
++    return DropTarget();
++  }
++
++  // A line at `line_y`, indented to the rows it would sit among.
++  const auto line_at = [this](int line_y, int level) {
++    const int x = kRowInset + level * kIndent;
++    return gfx::Rect(x, line_y - kDropLineThickness / 2,
++                     std::max(0, list_->width() - x - kRowInset),
++                     kDropLineThickness);
++  };
++  // The end of the section is after its last top-level row DRAWN, which may
++  // belong to a deleted workspace: the end of this workspace's own list would
++  // be above such rows (E15d review).
++  const auto to_end = [&]() {
++    DropTarget end;
++    for (size_t i = rows.size(); i-- > 0;) {
++      if (row_at(i)->level() == 0) {
++        end.to = row_at(i)->id();
++        end.where = Where::kAfter;
++        break;
++      }
++    }
++    return end;
++  };
++  DropTarget target;
++  gfx::Rect in_list;
++  if (r == rows.size()) {
++    // Under the last row -- over the line or "+ New Tab": the end.
++    target = to_end();
++    in_list = line_at(list_->height(), 0);
++  } else if (const PinRow* const row = row_at(r); row->folder() &&
++             y - row->y() >= row->height() / 4 &&
++             y - row->y() < row->height() * 3 / 4) {
++    // The middle of a folder: into it, first (Arc's order, Where::kInto).
++    target.to = row->id();
++    target.where = Where::kInto;
++    in_list = row->bounds();
++  } else if (y - row->y() < row->height() / 2) {
++    target.to = row->id();
++    in_list = line_at(row->y(), row->level());
++  } else if (r + 1 < rows.size()) {
++    // The lower half of a row is the top of the next, at the next one's level:
++    // under an open folder's name, that is inside it.
++    const PinRow* const next = row_at(r + 1);
++    target.to = next->id();
++    in_list = line_at(next->y(), next->level());
++  } else {
++    target = to_end();
++    in_list = line_at(row->bounds().bottom(), 0);
++  }
++  // Just before or after itself is where it already is.
++  if (target.to.empty() || target.to == drag_id_) {
++    return DropTarget();
++  }
++  target.indicator = views::View::ConvertRectToTarget(list_, parent(), in_list);
++  return target;
++}
++
++WorkspacePinnedSectionView::DropTarget WorkspacePinnedSectionView::ListTargetAt(
++    const gfx::Point& point_in_screen) {
++  // A folder does not become tabs.
++  const PinNode* const dragged = store_ ? store_->Find(drag_id_) : nullptr;
++  if (!dragged || dragged->type != PinNode::Type::kItem) {
++    return DropTarget();
++  }
++  UnpinnedTabContainerView* container = nullptr;
++  for (views::View* const child : parent()->children()) {
++    if ((container = views::AsViewClass<UnpinnedTabContainerView>(child))) {
++      break;
++    }
++  }
++  if (!container) {
++    return DropTarget();
++  }
++  // Between the two drawn tabs nearest the pointer. The list's own answer
++  // for that place: just below the edge is the top fifth of the tab under
++  // it, a place BEFORE that tab -- or the end, under the last one. It knows
++  // groups, splits and the hidden tabs of other workspaces (02's empty slots,
++  // LOCAL.md 43), which a count of drawn tabs would not.
++  const int y =
++      views::View::ConvertPointFromScreen(container, point_in_screen).y();
++  std::vector<int> edges;
++  CollectTabEdges(*container, *container, edges);
++  const int edge = edges.empty() ? 0
++                                 : *std::ranges::min_element(
++                                       edges, {}, [y](int edge_y) {
++                                         return std::abs(edge_y - y);
++                                       });
++  const std::optional<BrowserRootView::DropIndex> drop =
++      container->GetLinkDropIndex(gfx::Point(container->width() / 2, edge + 1));
++  if (!drop || drop->relative_to_index !=
++                   BrowserRootView::DropIndex::RelativeToIndex::
++                       kInsertBeforeIndex) {
++    return DropTarget();
++  }
++  // In a group when the place is inside it, or at its first tab and meant for
++  // it -- never a group split in two (MoveWebContentsAt and AddRestoredTab
++  // both keep a group whole only when told which).
++  TabStripModel* const model = browser_->GetTabStripModel();
++  std::optional<tab_groups::TabGroupId> group =
++      drop->index < model->count() ? model->GetTabGroupForTab(drop->index)
++                                   : std::nullopt;
++  if (group &&
++      drop->group_inclusion !=
++          BrowserRootView::DropIndex::GroupInclusion::kIncludeInGroup &&
++      (drop->index == 0 ||
++       model->GetTabGroupForTab(drop->index - 1) != group)) {
++    group.reset();
++  }
++  DropTarget target;
++  target.list_index = drop->index;
++  target.list_group = group;
++  target.indicator = views::View::ConvertRectToTarget(
++      container, parent(),
++      gfx::Rect(kRowInset, edge - kDropLineThickness / 2,
++                std::max(0, container->width() - 2 * kRowInset),
++                kDropLineThickness));
++  return target;
++}
++
++views::ScrollView* WorkspacePinnedSectionView::GetScrollView() {
++  return parent() ? views::ScrollView::GetScrollViewForContents(parent())
++                  : nullptr;
++}
++
++views::View* WorkspacePinnedSectionView::DropIndicator() {
++  if (!drop_indicator_.view() && parent()) {
++    auto indicator = std::make_unique<views::View>();
++    // Placed by hand over the rows and the tabs: never laid out, never hit.
++    indicator->SetProperty(views::kViewIgnoredByLayoutKey, true);
++    indicator->SetCanProcessEventsWithinSubtree(false);
++    // A layer of its own, so it is drawn above the tabs, which may paint to
++    // layers of their own. Added once, and kept hidden between drags: each
++    // add under the scroll view walks every tab's layer (E15b).
++    indicator->SetPaintToLayer();
++    indicator->layer()->SetFillsBoundsOpaquely(false);
++    indicator->SetVisible(false);
++    drop_indicator_.SetView(parent()->AddChildView(std::move(indicator)));
++  }
++  return drop_indicator_.view();
++}
++
+ void WorkspacePinnedSectionView::ShowContextMenuForViewImpl(
+     views::View* source,
+     const gfx::Point& point,
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -18,11 +18,16 @@
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
++#include "chrome/browser/ui/views/tabs/common/tab_drag_scroll_handler.h"
++#include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/point.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/view.h"
++#include "ui/views/view_tracker.h"
+ 
+ class BrowserWindowInterface;
+ 
+@@ -34,7 +39,8 @@ enum class VerticalTabStripCollapseState
+ 
+ namespace views {
+ class MenuRunner;
+-}
++class ScrollView;
++}  // namespace views
+ 
+ // The pinned section of the workspace this window shows (design 5, E15 spec):
+ // its folders and items, above today's tabs and scrolling with them.
+@@ -48,7 +54,9 @@ class MenuRunner;
+ // face -- sleeping, open (an X to close the page) or active (highlighted), with
+ // an arrow back to the item's address while the page is somewhere else.
+ // Closing the page keeps the item. Right-click: Unpin or Delete an item,
+-// Delete a folder, Rename either, or a New folder below it (E15d).
++// Delete a folder, Rename either, or a New folder below it (E15d). A row
++// dragged with the mouse moves among the rows -- before or after one, or into
++// a folder -- or, an item, into the tab list below as a Today tab (E15d).
+ //
+ // Below the rows, their line and then "+ New Tab", at the top of the list as
+ // in Arc (E15c.1); the line only while there are rows. Right-click on it:
+@@ -66,6 +74,9 @@ class WorkspacePinnedSectionView
+   METADATA_HEADER(WorkspacePinnedSectionView, views::View)
+ 
+  public:
++  // A row's mouse drag (E15d), step by step as the row reports it.
++  enum class DragStep { kMove, kDrop, kCancel };
++
+   WorkspacePinnedSectionView(
+       BrowserWindowInterface* browser,
+       tabs::VerticalTabStripStateController* state_controller);
+@@ -165,9 +176,13 @@ class WorkspacePinnedSectionView
+   // Opens `item` as a tab of this window, active, linked to the item and
+   // anchored at its address.
+   void OpenItem(const workspaces::pins::PinNode& item);
+-  // The item becomes a Today tab at the top of the list: its page if it has
+-  // one, opened first otherwise.
+-  void UnpinItem(const std::string& id);
++  // The item becomes a Today tab: its page if it has one, opened first
++  // otherwise. At model index `index` of this window, in `group` if given,
++  // when it was dropped there (E15d) -- a page open in another window comes
++  // here; else at the top of the list.
++  void UnpinItem(const std::string& id,
++                 int index = -1,
++                 std::optional<tab_groups::TabGroupId> group = std::nullopt);
+   // Removes an item, or a folder with all it holds, closing their pages.
+   void DeleteRow(const std::string& id);
+   void ShowDeleteFolderConfirm(const std::string& id, int items);
+@@ -177,6 +192,44 @@ class WorkspacePinnedSectionView
+   void ShowRenameBubble(const std::string& id);
+   void RenameRow(const std::string& id, const std::u16string& text);
+ 
++  // Where a drop at a point would go (E15d).
++  struct DropTarget {
++    DropTarget();
++    DropTarget(const DropTarget&);
++    DropTarget& operator=(const DropTarget&);
++    ~DropTarget();
++    // Among the rows, when `to` names one: Move(dragged, drawn_guid_, to,
++    // where).
++    std::string to;
++    workspaces::pins::Where where = workspaces::pins::Where::kBefore;
++    // In the tab list: the item becomes a Today tab at this model index.
++    std::optional<int> list_index;
++    std::optional<tab_groups::TabGroupId> list_group;
++    // What shows where it would go, in the scroll view's contents: a line
++    // between rows or tabs, or a frame round the folder it would go into
++    // (Where::kInto). Empty: nowhere, and a drop there does nothing.
++    gfx::Rect indicator;
++  };
++  // A row reports its drag here, the id bound when the row was made.
++  void OnRowDrag(const std::string& id,
++                 DragStep step,
++                 const gfx::Point& point_in_screen);
++  // Draws where a drop at the last point would go, and scrolls the list while
++  // it is held near an edge; also run when the list scrolls under a still
++  // pointer, which is how the scrolling stops at the end (E15d review).
++  void UpdateDrag();
++  void EndDrag();
++  DropTarget TargetAt(const gfx::Point& point_in_screen);
++  // Among the rows, `y` in list_'s coordinates.
++  DropTarget RowTargetAt(int y);
++  // In the tab list below the section.
++  DropTarget ListTargetAt(const gfx::Point& point_in_screen);
++  // The scroll view the section and the tab list scroll in.
++  views::ScrollView* GetScrollView();
++  // The line / frame, a child of the scroll view's contents that layout
++  // ignores, made at the first drag.
++  views::View* DropIndicator();
++
+   void OnCollapseChanged(tabs::VerticalTabStripCollapseState state);
+   // Whether the window paints as active: the rows dim with the tabs when not.
+   bool IsFrameActive() const;
+@@ -217,6 +270,16 @@ class WorkspacePinnedSectionView
+   // drawn, by the next Rebuild().
+   std::string rename_after_rebuild_;
+ 
++  // The row being dragged (empty: none) and the last point it was dragged
++  // to, in screen coordinates.
++  std::string drag_id_;
++  gfx::Point drag_point_;
++  views::ViewTracker drop_indicator_;
++  // Scrolls the list while a row is held near its top or bottom edge, as for
++  // a dragged tab.
++  TabDragScrollHandler drag_scroll_;
++  base::CallbackListSubscription drag_scrolled_subscription_;
++
+   // The row menu, and the row it was opened on.
+   std::string context_menu_id_;
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;

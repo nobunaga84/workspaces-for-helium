@@ -1,0 +1,450 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -38,6 +38,7 @@
+ #include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+@@ -233,6 +234,8 @@ constexpr int kCommandRename = 4;
+ constexpr int kCommandNewFolder = 5;
+ // A folder's Colour submenu (E17b): one item per colour id, 0-8.
+ constexpr int kCommandColor = 6;
++// An open page's Close (C26: the x is drawn only on mouse-over).
++constexpr int kCommandClose = 7;
+ constexpr int kCommandFirstColor = 20;
+ // A collapsed folder's pages (E17b): one item per page, in order.
+ constexpr int kCommandFirstPage = 100;
+@@ -680,6 +683,8 @@ class PinRow : public views::LabelButton
+     // The ring drawn inside: the rows sit in a clipping scroll view (E13).
+     views::FocusRing::Get(this)->SetOutsetFocusRingDisabled(true);
+     ConfigureInkDrop(this);
++    // The x is a child (C26): moving onto it is no exit from the row.
++    SetNotifyEnterExitOnChild(true);
+     // A tree to assistive tech (design 5): an item at its level, a folder
+     // expanded or collapsed; the arrow keys move and open (OnKeyPressed).
+     GetViewAccessibility().SetRole(ax::mojom::Role::kTreeItem);
+@@ -748,6 +753,10 @@ class PinRow : public views::LabelButton
+   bool folder() const { return folder_; }
+   // How deep in folders: 0 at the top level.
+   int level() const { return level_; }
++  // A folder drawn open; and the page in front's peek row (C12, SyncPeek).
++  bool open() const { return open_; }
++  bool peek() const { return peek_; }
++  void MarkPeek() { peek_ = true; }
+ 
+   // Tabs dim in a window that is not the active one, and so do the rows.
+   void SetFrameActive(bool active) {
+@@ -774,6 +783,7 @@ class PinRow : public views::LabelButton
+           on_reset_, vector_icons::kArrowBackIcon, kRowButtonIconSize));
+       reset_->SetTooltipText(
+           l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_ITEM_RESET));
++      UpdateCloseImage();
+     }
+     UpdateColors();
+     // The layout decides which buttons show (CalculateProposedLayout). Only
+@@ -832,8 +842,11 @@ class PinRow : public views::LabelButton
+     int right = layouts.host_size.width() - kRowInset;
+     for (views::View* const button : {static_cast<views::View*>(close_.get()),
+                                        static_cast<views::View*>(reset_.get())}) {
+-      const bool shown = open && (button == close_.get() || drifted_);
+-      if (!shown) {
++      // The x keeps its place on every open row; it is PAINTED only while the
++      // mouse is over the row (C26, UpdateCloseImage). Nothing moves: a click
++      // meant for the back arrow cannot land on a just-drawn x (design review).
++      const bool placed = open && (button == close_.get() || drifted_);
++      if (!placed) {
+         layouts.child_layouts.emplace_back(button, false, gfx::Rect());
+         continue;
+       }
+@@ -928,8 +941,41 @@ class PinRow : public views::LabelButton
+   bool IsTriggerableEvent(const ui::Event& event) override {
+     return !dragging_ && views::LabelButton::IsTriggerableEvent(event);
+   }
++  void OnThemeChanged() override {
++    views::LabelButton::OnThemeChanged();
++    // After the x's own (a view's children hear first): it sets its colours.
++    UpdateCloseImage();
++  }
++  void OnMouseEntered(const ui::MouseEvent& event) override {
++    views::LabelButton::OnMouseEntered(event);
++    SetHovered(true);
++  }
++  void OnMouseExited(const ui::MouseEvent& event) override {
++    views::LabelButton::OnMouseExited(event);
++    SetHovered(false);
++  }
+ 
+  private:
++  void SetHovered(bool hovered) {
++    if (hovered_ != hovered) {
++      hovered_ = hovered;
++      UpdateCloseImage();
++    }
++  }
++
++  // C26: the x is painted only while the mouse is over the row, see-through
++  // otherwise -- a repaint, no layout. It keeps its place, its name for a
++  // screen reader and the hands-free checks, and its stop for the Tab key.
++  void UpdateCloseImage() {
++    if (!close_) {
++      return;
++    }
++    views::SetImageFromVectorIconWithColor(
++        close_, vector_icons::kCloseSmallIcon, kRowButtonIconSize,
++        hovered_ ? views::IconColors(ui::kColorIcon, ui::kColorIconDisabled)
++                 : views::IconColors(SK_ColorTRANSPARENT, SK_ColorTRANSPARENT));
++  }
++
+   // The title ends at `right` at the latest: before what sits at the row's
+   // right end, an item's buttons or a folder's number.
+   void EndTitleAt(views::ProposedLayout& layouts, int right) const {
+@@ -1017,6 +1063,8 @@ class PinRow : public views::LabelButton
+   const DragCallback on_drag_;
+   gfx::Point press_point_;
+   bool dragging_ = false;
++  bool hovered_ = false;
++  bool peek_ = false;
+   raw_ptr<views::ImageButton> close_ = nullptr;
+   raw_ptr<views::ImageButton> reset_ = nullptr;
+   // A folder's, except collapsed; and its number of pages (E18).
+@@ -1445,6 +1493,7 @@ void WorkspacePinnedSectionView::Rebuild
+     RemoveChildViewT(old_list);
+   }
+   drawn_guid_.clear();
++  peek_id_.clear();
+   preferred_height_.reset();
+ 
+   workspaces::WorkspaceService* const service =
+@@ -1520,7 +1569,11 @@ void WorkspacePinnedSectionView::Rebuild
+   for (const PinNode* root : roots) {
+     rows += AddRow(*list, *root, /*level=*/0, frame_active);
+   }
+-  ApplyStates(*list, ReadLinks());
++  // After drawn_guid_ is set (above): ReadLinks may unlink a tab, which tells
++  // the workspace callbacks at once (design review).
++  const Links links = ReadLinks();
++  SyncPeek(*list, links);
++  ApplyStates(*list, links);
+   // After the header.
+   list_ = AddChildViewAt(std::move(list), 1);
+   LOG(INFO) << "[workspaces] pins: drew " << rows << " row(s) of '"
+@@ -1566,6 +1619,12 @@ void WorkspacePinnedSectionView::UpdateR
+     }
+   }
+   if (list_) {
++    // The peek row first, so the scroll below finds it (C12): one row added
++    // or removed in place, never a rebuild per tab switch (design review).
++    if (SyncPeek(*list_, links)) {
++      preferred_height_.reset();
++      PreferredSizeChanged();
++    }
+     ApplyStates(*list_, links);
+   }
+   // The evidence that a restart brought the pages back as their rows.
+@@ -1687,7 +1746,8 @@ void WorkspacePinnedSectionView::ApplySt
+ size_t WorkspacePinnedSectionView::AddRow(views::View& list,
+                                           const PinNode& row,
+                                           int level,
+-                                          bool frame_active) {
++                                          bool frame_active,
++                                          std::optional<size_t> peek_at) {
+   // The id only, never the row: the store is read again when it is clicked,
+   // since another window may have changed it since this row was made.
+   const bool folder = row.type == PinNode::Type::kFolder;
+@@ -1718,9 +1778,11 @@ size_t WorkspacePinnedSectionView::AddRo
+       browser_->GetProfile(), frame_active,
+       lists_pages ? views::Button::PressedCallback() : std::move(callback),
+       std::move(on_close), std::move(on_reset),
+-      collapsed_ ? DragCallback()
+-                 : base::BindRepeating(&WorkspacePinnedSectionView::OnRowDrag,
+-                                       base::Unretained(this), row.id));
++      // Nor the peek row (C12): it is not where its item is (D1).
++      collapsed_ || peek_at
++          ? DragCallback()
++          : base::BindRepeating(&WorkspacePinnedSectionView::OnRowDrag,
++                                base::Unretained(this), row.id));
+   if (lists_pages) {
+     // A menu button, as the bar's "+" is: clicking the icon again to close
+     // its menu would otherwise reopen it -- Windows replays that click to the
+@@ -1731,6 +1793,12 @@ size_t WorkspacePinnedSectionView::AddRo
+         std::make_unique<views::Button::DefaultButtonControllerDelegate>(
+             button)));
+   }
++  if (peek_at) {
++    pin_row->MarkPeek();
++    list.AddChildViewAt(std::move(pin_row), *peek_at)
++        ->set_context_menu_controller(this);
++    return 1;
++  }
+   views::View* const added = list.AddChildView(std::move(pin_row));
+   added->set_context_menu_controller(this);
+   size_t count = 1;
+@@ -1742,6 +1810,67 @@ size_t WorkspacePinnedSectionView::AddRo
+   return count;
+ }
+ 
++bool WorkspacePinnedSectionView::SyncPeek(views::View& list,
++                                          const Links& links) {
++  // The active item, open in this window, with no row of its own drawn: the
++  // top-most closed folder drawn that holds it (AddRow never goes into one).
++  const std::string active_id =
++      links.active ? workspaces::PinItemForTab(links.active->GetContents())
++                   : std::string();
++  std::string want;
++  std::string folder_id;
++  if (!collapsed_ && store_ && !active_id.empty() &&
++      links.open.contains(active_id) &&
++      std::ranges::none_of(list.children(), [&](const views::View* child) {
++        const auto* const row = views::AsViewClass<PinRow>(child);
++        return row->id() == active_id && !row->peek();
++      })) {
++    for (const views::View* const child : list.children()) {
++      const auto* const row = views::AsViewClass<PinRow>(child);
++      const PinNode* const folder =
++          row->folder() && !row->open() ? store_->Find(row->id()) : nullptr;
++      if (!folder) {
++        continue;
++      }
++      std::vector<const PinNode*> items;
++      CollectItems(*folder, items);
++      if (std::ranges::any_of(items, [&](const PinNode* item) {
++            return item->id == active_id;
++          })) {
++        want = active_id;
++        folder_id = row->id();
++        break;
++      }
++    }
++  }
++  if (want == peek_id_) {
++    return false;
++  }
++  for (views::View* const child : list.children()) {
++    if (views::AsViewClass<PinRow>(child)->peek()) {
++      list.RemoveChildViewT(child);
++      break;
++    }
++  }
++  peek_id_ = want;
++  if (want.empty()) {
++    LOG(INFO) << "[workspaces] pins: no peek row";
++    return true;
++  }
++  const views::View::Views& rows = list.children();
++  for (size_t i = 0; i < rows.size(); ++i) {
++    const auto* const row = views::AsViewClass<PinRow>(rows[i].get());
++    if (row->id() == folder_id) {
++      AddRow(list, *store_->Find(want), row->level() + 1, IsFrameActive(),
++             i + 1);
++      break;
++    }
++  }
++  LOG(INFO) << "[workspaces] pins: a closed folder shows its page in front '"
++            << want << "'";
++  return true;
++}
++
+ void WorkspacePinnedSectionView::OnFolderPressed(const std::string& id) {
+   if (store_) {
+     store_->ToggleFolder(id);
+@@ -1931,10 +2060,18 @@ void WorkspacePinnedSectionView::DeleteR
+   }
+   std::vector<const PinNode*> items;
+   CollectItems(*row, items);
+-  // Copied now: closing a page may change the store under the pointers.
++  // Copied now: closing a page may change the store under the pointers. So is
++  // each page's Archive entry (C30), filled in below.
+   std::vector<std::string> ids;
++  std::vector<workspaces::archive::ArchiveEntry> entries;
+   for (const PinNode* const item : items) {
+     ids.push_back(item->id);
++    workspaces::archive::ArchiveEntry entry;
++    entry.url = item->url;
++    entry.title = item->title;
++    entry.custom_title = item->custom_title;
++    entry.last_active = item->last_active;
++    entries.push_back(std::move(entry));
+   }
+   // Their open pages close with them. A page that asks "Leave site?" and is
+   // kept loses its link with the row, and joins the list (ReadLinks).
+@@ -1956,9 +2093,33 @@ void WorkspacePinnedSectionView::DeleteR
+       closed += service->ClosePinItemPage(tab, "Delete") ? 1 : 0;
+     }
+   }
++  // C30: one Archive entry per page, so Restore brings it back as a Today tab
++  // of this workspace, to pin again -- every page of a folder too (the owner).
++  // Not a page still open: a "Leave site?" answered Stay keeps it as an
++  // ordinary tab, whose own close is the archive's door then (design review).
++  Profile* const profile = browser_->GetProfile();
++  workspaces::archive::ArchiveStore* const archive =
++      workspaces::archive::ArchiveStore::GetOrCreate(profile,
++                                                     profile->GetPath());
++  const std::vector<BrowserWindowInterface*> windows = WindowsOf(profile);
++  int archived = 0;
++  for (size_t i = 0; i < ids.size(); ++i) {
++    if (std::ranges::any_of(windows, [&](BrowserWindowInterface* window) {
++          return LinkedTab(window->GetTabStripModel(), ids[i]) != nullptr;
++        })) {
++      continue;
++    }
++    workspaces::archive::ArchiveEntry& entry = entries[i];
++    entry.id = NewRowId();
++    entry.workspace = drawn_guid_;
++    entry.reason = workspaces::archive::ArchiveEntry::Reason::kManual;
++    entry.archived_at = base::Time::Now();
++    archived += archive->Add(std::move(entry)) ? 1 : 0;
++  }
+   store_->Remove(id);
+   LOG(INFO) << "[workspaces] pins: deleted '" << id << "' (" << ids.size()
+-            << " item(s), " << closed << " open page(s) closed)";
++            << " item(s), " << closed << " open page(s) closed, " << archived
++            << " archived)";
+ }
+ 
+ void WorkspacePinnedSectionView::ShowDeleteFolderConfirm(const std::string& id,
+@@ -2262,6 +2423,18 @@ WorkspacePinnedSectionView::DropTarget W
+   if (!InZone(point_in_screen)) {
+     return DropTarget();
+   }
++  if (!list_) {
++    // An empty section (C24): the tab becomes its first pinned page, marked by
++    // a line under the header.
++    DropTarget first;
++    first.where = Where::kAfter;
++    const int x = kCardMargin + kRowInset;
++    first.indicator = views::View::ConvertRectToTarget(
++        this, parent(),
++        gfx::Rect(x, header_->bounds().bottom() - kDropLineThickness / 2,
++                  std::max(0, width() - 2 * x), kDropLineThickness));
++    return first;
++  }
+   return RowTargetAt(
+       views::View::ConvertPointFromScreen(list_, point_in_screen).y());
+ }
+@@ -2296,6 +2469,19 @@ WorkspacePinnedSectionView::DropTarget W
+   if (r >= first && r < past) {
+     return DropTarget();
+   }
++  // A row dropped on the peek row goes into its folder, the row above it
++  // (C12, D2): the peek row is not a place in the list.
++  if (r > 0 && r < rows.size() && row_at(r)->peek()) {
++    DropTarget into;
++    into.to = row_at(r - 1)->id();
++    into.where = Where::kInto;
++    if (into.to == drag_id_) {
++      return DropTarget();
++    }
++    into.indicator = views::View::ConvertRectToTarget(list_, parent(),
++                                                      rows[r - 1]->bounds());
++    return into;
++  }
+ 
+   // A line at `line_y`, indented to the rows it would sit among.
+   const auto line_at = [this](int line_y, int level) {
+@@ -2334,10 +2520,12 @@ WorkspacePinnedSectionView::DropTarget W
+   } else if (y - row->y() < row->height() / 2) {
+     target.to = row->id();
+     in_list = line_at(row->y(), row->level());
+-  } else if (r + 1 < rows.size()) {
++  } else if (const size_t n =
++                 r + 1 < rows.size() && row_at(r + 1)->peek() ? r + 2 : r + 1;
++             n < rows.size()) {
+     // The lower half of a row is the top of the next, at the next one's level:
+-    // under an open folder's name, that is inside it.
+-    const PinRow* const next = row_at(r + 1);
++    // under an open folder's name, that is inside it. A peek row is passed by.
++    const PinRow* const next = row_at(n);
+     target.to = next->id();
+     in_list = line_at(next->y(), next->level());
+   } else {
+@@ -2434,9 +2622,12 @@ bool WorkspacePinnedSectionView::InZone(
+     const gfx::Point& point_in_screen) const {
+   const gfx::Point point =
+       views::View::ConvertPointFromScreen(this, point_in_screen);
+-  // Never in the collapsed column (E17b), whose "+ New Tab" is hidden.
+-  return list_ && !collapsed_ && IsDrawn() &&
+-         GetVisibleBounds().Contains(point) && point.y() < new_tab_button_->y();
++  // Never in the collapsed column (E17b), whose "+ New Tab" is hidden. An
++  // empty section takes a tab too, its header the zone (C24) -- only while the
++  // pins file can take it: loading or read-only, a drop would pin nothing.
++  return (list_ || (store_ && store_->loaded() && !store_->read_only())) &&
++         !collapsed_ && IsDrawn() && GetVisibleBounds().Contains(point) &&
++         point.y() < new_tab_button_->y();
+ }
+ 
+ TabDragContext* WorkspacePinnedSectionView::DragContext() {
+@@ -2560,6 +2751,14 @@ void WorkspacePinnedSectionView::ShowCon
+   } else if (const auto* const row = views::AsViewClass<PinRow>(source)) {
+     context_menu_id_ = row->id();
+     context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++    // An open page's Close, first (C26): with the x drawn only on mouse-over,
++    // the keyboard's and a screen reader's way to close a page in the
++    // background (design review).
++    if (!row->folder() &&
++        LinkedTab(browser_->GetTabStripModel(), row->id())) {
++      context_menu_model_->AddItemWithStringId(kCommandClose,
++                                               IDS_HELIUM_PINNED_ITEM_CLOSE);
++    }
+     if (!row->folder()) {
+       context_menu_model_->AddItemWithStringId(kCommandUnpin,
+                                                IDS_HELIUM_PINNED_ITEM_UNPIN);
+@@ -2568,8 +2767,12 @@ void WorkspacePinnedSectionView::ShowCon
+     // "Rename workspace" (the owner's check of E15d.1).
+     context_menu_model_->AddItemWithStringId(kCommandRename,
+                                              IDS_BOOKMARKS_RENAME);
+-    context_menu_model_->AddItemWithStringId(kCommandNewFolder,
+-                                             IDS_HELIUM_PINNED_NEW_FOLDER);
++    // Not on a peek row (C12): its place is inside the closed folder, where a
++    // new folder would land unseen (design review).
++    if (!row->peek()) {
++      context_menu_model_->AddItemWithStringId(kCommandNewFolder,
++                                               IDS_HELIUM_PINNED_NEW_FOLDER);
++    }
+     if (row->folder()) {
+       // Each folder its own colour (E17b): Chromium's nine, named and drawn
+       // as its tab-group menu draws them, the one drawn ticked.
+@@ -2636,6 +2839,9 @@ void WorkspacePinnedSectionView::Execute
+     case kCommandUnpin:
+       UnpinItem(id);
+       break;
++    case kCommandClose:
++      OnItemClosePressed(id);
++      break;
+     case kCommandDelete:
+       DeleteRow(id);
+       break;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -228,11 +228,18 @@ class WorkspacePinnedSectionView
+ 
+   // Adds `row` to `list`, then its children if it is an open folder -- not
+   // while collapsed, where a folder is one icon. Returns how many rows that
+-  // made.
++  // made. With `peek_at`, the item alone, at that index: SyncPeek's row.
+   size_t AddRow(views::View& list,
+                 const workspaces::pins::PinNode& row,
+                 int level,
+-                bool frame_active);
++                bool frame_active,
++                std::optional<size_t> peek_at = std::nullopt);
++  // C12: the page in front, when its item is inside a closed folder, is drawn
++  // once more right under that folder's row (the top-most closed one on its
++  // path, the only one drawn) -- its "peek" row. Never in the collapsed column.
++  // The one rule for Rebuild and the state pass alike: adds or removes that one
++  // row in `list`, and answers whether it changed anything.
++  bool SyncPeek(views::View& list, const Links& links);
+   void OnFolderPressed(const std::string& id);
+   // Collapsed, a folder's press: a menu of every page under it, by title,
+   // each opened as its row would be (E17b).
+@@ -338,6 +345,8 @@ class WorkspacePinnedSectionView
+   raw_ptr<VerticalNewTabButton> new_tab_button_ = nullptr;
+   // The workspace the rows are of; empty while the section is hidden.
+   std::string drawn_guid_;
++  // The item drawn as the peek row (SyncPeek); empty for none.
++  std::string peek_id_;
+   // Its effective colour (prefs::EffectiveColors): a folder's without one of
+   // its own (E17b).
+   int drawn_color_ = 0;

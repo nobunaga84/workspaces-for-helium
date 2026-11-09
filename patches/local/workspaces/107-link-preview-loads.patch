@@ -1,0 +1,206 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -251,6 +251,10 @@ bool ShouldPreviewPinnedLink(const Pinne
+          !facts.same_site;
+ }
+ 
++bool ShouldSendPreviewDownloadToTab(const PreviewDownloadFacts& facts) {
++  return facts.get && (facts.card_may_load || facts.blob) && !facts.sent;
++}
++
+ std::string SiteFromHost(std::string_view host) {
+   constexpr std::string_view kWww = "www.";
+   if (host.starts_with(kWww) &&
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -306,6 +306,23 @@ struct PinnedLinkFacts {
+ // the pinned page away from its address.
+ bool ShouldPreviewPinnedLink(const PinnedLinkFacts& facts);
+ 
++// C20: what the link preview knows about a download its page asks for (the
++// card's page is no tab, so the download never runs in it). Plain values, so
++// the rule below is tested here.
++struct PreviewDownloadFacts {
++  bool get = false;            // a GET; a POST would be sent twice
++  bool card_may_load = false;  // the web, or a file from a file page
++  bool blob = false;           // the page's own blob: data
++  bool sent = false;           // the card already sent one to a tab
++};
++
++// C20 (review 2, R2-18): whether the download goes to a new tab of the
++// window, where it downloads as any link does. The page picks the address
++// and needs no click, and the tab's load is the browser's, which Chromium's
++// download limit and its block on a page's own data: loads never see: so
++// once per card, and never a data: or filesystem: address.
++bool ShouldSendPreviewDownloadToTab(const PreviewDownloadFacts& facts);
++
+ // C5, links by rule: one site the owner chose for a workspace -- "this site
+ // always opens in workspace X". `site` is a host as SiteFromHost() leaves it.
+ // Plain values, so the rules below are tested here.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -716,6 +716,32 @@ TEST(WorkspacePinnedLinkTest, EachCondit
+   }
+ }
+ 
++// C20 (review 2, R2-18): a web download the link preview's page asks for.
++constexpr PreviewDownloadFacts kWebDownload = {.get = true,
++                                               .card_may_load = true,
++                                               .blob = false,
++                                               .sent = false};
++
++TEST(WorkspacePreviewDownloadTest, AWebOrBlobDownloadGoesToATab) {
++  EXPECT_TRUE(ShouldSendPreviewDownloadToTab(kWebDownload));
++  PreviewDownloadFacts blob = kWebDownload;
++  blob.card_may_load = false;
++  blob.blob = true;
++  EXPECT_TRUE(ShouldSendPreviewDownloadToTab(blob));
++}
++
++TEST(WorkspacePreviewDownloadTest, EachConditionAloneKeepsItFromATab) {
++  // Each flipped alone: a POST sent twice, a data: page opened with no
++  // click, a tab per request of a page that asks again and again.
++  for (bool PreviewDownloadFacts::*field :
++       {&PreviewDownloadFacts::get, &PreviewDownloadFacts::card_may_load,
++        &PreviewDownloadFacts::sent}) {
++    PreviewDownloadFacts facts = kWebDownload;
++    facts.*field = !(facts.*field);
++    EXPECT_FALSE(ShouldSendPreviewDownloadToTab(facts));
++  }
++}
++
+ // C5: links by rule.
+ TEST(WorkspaceSiteRuleTest, SiteFromHostDropsALeadingWww) {
+   EXPECT_EQ("github.com", SiteFromHost("www.github.com"));
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_link_preview.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_link_preview.cc
+@@ -74,6 +74,28 @@ namespace {
+ // 85% of the width and of the height, centred (Arc's look).
+ constexpr int kInsetFortieths = 3;
+ 
++// Where a load the browser starts for the card may go, the renderer's own
++// checks of the address never having run on it: the web, or a file from a
++// file.
++bool MayLoad(const GURL& url, const GURL& from) {
++  return url.SchemeIsHTTPOrHTTPS() ||
++         (url.SchemeIsFile() && from.SchemeIsFile());
++}
++
++// A link's load the browser starts for the card, with the link's referrer
++// and initiator: the site sees the click it was, not a typed visit (review
++// 2, R2-18, R2-23).
++content::OpenURLParams LinkParams(const GURL& url,
++                                  const content::Referrer& referrer,
++                                  const std::optional<url::Origin>& initiator,
++                                  WindowOpenDisposition disposition) {
++  content::OpenURLParams params(url, referrer, disposition,
++                                ui::PAGE_TRANSITION_LINK,
++                                /*is_renderer_initiated=*/false);
++  params.initiator_origin = initiator;
++  return params;
++}
++
+ // Why no card can show over `source` for `url` now, for the logs; null when
+ // one can.
+ const char* CannotShowReason(content::WebContents* source, const GURL& url) {
+@@ -102,10 +124,8 @@ const char* CannotShowReason(content::We
+   if (!tab->GetTabFeatures() || !tab->GetTabFeatures()->tab_dialog_manager()) {
+     return "no dialog manager";
+   }
+-  // The card's load is browser-initiated, so the renderer's own checks of the
+-  // address never ran: the web only, or a file from a file.
+-  if (!url.SchemeIsHTTPOrHTTPS() &&
+-      !(url.SchemeIsFile() && source->GetLastCommittedURL().SchemeIsFile())) {
++  // The card's load is browser-initiated.
++  if (!MayLoad(url, source->GetLastCommittedURL())) {
+     return "scheme";
+   }
+   return nullptr;
+@@ -222,9 +242,12 @@ class WorkspaceLinkPreview : public view
+   views::UnhandledKeyboardEventHandler unhandled_keys_;
+   // Set by CloseWithCause() for a close the widget's reason cannot tell.
+   const char* cause_ = nullptr;
+-  // The link's referrer, for a download the card's first page turns out to be
+-  // (CanDownload).
++  // The link's referrer and initiator, for a download the card's first page
++  // turns out to be (CanDownload).
+   const content::Referrer referrer_;
++  const std::optional<url::Origin> initiator_;
++  // One download per card goes to a tab (CanDownload).
++  bool download_sent_ = false;
+   // The first commit takes the keyboard back once; later ones leave it where
+   // the user put it (DidFinishNavigation).
+   bool focused_at_commit_ = false;
+@@ -237,7 +260,7 @@ WorkspaceLinkPreview::WorkspaceLinkPrevi
+     const content::Referrer& referrer,
+     const std::optional<url::Origin>& initiator,
+     const char* trigger)
+-    : tab_(tab), referrer_(referrer) {
++    : tab_(tab), referrer_(referrer), initiator_(initiator) {
+   Profile* const profile =
+       Profile::FromBrowserContext(tab->GetContents()->GetBrowserContext());
+ 
+@@ -416,25 +439,34 @@ void WorkspaceLinkPreview::CanDownload(
+     base::OnceCallback<void(bool)> callback) {
+   // Never in the card: its page is no tab, which the download's own UI and
+   // helpers expect. A GET goes to a new tab of the window instead, where it
+-  // downloads as any link does (the tab switch closes the card).
++  // downloads as any link does (the tab switch closes the card): once per
++  // card, never a data: page (ShouldSendPreviewDownloadToTab, R2-18).
+   std::move(callback).Run(false);
+-  const bool to_tab = request_method == "GET" && tab_;
++  const GURL& page = contents_->GetLastCommittedURL();
++  const bool to_tab =
++      tab_ && ShouldSendPreviewDownloadToTab(
++                  {.get = request_method == "GET",
++                   .card_may_load = MayLoad(url, page),
++                   .blob = url.SchemeIsBlob(),
++                   .sent = download_sent_});
+   LOG(INFO) << "[workspaces] link preview: a download -> "
+             << (to_tab ? "new tab" : "refused");
+   if (to_tab) {
++    content::OpenURLParams params =
++        LinkParams(url, referrer_, initiator_,
++                   WindowOpenDisposition::NEW_FOREGROUND_TAB);
+     // From the card's page, as the request was; the link's own when the
+     // download is the card's first page. The default policy: an origin only
+     // across sites.
+-    const GURL& page = contents_->GetLastCommittedURL();
+-    tab_->GetBrowserWindowInterface()->OpenURL(
+-        content::OpenURLParams(
+-            url,
+-            page.is_valid() ? content::Referrer(
+-                                  page, network::mojom::ReferrerPolicy::kDefault)
+-                            : referrer_,
+-            WindowOpenDisposition::NEW_FOREGROUND_TAB,
+-            ui::PAGE_TRANSITION_LINK, /*is_renderer_initiated=*/false),
+-        /*navigation_handle_callback=*/{});
++    if (page.is_valid()) {
++      params.referrer =
++          content::Referrer(page, network::mojom::ReferrerPolicy::kDefault);
++      params.initiator_origin =
++          contents_->GetPrimaryMainFrame()->GetLastCommittedOrigin();
++    }
++    // Spent only once a tab took it.
++    download_sent_ = tab_->GetBrowserWindowInterface()->OpenURL(
++                         params, /*navigation_handle_callback=*/{}) != nullptr;
+   }
+ }
+ 
+@@ -567,12 +599,10 @@ void ShowNow(base::WeakPtr<content::WebC
+     // menu's in a new tab. The scheme gate passed when it was asked.
+     if (source) {
+       source->OpenURL(
+-          content::OpenURLParams(
+-              url, referrer,
+-              std::string_view(trigger) == "pinned page"
+-                  ? WindowOpenDisposition::CURRENT_TAB
+-                  : WindowOpenDisposition::NEW_FOREGROUND_TAB,
+-              ui::PAGE_TRANSITION_LINK, /*is_renderer_initiated=*/false),
++          LinkParams(url, referrer, initiator,
++                     std::string_view(trigger) == "pinned page"
++                         ? WindowOpenDisposition::CURRENT_TAB
++                         : WindowOpenDisposition::NEW_FOREGROUND_TAB),
+           /*navigation_handle_callback=*/{});
+     }
+     return;

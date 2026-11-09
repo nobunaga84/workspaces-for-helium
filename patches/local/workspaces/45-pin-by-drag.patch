@@ -1,0 +1,527 @@
+--- a/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
+@@ -409,6 +409,13 @@ TabDragTarget* BaseTabStripRegionView::G
+     return nullptr;
+   }
+   gfx::Rect tab_strip_draggable_bounds = GetTabStripDraggableBounds();
++  // Helium Workspaces (E15d): the fork's drop targets beside the list take the
++  // tabs first (TabStripCollectionController::GetWorkspaceDragTarget).
++  if (TabDragTarget* const target =
++          tab_strip_controller_->GetWorkspaceDragTarget(
++              point_in_screen, tab_strip_draggable_bounds)) {
++    return target;
++  }
+   if (!tab_strip_draggable_bounds.Contains(point_in_screen)) {
+     return nullptr;
+   }
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -640,8 +640,23 @@ TabStripCollectionController::CreateUnpi
+       !workspaces::WorkspaceService::From(browser)) {
+     return nullptr;
+   }
+-  return std::make_unique<WorkspacePinnedSectionView>(browser,
+-                                                      GetStateController());
++  auto section = std::make_unique<WorkspacePinnedSectionView>(
++      browser, GetStateController());
++  pinned_section_.SetView(section.get());
++  return section;
++}
++
++TabDragTarget* TabStripCollectionController::GetWorkspaceDragTarget(
++    const gfx::Point& point_in_screen,
++    const gfx::Rect& draggable_bounds) {
++  if (!draggable_bounds.Contains(point_in_screen) ||
++      GetDragHandler().IsDraggingPinnedTabs() ||
++      GetDragHandler().IsDraggingGroups()) {
++    return nullptr;
++  }
++  auto* const section =
++      views::AsViewClass<WorkspacePinnedSectionView>(pinned_section_.view());
++  return section ? section->GetTabDragTarget(point_in_screen) : nullptr;
+ }
+ 
+ void TabStripCollectionController::TabGroupFocusChanged(
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
+@@ -18,6 +18,7 @@
+ #include "chrome/browser/ui/views/tabs/tab/tab_context_menu_controller.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "ui/base/models/list_selection_model.h"
++#include "ui/views/view_tracker.h"
+ 
+ class BrowserFrameView;
+ class BrowserView;
+@@ -25,6 +26,7 @@ class ExpandOnHoverLock;
+ class HorizontalTabClosingHelper;
+ class RootTabCollectionNode;
+ class TabCollectionNode;
++class TabDragTarget;
+ class TabGroup;
+ class TabHoverCardController;
+ 
+@@ -155,6 +157,12 @@ class TabStripCollectionController : pub
+   // Workspaces is on right now: the settings toggle can switch it on later,
+   // and the section hides itself while it is off.
+   std::unique_ptr<views::View> CreateUnpinnedHeader();
++  // The fork's drop targets beside the list, asked first by the tab strip's
++  // GetTabDragTarget with its draggable bounds: the pinned section (E15d),
++  // when the dragged tabs are inside the bounds, over it, and could be pinned
++  // there -- not favorites, not a group. Null otherwise.
++  TabDragTarget* GetWorkspaceDragTarget(const gfx::Point& point_in_screen,
++                                        const gfx::Rect& draggable_bounds);
+ 
+   void TabGroupFocusChanged(
+       std::optional<tab_groups::TabGroupId> new_focused_group_id,
+@@ -208,6 +216,8 @@ class TabStripCollectionController : pub
+   const raw_ref<RootTabCollectionNode> root_node_;
+   const raw_ref<TabDragHandler> drag_handler_;
+   raw_ptr<TabHoverCardController> hover_card_controller_;
++  // The section CreateUnpinnedHeader() made; the tab strip owns it.
++  views::ViewTracker pinned_section_;
+ 
+   TabCollectionAnimatingLayoutManager::AnimationCoordinator
+       animation_coordinator_;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -39,8 +39,13 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
++#include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
++#include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
++#include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+ #include "chrome/browser/ui/views/tabs/new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+@@ -139,6 +144,43 @@ constexpr int kCommandDeleteFolder = 3;
+ constexpr int kCommandRename = 4;
+ constexpr int kCommandNewFolder = 5;
+ 
++// How the log says where a row went.
++const char* WhereName(Where where) {
++  return where == Where::kInto    ? "into"
++         : where == Where::kAfter ? "after"
++                                  : "before";
++}
++
++// Whether `tab` can become an item: a web page drawn in the list -- not a
++// favorite, grouped or split (the tab menu's rule), not a tab this window
++// hides, which a shift-click range can hold (E13), not an item's page.
++bool CanPin(const workspaces::WorkspaceService& service,
++            tabs::TabInterface* tab) {
++  content::WebContents* const contents = tab->GetContents();
++  return contents && !tab->IsPinned() && !tab->GetGroup() && !tab->IsSplit() &&
++         service.IsTabOnScreen(tab) && !service.IsPinItemTab(tab) &&
++         workspaces::WorkspaceTabData::IsAnchorableUrl(
++             contents->GetLastCommittedURL());
++}
++
++// The dragged tabs, when every one of them can be pinned; none otherwise, so
++// a drop never pins part of a selection and leaves the rest (E15d review #5).
++std::vector<tabs::TabInterface*> PinnableTabs(
++    const workspaces::WorkspaceService& service,
++    const DragSessionData& session) {
++  std::vector<tabs::TabInterface*> tabs;
++  for (const TabDragData& data : session.tab_drag_data_) {
++    tabs::TabInterface* const tab =
++        data.contents ? tabs::TabInterface::MaybeGetFromContents(data.contents)
++                      : nullptr;
++    if (!tab || !CanPin(service, tab)) {
++      return {};
++    }
++    tabs.push_back(tab);
++  }
++  return tabs;
++}
++
+ // A new row's id: unique like the imported rows' (Arc's own ids), and never
+ // shown.
+ std::string NewRowId() {
+@@ -510,7 +552,9 @@ WorkspacePinnedSectionView::WorkspacePin
+   new_tab_button_->set_context_menu_controller(this);
+ }
+ 
+-WorkspacePinnedSectionView::~WorkspacePinnedSectionView() = default;
++WorkspacePinnedSectionView::~WorkspacePinnedSectionView() {
++  will_destroy_callbacks_.Notify();
++}
+ 
+ void WorkspacePinnedSectionView::AddedToWidget() {
+   views::View::AddedToWidget();
+@@ -1162,7 +1206,9 @@ void WorkspacePinnedSectionView::RenameR
+ // static
+ void WorkspacePinnedSectionView::PinTabs(
+     BrowserWindowInterface* browser,
+-    std::vector<tabs::TabInterface*> tabs) {
++    std::vector<tabs::TabInterface*> tabs,
++    std::string_view to,
++    Where where) {
+   workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser);
+   if (!service || !service->IsEnabled()) {
+@@ -1177,27 +1223,25 @@ void WorkspacePinnedSectionView::PinTabs
+   std::ranges::sort(tabs, {}, [model](tabs::TabInterface* tab) {
+     return model->GetIndexOfTab(tab);
+   });
+-  // After the last row DRAWN: the section shows a deleted workspace's rows
+-  // after its own, and the end of its own list would be above them (E15d
+-  // review).
+-  std::string after;
+-  if (const std::vector<const PinNode*> roots =
+-          workspaces::pins::RootsForWorkspace(store->tree(),
+-                                              service->active_guid(),
+-                                              service->known_guids());
+-      !roots.empty()) {
+-    after = roots.back()->id;
++  // The end: after the last row DRAWN -- the section shows a deleted
++  // workspace's rows after its own, and the end of its own list would be
++  // above them (E15d review).
++  std::string after(to);
++  if (after.empty()) {
++    where = Where::kAfter;
++    if (const std::vector<const PinNode*> roots =
++            workspaces::pins::RootsForWorkspace(store->tree(),
++                                                service->active_guid(),
++                                                service->known_guids());
++        !roots.empty()) {
++      after = roots.back()->id;
++    }
+   }
+   for (tabs::TabInterface* const tab : tabs) {
+-    content::WebContents* const contents = tab->GetContents();
+-    // What the menu asked of the clicked tab, asked of each; and not a tab
+-    // this window hides, which a shift-click range can hold (E13).
+-    if (!contents || tab->IsPinned() || tab->GetGroup() || tab->IsSplit() ||
+-        !service->IsTabOnScreen(tab) || service->IsPinItemTab(tab) ||
+-        !workspaces::WorkspaceTabData::IsAnchorableUrl(
+-            contents->GetLastCommittedURL())) {
++    if (!CanPin(*service, tab)) {
+       continue;
+     }
++    content::WebContents* const contents = tab->GetContents();
+     PinNode item;
+     item.id = NewRowId();
+     item.url = contents->GetLastCommittedURL().spec();
+@@ -1207,16 +1251,19 @@ void WorkspacePinnedSectionView::PinTabs
+     // The row first: a link to an item the store does not hold is dropped by
+     // the next state pass (ReadLinks).
+     if (!store->Insert(service->active_guid(), std::move(item), after,
+-                       Where::kAfter)) {
+-      LOG(WARNING) << "[workspaces] pins: could not pin a tab; the pins file "
+-                      "is not loaded yet, or is read-only";
++                       where)) {
++      LOG(WARNING) << "[workspaces] pins: could not pin a tab; the row it "
++                      "was dropped by is gone, or the pins file is not loaded "
++                      "yet or is read-only";
+       return;
+     }
+     service->SetPinItem(tab, id);
+     // Anchored at the page it shows, as an opened item is at its address.
+     service->SetAnchored(tab, true);
++    LOG(INFO) << "[workspaces] pins: pinned a tab as item '" << id << "' "
++              << WhereName(where) << " '" << after << "'";
+     after = id;
+-    LOG(INFO) << "[workspaces] pins: pinned a tab as item '" << id << "'";
++    where = Where::kAfter;
+   }
+ }
+ 
+@@ -1232,12 +1279,7 @@ void WorkspacePinnedSectionView::OnRowDr
+   if (step == DragStep::kMove) {
+     if (drag_id_.empty()) {
+       drag_id_ = id;
+-      if (views::ScrollView* const scroll_view = GetScrollView()) {
+-        drag_scrolled_subscription_ =
+-            scroll_view->AddContentsScrolledCallback(base::BindRepeating(
+-                &WorkspacePinnedSectionView::UpdateDrag,
+-                base::Unretained(this)));
+-      }
++      BeginDrag();
+     }
+     drag_point_ = point_in_screen;
+     UpdateDrag();
+@@ -1251,10 +1293,7 @@ void WorkspacePinnedSectionView::OnRowDr
+   if (!target.to.empty()) {
+     if (store_ && store_->Move(id, drawn_guid_, target.to, target.where)) {
+       LOG(INFO) << "[workspaces] pins: moved '" << id << "' "
+-                << (target.where == Where::kInto    ? "into"
+-                    : target.where == Where::kAfter ? "after"
+-                                                    : "before")
+-                << " '" << target.to << "'";
++                << WhereName(target.where) << " '" << target.to << "'";
+     }
+   } else if (target.list_index) {
+     UnpinItem(id, *target.list_index, target.list_group);
+@@ -1263,7 +1302,7 @@ void WorkspacePinnedSectionView::OnRowDr
+ 
+ void WorkspacePinnedSectionView::UpdateDrag() {
+   views::View* const indicator = DropIndicator();
+-  if (!indicator || drag_id_.empty()) {
++  if (!indicator || (drag_id_.empty() && !dragging_tabs_)) {
+     return;
+   }
+   // Held near the top or bottom edge, the list scrolls, as for a dragged tab.
+@@ -1277,7 +1316,8 @@ void WorkspacePinnedSectionView::UpdateD
+         *scroll_view,
+         gfx::Rect(0, y - height / 2, scroll_view->width(), height));
+   }
+-  const DropTarget target = TargetAt(drag_point_);
++  const DropTarget target =
++      dragging_tabs_ ? TabTargetAt(drag_point_) : TargetAt(drag_point_);
+   indicator->SetVisible(!target.indicator.IsEmpty());
+   if (target.indicator.IsEmpty()) {
+     return;
+@@ -1293,11 +1333,20 @@ void WorkspacePinnedSectionView::UpdateD
+   }
+ }
+ 
++void WorkspacePinnedSectionView::BeginDrag() {
++  if (views::ScrollView* const scroll_view = GetScrollView()) {
++    drag_scrolled_subscription_ =
++        scroll_view->AddContentsScrolledCallback(base::BindRepeating(
++            &WorkspacePinnedSectionView::UpdateDrag, base::Unretained(this)));
++  }
++}
++
+ void WorkspacePinnedSectionView::EndDrag() {
+-  if (drag_id_.empty()) {
++  if (drag_id_.empty() && !dragging_tabs_) {
+     return;
+   }
+   drag_id_.clear();
++  dragging_tabs_ = false;
+   drag_scrolled_subscription_ = {};
+   if (views::ScrollView* const scroll_view = GetScrollView()) {
+     drag_scroll_.StopScrolling(*scroll_view);
+@@ -1327,6 +1376,15 @@ WorkspacePinnedSectionView::DropTarget W
+   return ListTargetAt(point_in_screen);
+ }
+ 
++WorkspacePinnedSectionView::DropTarget WorkspacePinnedSectionView::TabTargetAt(
++    const gfx::Point& point_in_screen) {
++  if (!InZone(point_in_screen)) {
++    return DropTarget();
++  }
++  return RowTargetAt(
++      views::View::ConvertPointFromScreen(list_, point_in_screen).y());
++}
++
+ WorkspacePinnedSectionView::DropTarget WorkspacePinnedSectionView::RowTargetAt(
+     int y) {
+   const views::View::Views& rows = list_->children();
+@@ -1475,6 +1533,102 @@ WorkspacePinnedSectionView::DropTarget W
+   return target;
+ }
+ 
++TabDragTarget* WorkspacePinnedSectionView::GetTabDragTarget(
++    const gfx::Point& point_in_screen) {
++  if (!InZone(point_in_screen)) {
++    return nullptr;
++  }
++  // The drag is this window's context's once attached here (Attach hands it
++  // over); before that, from another window, it is claimed to attach it.
++  const TabDragController* const drag = DragContext()->GetDragController();
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  return !drag || (service &&
++                   !PinnableTabs(*service, drag->GetSessionData()).empty())
++             ? this
++             : nullptr;
++}
++
++bool WorkspacePinnedSectionView::InZone(
++    const gfx::Point& point_in_screen) const {
++  const gfx::Point point =
++      views::View::ConvertPointFromScreen(this, point_in_screen);
++  return list_ && IsDrawn() && GetVisibleBounds().Contains(point) &&
++         point.y() < new_tab_button_->y();
++}
++
++TabDragContext* WorkspacePinnedSectionView::DragContext() {
++  return BrowserView::GetBrowserViewForBrowser(browser_)
++      ->tab_strip_view()
++      ->GetDragContext();
++}
++
++TabDragContext* WorkspacePinnedSectionView::OnTabDragUpdated(
++    TabDragTarget::DragController& controller,
++    const gfx::Point& point_in_screen) {
++  // Never null, which would tear the tabs off into a window of their own:
++  // this window's context, as the list's target answers. Tabs dragged from
++  // another window are attached here first, and pinned only when this window
++  // shows their workspace (CanPin).
++  TabDragContext* const context = DragContext();
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (controller.GetAttachedContext() != context || !service ||
++      PinnableTabs(*service, controller.GetSessionData()).empty()) {
++    EndDrag();
++    return context;
++  }
++  if (!dragging_tabs_) {
++    dragging_tabs_ = true;
++    BeginDrag();
++  }
++  drag_point_ = point_in_screen;
++  UpdateDrag();
++  return context;
++}
++
++void WorkspacePinnedSectionView::OnTabDragExited(
++    const gfx::Point& point_in_screen) {
++  EndDrag();
++}
++
++void WorkspacePinnedSectionView::OnTabDragEnded() {
++  EndDrag();
++}
++
++bool WorkspacePinnedSectionView::CanDropTab() {
++  return dragging_tabs_ && !TabTargetAt(drag_point_).indicator.IsEmpty();
++}
++
++void WorkspacePinnedSectionView::HandleTabDrop(
++    TabDragTarget::DragController& controller) {
++  const DropTarget target = TabTargetAt(drag_point_);
++  EndDrag();
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return;
++  }
++  std::vector<tabs::TabInterface*> tabs =
++      PinnableTabs(*service, controller.GetSessionData());
++  LOG(INFO) << "[workspaces] pins: " << tabs.size()
++            << " tab(s) dropped on the rows";
++  // Now, not posted: linked before the drag's end lays the list out again,
++  // the pages are never drawn back in it.
++  PinTabs(browser_, std::move(tabs), target.to, target.where);
++  // Into a folder: opened, so the page on screen has its row, highlighted
++  // (E15d review #2).
++  if (target.where == Where::kInto && store_) {
++    store_->SetFolderOpen(target.to, true);
++  }
++}
++
++base::CallbackListSubscription
++WorkspacePinnedSectionView::RegisterWillDestroyCallback(
++    base::OnceClosure callback) {
++  return will_destroy_callbacks_.Add(std::move(callback));
++}
++
+ views::ScrollView* WorkspacePinnedSectionView::GetScrollView() {
+   return parent() ? views::ScrollView::GetScrollViewForContents(parent())
+                   : nullptr;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -19,6 +19,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_drag_scroll_handler.h"
++#include "chrome/browser/ui/views/tabs/dragging/tab_drag_target.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+@@ -56,7 +57,8 @@ class ScrollView;
+ // Closing the page keeps the item. Right-click: Unpin or Delete an item,
+ // Delete a folder, Rename either, or a New folder below it (E15d). A row
+ // dragged with the mouse moves among the rows -- before or after one, or into
+-// a folder -- or, an item, into the tab list below as a Today tab (E15d).
++// a folder -- or, an item, into the tab list below as a Today tab; and a
++// Today tab dragged over the rows is pinned where it is dropped (E15d).
+ //
+ // Below the rows, their line and then "+ New Tab", at the top of the list as
+ // in Arc (E15c.1); the line only while there are rows. Right-click on it:
+@@ -69,6 +71,7 @@ class WorkspacePinnedSectionView
+     : public views::View,
+       public workspaces::pins::PinStore::Observer,
+       public TabStripModelObserver,
++      public TabDragTarget,
+       public views::ContextMenuController,
+       public ui::SimpleMenuModel::Delegate {
+   METADATA_HEADER(WorkspacePinnedSectionView, views::View)
+@@ -118,13 +121,37 @@ class WorkspacePinnedSectionView
+   // ui::SimpleMenuModel::Delegate:
+   void ExecuteCommand(int command_id, int event_flags) override;
+ 
+-  // The tab menu's "Pin to workspace" (E15d): each of `tabs` that is a web
+-  // page drawn in the list becomes an item at the end of the workspace's
+-  // pinned section, in the list's order, and stays open as that item's page.
+-  // Static: the menu is run by TabStripCollectionController, which does not
+-  // hold the section it made.
+-  static void PinTabs(BrowserWindowInterface* browser,
+-                      std::vector<tabs::TabInterface*> tabs);
++  // This section as the target of a tab drag at the point (E15d): over its
++  // rows and their line (InZone), when every dragged tab can be pinned --
++  // any other drag is the list's to place (E15d review #1, #5). A drag not
++  // attached to this window yet is claimed, to attach it here; its tabs are
++  // judged once they are.
++  TabDragTarget* GetTabDragTarget(const gfx::Point& point_in_screen);
++
++  // TabDragTarget: the dragged tabs that can be pinned are, at the place a
++  // row dropped there would go. Nothing is drawn, and a drop does what it
++  // does in the list, when none can be.
++  void OnTabDragEntered() override {}
++  TabDragContext* OnTabDragUpdated(TabDragTarget::DragController& controller,
++                                   const gfx::Point& point_in_screen) override;
++  void OnTabDragExited(const gfx::Point& point_in_screen) override;
++  void OnTabDragEnded() override;
++  bool CanDropTab() override;
++  void HandleTabDrop(TabDragTarget::DragController& controller) override;
++  base::CallbackListSubscription RegisterWillDestroyCallback(
++      base::OnceClosure callback) override;
++
++  // The tab menu's "Pin to workspace" and a tab drop (E15d): each of `tabs`
++  // that is a web page drawn in the list becomes an item, in the list's
++  // order, and stays open as that item's page. The first goes `where` the row
++  // `to` is (PinStore::Insert), each next one after it; with no `to`, at the
++  // end of the section. Static: the menu is run by
++  // TabStripCollectionController, which does not hold the section it made.
++  static void PinTabs(
++      BrowserWindowInterface* browser,
++      std::vector<tabs::TabInterface*> tabs,
++      std::string_view to = {},
++      workspaces::pins::Where where = workspaces::pins::Where::kAfter);
+ 
+  private:
+   // The pages of this window that belong to items, by item id, and the tab
+@@ -218,8 +245,17 @@ class WorkspacePinnedSectionView
+   // it is held near an edge; also run when the list scrolls under a still
+   // pointer, which is how the scrolling stops at the end (E15d review).
+   void UpdateDrag();
++  // Follows the list's scrolling until EndDrag().
++  void BeginDrag();
+   void EndDrag();
+   DropTarget TargetAt(const gfx::Point& point_in_screen);
++  // Where dragged tabs would be pinned: among the rows only.
++  DropTarget TabTargetAt(const gfx::Point& point_in_screen);
++  // Over the rows and their line, while there are rows. "+ New Tab" below
++  // them is the list's: a tab dragged there goes to the top of the list.
++  bool InZone(const gfx::Point& point_in_screen) const;
++  // This window's tab drag context: the list's, which a drag attaches to.
++  TabDragContext* DragContext();
+   // Among the rows, `y` in list_'s coordinates.
+   DropTarget RowTargetAt(int y);
+   // In the tab list below the section.
+@@ -273,12 +309,16 @@ class WorkspacePinnedSectionView
+   // The row being dragged (empty: none) and the last point it was dragged
+   // to, in screen coordinates.
+   std::string drag_id_;
++  // Tabs that can be pinned are being dragged over the rows (E15d).
++  bool dragging_tabs_ = false;
+   gfx::Point drag_point_;
+   views::ViewTracker drop_indicator_;
+   // Scrolls the list while a row is held near its top or bottom edge, as for
+   // a dragged tab.
+   TabDragScrollHandler drag_scroll_;
+   base::CallbackListSubscription drag_scrolled_subscription_;
++  // A tab drag holding this as its target lets go of it (TabDragTarget).
++  base::OnceClosureList will_destroy_callbacks_;
+ 
+   // The row menu, and the row it was opened on.
+   std::string context_menu_id_;

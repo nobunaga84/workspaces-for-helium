@@ -1,0 +1,98 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -27,6 +27,7 @@
+ #include "ui/base/models/dialog_model.h"
+ #include "ui/views/bubble/bubble_border.h"
+ #include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/controls/label.h"
+ #include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/layout/layout_types.h"
+ #include "ui/views/widget/widget.h"
+@@ -85,6 +86,56 @@ std::u16string DisplayNameForWorkspace(
+   return base::UTF8ToUTF16(entry.guid);
+ }
+ 
++// A rail button, with the one line that keeps it from crashing a DCHECK build.
++//
++// TopContainerButton's constructor calls SetPaintToLayer() and then
++// layer()->SetFillsBoundsOpaquely(false). Upstream it is an ICON button --
++// CalculatePreferredSize() is a fixed square that ignores its text -- so its
++// Label never has anything to draw and nothing ever looked at that layer.
++//
++// Put text on it and views::Label's subpixel-antialiasing path walks up the
++// view tree for something opaque to draw onto, finds a transparent layer first,
++// and DCHECKs (ui/views/controls/label.cc:955, "we must paint to an opaque
++// layer"). In a release build the DCHECK compiles out and the rail renders
++// fine, which is why E9a and E9b both verified clean on screen. In a DCHECK
++// build it is FATAL at startup, so out/Dcheck could not launch at all from E9a
++// until this landed -- found 2026-09-12 the first time it was exercised.
++//
++// Grayscale antialiasing is the right answer regardless: subpixel AA over a
++// transparent layer has no fixed background to sample, which is exactly what
++// the DCHECK is complaining about.
++class WorkspaceRailButton : public TopContainerButton {
++  METADATA_HEADER(WorkspaceRailButton, TopContainerButton)
++
++ public:
++  WorkspaceRailButton() {
++    // A subclass rather than one line at the call site, because
++    // views::LabelButton::label() is PROTECTED -- reaching the label from
++    // outside does not compile, and there is no setter for this on the button.
++    label()->SetSubpixelRenderingEnabled(false);
++  }
++  WorkspaceRailButton(const WorkspaceRailButton&) = delete;
++  WorkspaceRailButton& operator=(const WorkspaceRailButton&) = delete;
++  ~WorkspaceRailButton() override = default;
++};
++
++// Required even for a one-file helper view: views::View::AddChildView<T>
++// static_asserts that T implements metadata, so a subclass without these does
++// not compile at the call site rather than at its declaration.
++BEGIN_METADATA(WorkspaceRailButton)
++END_METADATA
++
++std::unique_ptr<WorkspaceRailButton> MakeRailButton(
++    const std::u16string& text,
++    const std::u16string& tooltip,
++    views::Button::PressedCallback callback) {
++  auto button = std::make_unique<WorkspaceRailButton>();
++  button->SetText(text);
++  button->SetTooltipText(tooltip);
++  button->SetCallback(std::move(callback));
++  return button;
++}
++
+ // Carries the name bubble's result back out. A DialogModelDelegate is how a
+ // dialog reads its own textfield (ui/base/models/dialog_model.h): the model
+ // owns this, so `dialog_model()` is valid for exactly as long as the callback
+@@ -170,10 +221,8 @@ void WorkspaceRailView::Rebuild() {
+   for (size_t i = 0; i < entries.size(); ++i) {
+     const std::u16string display_name = DisplayNameForWorkspace(entries[i]);
+ 
+-    auto button = std::make_unique<TopContainerButton>();
+-    button->SetText(LabelForWorkspace(display_name, i));
+-    button->SetTooltipText(display_name);
+-    button->SetCallback(
++    auto button = MakeRailButton(
++        LabelForWorkspace(display_name, i), display_name,
+         base::BindRepeating(&WorkspaceRailView::OnWorkspacePressed,
+                             base::Unretained(this), entries[i].guid));
+     button->set_context_menu_controller(this);
+@@ -185,14 +234,10 @@ void WorkspaceRailView::Rebuild() {
+   // The "+" is last and is NOT in `buttons_`, which stays parallel to `guids_`.
+   // It is also why the rail no longer hides itself at one workspace: it is the
+   // only way to get a second one (see the header).
+-  auto new_button = std::make_unique<TopContainerButton>();
+-  new_button->SetText(u"+");
+-  new_button->SetTooltipText(
+-      l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_NEW));
+-  new_button->SetCallback(
++  AddChildView(MakeRailButton(
++      u"+", l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_NEW),
+       base::BindRepeating(&WorkspaceRailView::OnNewWorkspacePressed,
+-                          base::Unretained(this)));
+-  AddChildView(std::move(new_button));
++                          base::Unretained(this))));
+ 
+   SetVisible(true);
+   UpdateHighlight();

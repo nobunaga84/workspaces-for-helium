@@ -1,0 +1,2502 @@
+--- a/chrome/browser/sessions/session_restore.cc
++++ b/chrome/browser/sessions/session_restore.cc
+@@ -81,6 +81,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_selection_state.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/waap/initial_webui_window_metrics_manager.h"
+ #include "chrome/browser/ui/webui/whats_new/whats_new_util.h"
+@@ -1409,6 +1410,10 @@ class SessionRestoreImpl : public Browse
+     base::TimeTicks now = base::TimeTicks::Now();
+     BrowserWindowInterface* browser_window =
+         CreateBrowserWindow(std::move(params));
++    // Helium Workspaces (C9): the window's own open folders, in this task,
++    // before its pinned section first draws.
++    workspaces::RestoreWindowFromExtraData(
++        browser_window->GetUnownedUserDataHost(), extra_data);
+     if (auto* manager =
+             InitialWebUIWindowMetricsManager::From(browser_window)) {
+       manager->SetWindowCreationInfo(
+--- a/chrome/browser/sessions/session_service_base.cc
++++ b/chrome/browser/sessions/session_service_base.cc
+@@ -38,6 +38,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_selection_state.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/window_feature_controller/window_feature_controller.h"
+ #include "chrome/browser/ui/window_metadata/window_metadata_controller.h"
+@@ -790,6 +791,19 @@ void SessionServiceBase::BuildCommandsFo
+             base::NumberToString(controller->GetUncollapsedWidth())));
+   }
+ 
++  // Helium Workspaces (C9): the window's own open folders, re-emitted at every
++  // rebuild like the key above, or lost at the next one (every ~250 commands).
++  // The startup rebuild runs before any window exists: the restore sites write
++  // a restored window's value back.
++  std::map<std::string, std::string> window_data;
++  workspaces::PopulateWindowExtraData(browser->GetUnownedUserDataHost(),
++                                      &window_data);
++  for (const auto& [key, value] : window_data) {
++    command_storage_manager()->AppendRebuildCommand(
++        sessions::CreateAddWindowExtraDataCommand(browser->GetSessionID(), key,
++                                                  value));
++  }
++
+   int index = 0;
+   for (const tabs::TabInterface* tab_interface : *tab_strip) {
+     WebContents* tab = tab_interface->GetContents();
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -246,6 +246,8 @@ if (!is_android) {
+       "//chrome/browser/ui/tabs:features",
+       "//chrome/browser/ui/tabs:tab_strip",
+       "//chrome/browser/ui/tabs/saved_tab_groups",
++      "//chrome/browser/ui/tabs/workspaces:emoji",
++      "//chrome/browser/ui/tabs/workspaces:tab_data",
+       "//chrome/browser/ui/web_applications",
+       "//chrome/common:constants",
+       "//components/security_interstitials/content:security_interstitial_page",
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -239,6 +239,11 @@ BrowserLiveTabContext::GetExtraDataForWi
+     }
+   }
+ 
++  // Helium Workspaces (C9): the window's own open folders, so reopening the
++  // window shows them as it closed with them (Create, below).
++  workspaces::PopulateWindowExtraData(browser_->GetUnownedUserDataHost(),
++                                      &data);
++
+   return data;
+ }
+ 
+@@ -604,6 +609,9 @@ sessions::LiveTabContext* BrowserLiveTab
+ 
+   BrowserWindowInterface* browser =
+       CreateBrowserWindow(std::move(*create_params));
++  // Helium Workspaces (C9): as SessionRestore's CreateRestoredBrowser does.
++  workspaces::RestoreWindowFromExtraData(browser->GetUnownedUserDataHost(),
++                                         extra_data);
+ 
+   return BrowserLiveTabContext::From(browser);
+ }
+--- a/chrome/browser/ui/tab_ui_helper.cc
++++ b/chrome/browser/ui/tab_ui_helper.cc
+@@ -26,6 +26,8 @@
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_web_contents_listener.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_emoji.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/ui/web_applications/web_app_browser_controller.h"
+@@ -169,6 +171,10 @@ bool TabUIHelper::ShouldRenderLoadingTit
+ }
+ 
+ bool TabUIHelper::ShouldThemifyFavicon() {
++  // Helium Workspaces (C16): an emoji keeps its own colours.
++  if (!workspaces::EmojiForTab(tab().GetContents()).empty()) {
++    return false;
++  }
+   content::NavigationEntry* const entry =
+       tab().GetContents()->GetController().GetLastCommittedEntry();
+   return entry && favicon::ShouldThemifyFaviconForEntry(entry);
+@@ -212,6 +218,12 @@ bool TabUIHelper::IsMonochromeFavicon()
+ }
+ 
+ ui::ImageModel TabUIHelper::GetFavicon() {
++  // Helium Workspaces (C16): an emoji the user set wins over every icon, as a
++  // custom title does in GetTitle(), and first for the same reason.
++  if (const std::string emoji = workspaces::EmojiForTab(web_contents());
++      !emoji.empty()) {
++    return workspaces::EmojiFavicon(emoji);
++  }
+   const tab_groups::SavedTabGroupWebContentsListener* wc_listener =
+       tab().GetTabFeatures()->saved_tab_group_web_contents_listener();
+   if (wc_listener) {
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/existing_window_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/glic_tab_sub_menu_model.h"
+@@ -474,6 +475,9 @@ void TabMenuModel::Build(int index) {
+           tab_strip_->delegate()->GetBrowserWindowInterface())) {
+     AddItemWithStringId(TabStripModel::CommandRenameTab,
+                         IDS_HELIUM_WORKSPACE_RENAME_TAB);
++    // C16: the emoji drawn in place of the favicon, beside the name.
++    AddItemWithStringId(TabStripModel::CommandSetTabEmoji,
++                        IDS_HELIUM_SET_EMOJI);
+     // E15d: Arc's "Pin tab", the menu's half of pinning; the drag is the other.
+     AddItemWithStringId(TabStripModel::CommandPinToWorkspace,
+                         IDS_HELIUM_WORKSPACE_PIN_TAB);
+@@ -536,6 +540,19 @@ void TabMenuModel::Build(int index) {
+     }
+   }
+ 
++  // C11a: the right-clicked tab's group as a workspace of its own -- shown
++  // only when the whole group can move there (D13).
++  if (const std::optional<tab_groups::TabGroupId> group =
++          tab_strip_->GetTabGroupForTab(index)) {
++    const workspaces::WorkspaceService* const service =
++        workspaces::WorkspaceService::From(
++            tab_strip_->delegate()->GetBrowserWindowInterface());
++    if (service && service->CanMakeGroupAWorkspace(*group)) {
++      AddItemWithStringId(TabStripModel::CommandMakeGroupWorkspace,
++                          IDS_HELIUM_WORKSPACE_FROM_GROUP);
++    }
++  }
++
+   if (ExistingWindowSubMenuModel::ShouldShowSubmenu(tab_strip_->profile())) {
+     // Create submenu with existing windows
+     add_to_existing_window_submenu_ = ExistingWindowSubMenuModel::Create(
+@@ -579,9 +596,12 @@ void TabMenuModel::Build(int index) {
+   SetElementIdentifierAt(GetItemCount() - 1, kDuplicateMenuItem);
+ 
+   bool will_pin = tab_strip_->WillContextMenuPin(index);
++  // Helium Workspaces (the owner, after C16's try): "Add to Favorites", so it
++  // is told apart from "Pin to workspace" in the same menu, and
++  // "Remove from Favorites" (LOCAL.md 120's renames).
+   AddItemWithStringId(
+       TabStripModel::CommandTogglePinned,
+-      will_pin ? IDS_TAB_CXMENU_PIN_TAB : IDS_TAB_CXMENU_UNPIN_TAB);
++      will_pin ? IDS_HELIUM_PIN_AS_FAVORITE : IDS_HELIUM_REMOVE_FROM_FAVORITES);
+ 
+   if (features::IsMenuSimplificationEnabled()) {
+     SetIconForCommandId(
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2772,6 +2772,8 @@ bool TabStripModel::IsContextMenuCommand
+     case CommandAnchorTab:
+     case CommandRenameTab:
+     case CommandSnoozeTab:
++    case CommandSetTabEmoji:
++    case CommandMakeGroupWorkspace:
+       // Helium Workspaces. The submenu decides per item whether a destination
+       // makes sense; the parent is enabled whenever it exists at all, and
+       // ExistingWorkspaceSubMenuModel::ShouldShowSubmenu() is what decides
+@@ -2936,6 +2938,8 @@ void TabStripModel::ExecuteContextMenuCo
+     case CommandRenameTab:
+     case CommandPinToWorkspace:
+     case CommandSnoozeTab:
++    case CommandSetTabEmoji:
++    case CommandMakeGroupWorkspace:
+       break;
+ 
+     case CommandNewTabToRight: {
+--- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
+@@ -48,11 +48,13 @@ bool IsAnchorable(tabs::TabInterface* ta
+ 
+ // Holds the tab by WeakPtr and finds the service at OK time: the menu model
+ // that opened the dialog is gone by then, and the dialog is tab-modal, so it
+-// goes away with its tab and never outlives what it points at.
++// goes away with its tab and never outlives what it points at. With `emoji`
++// the box sets the tab's emoji, not its title (C16).
+ class TabTitleDialogDelegate : public ui::DialogModelDelegate {
+  public:
+-  explicit TabTitleDialogDelegate(base::WeakPtr<content::WebContents> contents)
+-      : contents_(contents) {}
++  TabTitleDialogDelegate(base::WeakPtr<content::WebContents> contents,
++                         bool emoji)
++      : contents_(contents), emoji_(emoji) {}
+ 
+   void OnAccepted() {
+     ui::DialogModelTextfield* const field =
+@@ -65,6 +67,11 @@ class TabTitleDialogDelegate : public ui
+                   tab->GetBrowserWindowInterface())
+             : nullptr;
+     if (field && service) {
++      // The service keeps the first character, and trims: spaces clear it.
++      if (emoji_) {
++        service->SetTabEmoji(tab, field->text());
++        return;
++      }
+       // Trimmed, so a title of spaces clears rather than blanking the tab.
+       std::u16string title;
+       base::TrimWhitespace(field->text(), base::TRIM_ALL, &title);
+@@ -74,14 +81,13 @@ class TabTitleDialogDelegate : public ui
+ 
+  private:
+   base::WeakPtr<content::WebContents> contents_;
++  const bool emoji_;
+ };
+ 
+-}  // namespace
+-
+ // The rail's one-textfield bubble, as a tab-modal dialog: this file is not a
+ // view and cannot anchor a bubble, and ShowWebModal takes the DialogModel as
+-// is. Empty text restores the page's own title.
+-void ShowRenameTabDialog(tabs::TabInterface* tab) {
++// is. Empty text restores the page's own title, or takes the emoji off.
++void ShowTabTextDialog(tabs::TabInterface* tab, bool emoji) {
+   content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
+   if (!contents) {
+     return;
+@@ -100,29 +106,44 @@ void ShowRenameTabDialog(tabs::TabInterf
+       model->ActivateTabAt(index);
+       // The one line that says the background case ran; the box appearing is
+       // otherwise only checkable by eye.
+-      LOG(INFO) << "[workspaces] rename dialog at index " << index
+-                << ", brought to front";
++      LOG(INFO) << "[workspaces] " << (emoji ? "emoji" : "rename")
++                << " dialog at index " << index << ", brought to front";
+     }
+   }
+   auto delegate =
+-      std::make_unique<TabTitleDialogDelegate>(contents->GetWeakPtr());
++      std::make_unique<TabTitleDialogDelegate>(contents->GetWeakPtr(), emoji);
+   TabTitleDialogDelegate* const delegate_ptr = delegate.get();
+   constrained_window::ShowWebModal(
+       ui::DialogModel::Builder(std::move(delegate))
+-          .SetTitle(l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_RENAME_TAB))
++          .SetTitle(l10n_util::GetStringUTF16(
++              emoji ? IDS_HELIUM_SET_EMOJI : IDS_HELIUM_WORKSPACE_RENAME_TAB))
+           .AddOkButton(base::BindOnce(&TabTitleDialogDelegate::OnAccepted,
+                                       base::Unretained(delegate_ptr)))
+           .AddCancelButton(base::DoNothing())
+           .AddTextfield(
+               kTabTitleFieldId,
+-              l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_TAB_TITLE_LABEL),
+-              base::UTF8ToUTF16(workspaces::CustomTitleForTab(contents)),
++              l10n_util::GetStringUTF16(
++                  emoji ? IDS_HELIUM_WORKSPACE_ICON_LABEL
++                        : IDS_HELIUM_WORKSPACE_TAB_TITLE_LABEL),
++              base::UTF8ToUTF16(emoji
++                                    ? workspaces::EmojiForTab(contents)
++                                    : workspaces::CustomTitleForTab(contents)),
+               ui::DialogModelTextfield::Params())
+           .SetInitiallyFocusedField(kTabTitleFieldId)
+           .Build(),
+       contents);
+ }
+ 
++}  // namespace
++
++void ShowRenameTabDialog(tabs::TabInterface* tab) {
++  ShowTabTextDialog(tab, /*emoji=*/false);
++}
++
++void ShowTabEmojiDialog(tabs::TabInterface* tab) {
++  ShowTabTextDialog(tab, /*emoji=*/true);
++}
++
+ WorkspaceAnchorSubMenuModel::WorkspaceAnchorSubMenuModel(
+     BrowserWindowInterface* browser,
+     TabStripModel* tab_strip,
+--- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h
+@@ -21,6 +21,10 @@ class TabInterface;
+ // the item itself is a plain TabMenuModel entry, CommandRenameTab.
+ void ShowRenameTabDialog(tabs::TabInterface* tab);
+ 
++// C16 "Set emoji...": the same dialog, setting `tab`'s emoji instead -- the
++// first character typed; an empty box takes it off. CommandSetTabEmoji.
++void ShowTabEmojiDialog(tabs::TabInterface* tab);
++
+ // The "Anchor" tab-menu submenu (design 5, E10 spec): anchor the right-clicked
+ // tab at its page or unanchor it, go back to the anchor, or move the anchor to
+ // the page it is showing now. Its own delegate, like
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -76,6 +76,33 @@ source_set("pins") {
+   deps = [
+     ":stamping",
+     "//base",
++
++    # C16: an emoji box keeps one grapheme, which takes ICU's break
++    # iterator. Still no //chrome, and ":archive" already brought it into
++    # workspaces_unittests.
++    "//base:i18n",
++  ]
++}
++
++# C16: a pinned row's or a Today tab's emoji drawn as a 16 px icon, the
++# folder's in a box. A leaf of its own -- //ui/gfx and //ui/base, no view and
++# no ":workspaces" -- because its users are chrome/browser/ui:tab_ui_helper,
++# which may not depend on the service, and the vertical views.
++source_set("emoji") {
++  sources = [
++    "workspace_emoji.cc",
++    "workspace_emoji.h",
++  ]
++
++  # Public, as the header returns their types.
++  public_deps = [
++    "//skia",
++    "//ui/base",
++    "//ui/gfx",
++  ]
++  deps = [
++    "//base",
++    "//cc/paint",
+   ]
+ }
+ 
+@@ -142,7 +169,7 @@ source_set("stamping") {
+ # The per-tab tag, and the session glue that carries it across a restart.
+ #
+ # A third leaf target, and the reason is the same GN constraint as ":prefs" read
+-# from the other end. The three session hook sites live in
++# from the other end. The session hook sites live in
+ # //chrome/browser/ui:ui and //chrome/browser/sessions:impl, and they need the
+ # tag and nothing else. Pointing them at ":workspaces" instead would make
+ # //chrome/browser/sessions:impl depend on TabStripModel and
+@@ -161,6 +188,13 @@ source_set("tab_data") {
+     "workspace_tab_data.h",
+   ]
+ 
++  # C9: a window's own folder states are kept here, on the window, beside the
++  # tab's tag: pins::FolderStates is ":pins"'s, the holder is unowned user
++  # data. Public, as the header names both. Neither reaches //chrome.
++  public_deps = [
++    ":pins",
++    "//ui/base/unowned_user_data",
++  ]
+   deps = [
+     # ":archive" so a reopened close leaves the archive (E14d.1). //base-only,
+     # so this target stays as free of //chrome as it was.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
+@@ -42,6 +42,7 @@ constexpr char kReasonKey[] = "reason";
+ constexpr char kArchivedAtKey[] = "archived_at";
+ constexpr char kLastActiveKey[] = "last_active";
+ constexpr char kWakeAtKey[] = "wake_at";
++constexpr char kFavoriteKey[] = "favorite";
+ 
+ // Its address is the store's key among its profile's user data.
+ constexpr char kUserDataKey[] = "helium_workspace_archive";
+@@ -63,6 +64,9 @@ base::DictValue EntryToValue(const Archi
+   if (entry.snoozed()) {
+     dict.Set(kWakeAtKey, base::TimeToValue(entry.wake_at));
+   }
++  if (entry.favorite) {
++    dict.Set(kFavoriteKey, true);
++  }
+   return dict;
+ }
+ 
+@@ -128,6 +132,12 @@ std::optional<ArchiveEntry> EntryFromVal
+     }
+     entry.wake_at = *time;
+   }
++  if (const base::Value* favorite = dict->Find(kFavoriteKey)) {
++    if (!favorite->is_bool()) {
++      return std::nullopt;
++    }
++    entry.favorite = favorite->GetBool();
++  }
+   return entry;
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.h
+@@ -70,6 +70,10 @@ struct ArchiveEntry {
+   // whose reason stays kManual, so an older build reads a snoozed entry as an
+   // ordinary archived page: the file's version stays 1.
+   base::Time wake_at;
++  // C27: a Chromium-pinned tab (a favorite), filed under the workspace on
++  // screen at the close and restored pinned. An older build ignores the key
++  // and restores it as an ordinary tab: the version stays 1 here too.
++  bool favorite = false;
+ 
+   bool snoozed() const { return !wake_at.is_null(); }
+ 
+@@ -86,8 +90,9 @@ std::string_view ReasonName(ArchiveEntry
+ 
+ // The file's JSON, and back. std::nullopt when `value` is not an archive this
+ // version can read -- an entry with an empty id or url, an unknown reason, a
+-// time that does not parse, or an id twice -- and the store then keeps the
+-// file aside rather than write over it.
++// time that does not parse, a favorite mark that is not a bool (C27), or an
++// id twice -- and the store then keeps the file aside rather than write over
++// it.
+ inline constexpr int kArchiveFileVersion = 1;
+ base::DictValue ArchiveToValue(const std::vector<ArchiveEntry>& entries);
+ std::optional<std::vector<ArchiveEntry>> ArchiveFromValue(
+@@ -302,7 +307,8 @@ struct SweepFacts {
+   base::Time not_before;
+   // The window's active tab.
+   bool active = false;
+-  // A Chromium-pinned tab (a favorite): never archived (E14d.2).
++  // A Chromium-pinned tab (a favorite): never AUTO-archived (E14d.2); the
++  // user's own close archives it (C27).
+   bool favorite = false;
+   // A pinned item's page (E15c). Judged before `anchored`, which every
+   // pinned item's page also is, so the log tells the two apart.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
+@@ -60,7 +60,9 @@ TEST(WorkspaceArchiveTest, JsonRoundTrip
+   full.reason = ArchiveEntry::Reason::kWindow;
+   full.last_active = base::Time::FromSecondsSinceUnixEpoch(1'759'000'000);
+   full.wake_at = base::Time::FromSecondsSinceUnixEpoch(1'761'000'000);
+-  // No name, no last-shown time, no title, no workspace, no wake.
++  full.favorite = true;
++  // No name, no last-shown time, no title, no workspace, no wake, not a
++  // favorite.
+   ArchiveEntry bare =
+       Entry("b", "https://b.example/",
+             base::Time::FromSecondsSinceUnixEpoch(1'760'000'100));
+@@ -79,6 +81,7 @@ TEST(WorkspaceArchiveTest, JsonRoundTrip
+   EXPECT_FALSE(written.Find("custom_title"));
+   EXPECT_FALSE(written.Find("last_active"));
+   EXPECT_FALSE(written.Find("wake_at"));
++  EXPECT_FALSE(written.Find("favorite"));
+   EXPECT_EQ(*written.FindString("reason"), "auto");
+ }
+ 
+@@ -89,6 +92,13 @@ TEST(WorkspaceArchiveTest, AWakeTimeThat
+   EXPECT_EQ(ArchiveFromValue(value), std::nullopt);
+ }
+ 
++// C27: the favorite mark is read as strictly as the wake time.
++TEST(WorkspaceArchiveTest, AFavoriteThatIsNotABoolRefusesTheFile) {
++  base::DictValue value = ArchiveToValue({Entry("a", "https://a.example/")});
++  (*value.FindList("entries"))[0].GetDict().Set("favorite", "yes");
++  EXPECT_EQ(ArchiveFromValue(value), std::nullopt);
++}
++
+ TEST(WorkspaceArchiveTest, ReasonNames) {
+   EXPECT_EQ(ReasonName(ArchiveEntry::Reason::kManual), "manual");
+   EXPECT_EQ(ReasonName(ArchiveEntry::Reason::kWindow), "window");
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_emoji.cc
+@@ -0,0 +1,97 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_emoji.h"
++
++#include <map>
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "base/strings/utf_string_conversions.h"
++#include "cc/paint/paint_flags.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/favicon_size.h"
++#include "ui/gfx/font_list.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/gfx/image/canvas_image_source.h"
++
++namespace workspaces {
++namespace {
++
++// D4: the folder box's corner, and how far the emoji sits inside it -- 12 px
++// of the 16.
++constexpr float kBoxRadius = 3.0f;
++constexpr int kBoxInset = 2;
++// Under the box's outline: faint enough that the emoji's own colours read.
++constexpr SkAlpha kBoxFillAlpha = 0x33;
++
++class EmojiSource : public gfx::CanvasImageSource {
++ public:
++  EmojiSource(std::u16string emoji, std::optional<SkColor> box)
++      : gfx::CanvasImageSource(
++            gfx::Size(gfx::kFaviconSize, gfx::kFaviconSize)),
++        emoji_(std::move(emoji)),
++        box_(box) {}
++
++  // gfx::CanvasImageSource:
++  void Draw(gfx::Canvas* canvas) override {
++    gfx::Rect rect(size());
++    if (box_) {
++      // A 1 px line on the pixel grid, not smeared across two.
++      gfx::RectF square(rect);
++      square.Inset(0.5f);
++      cc::PaintFlags flags;
++      flags.setAntiAlias(true);
++      flags.setColor(SkColorSetA(*box_, kBoxFillAlpha));
++      canvas->DrawRoundRect(square, kBoxRadius, flags);
++      flags.setStyle(cc::PaintFlags::kStroke_Style);
++      flags.setStrokeWidth(1);
++      flags.setColor(*box_);
++      canvas->DrawRoundRect(square, kBoxRadius, flags);
++      rect.Inset(kBoxInset);
++    }
++    // A colour emoji ignores the colour. ponytail: a text-style glyph (a
++    // plain star) is grey outside a box, as TabUIHelper has no ColorProvider
++    // to ask; pass a theme colour in if the owner meets one.
++    //
++    // Sized by the glyph, about one em: a font one pixel under the space
++    // fills it (Segoe UI Emoji's box is ~1.06 em). DeriveWithHeightUpperBound
++    // fits the whole LINE and drew ~11 px of 16 (review). ponytail: the 1 is
++    // the knob, judged by eye at 100% and 150%.
++    const gfx::FontList base;
++    const gfx::FontList font =
++        base.DeriveWithSizeDelta(rect.height() - 1 - base.GetFontSize());
++    canvas->DrawStringRectWithFlags(
++        emoji_, font, box_.value_or(SK_ColorGRAY), rect,
++        gfx::Canvas::TEXT_ALIGN_CENTER | gfx::Canvas::NO_ELLIPSIS |
++            gfx::Canvas::NO_SUBPIXEL_RENDERING);
++  }
++
++ private:
++  const std::u16string emoji_;
++  const std::optional<SkColor> box_;
++};
++
++}  // namespace
++
++gfx::ImageSkia EmojiIcon(const std::u16string& emoji,
++                         std::optional<SkColor> box) {
++  return gfx::CanvasImageSource::MakeImageSkia<EmojiSource>(emoji, box);
++}
++
++ui::ImageModel EmojiFavicon(const std::string& emoji) {
++  // ponytail: one image per distinct emoji set in this run, never dropped;
++  // a few kilobytes each. Prune it if the owner ever types hundreds.
++  static base::NoDestructor<std::map<std::string, ui::ImageModel>> cache;
++  auto [it, added] = cache->try_emplace(emoji);
++  if (added) {
++    it->second = ui::ImageModel::FromImageSkia(
++        EmojiIcon(base::UTF8ToUTF16(emoji), std::nullopt));
++  }
++  return it->second;
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_emoji.h
+@@ -0,0 +1,35 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_EMOJI_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_EMOJI_H_
++
++#include <optional>
++#include <string>
++
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/models/image_model.h"
++#include "ui/gfx/image/image_skia.h"
++
++// C16: the emoji a pinned row or a Today tab shows instead of its folder
++// symbol or favicon, drawn as a favicon-sized image. One leaf both the tab's
++// TabUIHelper and the vertical views can reach.
++namespace workspaces {
++
++// `emoji` in a gfx::kFaviconSize square. With `box`, the folder's look: a
++// rounded square in that colour, outlined over a faint fill, the emoji inset
++// in it (D4), so a folder never reads as a page. Without, the emoji fills
++// the square, as a page's favicon does.
++gfx::ImageSkia EmojiIcon(const std::u16string& emoji,
++                         std::optional<SkColor> box);
++
++// EmojiIcon(emoji, no box) for a Today tab, one image per emoji for the
++// whole run. An ImageModel compares by its image's storage, so a fresh one
++// at every TabUIHelper::GetFavicon() would make each tab update a change and
++// repaint the tab.
++ui::ImageModel EmojiFavicon(const std::string& emoji);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_EMOJI_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -11,10 +11,13 @@
+ #include "base/containers/to_vector.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
++#include "base/i18n/break_iterator.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+ #include "base/json/values_util.h"
+ #include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+@@ -27,6 +30,7 @@ constexpr char kWorkspacesKey[] = "works
+ constexpr char kTypeKey[] = "type";
+ constexpr char kIdKey[] = "id";
+ constexpr char kTitleKey[] = "title";
++constexpr char kEmojiKey[] = "emoji";
+ constexpr char kOpenKey[] = "open";
+ constexpr char kColorKey[] = "color";
+ constexpr char kChildrenKey[] = "children";
+@@ -47,6 +51,9 @@ base::DictValue NodeToValue(const PinNod
+   base::DictValue dict;
+   dict.Set(kIdKey, node.id);
+   dict.Set(kTitleKey, node.title);
++  if (!node.emoji.empty()) {
++    dict.Set(kEmojiKey, node.emoji);
++  }
+   if (node.type != PinNode::Type::kItem) {
+     if (node.type == PinNode::Type::kSplit) {
+       dict.Set(kTypeKey, kSplitType);
+@@ -96,6 +103,9 @@ std::optional<PinNode> NodeFromValue(con
+   if (const std::string* title = dict->FindString(kTitleKey)) {
+     node.title = *title;
+   }
++  if (const std::string* emoji = dict->FindString(kEmojiKey)) {
++    node.emoji = *emoji;
++  }
+ 
+   // A split's two pages are its children too (E19); that it has exactly two
+   // items is checked with the ids (AddSavable).
+@@ -309,6 +319,43 @@ int CountPages(const std::vector<PinNode
+   return items;
+ }
+ 
++std::string FirstGrapheme(std::u16string_view text) {
++  const std::u16string_view trimmed =
++      base::TrimWhitespace(text, base::TRIM_ALL);
++  if (trimmed.empty()) {
++    return std::string();
++  }
++  // tab_group_header.cc's idiom: one Advance() is one grapheme, so a flag's
++  // two code points or a family's ZWJ sequence come out whole.
++  base::i18n::BreakIterator graphemes(
++      trimmed, base::i18n::BreakIterator::BREAK_CHARACTER);
++  if (!graphemes.Init() || !graphemes.Advance()) {
++    return std::string();
++  }
++  return base::UTF16ToUTF8(graphemes.GetString());
++}
++
++std::string FolderStatesToString(const FolderStates& states) {
++  base::DictValue dict;
++  for (const auto& [id, open] : states) {
++    dict.Set(id, open);
++  }
++  return base::WriteJson(dict).value_or(std::string());
++}
++
++FolderStates FolderStatesFromString(std::string_view json) {
++  FolderStates states;
++  if (std::optional<base::DictValue> dict =
++          base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC)) {
++    for (const auto [id, open] : *dict) {
++      if (open.is_bool()) {
++        states.emplace(id, open.GetBool());
++      }
++    }
++  }
++  return states;
++}
++
+ std::vector<std::string> SelectRange(const std::vector<std::string>& drawn,
+                                      std::string_view anchor,
+                                      std::string_view clicked) {
+@@ -740,10 +787,21 @@ bool PinStore::SetFolderColor(std::strin
+   return false;
+ }
+ 
+-bool PinStore::ToggleFolder(std::string_view id) {
++bool PinStore::SetEmoji(std::string_view id, std::u16string_view text) {
++  if (!loaded_ || read_only_) {
++    return false;
++  }
+   for (auto& [guid, roots] : tree_) {
+-    if (const PinNode* node = FindNode(roots, id)) {
+-      return SetFolderOpen(id, !node->open);
++    if (PinNode* node = FindNode(roots, id)) {
++      if (node->type == PinNode::Type::kSplit) {
++        return false;
++      }
++      std::string emoji = FirstGrapheme(text);
++      if (node->emoji != emoji) {
++        node->emoji = std::move(emoji);
++        Changed();
++      }
++      return true;
+     }
+   }
+   return false;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -50,6 +50,11 @@ struct PinNode {
+   std::string id;
+   // A folder's name, or the page title an item last showed.
+   std::string title;
++  // C16: the emoji the row shows instead of its folder symbol or favicon,
++  // one grapheme (FirstGrapheme); empty for none. Not on a split row, whose
++  // two pages draw their own icons. An older build ignores the key and drops
++  // it at its next write: the file's version stays 2.
++  std::string emoji;
+ 
+   // Folder only.
+   bool open = false;
+@@ -94,6 +99,21 @@ void CountRows(const std::vector<PinNode
+ // wants the pages alone (E18).
+ int CountPages(const std::vector<PinNode>& rows);
+ 
++// C16: what a "Set emoji..." box keeps of what was typed -- the first
++// grapheme after the whitespace, so a flag or a ZWJ family stays whole, in
++// UTF-8; empty for an empty or all-blank box, which takes the emoji off.
++std::string FirstGrapheme(std::u16string_view text);
++
++// C9: a window's own word on the pinned section's folders, folder id -> open,
++// only for the folders it opened or closed itself (WindowFolders). The rest
++// show the pins file's PinNode::open.
++using FolderStates = std::map<std::string, bool, std::less<>>;
++// As the window's session extra data keeps them: a JSON dict, and back. An
++// entry that is not a bool, or a value that is not a dict, is dropped: it is
++// only a look, and the file's value stands in for it.
++std::string FolderStatesToString(const FolderStates& states);
++FolderStates FolderStatesFromString(std::string_view json);
++
+ // C29, the Shift+click: the ids from `anchor` to `clicked` in `drawn` -- the
+ // ids of the rows on screen, top to bottom -- both ends included, in drawn
+ // order, whichever of the two comes first. With no `anchor` (nothing was
+@@ -182,18 +202,21 @@ class PinStore : public base::SupportsUs
+   // nested past what the file can hold.
+   bool SetRoots(std::string_view guid, std::vector<PinNode> roots);
+ 
+-  // Opens or closes the folder with this id. The state is the profile's, so
+-  // every window shows the folder the same way (Arc keeps it per window:
+-  // later, design 5). False, and nothing changes, before the load, when
+-  // read_only(), or when no folder has this id.
++  // Opens or closes the folder with this id. Each window keeps its own word
++  // on its folders, as Arc does (C9, WorkspaceService::SetFolderOpen): the
++  // value here is the last change any window made, which is what a window
++  // with no word of its own -- a new one -- shows. False, and nothing
++  // changes, before the load, when read_only(), or when no folder has this
++  // id.
+   bool SetFolderOpen(std::string_view id, bool open);
+-  // Opens the folder if it is closed, closes it if open -- its state as the
+-  // store has it NOW, which another window may have changed. Same refusals.
+-  bool ToggleFolder(std::string_view id);
+   // Gives the folder with this id colour `color` (0-8, PinNode::color), or
+   // its workspace's again with -1 (E17b). SetFolderOpen's refusals, and false
+   // for any other colour.
+   bool SetFolderColor(std::string_view id, int color);
++  // C16: gives the row with this id -- a folder or an item -- the emoji
++  // FirstGrapheme(text), or takes it off for an empty one. SetFolderOpen's
++  // refusals, and false for a split row.
++  bool SetEmoji(std::string_view id, std::u16string_view text);
+ 
+   // The row with `id` in any workspace, or null (E15c): how an open tab finds
+   // its item, and how a row's menu reads it at click time.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -16,6 +16,7 @@
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/json/json_reader.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/supports_user_data.h"
+ #include "base/task/thread_pool.h"
+ #include "base/test/task_environment.h"
+@@ -229,6 +230,57 @@ TEST(WorkspacePinsTest, ABadFolderColour
+   }
+ }
+ 
++// C16: a folder's and an item's emoji go into the file and back; a row with
++// none writes no key.
++TEST(WorkspacePinsTest, AnEmojiRoundTripsAndNoneIsNotWritten) {
++  PinTree tree = SampleTree();
++  tree["default"][0].emoji = base::UTF16ToUTF8(u"\U0001F600");
++  tree["default"][1].emoji = base::UTF16ToUTF8(u"\U0001F4DA");
++  EXPECT_EQ(PinTreeFromValue(PinTreeToValue(tree)), tree);
++
++  base::DictValue plain = PinTreeToValue(SampleTree());
++  const base::DictValue* folder = FirstFolderDict(plain);
++  const base::ListValue* roots =
++      plain.FindListByDottedPath("workspaces.default");
++  ASSERT_TRUE(folder && roots && !roots->empty());
++  EXPECT_FALSE(folder->Find("emoji"));
++  EXPECT_FALSE((*roots)[0].GetDict().Find("emoji"));
++
++  // Read loosely, unlike the archive's "favorite": a key that is not text is
++  // no emoji, and the file still loads.
++  FirstFolderDict(plain)->Set("emoji", 5);
++  const std::optional<PinTree> loose = PinTreeFromValue(plain);
++  ASSERT_TRUE(loose && FirstFolder(*loose));
++  EXPECT_EQ(FirstFolder(*loose)->emoji, "");
++}
++
++// C16: what an emoji box keeps -- one character as the user sees it, so a
++// flag (two code points) and a family (a ZWJ sequence) stay whole.
++TEST(WorkspacePinsTest, FirstGraphemeKeepsOneWholeCharacter) {
++  const auto first = [](std::u16string_view text) {
++    return base::UTF8ToUTF16(FirstGrapheme(text));
++  };
++  EXPECT_EQ(first(u"  \U0001F600x"), u"\U0001F600");
++  EXPECT_EQ(first(u"\U0001F1EF\U0001F1F5\U0001F600"), u"\U0001F1EF\U0001F1F5");
++  EXPECT_EQ(first(u"\U0001F468\u200D\U0001F469\u200D\U0001F467!"),
++            u"\U0001F468\u200D\U0001F469\u200D\U0001F467");
++  EXPECT_EQ(first(u"ab"), u"a");
++  EXPECT_EQ(FirstGrapheme(u""), "");
++  EXPECT_EQ(FirstGrapheme(u"   "), "");
++}
++
++// C9: a window's word on its folders survives its session string; an entry
++// that is not a bool, or a string that is not a dict, is dropped.
++TEST(WorkspacePinsTest, FolderStatesRoundTripAndDropWhatIsNotABool) {
++  const FolderStates states = {{"f1", true}, {"f2", false}};
++  EXPECT_EQ(FolderStatesFromString(FolderStatesToString(states)), states);
++  EXPECT_TRUE(FolderStatesFromString("").empty());
++  EXPECT_TRUE(FolderStatesFromString("{not json").empty());
++  EXPECT_TRUE(FolderStatesFromString("[true]").empty());
++  EXPECT_EQ(FolderStatesFromString(R"({"a":1,"b":true,"c":"open"})"),
++            (FolderStates{{"b", true}}));
++}
++
+ TEST(WorkspacePinsTest, RowsOfADeletedWorkspaceShowUnderDefaultUntilItReturns) {
+   PinTree tree;
+   tree["default"] = {Item("d", "https://d.example/")};
+@@ -420,12 +472,6 @@ TEST_F(PinStoreTest, AFolderOpensAndClos
+   // Already open: nothing to tell anyone.
+   EXPECT_TRUE(store->SetFolderOpen("f3", true));
+   EXPECT_EQ(observer.calls, 1);
+-  // A toggle reads the state as it is now: closed, then open again.
+-  EXPECT_TRUE(store->ToggleFolder("f3"));
+-  EXPECT_TRUE(store->ToggleFolder("f3"));
+-  EXPECT_FALSE(store->ToggleFolder("c"));
+-  EXPECT_FALSE(store->ToggleFolder("nope"));
+-  EXPECT_EQ(observer.calls, 3);
+   store->RemoveObserver(&observer);
+ 
+   store.reset();
+@@ -463,6 +509,39 @@ TEST_F(PinStoreTest, AFolderColourIsSave
+   EXPECT_EQ(again->Find("f2")->color, -1);
+ }
+ 
++// C16: a folder and an item take an emoji -- its first character only -- a
++// blank box takes it off, a split row has none, and the file keeps it.
++TEST_F(PinStoreTest, SetEmojiKeepsOneCharacterAndABlankBoxClearsIt) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", SampleTree().at("default")));
++  ASSERT_TRUE(store->SetRoots(
++      "work", {Split("s", {Item("l", "https://l.example/"),
++                           Item("r", "https://r.example/")})}));
++  CountingObserver observer;
++  store->AddObserver(&observer);
++
++  EXPECT_TRUE(store->SetEmoji("f1", u" \U0001F4DA\U0001F600"));
++  EXPECT_TRUE(store->SetEmoji("c", u"\U0001F600"));
++  EXPECT_TRUE(store->SetEmoji("a", u"\U0001F600"));
++  EXPECT_FALSE(store->SetEmoji("s", u"\U0001F600"));
++  EXPECT_FALSE(store->SetEmoji("nope", u"\U0001F600"));
++  // The same emoji again: nothing to tell anyone.
++  EXPECT_TRUE(store->SetEmoji("c", u"\U0001F600"));
++  EXPECT_TRUE(store->SetEmoji("a", u"  "));
++  EXPECT_EQ(observer.calls, 4);
++  store->RemoveObserver(&observer);
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->Find("f1") && again->Find("c") && again->Find("a") &&
++              again->Find("s"));
++  EXPECT_EQ(base::UTF8ToUTF16(again->Find("f1")->emoji), u"\U0001F4DA");
++  EXPECT_EQ(base::UTF8ToUTF16(again->Find("c")->emoji), u"\U0001F600");
++  EXPECT_EQ(again->Find("a")->emoji, "");
++  EXPECT_EQ(again->Find("s")->emoji, "");
++}
++
+ // E15c: an item is found at any depth, a folder goes with everything in it,
+ // and a workspace left empty goes too; each removal is announced and saved.
+ TEST_F(PinStoreTest, FindAndRemoveReachAnyDepth) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -49,6 +49,7 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/split_tabs/split_tab_id.h"
++#include "components/tab_groups/tab_group_visual_data.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -153,9 +154,8 @@ bool AnotherSessionWindowStays(BrowserWi
+   return stays;
+ }
+ 
+-// Chromium's own test of an untouched New Tab page
+-// (TabStripModel::IsNewTabAtEndOfTabStrip): nothing to go back to. The door's
+-// rule and the sweep's (E14d.3).
++}  // namespace
++
+ bool IsUntouchedNewTabPage(content::WebContents* contents) {
+   const GURL& url = contents->GetLastCommittedURL();
+   return url.SchemeIs(content::kChromeUIScheme) &&
+@@ -163,6 +163,8 @@ bool IsUntouchedNewTabPage(content::WebC
+          contents->GetController().GetEntryCount() == 1;
+ }
+ 
++namespace {
++
+ // Whether the archive could give `contents` back: a last committed address a
+ // restore opens (http, https, file, chrome: -- never blob:, data:, about:,
+ // filesystem:), and not an untouched New Tab page. The sweep's rule
+@@ -179,16 +181,27 @@ bool HasRestorableAddress(content::WebCo
+ // Keeps `contents` in `window`'s profile archive with `reason`, and logs it:
+ // the door's entry and the sweep's are made here, one way (E14d.3). The last
+ // committed address, which a restored tab never loaded since has too (design
+-// 5): a sleeping import is archived at its page. True when the store took it.
++// 5): a sleeping import is archived at its page. A favorite -- a pinned tab,
++// which has no workspace of its own (design 2.5) -- is filed under
++// `on_screen`, the workspace its window shows, and marked so that Restore
++// pins it again (C27). True when the store took it.
+ bool AddToArchive(BrowserWindowInterface* window,
+                   content::WebContents* contents,
+-                  archive::ArchiveEntry::Reason reason) {
++                  archive::ArchiveEntry::Reason reason,
++                  std::string_view on_screen) {
+   archive::ArchiveEntry entry;
+   entry.id = ArchiveIdForTab(contents);
+   entry.url = contents->GetLastCommittedURL().spec();
+   entry.title = base::UTF16ToUTF8(contents->GetTitle());
+   entry.custom_title = CustomTitleForTab(contents);
+-  entry.workspace = WorkspaceGuidForTab(contents);
++  // The tab is still in its model here: DetachTabImpl asks the delegate
++  // before removing it (tab_strip_model.cc). Maybe-: a contents that is not a
++  // tab is archived as an ordinary page rather than CHECK-crashing a close.
++  const tabs::TabInterface* const tab =
++      tabs::TabInterface::MaybeGetFromContents(contents);
++  entry.favorite = tab && tab->IsPinned();
++  entry.workspace =
++      entry.favorite ? std::string(on_screen) : WorkspaceGuidForTab(contents);
+   if (entry.workspace.empty()) {
+     entry.workspace = kDefaultWorkspaceGuid;
+   }
+@@ -202,6 +215,7 @@ bool AddToArchive(BrowserWindowInterface
+   }
+   const std::string workspace = entry.workspace;
+   const bool snoozed = entry.snoozed();
++  const bool favorite = entry.favorite;
+   Profile* const profile = window->GetProfile();
+   const bool added =
+       archive::ArchiveStore::GetOrCreate(profile, profile->GetPath())
+@@ -209,7 +223,8 @@ bool AddToArchive(BrowserWindowInterface
+   // Never the address or the title: a log is pasted when asking for help.
+   LOG(INFO) << "[workspaces] archived a " << archive::ReasonName(reason)
+             << " close in '" << workspace << "'"
+-            << (snoozed ? " (snoozed)" : "") << (added ? "" : " (refused)");
++            << (snoozed ? " (snoozed)" : "") << (favorite ? " (favorite)" : "")
++            << (added ? "" : " (refused)");
+   return added;
+ }
+ 
+@@ -267,7 +282,10 @@ WorkspaceService::WorkspaceService(
+       prefs_(prefs),
+       active_guid_(InitialWorkspace(browser_window)),
+       known_guids_(prefs::GetWorkspaceGuids(prefs)),
++      folders_(unowned_user_data_host),
+       scoped_data_holder_(unowned_user_data_host, *this) {
++  folders_.persist = base::BindRepeating(&WorkspaceService::PersistFolders,
++                                         base::Unretained(this));
+   tab_strip_->AddObserver(this);
+   LOG(INFO) << "[workspaces] a window opens on workspace '" << active_guid_
+             << "'";
+@@ -537,6 +555,53 @@ std::string WorkspaceService::EnsureWork
+   return guid;
+ }
+ 
++bool WorkspaceService::CanMakeGroupAWorkspace(
++    tab_groups::TabGroupId group) const {
++  return IsEnabled() && !WholeGroupTabs(group).empty();
++}
++
++void WorkspaceService::MakeGroupAWorkspace(
++    tabs::TabInterface* tab,
++    const std::string& untitled) {
++  const std::optional<tab_groups::TabGroupId> group =
++      tab ? tab->GetGroup() : std::nullopt;
++  const std::vector<tabs::TabInterface*> members =
++      (IsEnabled() && group) ? WholeGroupTabs(*group)
++                             : std::vector<tabs::TabInterface*>();
++  // Also refused when `tab` left this window while the menu was open: its
++  // group is then another window's.
++  if (!std::ranges::contains(members, tab)) {
++    return;
++  }
++  const tab_groups::TabGroupVisualData* const visual =
++      tab_strip_->group_model()->GetTabGroup(*group)->visual_data();
++  const std::string title = visual->title().empty()
++                                ? untitled
++                                : base::UTF16ToUTF8(visual->title());
++  const std::string guid = base::Uuid::GenerateRandomV4().AsLowercaseString();
++  // ONE write, named and coloured -- a TabGroupColorId is the 0-8 a workspace
++  // colour stores -- so the list observers run once and know the guid before
++  // the first tab is tagged with it (see CreateWorkspace()). Not
++  // EnsureWorkspaceForImport(): it hands back a workspace of the same title.
++  prefs::WriteWorkspaces(
++      prefs_, prefs::SetWorkspaceColor(
++                  prefs::AddWorkspace(GetWorkspaces(), guid, title), guid,
++                  static_cast<int>(visual->color())));
++  // Retagged where they stand, still grouped: a group is drawn by its tabs'
++  // tag. Not MoveTabsToWorkspace(), whose EnsureActiveTabVisible() would spawn
++  // a New Tab in the workspace the group leaves, before the switch.
++  for (tabs::TabInterface* const member : members) {
++    SetTag(member->GetContents(), guid);
++  }
++  const tabs::TabInterface* const active = tab_strip_->GetActiveTab();
++  last_active_[guid] =
++      (std::ranges::contains(members, active) ? active : tab)->GetHandle();
++  // From a menu handler, outside every observer (design 2.2).
++  SwitchToWorkspace(guid);
++  LOG(INFO) << "[workspaces] group -> new workspace '" << guid << "', "
++            << members.size() << " tab(s)";
++}
++
+ void WorkspaceService::RenameWorkspace(std::string_view guid,
+                                        const std::string& title) {
+   prefs::WriteWorkspaces(
+@@ -775,7 +840,8 @@ std::vector<tabs::TabHandle> WorkspaceSe
+     // closing a saved group's last tab deletes the group, and the Archive
+     // keeps no anchor -- so it is the copy that stays.
+     if (tab->IsSplit() || tab->GetGroup().has_value() || IsAnchored(tab) ||
+-        !CustomTitleForTab(contents).empty()) {
++        !CustomTitleForTab(contents).empty() ||
++        !EmojiForTab(contents).empty()) {
+       kept.insert(std::move(key));
+       continue;
+     }
+@@ -934,8 +1000,7 @@ std::vector<tabs::TabInterface*> Workspa
+     // review).
+     // Nor an open pinned item's page (E15c): it is on screen, as its row, and
+     // an active one anchors the shift-click range at the end of the model.
+-    if (!tab || !tab->GetContents() || tab->IsPinned() ||
+-        !IsTabOnScreen(tab) || IsPinItemTab(tab)) {
++    if (!IsMovable(tab)) {
+       continue;
+     }
+     const std::optional<split_tabs::SplitTabId> split = tab->GetSplit();
+@@ -957,6 +1022,34 @@ int WorkspaceService::SelectedMovableTab
+   return static_cast<int>(SelectedMovableTabs().size());
+ }
+ 
++std::vector<tabs::TabInterface*> WorkspaceService::WholeGroupTabs(
++    tab_groups::TabGroupId group) const {
++  if (!tab_strip_->group_model() ||
++      !tab_strip_->group_model()->ContainsTabGroup(group)) {
++    return {};
++  }
++  const gfx::Range range =
++      tab_strip_->group_model()->GetTabGroup(group)->ListTabs();
++  std::vector<tabs::TabInterface*> members;
++  for (size_t i = range.start(); i < range.end(); ++i) {
++    members.push_back(tab_strip_->GetTabAtIndex(static_cast<int>(i)));
++  }
++  // Whole or not at all: a tab left out would stay behind in the group, which
++  // is drawn by its first tab's tag (02-render). Per member, not through
++  // MovableTabs(), which walks the strip: the tab menu asks as it opens.
++  if (!std::ranges::all_of(members, [this](tabs::TabInterface* tab) {
++        return IsMovable(tab);
++      })) {
++    return {};
++  }
++  return members;
++}
++
++bool WorkspaceService::IsMovable(tabs::TabInterface* tab) const {
++  return tab && tab->GetContents() && !tab->IsPinned() && IsTabOnScreen(tab) &&
++         !IsPinItemTab(tab);
++}
++
+ int WorkspaceService::MoveSelectedTabsToWorkspace(std::string_view guid) {
+   return MoveTabsToWorkspace(SelectedMovableTabs(), guid);
+ }
+@@ -1254,7 +1347,8 @@ void WorkspaceService::ApplyClosedTabDat
+   workspace_changed_callbacks_.Notify();
+   LOG(INFO) << "[workspaces] restore: a rebuilt tab took its closed tab's"
+             << (carried.contains(kAnchorUrlExtraDataKey) ? " anchor" : "")
+-            << (carried.contains(kCustomTitleExtraDataKey) ? " name" : "");
++            << (carried.contains(kCustomTitleExtraDataKey) ? " name" : "")
++            << (carried.contains(kEmojiExtraDataKey) ? " emoji" : "");
+ }
+ 
+ base::CallbackListSubscription
+@@ -1928,8 +2022,9 @@ void WorkspaceService::CarryTagAcrossRep
+   const std::string old_anchor = AnchorUrlForTab(replace->old_contents);
+   const std::string old_title = CustomTitleForTab(replace->old_contents);
+   const std::string old_pin_item = PinItemForTab(replace->old_contents);
++  const std::string old_emoji = EmojiForTab(replace->old_contents);
+   if (old_guid.empty() && old_anchor.empty() && old_title.empty() &&
+-      old_pin_item.empty()) {
++      old_pin_item.empty() && old_emoji.empty()) {
+     return;
+   }
+   // The anchor first, so the SetTag below persists both in one write. This is
+@@ -1946,6 +2041,11 @@ void WorkspaceService::CarryTagAcrossRep
+     WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
+         ->set_custom_title(old_title);
+   }
++  // And the emoji, or the tab would wake up under the page's favicon (C16).
++  if (!old_emoji.empty()) {
++    WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
++        ->set_emoji(old_emoji);
++  }
+   // And an open item's page stays its item's when it is put to sleep.
+   if (!old_pin_item.empty()) {
+     WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
+@@ -2100,6 +2200,23 @@ void WorkspaceService::PersistTag(conten
+   session_service->AddTabExtraData(
+       session_tab_helper->window_id(), session_tab_helper->session_id(),
+       kPinItemExtraDataKey, PinItemForTab(contents));
++  // And the emoji drawn in place of its favicon (C16), under the same rule.
++  session_service->AddTabExtraData(
++      session_tab_helper->window_id(), session_tab_helper->session_id(),
++      kEmojiExtraDataKey, EmojiForTab(contents));
++}
++
++void WorkspaceService::PersistFolders() {
++  SessionService* const session_service =
++      SessionServiceFactory::GetForProfileIfExisting(
++          browser_window_->GetProfile());
++  if (!session_service) {
++    return;
++  }
++  // Dropped by SessionService for a window it does not track.
++  session_service->AddWindowExtraData(
++      browser_window_->GetSessionID(), kFolderOpenExtraDataKey,
++      pins::FolderStatesToString(folders_.states));
+ }
+ 
+ void WorkspaceService::ApplyCollectionGuid(
+@@ -2311,6 +2428,46 @@ bool WorkspaceService::ClosePinItemPage(
+   return true;
+ }
+ 
++bool WorkspaceService::IsFolderOpen(const pins::PinNode& folder) const {
++  const auto it = folders_.states.find(folder.id);
++  return it != folders_.states.end() ? it->second : folder.open;
++}
++
++bool WorkspaceService::SetFolderOpen(std::string_view id, bool open) {
++  Profile* const profile = browser_window_->GetProfile();
++  pins::PinStore* const store =
++      pins::PinStore::GetOrCreate(profile, profile->GetPath());
++  const pins::PinNode* const folder = store->Find(id);
++  if (!folder || folder->type != pins::PinNode::Type::kFolder) {
++    return false;
++  }
++  const std::string key(id);
++  const bool was = folder->open;
++  // D11: a window with no word of its own shows the file, which is about to
++  // change -- so it is given the file's value first, and keeps it.
++  int kept = 0;
++  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
++      [&](BrowserWindowInterface* other) {
++        WorkspaceService* const service =
++            other == browser_window_ ? nullptr : From(other);
++        if (service && service->folders_.states.try_emplace(key, was).second) {
++          service->PersistFolders();
++          ++kept;
++        }
++        return true;
++      });
++  folders_.states.insert_or_assign(key, open);
++  PersistFolders();
++  // The last change made anywhere, which a new window starts from. Refused
++  // while the file is read-only, and silent when it already holds `open`:
++  // this window's word stands either way.
++  store->SetFolderOpen(key, open);
++  LOG(INFO) << "[workspaces] folder '" << key << "' "
++            << (open ? "open" : "closed") << " in this window (" << kept
++            << " other window(s) keep theirs)";
++  return true;
++}
++
+ bool WorkspaceService::ArchiveClosingTab(content::WebContents* contents,
+                                          bool quitting) {
+   if (!contents) {
+@@ -2343,20 +2500,9 @@ bool WorkspaceService::ArchiveClosingTab
+     LOG(INFO) << "[workspaces] not archived: a pinned item's page";
+     return true;
+   }
+-  // Nor a favorite, a pinned tab (E14c imports Arc's favorites as these): it
+-  // belongs to no workspace (design 2.5), so an entry would be filed under
+-  // Home and restored there unpinned. Arc never archives one -- its archive
+-  // holds tabs only, 1,757 of 1,757 (LOCAL.md 51); Recently Closed still
+-  // keeps the close. A defaulted owner decision (E14d.2 review). The tab is
+-  // still in its model here: DetachTabImpl asks the delegate before removing
+-  // it (tab_strip_model.cc). Maybe-: a contents that is not a tab is archived
+-  // as before rather than CHECK-crashing a close.
+-  if (const tabs::TabInterface* const tab =
+-          tabs::TabInterface::MaybeGetFromContents(contents);
+-      tab && tab->IsPinned()) {
+-    LOG(INFO) << "[workspaces] not archived: a favorite (a pinned tab)";
+-    return true;
+-  }
++  // A favorite, a pinned tab, goes on through the gates below since C27 (the
++  // owner's word; E14d.2 had defaulted to Arc's tabs-only archive).
++  //
+   // Before the window rule: a quit that skips unload handlers (a silent exit,
+   // log-off) marks no window closing, so every tab would pass as `manual`
+   // (review, LOCAL.md 52).
+@@ -2394,7 +2540,7 @@ bool WorkspaceService::ArchiveClosingTab
+     LOG(INFO) << "[workspaces] not archived: an untouched New Tab page";
+     return true;
+   }
+-  AddToArchive(browser_window_, contents, reason);
++  AddToArchive(browser_window_, contents, reason, active_guid_);
+   return true;
+ }
+ 
+@@ -2555,8 +2701,10 @@ void WorkspaceService::SweepForAutoArchi
+       continue;
+     }
+     content::WebContents* const contents = tab->GetContents();
++    // The workspace on screen only files a favorite, which the sweep never
++    // takes (archive::SweepVerdict::kFavorite).
+     if (!AddToArchive(browser_window_, contents,
+-                      archive::ArchiveEntry::Reason::kAuto)) {
++                      archive::ArchiveEntry::Reason::kAuto, active_guid_)) {
+       ++refused;
+       continue;
+     }
+@@ -2646,6 +2794,24 @@ void WorkspaceService::SetCustomTitle(ta
+             << tab_strip_->GetIndexOfTab(tab) << " -> '" << title << "'";
+ }
+ 
++void WorkspaceService::SetTabEmoji(tabs::TabInterface* tab,
++                                   std::u16string_view text) {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return;
++  }
++  WorkspaceTabData* const data =
++      WorkspaceTabData::GetOrCreateForWebContents(contents);
++  data->set_emoji(pins::FirstGrapheme(text));
++  PersistTag(contents);
++  // The favicon this time, which TabUIHelper::GetFavicon draws the emoji as:
++  // INVALIDATE_TYPE_TAB rebuilds the tab's whole TabData, as a title does.
++  contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TAB);
++  LOG(INFO) << "[workspaces] tab emoji "
++            << (data->emoji().empty() ? "cleared" : "set") << " at index "
++            << tab_strip_->GetIndexOfTab(tab);
++}
++
+ void WorkspaceService::ResetToAnchor(tabs::TabInterface* tab) {
+   content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
+   if (!contents) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -22,6 +22,7 @@
+ #include "base/timer/timer.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/tab_groups/tab_group_id.h"
+ // For tabs::TabHandle, which is TabInterface::Handle and so needs the full
+@@ -48,6 +49,15 @@ class VerticalTabStripStateController;
+ 
+ namespace workspaces {
+ 
++namespace pins {
++struct PinNode;
++}
++
++// Chromium's own test of an untouched New Tab page
++// (TabStripModel::IsNewTabAtEndOfTabStrip): nothing to go back to. The
++// archive door's rule and the sweep's (E14d.3); Save as bookmarks' (C11b).
++bool IsUntouchedNewTabPage(content::WebContents* contents);
++
+ // One per browser window. Owns which workspace that window is showing, and
+ // stamps membership onto tabs as they arrive.
+ //
+@@ -172,6 +182,21 @@ class WorkspaceService : public TabStrip
+   std::string EnsureWorkspaceForImport(const std::string& title,
+                                        const std::string& icon);
+ 
++  // C11a: whether "Make this group a workspace" can take `group`: Workspaces
++  // on, and every tab of the group able to move (IsMovable: no open pinned
++  // page, no tab this window hides), so that the group moves whole.
++  bool CanMakeGroupAWorkspace(tab_groups::TabGroupId group) const;
++
++  // C11a: a new workspace named after `tab`'s group -- `untitled` when the
++  // group has no name -- in the group's colour. The group's tabs are retagged
++  // into it where they stand, still grouped, and the window switches there,
++  // onto the active tab if it is one of them, else onto `tab`. One write of
++  // the list, never CreateWorkspace(), which switches into the empty
++  // workspace and spawns a tab there first. ONLY FROM A MENU OR COMMAND
++  // HANDLER: it ends in SwitchToWorkspace().
++  void MakeGroupAWorkspace(tabs::TabInterface* tab,
++                           const std::string& untitled);
++
+   // Renames a workspace, including the default one -- which is how the default
+   // workspace acquires the title E7c deliberately did not give it.
+   void RenameWorkspace(std::string_view guid, const std::string& title);
+@@ -231,6 +256,15 @@ class WorkspaceService : public TabStrip
+   // can ask first when that is more than Recently Closed keeps (E13.5).
+   int CountTabsToClose(std::string_view guid, bool today_only = false) const;
+ 
++  // The tabs CloseWorkspaceTabs(guid) closes, as handles: the workspace's own,
++  // never a pinned one. `pinned_kept`, when given, counts the pinned tabs that
++  // would otherwise have matched. One collector, so the confirm's count and the
++  // close cannot disagree -- and Save as bookmarks' Today is Clear Today's
++  // (C11b).
++  std::vector<tabs::TabHandle> TabsToClose(std::string_view guid,
++                                           int* pinned_kept,
++                                           bool today_only) const;
++
+   // C32, "Close duplicate tabs...": the Today tabs of `guid` in this window
+   // whose address -- without its #part (D7) -- is already one of the
+   // workspace's pinned pages (at home, or the page an open one shows), a
+@@ -325,9 +359,10 @@ class WorkspaceService : public TabStrip
+   // -- never a group that was already open -- take a closed tab's data.
+   void ExpectClosedTabData(tab_groups::TabGroupId group);
+ 
+-  // Gives `tab`, if it is one of those rebuilt tabs, its closed tab's anchor
+-  // and custom title from `extra_data` -- not the workspace (the group has one,
+-  // patch 58) and not the pinned item (a group never holds one).
++  // Gives `tab`, if it is one of those rebuilt tabs, its closed tab's anchor,
++  // custom title and emoji (C16) from `extra_data` -- not the workspace (the
++  // group has one, patch 58) and not the pinned item (a group never holds
++  // one).
+   void ApplyClosedTabData(tabs::TabInterface* tab,
+                           const std::map<std::string, std::string>& extra_data);
+ 
+@@ -445,6 +480,12 @@ class WorkspaceService : public TabStrip
+   // and the only way to set one is a menu that is.
+   void SetCustomTitle(tabs::TabInterface* tab, const std::string& title);
+ 
++  // C16: gives `tab` the first character of `text` (pins::FirstGrapheme) as
++  // its emoji, drawn in place of its favicon, or takes the emoji off for a box
++  // left empty or blank. Persisted through the same session write as the tag;
++  // not gated on IsEnabled(), for SetCustomTitle()'s reason.
++  void SetTabEmoji(tabs::TabInterface* tab, std::u16string_view text);
++
+   // Navigates an anchored tab back to its anchor. No-op when it is there.
+   void ResetToAnchor(tabs::TabInterface* tab);
+ 
+@@ -518,14 +559,33 @@ class WorkspaceService : public TabStrip
+   // Never from an observer: closing a tab mutates the model (design 2.2).
+   bool ClosePinItemPage(tabs::TabInterface* tab, const char* via);
+ 
++  // C9: whether `folder` of a pinned section is open in THIS window: the
++  // window's own word on it (WindowFolders, saved with the window in the
++  // session), else the pins file's PinNode::open -- the last change any
++  // window made, which is what a new window starts from.
++  bool IsFolderOpen(const pins::PinNode& folder) const;
++
++  // C9: opens or closes folder `id` in this window. Copy-on-write (D11):
++  // every other window of the profile with no word of its own on the folder
++  // is first given the file's value, so it goes on showing what it showed;
++  // then this window's word; then the file, which records the last change
++  // made anywhere. Each window's word goes into its session at once. True
++  // when `id` is a folder, even when the file is read-only or already held
++  // `open`: the store tells its observers only of a change to the file, so
++  // the caller redraws on true. Logs
++  //   "[workspaces] folder '<id>' open|closed in this window (<N> other
++  //   window(s) keep theirs)"
++  bool SetFolderOpen(std::string_view id, bool open);
++
+   // Arc's archive (E14d.1, design 5 "E14d spec"): keeps `contents`, which the
+   // user is closing, or logs why not. The gates, in order: nothing while the
+-  // feature is off; never a pinned item's page; never a favorite (a pinned
+-  // tab: Arc archives tabs only -- a defaulted owner decision, E14d.2
+-  // review); nothing while `quitting`; a committed window close only while
+-  // the session commits it too -- its service still up and another window it
+-  // tracks staying open; never a tab with no address or an untouched New Tab
+-  // page (review, LOCAL.md 52).
++  // feature is off; never a pinned item's page; nothing while `quitting`; a
++  // committed window close only while the session commits it too -- its
++  // service still up and another window it tracks staying open; never a tab
++  // with no address or an untouched New Tab page (review, LOCAL.md 52). A
++  // favorite (a pinned tab) passes the same gates since C27: it is filed
++  // under the workspace on screen, marked a favorite, and Restore pins it
++  // again (AddToArchive).
+   // `quitting` is browser_shutdown::HasShutdownStarted(), which this target
+   // cannot ask (a GN cycle), so the caller passes it. Called from the
+   // delegate's CreateHistoricalTab, INSIDE TabStripModel's close: it reads the
+@@ -540,11 +600,12 @@ class WorkspaceService : public TabStrip
+   bool ArchiveClosingTab(content::WebContents* contents, bool quitting);
+ 
+   // C33: whether the tab menu's Snooze can take `tab`: Workspaces on, a Today
+-  // tab -- not a favorite or a pinned page, which are never archived
+-  // (ArchiveClosingTab), not an anchored tab, whose close resets it (E14a) and
+-  // which this close would go round, not a split's half, which closes with its
+-  // other half -- whose page the archive can give back (the sweep's address
+-  // rule: the tab must come back).
++  // tab -- not a favorite, as a wake reopens a page in the list, never pinned
++  // (C27: only Restore pins one again), not a pinned page, which is never
++  // archived (ArchiveClosingTab), not an anchored tab, whose close resets it
++  // (E14a) and which this close would go round, not a split's half, which
++  // closes with its other half -- whose page the archive can give back (the
++  // sweep's address rule: the tab must come back).
+   bool CanSnooze(tabs::TabInterface* tab) const;
+ 
+   // C33: closes those of `tabs` that CanSnooze(), each marked to wake at
+@@ -594,6 +655,14 @@ class WorkspaceService : public TabStrip
+   // MovableTabs() of everything selected in this window.
+   std::vector<tabs::TabInterface*> SelectedMovableTabs() const;
+ 
++  // The tabs of `group` in this window, in strip order, when every one
++  // IsMovable(); else empty (C11a).
++  std::vector<tabs::TabInterface*> WholeGroupTabs(
++      tab_groups::TabGroupId group) const;
++  // What MovableTabs() keeps: a tab on screen here that is not a favorite or
++  // an open pinned page.
++  bool IsMovable(tabs::TabInterface* tab) const;
++
+   // The workspace `tab` belongs to, or empty for a tab that has never been
+   // stamped or has no contents. Empty means the default workspace, never "no
+   // workspace" -- see IsVisibleInWorkspace.
+@@ -611,13 +680,6 @@ class WorkspaceService : public TabStrip
+   // why it is conservative, not exact).
+   bool InsideACollection(int index) const;
+ 
+-  // The tabs CloseWorkspaceTabs(guid) closes, as handles: the workspace's own,
+-  // never a pinned one. `pinned_kept`, when given, counts the pinned tabs that
+-  // would otherwise have matched. One collector, so the confirm's count and the
+-  // close cannot disagree.
+-  std::vector<tabs::TabHandle> TabsToClose(std::string_view guid,
+-                                           int* pinned_kept,
+-                                           bool today_only) const;
+ 
+   // Closes `doomed` with CLOSE_CREATE_HISTORICAL_TAB, the active tab last,
+   // re-resolving each handle on the way past; answers the closes asked. The
+@@ -656,6 +718,12 @@ class WorkspaceService : public TabStrip
+   // covers a tag set before this window was being tracked at all.
+   void PersistTag(content::WebContents* contents);
+ 
++  // Writes folders_ into this window's session, so a restart shows this
++  // window's folders as it left them (C9). Nothing without a SessionService,
++  // as PersistTag(); SessionServiceBase::BuildCommandsForBrowser re-emits
++  // the value at every rebuild of the file.
++  void PersistFolders();
++
+   // Applies the collection rule to `tab` given the tags of the other members
+   // it is joining. Shared by the group and split paths, which differ only in
+   // how the membership is looked up.
+@@ -673,8 +741,8 @@ class WorkspaceService : public TabStrip
+   // arrive here as kReplaced. Without this the tag is left on the discarded
+   // contents and the tab silently rejoins the default workspace, minutes after
+   // the user last touched it and with nothing on screen tying it to
+-  // Workspaces. The anchor, the custom title, the pinned item and the
+-  // auto-archive's left_at ride along the same way.
++  // Workspaces. The anchor, the custom title, the emoji (C16), the pinned item
++  // and the auto-archive's left_at ride along the same way.
+   void CarryTagAcrossReplacement(const TabStripModelChange::Replace* replace);
+ 
+   // The index this window should activate to show the active workspace, or
+@@ -888,6 +956,11 @@ class WorkspaceService : public TabStrip
+   base::RepeatingClosureList workspace_list_changed_callbacks_;
+   base::RepeatingClosureList tab_row_height_changed_callbacks_;
+ 
++  // This window's own word on the pinned sections' folders (C9). Published on
++  // the window as unowned user data of its own, so the session hooks, which
++  // cannot depend on this target, save and restore it through :tab_data.
++  WindowFolders folders_;
++
+   // For EnsureActiveTabVisible(), which is posted and so can outlive the
+   // window that scheduled it -- closing the last tab of a window schedules the
+   // repair and then destroys this service before it runs.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
+@@ -44,6 +44,15 @@ std::string CustomTitleForTab(content::W
+   return tab_data ? tab_data->custom_title() : std::string();
+ }
+ 
++std::string EmojiForTab(content::WebContents* contents) {
++  if (!contents) {
++    return std::string();
++  }
++  const WorkspaceTabData* tab_data =
++      WorkspaceTabData::FromWebContents(contents);
++  return tab_data ? tab_data->emoji() : std::string();
++}
++
+ std::string PinItemForTab(content::WebContents* contents) {
+   if (!contents) {
+     return std::string();
+@@ -109,6 +118,10 @@ void PopulateWorkspaceExtraData(
+   if (!title.empty()) {
+     (*extra_data)[kCustomTitleExtraDataKey] = std::move(title);
+   }
++  std::string emoji = EmojiForTab(contents);
++  if (!emoji.empty()) {
++    (*extra_data)[kEmojiExtraDataKey] = std::move(emoji);
++  }
+   std::string pin_item = PinItemForTab(contents);
+   if (!pin_item.empty()) {
+     (*extra_data)[kPinItemExtraDataKey] = std::move(pin_item);
+@@ -125,8 +138,10 @@ void RestoreWorkspaceFromExtraData(
+   const auto anchor_it = extra_data.find(kAnchorUrlExtraDataKey);
+   const auto title_it = extra_data.find(kCustomTitleExtraDataKey);
+   const auto pin_it = extra_data.find(kPinItemExtraDataKey);
++  const auto emoji_it = extra_data.find(kEmojiExtraDataKey);
+   if (guid_it == extra_data.end() && anchor_it == extra_data.end() &&
+-      title_it == extra_data.end() && pin_it == extra_data.end()) {
++      title_it == extra_data.end() && pin_it == extra_data.end() &&
++      emoji_it == extra_data.end()) {
+     return;
+   }
+   // Set even when the stored value is empty. An empty tag is a real state --
+@@ -157,6 +172,48 @@ void RestoreWorkspaceFromExtraData(
+                 << "'";
+     }
+   }
++  // C16: as the title, before the first paint. Not through FirstGrapheme
++  // again: SetTabEmoji wrote it, and a hand-edited value is only drawn,
++  // clipped to its 16 px.
++  if (emoji_it != extra_data.end()) {
++    data->set_emoji(emoji_it->second);
++    if (!emoji_it->second.empty()) {
++      LOG(INFO) << "[workspaces] restored tab emoji";
++    }
++  }
++}
++
++DEFINE_USER_DATA(WindowFolders);
++
++WindowFolders::WindowFolders(ui::UnownedUserDataHost& host)
++    : scoped_data_holder_(host, *this) {}
++
++WindowFolders::~WindowFolders() = default;
++
++void PopulateWindowExtraData(const ui::UnownedUserDataHost& host,
++                             std::map<std::string, std::string>* data) {
++  const WindowFolders* const folders = WindowFolders::Get(host);
++  if (!data || !folders || folders->states.empty()) {
++    return;
++  }
++  (*data)[kFolderOpenExtraDataKey] =
++      pins::FolderStatesToString(folders->states);
++}
++
++void RestoreWindowFromExtraData(
++    ui::UnownedUserDataHost& host,
++    const std::map<std::string, std::string>& data) {
++  WindowFolders* const folders = WindowFolders::Get(host);
++  const auto it = data.find(kFolderOpenExtraDataKey);
++  if (!folders || it == data.end()) {
++    return;
++  }
++  folders->states = pins::FolderStatesFromString(it->second);
++  if (folders->persist) {
++    folders->persist.Run();
++  }
++  LOG(INFO) << "[workspaces] window folders: restored "
++            << folders->states.size();
+ }
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
+@@ -8,6 +8,11 @@
+ #include <map>
+ #include <string>
+ 
++#include "base/functional/callback.h"
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
++#include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
++
+ namespace content {
+ class BrowserContext;
+ class WebContents;
+@@ -60,6 +65,10 @@ inline constexpr char kAnchorUrlExtraDat
+ // written empty to clear, absent means "not renamed".
+ inline constexpr char kCustomTitleExtraDataKey[] = "helium.custom_title";
+ 
++// The emoji the user set on a Today tab (C16). Same carrier, same rules:
++// written empty to clear, absent means "no emoji".
++inline constexpr char kEmojiExtraDataKey[] = "helium.emoji";
++
+ // The pinned item an open item's page belongs to (E15c). Same carrier, same
+ // rules: written empty to clear, absent means "an ordinary tab".
+ inline constexpr char kPinItemExtraDataKey[] = "helium.pin_item";
+@@ -82,10 +91,17 @@ inline constexpr char kArchiveIdExtraDat
+ inline constexpr char kSavedTabExtraDataKey[] = "helium.saved_tab";
+ 
+ // What a rebuilt tab takes back from its closed tab, by that id (E18.2): the
+-// anchor and the name -- not the workspace (the group has one, patch 58) and
+-// not the pinned item (a group never holds one).
++// anchor, the name and the emoji (C16) -- not the workspace (the group has
++// one, patch 58) and not the pinned item (a group never holds one).
+ inline constexpr const char* kCarriedOnReopenKeys[] = {
+-    kAnchorUrlExtraDataKey, kCustomTitleExtraDataKey};
++    kAnchorUrlExtraDataKey, kCustomTitleExtraDataKey, kEmojiExtraDataKey};
++
++// C9: the folders of the pinned section a window opened or closed itself,
++// pins::FolderStatesToString's JSON dict. WINDOW extra data, not a tab's:
++// SessionService::AddWindowExtraData, and Recently Closed's copy of a closed
++// window (BrowserLiveTabContext::GetExtraDataForWindow). CHOSEN ONCE, like
++// the keys above.
++inline constexpr char kFolderOpenExtraDataKey[] = "helium.folder_open";
+ 
+ // The workspace `contents` is tagged for, or empty for a tab that has never
+ // been stamped, a pinned tab (pinning clears the tag), or a null argument.
+@@ -98,6 +114,9 @@ std::string AnchorUrlForTab(content::Web
+ // The title the user typed for `contents`, or empty when it has none.
+ std::string CustomTitleForTab(content::WebContents* contents);
+ 
++// The emoji the user set on `contents` (C16), or empty when it has none.
++std::string EmojiForTab(content::WebContents* contents);
++
+ // The pinned item `contents` is the open page of, or empty for an ordinary tab.
+ std::string PinItemForTab(content::WebContents* contents);
+ 
+@@ -171,6 +190,44 @@ void RestoreWorkspaceFromExtraData(
+     content::WebContents* contents,
+     const std::map<std::string, std::string>& extra_data);
+ 
++// C9: a window's own word on its folders, kept on the window as unowned user
++// data by its WorkspaceService (a member, so a window with no service has
++// none). Here and not in the service so the session hook sites reach it
++// through the window's host without depending on ":workspaces", as the tab
++// functions above do. Saved under kFolderOpenExtraDataKey.
++class WindowFolders {
++ public:
++  DECLARE_USER_DATA(WindowFolders);
++
++  explicit WindowFolders(ui::UnownedUserDataHost& host);
++  WindowFolders(const WindowFolders&) = delete;
++  WindowFolders& operator=(const WindowFolders&) = delete;
++  ~WindowFolders();
++
++  pins::FolderStates states;
++  // Writes `states` to the session (the service's PersistFolders). Run by
++  // RestoreWindowFromExtraData: the session's startup rebuild ran before any
++  // window existed, so a restored window saves what it was given at once,
++  // or a quit before the next rebuild would forget it (review R1).
++  base::RepeatingClosure persist;
++
++ private:
++  ui::ScopedUnownedUserData<WindowFolders> scoped_data_holder_;
++};
++
++// Adds the window's folder states to `data`, the window's extra data as the
++// session rebuild and Recently Closed write it. Nothing for a window without
++// WindowFolders, or with no word of its own: the pins file stands in.
++void PopulateWindowExtraData(const ui::UnownedUserDataHost& host,
++                             std::map<std::string, std::string>* data);
++
++// Gives a restored window back its folder states, right after the window is
++// made and before its pinned section first draws (a posted Rebuild), and
++// saves them back (WindowFolders::persist). A missing key leaves the window
++// on the pins file's values.
++void RestoreWindowFromExtraData(ui::UnownedUserDataHost& host,
++                                const std::map<std::string, std::string>& data);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SESSION_DATA_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -70,6 +70,12 @@ class WorkspaceTabData : public content:
+   const std::string& custom_title() const { return custom_title_; }
+   void set_custom_title(std::string title) { custom_title_ = std::move(title); }
+ 
++  // C16: the emoji the user set on this Today tab, one grapheme in UTF-8, or
++  // empty for none. Drawn instead of the favicon by TabUIHelper::GetFavicon(),
++  // as the custom title is by GetTitle().
++  const std::string& emoji() const { return emoji_; }
++  void set_emoji(std::string emoji) { emoji_ = std::move(emoji); }
++
+   // The pinned item this tab is the open page of (E15c, design 5): its id in
+   // the pins file, or empty for an ordinary tab. The list does not draw such a
+   // tab -- its row in the pinned section is its face.
+@@ -129,6 +135,7 @@ class WorkspaceTabData : public content:
+   std::string guid_;
+   std::string anchor_url_;
+   std::string custom_title_;
++  std::string emoji_;
+   std::string pin_item_;
+   std::string archive_id_;
+   base::Time left_at_;
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -910,6 +910,12 @@ void BrowserTabStripController::ExecuteC
+     ShowRenameTabDialog(tab);
+     return;
+   }
++  // C16, as TabStripCollectionController runs it. (C11a's item needs
++  // Workspaces, so the vertical strip: it never reaches this controller.)
++  if (command_id == TabStripModel::CommandSetTabEmoji) {
++    ShowTabEmojiDialog(tab);
++    return;
++  }
+   model_->ExecuteContextMenuCommand(model_->GetIndexOfTab(tab), command_id);
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -549,6 +549,22 @@ void TabStripCollectionController::Execu
+     ShowRenameTabDialog(tab);
+     return;
+   }
++  // C16: the rename box's sibling.
++  if (command_id == TabStripModel::CommandSetTabEmoji) {
++    ShowTabEmojiDialog(tab);
++    return;
++  }
++  // C11a: the clicked tab's group, whole, into a workspace of its own; the
++  // service of the window the tab is in now refuses one it cannot move.
++  if (command_id == TabStripModel::CommandMakeGroupWorkspace) {
++    if (workspaces::WorkspaceService* const service =
++            workspaces::WorkspaceService::From(
++                tab->GetBrowserWindowInterface())) {
++      service->MakeGroupAWorkspace(
++          tab, l10n_util::GetStringUTF8(IDS_HELIUM_WORKSPACE_NEW));
++    }
++    return;
++  }
+   // E15d: the clicked tab, or the selection it is part of, as the menu's
+   // other commands take it; PinTabs skips what cannot be pinned.
+   if (command_id == TabStripModel::CommandPinToWorkspace) {
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -109,11 +109,16 @@ source_set("impl") {
+     # cycle (LOCAL.md 43). //chrome/browser/sessions is likewise the header
+     # target (TabRestoreServiceFactory, the archive's restore), never :impl;
+     # //chrome/browser/ui/tabs already reaches it as a public dep, so it adds
+-    # no edge and no cycle.
++    # no edge and no cycle. //chrome/browser/bookmarks is the header target
++    # too (C11b's Save as bookmarks): //chrome/browser/ui/views/toolbar below
++    # already reaches it as a public dep. The pinned rows' emoji (C16) are
++    # drawn by the leaf :emoji.
+     "//base:i18n",
++    "//chrome/browser/bookmarks",
+     "//chrome/browser/favicon",
+     "//chrome/browser/sessions",
+     "//chrome/browser/ui/tabs/workspaces:archive",
++    "//chrome/browser/ui/tabs/workspaces:emoji",
+     "//chrome/browser/ui/tabs/workspaces:pins",
+     "//components/favicon/content",
+     "//components/favicon/core",
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
+@@ -973,7 +973,13 @@ void WorkspaceArchiveView::Rebuild() {
+     row.guid = std::string(
+         workspaces::ResolveTabGuid(entry->workspace, service->known_guids()));
+     row.search_text = workspaces::archive::SearchTextFor(*entry);
+-    row.text = EntryText(*entry);
++    // C27: a favorite's row shows a star before its name, and says so to a
++    // screen reader -- its name still ends with the title (D9).
++    const std::u16string shown = EntryText(*entry);
++    row.text = entry->favorite
++                   ? l10n_util::GetStringFUTF16(IDS_HELIUM_ARCHIVE_FAVORITE_ROW,
++                                                shown)
++                   : shown;
+     const auto mark = marks.find(row.guid);
+     std::u16string workspace_name = base::UTF8ToUTF16(row.guid);
+     int color = -1;
+@@ -983,7 +989,7 @@ void WorkspaceArchiveView::Rebuild() {
+       color = mark->second.color;
+     }
+     auto view = std::make_unique<ArchiveRow>(
+-        row.text,
++        entry->favorite ? base::StrCat({u"\u2605 ", shown}) : shown,
+         base::StrCat({row.text, u"\n", base::UTF8ToUTF16(entry->url), u"\n",
+                       workspace_name}),
+         entry->snoozed() ? WakeTimeText(entry->wake_at, now)
+@@ -1166,8 +1172,14 @@ content::WebContents* Reopen(BrowserWind
+   const std::string guid(
+       workspaces::ResolveTabGuid(entry.workspace, service->known_guids()));
+   TabStripModel* const model = browser->GetTabStripModel();
++  // C27: a favorite comes back a favorite, after the others. It is drawn in
++  // every workspace, so the window stays where it is (D9), and it takes no
++  // workspace tag. Never a wake: a favorite is never snoozed.
++  const bool favorite = entry.favorite;
+   int index;
+-  if (wake) {
++  if (favorite) {
++    index = model->IndexOfFirstNonPinnedTab();
++  } else if (wake) {
+     // C33: the window stays where it is; the page goes to the top of its
+     // workspace's Today, where a tab moved there goes (C4).
+     index = service->FirstTodayIndexOf(guid);
+@@ -1195,7 +1207,9 @@ content::WebContents* Reopen(BrowserWind
+   navigation.set_virtual_url(url);
+   navigation.set_title(base::UTF8ToUTF16(entry.title));
+   std::map<std::string, std::string> extra_data;
+-  extra_data[workspaces::kWorkspaceExtraDataKey] = guid;
++  if (!favorite) {
++    extra_data[workspaces::kWorkspaceExtraDataKey] = guid;
++  }
+   if (!entry.custom_title.empty()) {
+     extra_data[workspaces::kCustomTitleExtraDataKey] = entry.custom_title;
+   }
+@@ -1204,7 +1218,7 @@ content::WebContents* Reopen(BrowserWind
+   content::WebContents* const contents = chrome::AddRestoredTab(
+       browser, base::span_from_ref(navigation), index,
+       /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
+-      /*group=*/std::nullopt, /*select=*/!wake, /*pin=*/false,
++      /*group=*/std::nullopt, /*select=*/!wake, /*pin=*/favorite,
+       base::TimeTicks::Now(), base::Time::Now(),
+       /*storage_namespace=*/nullptr, sessions::SerializedUserAgentOverride(),
+       extra_data, /*from_session_restore=*/false,
+@@ -1214,7 +1228,8 @@ content::WebContents* Reopen(BrowserWind
+   // of Recently Closed.
+   store->Remove(id);
+   LOG(INFO) << "[workspaces] archive: " << (wake ? "woke" : "restored")
+-            << " an entry into '" << guid << "'";
++            << " an entry into '" << guid << "'"
++            << (favorite ? " a favorite" : "");
+   RemoveRecentlyClosedTab(profile, id);
+   return contents;
+ }
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
+@@ -175,7 +175,8 @@ class WorkspaceArchiveView : public view
+   static void ShowOverPage(BrowserWindowInterface* browser);
+   // Restores the archive entry `id` into `browser` (the class comment's
+   // road: its workspace entered, the page at the top of the list, the entry
+-  // out of the archive and of Recently Closed). False, with nothing changed,
++  // out of the archive and of Recently Closed; a favorite pinned again, after
++  // the others, the window where it is: C27). False, with nothing changed,
+   // while Workspaces is off in `browser`, when the entry is gone, or when its
+   // address is not one a tab can open. The screen's rows and the quick search
+   // box (C1) both restore through it; neither closes anything here.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -42,6 +42,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_emoji.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+@@ -274,6 +275,8 @@ constexpr int kCommandUndoSort = 12;
+ constexpr int kCommandCopyLinks = 13;
+ // An open page away from its home makes where it is its address (C31).
+ constexpr int kCommandReplaceUrl = 14;
++// C16: an emoji in place of the row's icon.
++constexpr int kCommandSetEmoji = 15;
+ constexpr int kCommandFirstColor = 20;
+ // The Move to workspace submenu (C3): one item per workspace, in the bar's
+ // order. ponytail: a 61st workspace is left out of the menu; a range of its
+@@ -495,6 +498,19 @@ BrowserWindowInterface* WindowOfSplit(Br
+   return browser;
+ }
+ 
++// C16 (D3): an unpinned page's tab takes its item's emoji -- none takes off
++// one the tab had before it was pinned. Asked while the tab is still linked.
++void TakeItemEmoji(workspaces::WorkspaceService& service,
++                   const workspaces::pins::PinStore& store,
++                   tabs::TabInterface* tab) {
++  content::WebContents* const contents = tab->GetContents();
++  const PinNode* const item = store.Find(workspaces::PinItemForTab(contents));
++  const std::string emoji = item ? item->emoji : std::string();
++  if (workspaces::EmojiForTab(contents) != emoji) {
++    service.SetTabEmoji(tab, base::UTF8ToUTF16(emoji));
++  }
++}
++
+ // Unpin's second half, once item `id`'s page is open in a window (UnpinItem,
+ // the Pin shortcut): every page of it goes to the top of its window's list --
+ // to `index` of `here`, in `group` if given, when it was dropped there -- and
+@@ -545,6 +561,7 @@ void UnlinkItem(BrowserWindowInterface*
+                            dropped_here ? group : std::nullopt);
+       }
+       for (tabs::TabInterface* const tab : tabs) {
++        TakeItemEmoji(*service, store, tab);
+         service->SetPinItem(tab, std::string());
+         service->SetAnchored(tab, false);
+       }
+@@ -560,6 +577,7 @@ void UnlinkItem(BrowserWindowInterface*
+         model->MoveWebContentsAt(from, final_index,
+                                  /*select_after_move=*/false);
+       }
++      TakeItemEmoji(*service, store, tab);
+       service->SetPinItem(tab, std::string());
+       service->SetAnchored(tab, false);
+     }
+@@ -1198,7 +1216,8 @@ END_METADATA
+ // asks nothing. `icon_only`: the collapsed strip's row, its icon centred --
+ // a split's left page's -- and its title kept as its name and tooltip
+ // (E17b); an item there never shows its buttons. A row given no `on_drag` is
+-// not dragged.
++// not dragged. A row's emoji (C16) takes its icon's place: a page's fills it,
++// a folder's sits in a box of the folder's colour.
+ class PinRow : public views::LabelButton {
+   METADATA_HEADER(PinRow, views::LabelButton)
+ 
+@@ -1208,7 +1227,9 @@ class PinRow : public views::LabelButton
+   using PageCallback = base::RepeatingCallback<void(const std::string& id)>;
+ 
+   // `color` is a folder's colour id as drawn: its own, else its workspace's.
++  // `open`: a folder drawn open, this window's word on it (C9).
+   PinRow(const PinNode& node,
++         bool open,
+          int level,
+          int color,
+          bool icon_only,
+@@ -1223,7 +1244,11 @@ class PinRow : public views::LabelButton
+                                                               : RowText(node)),
+         id_(node.id),
+         folder_(node.type == PinNode::Type::kFolder),
+-        open_(node.open),
++        open_(open),
++        // A split's two pages draw their own icons (D2).
++        emoji_(node.type == PinNode::Type::kSplit
++                   ? std::u16string()
++                   : base::UTF8ToUTF16(node.emoji)),
+         level_(level),
+         color_(color),
+         icon_only_(icon_only),
+@@ -1296,8 +1321,10 @@ class PinRow : public views::LabelButton
+         }
+       }
+       // The state shows on the chevron, so the folder is one solid icon
+-      // (E17b). Made here, off the widget, like the row itself.
+-      vector_icon_ = &vector_icons::kFolderFilledIcon;
++      // (E17b) -- or its emoji in a box (C16, UpdateColors). Made here, off
++      // the widget, like the row itself.
++      vector_icon_ =
++          emoji_.empty() ? &vector_icons::kFolderFilledIcon : nullptr;
+       if (!icon_only_) {
+         chevron_ = AddChildView(std::make_unique<views::ImageView>());
+         chevron_->SetCanProcessEventsWithinSubtree(false);
+@@ -1324,6 +1351,14 @@ class PinRow : public views::LabelButton
+       UpdateColors();
+       return;
+     }
++    if (!emoji_.empty()) {
++      // C16: an item's emoji fills the icon's place for good (D4): nothing
++      // is looked up, and its open page lends it no icon (SetPageIcon).
++      SetImageModel(views::Button::STATE_NORMAL,
++                    workspaces::EmojiFavicon(node.emoji));
++      UpdateColors();
++      return;
++    }
+     vector_icon_ = &vector_icons::kGlobeIcon;
+     // A split in the open strip draws its pages instead of its own icon and
+     // title (CalculateProposedLayout), which stay its name.
+@@ -1461,6 +1496,10 @@ class PinRow : public views::LabelButton
+   // split's page draws it in its half; a split in the collapsed column
+   // shows its first page's, as its lookup does.
+   void SetPageIcon(size_t index, const gfx::ImageSkia& image) {
++    // C16: an emoji stays the row's icon.
++    if (!emoji_.empty()) {
++      return;
++    }
+     if (index < split_pages_.size()) {
+       split_pages_[index]->TakePageIcon(image);
+       return;
+@@ -1789,17 +1828,33 @@ class PinRow : public views::LabelButton
+                                           ItemState::kActive)},
+           closed);
+     }
++    // A folder in its colour, as the strip draws that tab-group colour -- a
++    // ColorId, so no provider is needed (E17b); the globe in the text's.
++    const ui::ColorId icon =
++        folder_ ? GetTabGroupTabStripColorId(
++                      static_cast<tab_groups::TabGroupColorId>(color_),
++                      frame_active_)
++                : text;
+     if (vector_icon_) {
+-      // A folder in its colour, as the strip draws that tab-group colour --
+-      // a ColorId, so no provider is needed (E17b); the globe in the text's.
+-      const ui::ColorId icon =
+-          folder_ ? GetTabGroupTabStripColorId(
+-                        static_cast<tab_groups::TabGroupColorId>(color_),
+-                        frame_active_)
+-                  : text;
+       SetImageModel(views::Button::STATE_NORMAL,
+                     ui::ImageModel::FromVectorIcon(*vector_icon_, icon,
+                                                    gfx::kFaviconSize));
++    } else if (folder_ && !emoji_.empty()) {
++      // C16: a folder's emoji in a box of the folder's colour (D4), told
++      // from a page's. Drawn from the provider at paint time, so the box
++      // follows the theme as the folder icon does.
++      SetImageModel(
++          views::Button::STATE_NORMAL,
++          ui::ImageModel::FromImageGenerator(
++              base::BindRepeating(
++                  [](const std::u16string& emoji, ui::ColorId box,
++                     const ui::ColorProvider* provider) {
++                    return workspaces::EmojiIcon(
++                        emoji,
++                        provider ? provider->GetColor(box) : SK_ColorGRAY);
++                  },
++                  emoji_, icon),
++              gfx::Size(gfx::kFaviconSize, gfx::kFaviconSize)));
+     }
+     if (chevron_) {
+       chevron_->SetImage(ui::ImageModel::FromVectorIcon(
+@@ -1848,6 +1903,8 @@ class PinRow : public views::LabelButton
+   const std::string id_;
+   const bool folder_;
+   const bool open_;
++  // C16: the row's emoji, drawn in place of its icon; never a split's.
++  const std::u16string emoji_;
+   const int level_;
+   const int color_;
+   const bool icon_only_;
+@@ -1869,7 +1926,7 @@ class PinRow : public views::LabelButton
+   raw_ptr<views::ImageView> chevron_ = nullptr;
+   raw_ptr<views::Label> count_ = nullptr;
+   // The icon drawn in the text color (a folder's in its own); null once the
+-  // page's own icon arrived.
++  // page's own icon arrived, and for an emoji (C16).
+   raw_ptr<const gfx::VectorIcon> vector_icon_ = nullptr;
+   // The icon an open page lent the row (SetPageIcon); null until then.
+   gfx::ImageSkia page_icon_;
+@@ -2679,10 +2736,16 @@ size_t WorkspacePinnedSectionView::AddRo
+         &WorkspacePinnedSectionView::OnItemResetPressed,
+         base::Unretained(this));
+   }
++  // C9: this window's word on the folder, else the file's.
++  const workspaces::WorkspaceService* const folders_service =
++      workspaces::WorkspaceService::From(browser_);
++  const bool open =
++      folder && (folders_service ? folders_service->IsFolderOpen(row)
++                                 : row.open);
+   // Nothing is dragged in the collapsed column (E17b): its rows get no drag
+   // callback.
+   auto pin_row = std::make_unique<PinRow>(
+-      row, level, FolderColor(row, drawn_color_), collapsed_,
++      row, open, level, FolderColor(row, drawn_color_), collapsed_,
+       browser_->GetProfile(), frame_active,
+       lists_pages ? views::Button::PressedCallback() : std::move(callback),
+       std::move(on_close), std::move(on_reset),
+@@ -2718,7 +2781,7 @@ size_t WorkspacePinnedSectionView::AddRo
+   views::View* const added = list.AddChildView(std::move(pin_row));
+   added->set_context_menu_controller(this);
+   size_t count = 1;
+-  if (folder && row.open && !collapsed_) {
++  if (open && !collapsed_) {
+     for (const PinNode& child : row.children) {
+       count += AddRow(list, child, level + 1, frame_active);
+     }
+@@ -2834,8 +2897,15 @@ void WorkspacePinnedSectionView::OnFoldP
+ }
+ 
+ void WorkspacePinnedSectionView::OnFolderPressed(const std::string& id) {
+-  if (store_) {
+-    store_->ToggleFolder(id);
++  // C9: this window's own word, which the file keeps as the last change. The
++  // store tells no one of a value it already held, so the rows are made
++  // again here.
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
++  if (folder && service &&
++      service->SetFolderOpen(id, !service->IsFolderOpen(*folder))) {
++    ScheduleRebuild();
+   }
+ }
+ 
+@@ -3808,6 +3878,8 @@ void WorkspacePinnedSectionView::PinTabs
+       item.url = contents->GetLastCommittedURL().spec();
+       item.title = base::UTF16ToUTF8(contents->GetTitle());
+       item.custom_title = workspaces::CustomTitleForTab(contents);
++      // C16 (D3): a Today tab pinned keeps its emoji.
++      item.emoji = workspaces::EmojiForTab(contents);
+     }
+     if (pages.size() == 2) {
+       row.type = PinNode::Type::kSplit;
+@@ -3827,6 +3899,11 @@ void WorkspacePinnedSectionView::PinTabs
+       service->SetPinItem(pages[p], page_ids[p]);
+       // Anchored at the page it shows, as an opened item is at its address.
+       service->SetAnchored(pages[p], true);
++      // D3: the item holds the emoji now (TakeItemEmoji gives it back at
++      // Unpin); one left on the hidden tab would go stale in Tab Search.
++      if (!workspaces::EmojiForTab(pages[p]->GetContents()).empty()) {
++        service->SetTabEmoji(pages[p], std::u16string_view());
++      }
+     }
+     LOG(INFO) << "[workspaces] pins: pinned "
+               << (pages.size() == 2 ? "a split" : "a tab") << " as item '"
+@@ -4196,8 +4273,14 @@ void WorkspacePinnedSectionView::OnHover
+     return;
+   }
+   // It STAYS open, a real open, until the drop decides (CloseHoverOpened).
+-  if (store_ && store_->SetFolderOpen(id, true) &&
+-      !std::ranges::contains(hover_opened_, id)) {
++  // C9: this window's open, its rows made again here (OnFolderPressed).
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || !service->SetFolderOpen(id, true)) {
++    return;
++  }
++  ScheduleRebuild();
++  if (!std::ranges::contains(hover_opened_, id)) {
+     hover_opened_.push_back(id);
+     LOG(INFO) << "[workspaces] pins: a drag opened folder '" << id << "'";
+   }
+@@ -4246,14 +4329,18 @@ void WorkspacePinnedSectionView::ResumeD
+ 
+ void WorkspacePinnedSectionView::CloseHoverOpened(
+     const std::vector<std::string>& kept) {
++  // C9: closed in this window, its rows made again here (OnFolderPressed).
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
+   int closed = 0;
+   for (const std::string& id : std::exchange(hover_opened_, {})) {
+-    if (!std::ranges::contains(kept, id) && store_ &&
+-        store_->SetFolderOpen(id, false)) {
++    if (!std::ranges::contains(kept, id) && service &&
++        service->SetFolderOpen(id, false)) {
+       ++closed;
+     }
+   }
+   if (closed > 0) {
++    ScheduleRebuild();
+     LOG(INFO) << "[workspaces] pins: closed " << closed
+               << " folder(s) a drag had opened";
+   }
+@@ -4398,17 +4485,29 @@ WorkspacePinnedSectionView::DropTarget W
+   } else if (y - row->y() < row->height() / 2) {
+     target.to = row->id();
+     in_list = line_at(row->y(), row->level());
+-  } else if (const size_t n =
+-                 r + 1 < rows.size() && row_at(r + 1)->peek() ? r + 2 : r + 1;
+-             n < rows.size()) {
++  } else {
+     // The lower half of a row is the top of the next, at the next one's level:
+     // under an open folder's name, that is inside it. A peek row is passed by.
+-    const PinRow* const next = row_at(n);
+-    target.to = next->id();
+-    in_list = line_at(next->y(), next->level());
+-  } else {
+-    target = to_end();
+-    in_list = line_at(row->bounds().bottom(), 0);
++    // C25: under a folder's LAST row -- the next is shallower, or there is
++    // none -- it is after that row, at its level: the folder's end. The upper
++    // half of the row below stays before it, after the folder. ponytail: an
++    // open sub-folder last in its folder hides the place after it, still in
++    // the outer folder (D7); the pointer's x could tell the two apart.
++    const size_t n =
++        r + 1 < rows.size() && row_at(r + 1)->peek() ? r + 2 : r + 1;
++    const int line_y =
++        n < rows.size() ? row_at(n)->y() : rows[n - 1]->bounds().bottom();
++    if (n < rows.size() && row_at(n)->level() >= row->level()) {
++      target.to = row_at(n)->id();
++      in_list = line_at(line_y, row_at(n)->level());
++    } else if (row->level() > 0) {
++      target.to = row->id();
++      target.where = Where::kAfter;
++      in_list = line_at(line_y, row->level());
++    } else {
++      target = to_end();
++      in_list = line_at(line_y, 0);
++    }
+   }
+   // Just before or after itself is where it already is.
+   if (target.to.empty() || InDragGroup(target.to)) {
+@@ -4569,7 +4668,7 @@ void WorkspacePinnedSectionView::HandleT
+     TabDragTarget::DragController& controller) {
+   const DropTarget target = TabTargetAt(drag_point_);
+   EndDrag();
+-  const workspaces::WorkspaceService* const service =
++  workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
+   if (!service) {
+     return;
+@@ -4582,9 +4681,10 @@ void WorkspacePinnedSectionView::HandleT
+   // the pages are never drawn back in it.
+   PinTabs(browser_, std::move(tabs), target.to, target.where);
+   // Into a folder: opened, so the page on screen has its row, highlighted
+-  // (E15d review #2).
+-  if (target.where == Where::kInto && store_) {
+-    store_->SetFolderOpen(target.to, true);
++  // (E15d review #2) -- in this window (C9).
++  if (target.where == Where::kInto &&
++      service->SetFolderOpen(target.to, true)) {
++    ScheduleRebuild();
+   }
+   // Onto a folded card, PinTabs unfolded it (C15, B5).
+   // C8: the folders holding the drop stay open; the card the drag unfolded
+@@ -4683,6 +4783,12 @@ void WorkspacePinnedSectionView::ShowCon
+     // "Rename workspace" (the owner's check of E15d.1).
+     context_menu_model_->AddItemWithStringId(kCommandRename,
+                                              IDS_BOOKMARKS_RENAME);
++    // C16: a folder's or a page's; a split's two pages draw their own icons
++    // (D2).
++    if (row->page_count() != 2) {
++      context_menu_model_->AddItemWithStringId(kCommandSetEmoji,
++                                               IDS_HELIUM_SET_EMOJI);
++    }
+     AddMoveToWorkspaceMenu();
+     // Not on a peek row (C12): its place is inside the closed folder, where a
+     // new folder would land unseen (design review).
+@@ -4820,6 +4926,34 @@ void WorkspacePinnedSectionView::Execute
+     case kCommandRename:
+       ShowRenameBubble(context_menu_page_id_);
+       break;
++    case kCommandSetEmoji: {
++      // C16: the box the workspace's own icon is typed in -- Win+. opens
++      // Windows' emoji panel there; the store keeps the first character
++      // (D5), and an empty box takes the emoji off. The rows are drawn again
++      // through the store's observer, posted.
++      const PinNode* const row = store_ ? store_->Find(id) : nullptr;
++      views::View* const anchor = RowFor(id);
++      if (!row || !anchor) {
++        break;
++      }
++      anchor->ScrollViewToVisible();
++      WorkspaceRailView::ShowNameBubble(
++          anchor, IDS_HELIUM_SET_EMOJI, IDS_HELIUM_WORKSPACE_ICON_LABEL,
++          base::UTF8ToUTF16(row->emoji),
++          base::BindOnce(
++              [](base::WeakPtr<WorkspacePinnedSectionView> self,
++                 const std::string& id, const std::u16string& text) {
++                if (!self || !self->store_ ||
++                    !self->store_->SetEmoji(id, text)) {
++                  return;
++                }
++                const PinNode* const set = self->store_->Find(id);
++                LOG(INFO) << "[workspaces] pins: emoji of '" << id << "' "
++                          << (set && !set->emoji.empty() ? "set" : "cleared");
++              },
++              weak_factory_.GetWeakPtr(), id));
++      break;
++    }
+     case kCommandReplaceUrl: {
+       tabs::TabInterface* const tab =
+           ReplaceUrlTab(browser_, context_menu_page_id_);
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -30,12 +30,14 @@
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/bookmarks/bookmark_model_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_commands.h"
+@@ -53,6 +55,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+@@ -67,6 +70,9 @@
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_edit_bubble_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
+ #include "chrome/grit/generated_resources.h"
++#include "components/bookmarks/browser/bookmark_model.h"
++#include "components/bookmarks/browser/bookmark_node.h"
++#include "components/bookmarks/browser/scoped_group_bookmark_actions.h"
+ #include "components/tab_groups/tab_group_color.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tab_groups/tab_group_visual_data.h"
+@@ -119,6 +125,7 @@
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
++#include "url/gurl.h"
+ 
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kWorkspaceRailElementId);
+ 
+@@ -145,6 +152,8 @@ constexpr int kMenuCommandCloseAll = 9;
+ // C32. 22, a number no item ever had: a retired one may still be named in an
+ // old log or test.
+ constexpr int kMenuCommandCloseDuplicates = 22;
++// C11b. 23, a number no item ever had, as C32's.
++constexpr int kMenuCommandSaveAsBookmarks = 23;
+ 
+ // The "+" menu (E13). Its Archive item (21) became the bar's Archive button.
+ constexpr int kMenuCommandNewTab = 17;
+@@ -459,6 +468,134 @@ void ShowCloseDuplicatesConfirm(BrowserW
+       ->Show();
+ }
+ 
++// C11b: the profile's bookmarks once they and the pins file have loaded, null
++// before -- a save never does half its work.
++bookmarks::BookmarkModel* LoadedBookmarkModel(Profile* profile) {
++  bookmarks::BookmarkModel* const model =
++      BookmarkModelFactory::GetForBrowserContext(profile);
++  return model && model->loaded() &&
++                 workspaces::pins::PinStore::GetOrCreate(profile,
++                                                         profile->GetPath())
++                     ->loaded()
++             ? model
++             : nullptr;
++}
++
++// C11b: pinned row `row` as bookmarks at the end of `parent` -- a folder as a
++// folder, a split as its two pages, a page at its pinned address under the
++// name its row shows. Answers how many pages it saved: an address no bookmark
++// can hold is left out (AddURL DCHECKs it).
++int AddPinBookmarks(bookmarks::BookmarkModel& model,
++                    const bookmarks::BookmarkNode* parent,
++                    const workspaces::pins::PinNode& row) {
++  using Type = workspaces::pins::PinNode::Type;
++  if (row.type != Type::kItem) {
++    const bookmarks::BookmarkNode* const into =
++        row.type == Type::kFolder
++            ? model.AddFolder(parent, parent->children().size(),
++                              base::UTF8ToUTF16(row.title))
++            : parent;
++    int saved = 0;
++    for (const workspaces::pins::PinNode& child : row.children) {
++      saved += AddPinBookmarks(model, into, child);
++    }
++    return saved;
++  }
++  const GURL url(row.url);
++  if (!url.is_valid()) {
++    return 0;
++  }
++  model.AddNewURL(parent, parent->children().size(),
++                  workspaces::archive::ShownTitle(row.custom_title, row.title,
++                                                  row.url),
++                  url);
++  return 1;
++}
++
++// C11b, "Save as bookmarks": workspace `guid` into Other bookmarks >
++// Workspaces > "<name> YYYY-MM-DD HH:MM", a new folder each time -- the time
++// tells two saves of one day apart (D14). Its pinned rows with their
++// folders, then `browser`'s Today tabs of it in a "Today" folder, groups
++// flattened. One undo for all of it; nothing to save makes no folder, and
++// nothing is shown: the folder is the answer.
++void SaveAsBookmarks(BrowserWindowInterface* browser, const std::string& guid) {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  Profile* const profile = browser->GetProfile();
++  bookmarks::BookmarkModel* const model = LoadedBookmarkModel(profile);
++  if (!service || !model) {
++    return;
++  }
++  const std::vector<workspaces::prefs::WorkspaceEntry> entries =
++      service->GetWorkspaces();
++  const auto entry = std::ranges::find(
++      entries, guid, &workspaces::prefs::WorkspaceEntry::guid);
++  if (entry == entries.end()) {
++    return;
++  }
++  const std::vector<const workspaces::pins::PinNode*> roots =
++      workspaces::pins::RootsForWorkspace(
++          workspaces::pins::PinStore::GetOrCreate(profile, profile->GetPath())
++              ->tree(),
++          guid, service->known_guids());
++  // The Today tabs Clear Today takes, each under the name its row shows.
++  std::vector<std::pair<std::u16string, GURL>> today;
++  for (const tabs::TabHandle& handle :
++       service->TabsToClose(guid, nullptr, /*today_only=*/true)) {
++    tabs::TabInterface* const tab = handle.Get();
++    content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++    if (!contents || !contents->GetLastCommittedURL().is_valid() ||
++        workspaces::IsUntouchedNewTabPage(contents)) {
++      continue;
++    }
++    const std::string custom_title = workspaces::CustomTitleForTab(contents);
++    today.emplace_back(custom_title.empty() ? contents->GetTitle()
++                                            : base::UTF8ToUTF16(custom_title),
++                       contents->GetLastCommittedURL());
++  }
++  if (roots.empty() && today.empty()) {
++    LOG(INFO) << "[workspaces] bookmarks: nothing to save in '" << guid << "'";
++    return;
++  }
++
++  bookmarks::ScopedGroupBookmarkActions group(model);
++  // The "Workspaces" folder of an earlier save, found by its name, else a new
++  // one: a folder the user renamed is left alone.
++  const std::u16string folder_name =
++      l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_BOOKMARKS_FOLDER);
++  const bookmarks::BookmarkNode* const other = model->other_node();
++  const auto found =
++      std::ranges::find_if(other->children(), [&folder_name](const auto& node) {
++        return node->is_folder() && node->GetTitle() == folder_name;
++      });
++  const bookmarks::BookmarkNode* const parent =
++      found != other->children().end()
++          ? found->get()
++          : model->AddFolder(other, other->children().size(), folder_name);
++  base::Time::Exploded now;
++  base::Time::Now().LocalExplode(&now);
++  const bookmarks::BookmarkNode* const saved = model->AddFolder(
++      parent, parent->children().size(),
++      base::StrCat({WorkspaceRailView::DisplayName(*entry), u" ",
++                    base::UTF8ToUTF16(base::StringPrintf(
++                        "%04d-%02d-%02d %02d:%02d", now.year, now.month,
++                        now.day_of_month, now.hour, now.minute))}));
++  int pinned = 0;
++  for (const workspaces::pins::PinNode* const root : roots) {
++    pinned += AddPinBookmarks(*model, saved, *root);
++  }
++  if (!today.empty()) {
++    const bookmarks::BookmarkNode* const folder = model->AddFolder(
++        saved, saved->children().size(),
++        l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_BOOKMARKS_TODAY));
++    for (const auto& [title, url] : today) {
++      model->AddNewURL(folder, folder->children().size(), title, url);
++    }
++  }
++  LOG(INFO) << "[workspaces] bookmarks: saved '" << guid << "' as " << pinned
++            << " pinned + " << today.size() << " Today";
++}
++
+ // The alert a chip shows for `tab` (C14, D8), or nullopt: screen, tab or
+ // camera / microphone capture, or sound -- sound only while it is heard, as a
+ // muted tab that plays holds kAudioMuting AND kAudioPlaying (B3). The top one
+@@ -1993,13 +2130,18 @@ void WorkspaceRailView::ShowWorkspaceMen
+       column ? IDS_HELIUM_WORKSPACE_MOVE_DOWN : IDS_HELIUM_WORKSPACE_MOVE_RIGHT,
+       MenuIcon(column ? kArrowDownwardIcon : vector_icons::kArrowForwardIcon));
+ 
+-  // The four that act on the workspace's TABS (E11, C32), in order of how much
+-  // they take away: unloading keeps everything and can be undone by a click,
+-  // closing keeps the workspace and can be undone by Ctrl+Shift+T -- the
+-  // duplicates first, then all. Delete is separated again below them: it
+-  // closes every tab in the workspace, and a mis-click on it is the most
+-  // expensive one in the menu.
++  // The ones that act on the workspace's TABS (E11, C32, C11b), in order of
++  // how much they take away: saving them as bookmarks takes nothing,
++  // unloading keeps everything and can be undone by a click, closing keeps
++  // the workspace and can be undone by Ctrl+Shift+T -- the duplicates first,
++  // then all. Delete is separated again below them: it closes every tab in
++  // the workspace, and a mis-click on it is the most expensive one in the
++  // menu.
+   context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  // Chromium's own "Bookmark all tabs" icon.
++  context_menu_model_->AddItemWithStringIdAndIcon(
++      kMenuCommandSaveAsBookmarks, IDS_HELIUM_WORKSPACE_SAVE_AS_BOOKMARKS,
++      MenuIcon(kHotelClassIcon));
+   context_menu_model_->AddItemWithStringIdAndIcon(
+       kMenuCommandUnload, IDS_HELIUM_WORKSPACE_UNLOAD,
+       MenuIcon(vector_icons::kPauseIcon));
+@@ -2061,6 +2203,11 @@ bool WorkspaceRailView::IsCommandIdEnabl
+     return context_menu_duplicates_ > 0;
+   }
+ 
++  // C11b: greyed until the bookmarks and the pins file have loaded.
++  if (command_id == kMenuCommandSaveAsBookmarks) {
++    return LoadedBookmarkModel(browser_->GetProfile()) != nullptr;
++  }
++
+   // Moving tabs into the workspace they are already in is a no-op; the item is
+   // left off that workspace's menu (E17a), and this still greys it should a
+   // shortcut switch to it while the menu is open, because an enabled item that
+@@ -2151,6 +2298,9 @@ void WorkspaceRailView::ExecuteCommand(i
+           base::BindOnce(&WorkspaceRailView::RenameFromEditor,
+                          weak_factory_.GetWeakPtr(), guid));
+       break;
++    case kMenuCommandSaveAsBookmarks:
++      SaveAsBookmarks(browser_, guid);
++      break;
+     case kMenuCommandUnload:
+       service->UnloadWorkspaceTabs(guid, /*others=*/false);
+       break;
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -57,6 +57,12 @@ enum TabContextMenuCommand {
+   // C33: the parent of the "Snooze tab" submenu, its own delegate
+   // (workspace_snooze_sub_menu_model.h), as CommandMoveToWorkspace is.
+   CommandSnoozeTab,
++  // C16 "Set emoji..." (both controllers, the rename box's sibling) and C11a
++  // "Make this group a workspace" (TabStripCollectionController only: it
++  // needs Workspaces): plain items run before the model sees them, as
++  // CommandRenameTab is.
++  CommandSetTabEmoji,
++  CommandMakeGroupWorkspace,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 

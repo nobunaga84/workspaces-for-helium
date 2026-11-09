@@ -1,0 +1,256 @@
+--- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
+@@ -19,6 +19,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/constrained_window/constrained_window_views.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -38,6 +39,13 @@ constexpr int kReplaceAnchor = kToggleAn
+ 
+ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kTabTitleFieldId);
+ 
++// The page the tab is on could be an anchor (WorkspaceTabData::IsAnchorableUrl).
++bool IsAnchorable(tabs::TabInterface* tab) {
++  return tab->GetContents() &&
++         workspaces::WorkspaceTabData::IsAnchorableUrl(
++             tab->GetContents()->GetLastCommittedURL());
++}
++
+ // Holds the tab by WeakPtr and finds the service at OK time: the menu model
+ // that opened the dialog is gone by then, and the dialog is tab-modal, so it
+ // goes away with its tab and never outlives what it points at.
+@@ -159,13 +167,17 @@ bool WorkspaceAnchorSubMenuModel::IsComm
+   switch (command_id) {
+     case kToggleAnchor:
+       // Unanchoring is always allowed; anchoring declines a split, as Ctrl+W
+-      // on a split closes rather than hibernates (design 5).
+-      return service->IsAnchored(tab) || !tab->IsSplit();
++      // on a split closes rather than hibernates (design 5), and a page that
++      // is not a web page, which the anchor's setter would refuse (E13).
++      return service->IsAnchored(tab) ||
++             (!tab->IsSplit() && IsAnchorable(tab));
+     case kResetToAnchor:
+-    case kReplaceAnchor:
+-      // Drifted is the only state in which "go back" and "move anchor here"
+-      // do anything.
++      // Drifted is the only state in which "go back" does anything.
+       return workspaces::HasDrifted(tab->GetContents());
++    case kReplaceAnchor:
++      // And "move anchor here" only onto a web page: the setter would refuse
++      // anything else and leave the tab unanchored, not re-anchored.
++      return workspaces::HasDrifted(tab->GetContents()) && IsAnchorable(tab);
+     default:
+       return false;
+   }
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -1294,6 +1294,17 @@ void WorkspaceService::SetAnchored(tabs:
+   if (!contents) {
+     return;
+   }
++  // Checked again here, not only when the menu was built: the page can move to
++  // a non-web address while the menu is open, and the setter's refusal would
++  // then clear the tab's existing anchor instead of leaving it -- "Move anchor
++  // here" silently un-anchoring the tab (E13 review).
++  if (anchored &&
++      !WorkspaceTabData::IsAnchorableUrl(contents->GetLastCommittedURL())) {
++    LOG(INFO) << "[workspaces] anchor at index "
++              << tab_strip_->GetIndexOfTab(tab)
++              << " not moved: the page is not an http(s) page";
++    return;
++  }
+   WorkspaceTabData* const data =
+       WorkspaceTabData::GetOrCreateForWebContents(contents);
+   data->set_anchor_url(anchored ? contents->GetLastCommittedURL().spec()
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.cc
+@@ -4,7 +4,9 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ 
++#include "base/logging.h"
+ #include "content/public/browser/web_contents.h"
++#include "url/gurl.h"
+ 
+ namespace workspaces {
+ 
+@@ -13,6 +15,21 @@ WorkspaceTabData::WorkspaceTabData(conte
+ 
+ WorkspaceTabData::~WorkspaceTabData() = default;
+ 
++// static
++bool WorkspaceTabData::IsAnchorableUrl(const GURL& url) {
++  return url.SchemeIsHTTPOrHTTPS();
++}
++
++void WorkspaceTabData::set_anchor_url(std::string url) {
++  if (!url.empty() && !IsAnchorableUrl(GURL(url))) {
++    // Logged, because the only other sign is an anchor that is silently gone.
++    LOG(WARNING) << "[workspaces] anchor refused, not an http(s) page: '"
++                 << url << "'";
++    url.clear();
++  }
++  anchor_url_ = std::move(url);
++}
++
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(WorkspaceTabData);
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -9,6 +9,8 @@
+ 
+ #include "content/public/browser/web_contents_user_data.h"
+ 
++class GURL;
++
+ namespace content {
+ class WebContents;
+ }
+@@ -42,12 +44,23 @@ class WorkspaceTabData : public content:
+   // Stage 5 anchors (design 5, E10 spec). An anchored tab has a home URL:
+   // Ctrl+W puts it to sleep and points it back there instead of closing it.
+   // One field, not two -- "anchored" simply means the URL is non-empty, so the
+-  // two can never disagree. Kept as a string so :tab_data stays free of //url;
+-  // the service validates it at the one place it is navigated to.
++  // two can never disagree.
++  //
++  // THE SETTER IS THE ONE DOOR, and it keeps only a web page (IsAnchorableUrl).
++  // All three writers come through it -- the menu, the session file on restore,
++  // and a replaced contents -- and an anchor is later navigated to and written
++  // into a history entry, so an address planted in the session file on disk
++  // (a javascript: one, say) must not survive the restore (E13 review).
+   const std::string& anchor_url() const { return anchor_url_; }
+-  void set_anchor_url(std::string url) { anchor_url_ = std::move(url); }
++  void set_anchor_url(std::string url);
+   bool anchored() const { return !anchor_url_.empty(); }
+ 
++  // Whether `url` may be an anchor: http or https, nothing else. Also what the
++  // tab menu asks before offering "Anchor to this page" or
++  // "Anchor to this page instead", so an item is never enabled only to have its
++  // write refused.
++  static bool IsAnchorableUrl(const GURL& url);
++
+   // A title the user typed over the page's own (E11, "Rename tab"). Empty
+   // means "show the page title". Read in TabUIHelper::GetTitle(), so every
+   // place that draws a title sees it without a hook of its own.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -29,12 +29,15 @@
+ #include "chrome/grit/generated_resources.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/l10n/l10n_util.h"
++#include "ui/base/menu_source_utils.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/mojom/menu_source_type.mojom-shared.h"
+ #include "ui/base/models/dialog_model.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/bubble/bubble_border.h"
+ #include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/controls/button/menu_button_controller.h"
++#include "ui/views/controls/focus_ring.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/controls/scroll_view.h"
+@@ -197,6 +200,11 @@ std::unique_ptr<WorkspaceRailButton> Mak
+   // after its glyph first, and Button replaces only an empty name or one equal
+   // to the old tooltip (button.cc), so an arrow read as its glyph without this.
+   button->GetViewAccessibility().SetName(tooltip);
++  // The keyboard focus ring drawn INSIDE the button, not 4 px around it: the
++  // workspace buttons sit in a ScrollView whose viewport clips to its bounds,
++  // and an outset ring lost its top and bottom (E13 review). The bookmark bar
++  // does the same for the same reason.
++  views::FocusRing::Get(button.get())->SetOutsetFocusRingDisabled(true);
+   button->SetCallback(std::move(callback));
+   return button;
+ }
+@@ -263,10 +271,23 @@ WorkspaceRailView::WorkspaceRailView(
+   back_button_->SetPreferredSize(gfx::Size(kArrowWidth, size));
+   forward_button_->SetPreferredSize(gfx::Size(kArrowWidth, size));
+ 
+-  add_button_ = AddChildView(MakeRailButton(
+-      u"+", l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_ADD_MENU),
++  // "+" opens its menu through Chromium's MenuButtonController, not a plain
++  // press callback. Handed to RunMenuAt, it holds the button pressed while the
++  // menu is up and ignores the click that closed that menu -- without it, a
++  // click on "+" to close the menu reached the button again and reopened it
++  // (E13 review). views::MenuButton is built the same way.
++  auto add_button =
++      MakeRailButton(u"+", l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_ADD_MENU),
++                     views::Button::PressedCallback());
++  auto add_menu_controller = std::make_unique<views::MenuButtonController>(
++      add_button.get(),
+       base::BindRepeating(&WorkspaceRailView::OnAddPressed,
+-                          base::Unretained(this))));
++                          base::Unretained(this)),
++      std::make_unique<views::Button::DefaultButtonControllerDelegate>(
++          add_button.get()));
++  add_menu_controller_ = add_menu_controller.get();
++  add_button->SetButtonController(std::move(add_menu_controller));
++  add_button_ = AddChildView(std::move(add_button));
+ 
+   // Unretained is safe on both: the scroll view is a child, so it and the
+   // subscription die with this view.
+@@ -403,7 +424,10 @@ void WorkspaceRailView::OnWorkspacePress
+   service->SwitchToWorkspace(guid);
+ }
+ 
+-void WorkspaceRailView::OnAddPressed() {
++void WorkspaceRailView::OnAddPressed(const ui::Event& event) {
++  // Logged, so "clicking + again closes the menu" is countable: one open per
++  // click that should open, and none for the click that closes it.
++  LOG(INFO) << "[workspaces] rail + menu opened";
+   // Same model, runner and delegate as a workspace's context menu; an empty
+   // context_menu_guid_ is how ExecuteCommand tells the two apart.
+   context_menu_guid_.clear();
+@@ -415,9 +439,12 @@ void WorkspaceRailView::OnAddPressed() {
+                                            IDS_TAB_SEARCH_MENU);
+   context_menu_runner_ = std::make_unique<views::MenuRunner>(
+       context_menu_model_.get(), views::MenuRunner::HAS_MNEMONICS);
++  // The event's source type, so a keyboard press opens the menu with its first
++  // item already highlighted, as every other Chromium menu button does.
+   context_menu_runner_->RunMenuAt(
+-      GetWidget(), nullptr, add_button_->GetBoundsInScreen(),
+-      views::MenuAnchorPosition::kTopLeft, ui::mojom::MenuSourceType::kNone);
++      GetWidget(), add_menu_controller_, add_button_->GetBoundsInScreen(),
++      views::MenuAnchorPosition::kTopLeft,
++      ui::GetMenuSourceTypeForEvent(event));
+ }
+ 
+ void WorkspaceRailView::SlideBy(int direction) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -26,7 +26,12 @@ class VerticalTabStripStateController;
+ enum class VerticalTabStripCollapseState;
+ }  // namespace tabs
+ 
++namespace ui {
++class Event;
++}  // namespace ui
++
+ namespace views {
++class MenuButtonController;
+ class MenuRunner;
+ class ScrollView;
+ }  // namespace views
+@@ -118,7 +123,7 @@ class WorkspaceRailView : public views::
+ 
+   void OnWorkspacePressed(const std::string& guid);
+   void OnNewWorkspacePressed();
+-  void OnAddPressed();
++  void OnAddPressed(const ui::Event& event);
+ 
+   // Brings the next workspace button past the visible edge into view, one
+   // whole button at a time: `direction` -1 for earlier, +1 for later.
+@@ -158,6 +163,8 @@ class WorkspaceRailView : public views::
+   raw_ptr<views::FlexLayoutView> scroll_contents_ = nullptr;
+   raw_ptr<views::View> forward_button_ = nullptr;
+   raw_ptr<views::View> add_button_ = nullptr;
++  // Owned by `add_button_`; see the constructor for why "+" has one.
++  raw_ptr<views::MenuButtonController> add_menu_controller_ = nullptr;
+   views::ViewTracker new_tab_button_;
+ 
+   // Which workspace the open context menu belongs to. A menu is modal to the

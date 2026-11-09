@@ -1,0 +1,135 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -348,6 +348,7 @@ WorkspaceService::WorkspaceService(
+   // Reachable here at all only because browser_window_features.cc already
+   // constructs the controller before this service, for the gate's sake.
+   if (tabs::VerticalTabStripStateController* vertical_tabs = VerticalTabs()) {
++    vertical_ = vertical_tabs->ShouldDisplayVerticalTabs();
+     layout_mode_subscription_ = vertical_tabs->RegisterOnModeChanged(
+         base::BindRepeating(&WorkspaceService::OnLayoutModeChanged,
+                             base::Unretained(this)));
+@@ -1619,10 +1620,50 @@ void WorkspaceService::OnLayoutModeChang
+   // -- the mode has changed by the time this runs. What has to be known is
+   // whether this window WAS filtering a moment ago, and with the mode now
+   // classic that is exactly "the feature was wanted".
+-  if (controller && !controller->ShouldDisplayVerticalTabs() && prefs_ &&
++  // "Tabs on the right" fires this too and changes nothing here (review 2).
++  const bool vertical = controller && controller->ShouldDisplayVerticalTabs();
++  if (vertical == vertical_) {
++    return;
++  }
++  vertical_ = vertical;
++
++  if (!vertical && prefs_ &&
+       prefs_->GetBoolean(prefs::kHeliumWorkspacesEnabled)) {
+     PostReconcile();
++    // The tab in front is the one this workspace leaves: a click in classic
++    // does not move the workspace, and the follow below may (review 2).
++    if (tabs::TabInterface* const active = tab_strip_->GetActiveTab()) {
++      last_active_[active_guid_] = active->GetHandle();
++    }
+   }
++
++  // Posted, so both run after BrowserView has swapped the tab lists.
++  //
++  // The bar (review 2, R2-15): it decides whether it shows only when the list
++  // changes, and on 156 and 157 (checked) a layout switch does not remake the
++  // sidebar -- BrowserView makes the vertical region once and resets only its
++  // tab list -- so a bar built in the classic layout stayed hidden in
++  // vertical. The list-changed path redraws it, as OnEnabledChanged does for
++  // the switch.
++  //
++  // The page in front (R2-2): in the classic layout the active workspace does
++  // not follow a click, so back in vertical the page may be another
++  // workspace's. It is followed, as a click in the list would be (the owner's
++  // pick): FollowTab, the auto-switch's own rule.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(
++                     [](base::WeakPtr<WorkspaceService> self) {
++                       if (!self) {
++                         return;
++                       }
++                       self->OnWorkspaceListChanged();
++                       if (self->IsEnabled() &&
++                           self->FollowTab(self->tab_strip_->GetActiveTab())) {
++                         LOG(INFO) << "[workspaces] layout: back to vertical, "
++                                      "following the page in front";
++                       }
++                     },
++                     weak_factory_.GetWeakPtr()));
+ }
+ 
+ int WorkspaceService::TargetTabIndexForActiveWorkspace() const {
+@@ -1996,17 +2037,24 @@ void WorkspaceService::OnTabStripModelCh
+   // -- activate one from workspace "second" and the rule below would dutifully
+   // move the whole window to "default". Same pinned-tab door as IsTabOnScreen
+   // exists for (LOCAL.md 13).
+-  if (selection.active_tab_changed() && !IsTabOnScreen(selection.new_tab)) {
++  if (selection.active_tab_changed()) {
+     // Zen's auto-switch. Follows the tab rather than moving it, and so needs
+     // no model call at all -- the tab the caller wanted is already active,
+     // which is the only reason this is legal from inside an observer.
+-    if (std::optional<std::string> target =
+-            ResolveActiveWorkspaceAfterSelection(GuidOf(selection.new_tab),
+-                                                 active_guid_,
+-                                                 /*is_removal=*/false)) {
+-      SetActiveWorkspace(*target);
+-    }
++    FollowTab(selection.new_tab);
++  }
++}
++
++bool WorkspaceService::FollowTab(tabs::TabInterface* tab) {
++  if (IsTabOnScreen(tab)) {
++    return false;
++  }
++  if (std::optional<std::string> target = ResolveActiveWorkspaceAfterSelection(
++          GuidOf(tab), active_guid_, /*is_removal=*/false)) {
++    SetActiveWorkspace(*target);
++    return true;
+   }
++  return false;
+ }
+ 
+ void WorkspaceService::OnTabPinnedStateChanged(tabs::TabInterface* tab,
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -891,6 +891,11 @@ class WorkspaceService : public TabStrip
+   // can stop filtering.
+   void OnLayoutModeChanged(tabs::VerticalTabStripStateController* controller);
+ 
++  // The auto-switch's rule: when `tab` is not on screen here, this window
++  // moves into the workspace it belongs to. True when it moved. Never a model
++  // call, so legal from an observer.
++  bool FollowTab(tabs::TabInterface* tab);
++
+   // This window's vertical-tab state, or null when it has none -- which is
+   // when the vertical-tabs feature flag is off, because BrowserWindowFeatures
+   // builds the controller only in that case. That is exactly when IsEnabled()
+@@ -1015,6 +1020,10 @@ class WorkspaceService : public TabStrip
+   // IsEnabled(), and letting this subscription drop would leave the classic
+   // switch as the one exit from the filtered state that never tidies up.
+   base::CallbackListSubscription layout_mode_subscription_;
++  // Whether this window drew vertical tabs at the last mode change: the
++  // notification also fires for "tabs on the right", which changes nothing
++  // here (review 2).
++  bool vertical_ = false;
+ 
+   // True while a repair (EnsureActiveTabVisible, MoveOffPinnedPage) moves
+   // activation: the tab it moves off was not LEFT by the user, so the
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -145,9 +145,10 @@ class WorkspaceRailView : public views::
+   // reached through BrowserWindowInterface, and its answer to IsEnabled()
+   // depends on the vertical-tab-strip controller being up; being in a widget is
+   // the cheapest moment that is certainly after all of that, and it needs no
+-  // subscription of its own. Switching kHeliumLayout destroys and rebuilds the
+-  // whole view tree (design 2.7), so this runs again on the way back to
+-  // vertical.
++  // subscription of its own. A layout switch does NOT run this again: on 156
++  // and 157 (checked) BrowserView makes the vertical region once and resets
++  // only its tab list, so the service's OnLayoutModeChanged redraws the bar
++  // through the list-changed callback (review 2, R2-15).
+   void AddedToWidget() override;
+ 
+   // views::View, the drop end of a chip's drag (C4): a chip of this profile

@@ -1,0 +1,19 @@
+
+# --- Dcheck overrides (last assignment wins) -------------------------------
+# A second output dir purely for catching bugs the release build compiles out.
+# out/Default is untouched; the two never share state beyond the source tree.
+#
+# DCHECKs are what catch the two bug classes this project is most exposed to:
+#   - TabStripModel re-entrancy. Observers run inside a guarded scope and the
+#     model CHECKs on a mutator call from there (design 2.2). Our observer is
+#     supposed to stamp only; this is what proves it does.
+#   - Helium's BrowserShortcutService DCHECK(false)s on a command id with no
+#     label, and in release silently drops it instead (design 3.5). Shortcuts
+#     land in E6b.
+dcheck_always_on=true
+
+# Default builds with symbol_level=0, which makes a DCHECK stack unreadable and
+# so defeats the point. Chrome frames only -- blink and v8 stay at 0, since we
+# are not debugging those and they dominate the cost.
+symbol_level=1
+

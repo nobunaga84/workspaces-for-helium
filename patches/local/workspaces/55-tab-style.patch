@@ -1,0 +1,572 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -41,6 +41,9 @@ bool ContainsGuid(const std::vector<Work
+   return false;
+ }
+ 
++// What TabRowHeight() answers (E18). Only ever touched on the UI thread.
++int g_tab_row_height = kCompactTabRowHeight;
++
+ }  // namespace
+ 
+ void RegisterProfilePrefs(PrefRegistrySimple* registry) {
+@@ -56,6 +59,10 @@ void RegisterProfilePrefs(PrefRegistrySi
+ 
+   // Never (the owner, design 5 "Auto-archive").
+   registry->RegisterIntegerPref(kHeliumWorkspacesArchiveAfterMinutes, 0);
++
++  // Compact, today's look (E18).
++  registry->RegisterIntegerPref(kHeliumWorkspacesTabRowHeight,
++                                kCompactTabRowHeight);
+ }
+ 
+ base::DictValue DefaultWorkspacesDict() {
+@@ -366,4 +373,23 @@ base::TimeDelta ArchiveAfter(const PrefS
+   return minutes > 0 ? base::Minutes(minutes) : base::TimeDelta();
+ }
+ 
++void SetTabRowHeight(int height) {
++  g_tab_row_height =
++      height >= kCompactTabRowHeight && height <= kMaxTabRowHeight
++          ? height
++          : kCompactTabRowHeight;
++}
++
++int TabRowHeight() {
++  return g_tab_row_height;
++}
++
++int IconInsetExtra() {
++  return g_tab_row_height > kCompactTabRowHeight ? 3 : 0;
++}
++
++int IconTitleGap() {
++  return g_tab_row_height > kCompactTabRowHeight ? 12 : 7;
++}
++
+ }  // namespace workspaces::prefs
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -66,6 +66,19 @@ inline constexpr char kHeliumWorkspacesA
+ inline constexpr char kHeliumWorkspacesArchiveAfterMinutes[] =
+     "helium.workspaces.archive_after_minutes";
+ 
++// How tall a tab of the vertical list is, in DIP: the Tab style setting (E18,
++// design 5 "E18 spec" 2). The setting offers kCompactTabRowHeight, today's
++// look and the default, and taller ones at 36, 40 or 42 (the dropdown's
++// values, in appearance_page.html.ts -- change them there); any value from 30
++// to kMaxTabRowHeight is honoured too, so a test can seed 36 or 40. One
++// value for the whole browser, last writer wins (D11): a tab's layout knows
++// no profile, and the fork runs one. A sibling of the prefs above for the
++// reason above, and pinned by the same test.
++inline constexpr char kHeliumWorkspacesTabRowHeight[] =
++    "helium.workspaces.tab_row_height";
++inline constexpr int kCompactTabRowHeight = 30;
++inline constexpr int kMaxTabRowHeight = 48;
++
+ // Keys inside kHeliumWorkspacesList.
+ inline constexpr char kSchemaVersionKey[] = "schema_version";
+ inline constexpr char kItemsKey[] = "items";
+@@ -260,6 +273,24 @@ std::vector<std::string> GetWorkspaceGui
+ // for 0, a negative value, and a null `prefs`.
+ base::TimeDelta ArchiveAfter(const PrefService* prefs);
+ 
++// The tab row height the strips draw now (E18). Process-wide, because the
++// tab's layout (tab_view_vertical_layout.cc) is handed no profile or window:
++// each regular window's WorkspaceService sets it from
++// kHeliumWorkspacesTabRowHeight when it is made and when the pref changes. A
++// height outside kCompactTabRowHeight..kMaxTabRowHeight -- a hand-edited
++// Preferences file -- sets kCompactTabRowHeight.
++void SetTabRowHeight(int height);
++int TabRowHeight();
++
++// What a tab taller than compact changes besides its height, so its icon and
++// title line up with the pinned pages' (favicon at 16, title at 44): the
++// contents inset grows by IconInsetExtra() on each side (0 compact, 3
++// taller), and the gap from the icon to the title is IconTitleGap() (7
++// compact -- Helium's own kHorizontalInset -- 12 taller, a LabelButton's
++// default spacing, which the pinned rows use).
++int IconInsetExtra();
++int IconTitleGap();
++
+ }  // namespace workspaces::prefs
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -122,14 +122,16 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+   EXPECT_FALSE(enabled.starts_with(list + "."))
+       << enabled << " is stored inside " << list;
+ 
+-  // Every later pref too (E14c, E14d.3): a dotted path is a JSON node, so a
+-  // pref named inside another would be eaten by the first write of its parent
+-  // (15).
++  // Every later pref too (E14c, E14d.3, E18): a dotted path is a JSON node, so
++  // a pref named inside another would be eaten by the first write of its
++  // parent (15).
+   const std::string imported_at(kHeliumWorkspacesArcImportedAt);
+   const std::string archive_after(kHeliumWorkspacesArchiveAfterMinutes);
+-  for (const std::string& later : {imported_at, archive_after}) {
++  const std::string tab_row_height(kHeliumWorkspacesTabRowHeight);
++  for (const std::string& later :
++       {imported_at, archive_after, tab_row_height}) {
+     for (const std::string& other :
+-         {enabled, list, imported_at, archive_after}) {
++         {enabled, list, imported_at, archive_after, tab_row_height}) {
+       if (other == later) {
+         continue;
+       }
+@@ -172,6 +174,63 @@ TEST(WorkspacePrefsTest, ArchiveAfterRea
+   EXPECT_EQ(base::TimeDelta(), ArchiveAfter(&pref_service));
+ }
+ 
++// ------------------------------------------------------- tab style (E18)
++
++TEST(WorkspacePrefsTest, TabRowHeightPrefNameIsStable) {
++  EXPECT_STREQ("helium.workspaces.tab_row_height",
++               kHeliumWorkspacesTabRowHeight);
++}
++
++// Compact, today's look, is the default.
++TEST(WorkspacePrefsTest, TabRowHeightDefaultsToCompact) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  EXPECT_EQ(30, pref_service.GetInteger(kHeliumWorkspacesTabRowHeight));
++  EXPECT_EQ(30, kCompactTabRowHeight);
++}
++
++// The height is process-wide, so every test below puts compact back.
++//
++// 30 to 48 is kept as it is; anything else -- a hand-edited Preferences file
++// -- is compact, never a guess at what was meant.
++TEST(WorkspacePrefsTest, SetTabRowHeightKeeps30To48) {
++  EXPECT_EQ(30, TabRowHeight());
++  for (int height : {30, 36, 42, 48}) {
++    SetTabRowHeight(height);
++    EXPECT_EQ(height, TabRowHeight());
++  }
++  for (int height : {29, 49, 0, -42, 1000}) {
++    SetTabRowHeight(42);
++    SetTabRowHeight(height);
++    EXPECT_EQ(30, TabRowHeight()) << height;
++  }
++  SetTabRowHeight(kCompactTabRowHeight);
++}
++
++// Compact draws Helium's tab as it always was (icon gap 7, no extra inset);
++// any taller height lines the icon and title up with the pinned pages'.
++TEST(WorkspacePrefsTest, TabStyleRulesFollowTheHeight) {
++  SetTabRowHeight(30);
++  EXPECT_EQ(0, IconInsetExtra());
++  EXPECT_EQ(7, IconTitleGap());
++
++  SetTabRowHeight(42);
++  EXPECT_EQ(3, IconInsetExtra());
++  EXPECT_EQ(12, IconTitleGap());
++
++  SetTabRowHeight(36);
++  EXPECT_EQ(3, IconInsetExtra());
++  EXPECT_EQ(12, IconTitleGap());
++
++  // Out of range is compact, rules included.
++  SetTabRowHeight(60);
++  EXPECT_EQ(0, IconInsetExtra());
++  EXPECT_EQ(7, IconTitleGap());
++
++  SetTabRowHeight(kCompactTabRowHeight);
++}
++
+ // ------------------------------------------------------- registered default
+ 
+ TEST(WorkspacePrefsTest, RegistersWorkspacesPref) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -253,6 +253,15 @@ WorkspaceService::WorkspaceService(
+         base::BindRepeating(&WorkspaceService::UpdateAutoArchiveTimer,
+                             base::Unretained(this)));
+     UpdateAutoArchiveTimer();
++    // The Tab style (E18). Set here, before this window's views exist
++    // (BrowserWindowFeatures::Init), so its tabs are made at the right height.
++    prefs::SetTabRowHeight(
++        prefs_->GetInteger(prefs::kHeliumWorkspacesTabRowHeight));
++    tab_row_height_ = prefs::TabRowHeight();
++    pref_registrar_.Add(
++        prefs::kHeliumWorkspacesTabRowHeight,
++        base::BindRepeating(&WorkspaceService::OnTabRowHeightChanged,
++                            base::Unretained(this)));
+   }
+ 
+   // The layout half of the gate. The pref above says whether the feature is
+@@ -799,6 +808,12 @@ WorkspaceService::RegisterWorkspaceListC
+   return workspace_list_changed_callbacks_.Add(std::move(callback));
+ }
+ 
++base::CallbackListSubscription
++WorkspaceService::RegisterTabRowHeightChangedCallback(
++    base::RepeatingClosure callback) {
++  return tab_row_height_changed_callbacks_.Add(std::move(callback));
++}
++
+ void WorkspaceService::OnWorkspaceListChanged() {
+   known_guids_ = prefs::GetWorkspaceGuids(prefs_);
+ 
+@@ -876,6 +891,20 @@ void WorkspaceService::OnEnabledChanged(
+   PostEnsureActiveTabVisible();
+ }
+ 
++void WorkspaceService::OnTabRowHeightChanged() {
++  // Every window's service hears the change and sets the same browser-wide
++  // height; each logs the change from the height IT last applied.
++  const int old_height = tab_row_height_;
++  prefs::SetTabRowHeight(
++      prefs_->GetInteger(prefs::kHeliumWorkspacesTabRowHeight));
++  tab_row_height_ = prefs::TabRowHeight();
++  LOG(INFO) << "[workspaces] tab style: row height " << old_height << " -> "
++            << tab_row_height_;
++  // The pinned section rebuilds and, in that rebuild, lays every tab of this
++  // window out again at the new height (E18).
++  tab_row_height_changed_callbacks_.Notify();
++}
++
+ void WorkspaceService::OnLayoutModeChanged(
+     tabs::VerticalTabStripStateController* controller) {
+   // prefs_ is null-checked here and deliberately not in OnEnabledChanged. The
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -277,6 +277,13 @@ class WorkspaceService : public TabStrip
+   base::CallbackListSubscription RegisterWorkspaceListChangedCallback(
+       base::RepeatingClosure callback);
+ 
++  // Fired when the Tab style setting changes the tab row height (E18): the
++  // pinned section lays its strip out again at the new height. A signal of its
++  // own, not the list's -- nothing about the workspaces changed, so the bar
++  // and every other list subscriber are left alone.
++  base::CallbackListSubscription RegisterTabRowHeightChangedCallback(
++      base::RepeatingClosure callback);
++
+   // Just the guids of the above, cached and refreshed by the pref itself, which
+   // is what ResolveTabGuid() takes. Cheaper than GetWorkspaces() for a caller
+   // that only needs to ask "does this guid still exist".
+@@ -643,6 +650,13 @@ class WorkspaceService : public TabStrip
+   // rather than at the next rebuild of the view tree (LOCAL.md 12).
+   void OnEnabledChanged();
+ 
++  // Reacts to the Tab style setting (E18): sets the browser-wide tab row
++  // height (prefs::SetTabRowHeight), logs
++  //   "[workspaces] tab style: row height <A> -> <B>"
++  // and tells the tab-row-height subscribers, so this window's pinned section
++  // lays its strip out again at the new height.
++  void OnTabRowHeightChanged();
++
+   // The auto-archive (E14d.3, design 5 "Auto-archive"). The timer follows the
+   // setting alone -- (re)started at construction and whenever
+   // kHeliumWorkspacesArchiveAfterMinutes changes, every
+@@ -698,6 +712,11 @@ class WorkspaceService : public TabStrip
+ 
+   PrefChangeRegistrar pref_registrar_;
+ 
++  // The tab row height this window last applied (E18), so each window's log
++  // line shows its own "<A> -> <B>" -- the browser-wide value is already the
++  // new one when a second window hears the change.
++  int tab_row_height_ = 0;
++
+   // Held for its lifetime: the layout switch is the non-pref half of
+   // IsEnabled(), and letting this subscription drop would leave the classic
+   // switch as the one exit from the filtered state that never tidies up.
+@@ -716,6 +735,7 @@ class WorkspaceService : public TabStrip
+ 
+   base::RepeatingClosureList workspace_changed_callbacks_;
+   base::RepeatingClosureList workspace_list_changed_callbacks_;
++  base::RepeatingClosureList tab_row_height_changed_callbacks_;
+ 
+   // For EnsureActiveTabVisible(), which is posted and so can outlive the
+   // window that scheduled it -- closing the last tab of a window schedules the
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -125,6 +125,7 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs/organizer:impl",
+     "//chrome/browser/ui/tabs/saved_tab_groups",
+     "//chrome/browser/ui/tabs/workspaces",
++    "//chrome/browser/ui/tabs/workspaces:prefs",
+     "//chrome/browser/ui/user_education",
+     "//chrome/browser/ui/views:layout_provider",
+     "//chrome/browser/ui/views/frame",
+--- a/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
+@@ -8,7 +8,9 @@
+ #include "chrome/browser/glic/browser_ui/tab_underline_view.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
+ #include "chrome/browser/ui/views/tabs/tab/alert_indicator_button.h"
+ #include "chrome/browser/ui/views/tabs/tab/tab_close_button.h"
+@@ -50,14 +52,23 @@ views::ProposedLayout TabViewVerticalLay
+     const views::SizeBounds& size_bounds) const {
+   const int width =
+       size_bounds.width().value_or(tabs::kVerticalTabStripUncollapsedMaxWidth);
+-  const int height = GetLayoutConstant(
+-      TabView().pinned_ ? LayoutConstant::kVerticalTabPinnedHeight
+-                        : LayoutConstant::kVerticalTabHeight);
++  // Helium Workspaces (E18): the Tab style's height and, when roomy, the icon
++  // further in and further from its title (workspace_view_hooks.h). Read here,
++  // live: the configs below are copied once, at OnInstalled.
++  const bool roomy =
++      workspaces::IsRoomyTabRow(TabView().pinned_, TabView().collapsed_);
++  const int height = workspaces::TabRowHeightFor(
++      TabView().pinned_, TabView().collapsed_,
++      GetLayoutConstant(TabView().pinned_
++                            ? LayoutConstant::kVerticalTabPinnedHeight
++                            : LayoutConstant::kVerticalTabHeight));
+   views::ProposedLayout layouts;
+   layouts.host_size = gfx::Size(width, height);
+ 
+   gfx::Rect bounds_remaining = gfx::Rect(layouts.host_size);
+   bounds_remaining.Inset(TabView().tab_styling()->GetContentsInsets());
++  bounds_remaining.Inset(
++      gfx::Insets::VH(0, roomy ? workspaces::prefs::IconInsetExtra() : 0));
+ 
+   // If the tab is collapsed but animating with a wider width then we shouldn't
+   // center the contents.
+@@ -65,7 +76,10 @@ views::ProposedLayout TabViewVerticalLay
+                            !TabView().IsInExpandOnHover(width);
+ 
+   int placed_children = 0;
+-  for (const auto& child : tab_children_configs_) {
++  for (TabChildConfig child : tab_children_configs_) {
++    if (roomy && child.view == TabView().icon_) {
++      child.padding = workspaces::prefs::IconTitleGap();
++    }
+     const bool can_render_child =
+         is_centered
+             ? (placed_children == 0)
+--- a/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
+@@ -12,6 +12,7 @@
+ #include "base/location.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/sessions/session_restore.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ 
+@@ -86,4 +87,16 @@ bool IsBulkLayoutInProgress() {
+   return g_bulk_layout_depth > 0 || SessionRestore::IsRestoringSynchronously();
+ }
+ 
++bool IsRoomyTabRow(bool pinned, bool collapsed) {
++  return !pinned && !collapsed &&
++         prefs::TabRowHeight() > prefs::kCompactTabRowHeight;
++}
++
++int TabRowHeightFor(bool pinned, bool collapsed, int helium_height) {
++  if (pinned || collapsed) {
++    return helium_height;
++  }
++  return prefs::TabRowHeight();
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/common/workspace_view_hooks.h
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.h
+@@ -43,6 +43,15 @@ class ScopedBulkLayout {
+ };
+ bool IsBulkLayoutInProgress();
+ 
++// TabViewVerticalLayout (E18): a tab of the list -- not a favorite, not in
++// the collapsed column, where a taller cell would be a thin tile -- is as
++// tall as the Tab style setting says (TabRowHeightFor), its icon further in
++// and further from its title when roomy (IsRoomyTabRow). Compact keeps
++// Helium's own inset and gap, whatever they become. `helium_height` is the
++// height Helium's layout gives the tab.
++bool IsRoomyTabRow(bool pinned, bool collapsed);
++int TabRowHeightFor(bool pinned, bool collapsed, int helium_height);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_WORKSPACE_VIEW_HOOKS_H_
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -47,6 +47,7 @@
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
++#include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
+ #include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+@@ -145,6 +146,22 @@ void CollectTabEdges(const views::View&
+   }
+ }
+ 
++// Has every tab `view` draws lay itself out again, and returns how many
++// (E18): a tab keeps the size it last measured until it is told, and
++// InvalidateLayout reaches up to the parents, never down to the children.
++int InvalidateTabViews(views::View& view) {
++  int count = 0;
++  for (views::View* const child : view.children()) {
++    if (views::IsViewClass<TabView>(child)) {
++      child->InvalidateLayout();
++      ++count;
++    } else {
++      count += InvalidateTabViews(*child);
++    }
++  }
++  return count;
++}
++
+ // Per nesting level, and on each side of a row.
+ constexpr int kIndent = 16;
+ constexpr int kRowInset = 8;
+@@ -167,6 +184,14 @@ constexpr SkAlpha kCardAlphaLight = 0x09
+ constexpr int kCardMargin = 8;
+ constexpr int kCardPadding = 4;
+ 
++// "+ New Tab" (E18): Helium's own insets, which compact keeps
++// (vertical_new_tab_button.cc); taller than compact, its icon starts where
++// the pinned pages' do -- the button sits at the section's edge, the rows a
++// card margin and a row inset in.
++constexpr int kNewTabInsetVertical = 4;
++constexpr int kNewTabInsetCompact = 7;
++constexpr int kNewTabInsetRoomy = kCardMargin + kRowInset;
++
+ // The header (E17b): 34 px, the workspace's mark -- the size of its chip on
+ // the bar, with its 16 px icon -- then the name, which starts where the rows'
+ // titles do.
+@@ -586,8 +611,11 @@ class PinRow : public views::LabelButton
+                                        kRowInset + level * kIndent +
+                                            (folder_ ? kChevronSpace : 0),
+                                        0, kRowInset)));
+-    SetMinSize(
+-        gfx::Size(0, GetLayoutConstant(LayoutConstant::kVerticalTabHeight)));
++    // As tall as a Today tab (E18, the Tab style); the collapsed column stays
++    // compact, as the tabs there do.
++    SetMinSize(gfx::Size(
++        0, icon_only_ ? GetLayoutConstant(LayoutConstant::kVerticalTabHeight)
++                      : workspaces::prefs::TabRowHeight()));
+     // No opaque background under the text, as on the rail's buttons.
+     label()->SetSubpixelRenderingEnabled(false);
+     // The ring drawn inside: the rows sit in a clipping scroll view (E13).
+@@ -955,7 +983,10 @@ WorkspacePinnedSectionView::Links::~Link
+ WorkspacePinnedSectionView::WorkspacePinnedSectionView(
+     BrowserWindowInterface* browser,
+     tabs::VerticalTabStripStateController* state_controller)
+-    : browser_(browser), state_controller_(state_controller) {
++    : browser_(browser),
++      state_controller_(state_controller),
++      tabs_row_height_(workspaces::prefs::TabRowHeight()),
++      new_tab_row_height_(workspaces::prefs::kCompactTabRowHeight) {
+   SetLayoutManager(std::make_unique<views::BoxLayout>(
+                        views::BoxLayout::Orientation::kVertical))
+       ->set_inside_border_insets(gfx::Insets::TLBR(0, 0, 4, 0));
+@@ -998,6 +1029,11 @@ void WorkspacePinnedSectionView::AddedTo
+           service->RegisterWorkspaceListChangedCallback(base::BindRepeating(
+               &WorkspacePinnedSectionView::ScheduleRebuild,
+               base::Unretained(this)));
++      // The Tab style (E18): the rebuild lays the strip out at the new height.
++      tab_row_height_changed_subscription_ =
++          service->RegisterTabRowHeightChangedCallback(base::BindRepeating(
++              &WorkspacePinnedSectionView::ScheduleRebuild,
++              base::Unretained(this)));
+     }
+     if (state_controller_) {
+       collapse_changed_subscription_ =
+@@ -1116,8 +1152,47 @@ void WorkspacePinnedSectionView::Schedul
+                                 weak_factory_.GetWeakPtr()));
+ }
+ 
++void WorkspacePinnedSectionView::ApplyTabStyle() {
++  const int height = workspaces::prefs::TabRowHeight();
++  views::ScrollView* const scroll_view = GetScrollView();
++  if (!scroll_view || !scroll_view->parent()) {
++    return;
++  }
++  if (height != tabs_row_height_) {
++    const base::ElapsedTimer timer;
++    // Each tab container works its layout out once, at the next layout pass,
++    // not once per tab told (patch 37). The tabs then glide to the new height.
++    workspaces::ScopedBulkLayout bulk;
++    // The scroll view's parent is the whole strip: the favorites, and the tabs
++    // of every workspace -- a hidden one's would come back at the old height.
++    const int tabs = InvalidateTabViews(*scroll_view->parent());
++    tabs_row_height_ = height;
++    LOG(INFO) << "[workspaces] tab style: " << tabs
++              << " tab view(s) invalidated in "
++              << timer.Elapsed().InMilliseconds() << " ms";
++  }
++  if (height != new_tab_row_height_) {
++    // "+ New Tab" is the list's first row: as tall as a tab; taller than
++    // compact, its icon at 16 and its title at 44, as the pinned pages' are.
++    // Helium made it once, in its constructor, at the compact numbers.
++    const gfx::Insets insets = gfx::Insets::TLBR(
++        kNewTabInsetVertical,
++        height > workspaces::prefs::kCompactTabRowHeight ? kNewTabInsetRoomy
++                                                         : kNewTabInsetCompact,
++        kNewTabInsetVertical, kNewTabInsetCompact);
++    new_tab_button_->SetLabelInsets(insets, insets);
++    new_tab_button_->SetImageLabelSpacing(workspaces::prefs::IconTitleGap());
++    new_tab_button_->SetPreferredSize(gfx::Size(-1, height));
++    new_tab_row_height_ = height;
++  }
++}
++
+ void WorkspacePinnedSectionView::Rebuild() {
+   rebuild_scheduled_ = false;
++  // First, and whether or not the section is shown: the Tab style is
++  // Helium's tabs' too, with Workspaces off (E18). The rows below are made
++  // at the new height.
++  ApplyTabStyle();
+   // The dragged row is about to go, and with it the mouse release that would
+   // end its drag: another window changed the pins, or the workspace changed.
+   EndDrag();
+@@ -1893,7 +1968,10 @@ void WorkspacePinnedSectionView::UpdateD
+   if (views::ScrollView* const scroll_view = GetScrollView()) {
+     const int y =
+         views::View::ConvertPointFromScreen(scroll_view, drag_point_).y();
+-    const int height = GetLayoutConstant(LayoutConstant::kVerticalTabHeight);
++    // The probe a dragged tab would be: a Today tab's height (E18).
++    const int height =
++        collapsed_ ? GetLayoutConstant(LayoutConstant::kVerticalTabHeight)
++                   : workspaces::prefs::TabRowHeight();
+     drag_scroll_.OnDraggedTabPositionUpdated(
+         *scroll_view,
+         gfx::Rect(0, y - height / 2, scroll_view->width(), height));
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -201,6 +201,12 @@ class WorkspacePinnedSectionView
+   // far more often than the rows do.
+   void ScheduleRebuild();
+   void Rebuild();
++  // The Tab style (E18), first thing in each Rebuild(): when the tab row
++  // height is not the one this window draws, every tab of the strip lays
++  // itself out again and "+ New Tab" takes the new height. Logs
++  //   "[workspaces] tab style: <N> tab view(s) invalidated in <M> ms"
++  // Not from AddedToWidget(): the scroll view it walks from is not set yet.
++  void ApplyTabStyle();
+   void ScheduleRowStates();
+   void UpdateRowStates();
+   // The service's "workspace changed" also fires for every tag written to a
+@@ -311,6 +317,7 @@ class WorkspacePinnedSectionView
+       store_observation_{this};
+   base::CallbackListSubscription workspace_changed_subscription_;
+   base::CallbackListSubscription workspace_list_changed_subscription_;
++  base::CallbackListSubscription tab_row_height_changed_subscription_;
+   base::CallbackListSubscription collapse_changed_subscription_;
+   base::CallbackListSubscription paint_as_active_subscription_;
+   // The workspace's header, the first child; made once (E17b).
+@@ -328,6 +335,12 @@ class WorkspacePinnedSectionView
+   // How many pinned pages it holds, all the way down: the header's first
+   // number (E18), counted by each Rebuild().
+   int drawn_pages_ = 0;
++  // The tab row height this window's tabs were last laid out at, and the one
++  // "+ New Tab" was styled at (E18). The tabs start at the current height:
++  // this window's service set it before its views existed, so a saved Roomy
++  // style re-measures no tab at startup. Helium makes "+ New Tab" compact.
++  int tabs_row_height_;
++  int new_tab_row_height_;
+   // The rows are the collapsed strip's column of icons (E17b).
+   bool collapsed_ = false;
+   // The item whose page was last seen active: its row is scrolled into view

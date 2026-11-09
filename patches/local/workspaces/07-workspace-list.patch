@@ -1,0 +1,623 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -22,7 +22,20 @@ source_set("prefs") {
+     "workspace_prefs.h",
+   ]
+ 
+-  deps = [ "//components/prefs" ]
++  # ":stamping" for kDefaultWorkspaceGuid -- the guid the parser falls back
++  # to and guarantees is present. It is the same constant the visibility
++  # predicate compares against, and a second copy here would be a second
++  # thing to keep in step. ":stamping" has no dependencies of its own, so
++  # this leaves ":prefs" as free of //chrome as it was.
++  #
++  # "//base" for base::DictValue, which the workspace list is stored as. At
++  # 152 that type is base::DictValue, NOT the older base::Value::Dict -- the
++  # nested spelling does not exist in this tree and does not compile.
++  deps = [
++    ":stamping",
++    "//base",
++    "//components/prefs",
++  ]
+ }
+ 
+ # The workspace membership rules, as free functions over plain values.
+@@ -93,6 +106,7 @@ source_set("unit_tests") {
+   deps = [
+     ":prefs",
+     ":stamping",
++    "//base",
+     "//components/prefs",
+     "//components/prefs:test_support",
+     "//testing/gtest",
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -4,15 +4,125 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ 
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/values.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
+ 
+ namespace workspaces::prefs {
+ 
++namespace {
++
++// What every failure falls back to, and the only list this file ever invents.
++//
++// No title: naming the default workspace puts a user-visible string on screen,
++// which has to be localised and belongs with the Stage 5 rail that draws it.
++// An absent title already parses as an empty one.
++std::vector<WorkspaceEntry> DefaultOnly() {
++  return {WorkspaceEntry{std::string(kDefaultWorkspaceGuid), std::string()}};
++}
++
++bool ContainsGuid(const std::vector<WorkspaceEntry>& entries,
++                  std::string_view guid) {
++  for (const WorkspaceEntry& entry : entries) {
++    if (entry.guid == guid) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
+ void RegisterProfilePrefs(PrefRegistrySimple* registry) {
+   // Defaults on: this is a private fork built to run Workspaces, so there is
+   // nobody to opt in. The settings-page toggle lands in Stage 5 with the rest
+   // of the settings integration (helium-workspaces-design.md 3.4).
+   registry->RegisterBooleanPref(kHeliumWorkspacesEnabled, true);
++
++  registry->RegisterDictionaryPref(kHeliumWorkspacesList, DefaultWorkspacesDict());
++}
++
++base::DictValue DefaultWorkspacesDict() {
++  base::DictValue entry;
++  entry.Set(kGuidKey, std::string(kDefaultWorkspaceGuid));
++
++  base::ListValue list;
++  list.Append(std::move(entry));
++
++  base::DictValue dict;
++  dict.Set(kSchemaVersionKey, kSchemaVersion);
++  dict.Set(kItemsKey, std::move(list));
++  return dict;
++}
++
++std::vector<WorkspaceEntry> ParseWorkspaces(const base::DictValue& dict) {
++  // An exact match rather than "at least kSchemaVersion". A version this build
++  // has never heard of was written by a newer one, and reading its list with
++  // this build's rules would quietly drop whatever that version added. Falling
++  // back costs the user one session of their list; guessing could cost them
++  // the list itself, because a later write would persist the guess.
++  if (dict.FindInt(kSchemaVersionKey).value_or(-1) != kSchemaVersion) {
++    return DefaultOnly();
++  }
++
++  const base::ListValue* const list = dict.FindList(kItemsKey);
++  if (!list) {
++    return DefaultOnly();
++  }
++
++  std::vector<WorkspaceEntry> entries;
++  for (const base::Value& element : *list) {
++    const base::DictValue* const entry = element.GetIfDict();
++    if (!entry) {
++      continue;
++    }
++
++    // The guid is the entry's identity -- there is nothing to tag a tab with
++    // without one. An empty guid is skipped rather than kept because empty
++    // already means "the default workspace" to IsVisibleInWorkspace, and the
++    // default workspace is guaranteed below in any case.
++    const std::string* const guid = entry->FindString(kGuidKey);
++    if (!guid || guid->empty() || ContainsGuid(entries, *guid)) {
++      continue;
++    }
++
++    const std::string* const title = entry->FindString(kTitleKey);
++    entries.push_back(WorkspaceEntry{*guid, title ? *title : std::string()});
++  }
++
++  if (entries.empty()) {
++    return DefaultOnly();
++  }
++
++  // The default workspace always exists (design 2.4), and this is where that
++  // is made true rather than merely assumed. A tab with no tag belongs to it,
++  // so a list without it leaves every untagged tab matching no workspace at
++  // all -- drawn nowhere, with no rail, menu or shortcut in this build that
++  // could bring it back. Prepending costs one entry; not prepending costs the
++  // user every tab they had not yet stamped.
++  if (!ContainsGuid(entries, kDefaultWorkspaceGuid)) {
++    entries.insert(entries.begin(), DefaultOnly().front());
++  }
++  return entries;
++}
++
++std::vector<std::string> GetWorkspaceGuids(const PrefService* prefs) {
++  const std::vector<WorkspaceEntry> entries =
++      prefs ? ParseWorkspaces(prefs->GetDict(kHeliumWorkspacesList))
++            : DefaultOnly();
++
++  std::vector<std::string> guids;
++  guids.reserve(entries.size());
++  for (const WorkspaceEntry& entry : entries) {
++    guids.push_back(entry.guid);
++  }
++  return guids;
+ }
+ 
+ }  // namespace workspaces::prefs
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -5,7 +5,13 @@
+ #ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
+ #define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
+ 
++#include <string>
++#include <vector>
++
++#include "base/values.h"
++
+ class PrefRegistrySimple;
++class PrefService;
+ 
+ namespace workspaces::prefs {
+ 
+@@ -18,8 +24,91 @@ namespace workspaces::prefs {
+ // syncing at all. See helium-workspaces-design.md 2.4.
+ inline constexpr char kHeliumWorkspacesEnabled[] = "helium.workspaces.enabled";
+ 
++// The workspaces this profile has, in the order switching cycles through them.
++//
++// A dict rather than a bare list so that the payload can carry a schema version
++// beside it. Design 2.4 wants four fields per workspace -- guid, title, emoji
++// and accent -- and this build stores the first two, because nothing draws the
++// other two until the Stage 5 rail exists. kSchemaVersion is what makes adding
++// them later a non-event instead of a migration.
++//
++// ".list" IS NOT DECORATION. PrefService stores user values by dotted path --
++// JsonPrefStore calls SetByDottedPath -- so a pref name is a node in one JSON
++// tree, not an opaque key. Naming this "helium.workspaces" would make it the
++// PARENT of kHeliumWorkspacesEnabled: reading it would hand back
++// {"enabled": true} and never a list, and the first write of a list would
++// delete the toggle along with it. Nothing diagnoses that for you --
++// PrefRegistry::RegisterPreference rejects only an exact duplicate path, and
++// the defaults live in a flat PrefValueMap where the two never meet, which is
++// also why a TestingPrefServiceSimple test cannot reproduce it. The rule is
++// pinned by NeitherPrefPathIsNestedInsideTheOther instead.
++//
++// Local-only for the same reason as the pref above, and by the same mechanism:
++// PrefRegistrySimple has no syncable variant, so this cannot be synced by
++// accident even if someone later wants it to be.
++inline constexpr char kHeliumWorkspacesList[] = "helium.workspaces.list";
++
++// Keys inside kHeliumWorkspacesList.
++inline constexpr char kSchemaVersionKey[] = "schema_version";
++inline constexpr char kItemsKey[] = "items";
++
++// Keys inside one entry of kItemsKey.
++inline constexpr char kGuidKey[] = "guid";
++inline constexpr char kTitleKey[] = "title";
++
++// The schema this build writes, and the only one it is willing to interpret.
++//
++// Bump this only for a change that an older build would read *wrongly*. Adding
++// emoji and accent at Stage 5 is not such a change: an older build ignores keys
++// it does not know, which is exactly right. Renaming or repurposing an existing
++// key is.
++inline constexpr int kSchemaVersion = 1;
++
++// One workspace, as stored. A plain data holder with no behaviour -- the rules
++// that act on workspaces live in workspace_stamping.h and take plain values.
++struct WorkspaceEntry {
++  std::string guid;
++  std::string title;
++};
++
+ void RegisterProfilePrefs(PrefRegistrySimple* registry);
+ 
++// The value kHeliumWorkspacesList is registered with: schema version plus a list
++// holding only the default workspace.
++//
++// Registering a populated default rather than an empty dict is what puts the
++// list on chrome://prefs-internals from the very first run, with no write and
++// no first-run bootstrap step to get wrong.
++base::DictValue DefaultWorkspacesDict();
++
++// Reads `dict` into the workspace list, in stored order.
++//
++// Every failure is the same failure: fall back to a list holding just the
++// default workspace. That is the only answer that cannot strand the user,
++// because an untagged tab belongs to the default workspace (design 2.4) and
++// this build has no rail, no menu and no shortcut that could rebuild a list
++// that came back empty.
++//
++// NEVER RETURNS EMPTY, and the default workspace is always present -- prepended
++// if the stored list does not contain it. That second guarantee is not
++// housekeeping: the visibility predicate hides every tab whose guid is not the
++// active one, so a list missing the default workspace draws every untagged tab
++// in no workspace at all. The user sees an empty browser and has no way back.
++//
++// A stored schema version this build does not recognise is treated as a
++// failure rather than parsed optimistically, and this function never writes, so
++// a profile opened by a newer build and then by this one keeps its list intact
++// instead of having it flattened.
++std::vector<WorkspaceEntry> ParseWorkspaces(const base::DictValue& dict);
++
++// The workspace guids for this profile, in cycling order -- what
++// RelativeWorkspaceGuid consumes.
++//
++// Tolerates a null `prefs` and answers with the default workspace, matching
++// every other caller-facing guarantee here, because the service holds a
++// PrefService it declines to assume is non-null.
++std::vector<std::string> GetWorkspaceGuids(const PrefService* prefs);
++
+ }  // namespace workspaces::prefs
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -4,6 +4,12 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ 
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/values.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/prefs/testing_pref_service.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -16,6 +22,44 @@
+ namespace workspaces::prefs {
+ namespace {
+ 
++std::string DefaultGuid() {
++  return std::string(kDefaultWorkspaceGuid);
++}
++
++base::DictValue Entry(std::string_view guid, std::string_view title) {
++  base::DictValue entry;
++  entry.Set(kGuidKey, std::string(guid));
++  entry.Set(kTitleKey, std::string(title));
++  return entry;
++}
++
++// A stored payload at the current schema version wrapping `list`.
++base::DictValue Stored(base::ListValue list) {
++  base::DictValue dict;
++  dict.Set(kSchemaVersionKey, kSchemaVersion);
++  dict.Set(kItemsKey, std::move(list));
++  return dict;
++}
++
++std::vector<std::string> GuidsOf(const std::vector<WorkspaceEntry>& entries) {
++  std::vector<std::string> guids;
++  for (const WorkspaceEntry& entry : entries) {
++    guids.push_back(entry.guid);
++  }
++  return guids;
++}
++
++// Most cases below open their list with the default workspace so that the
++// prepend rule is a no-op and the test isolates the one behaviour it names.
++// The prepend rule has its own two tests.
++base::ListValue ListOpeningWithDefault() {
++  base::ListValue list;
++  list.Append(Entry(kDefaultWorkspaceGuid, "Home"));
++  return list;
++}
++
++// ---------------------------------------------------------------- enabled
++
+ TEST(WorkspacePrefsTest, RegistersEnabledPref) {
+   TestingPrefServiceSimple pref_service;
+   RegisterProfilePrefs(pref_service.registry());
+@@ -51,5 +95,237 @@ TEST(WorkspacePrefsTest, PrefNameIsStabl
+   EXPECT_STREQ("helium.workspaces.enabled", kHeliumWorkspacesEnabled);
+ }
+ 
++TEST(WorkspacePrefsTest, WorkspacesPrefNameIsStable) {
++  EXPECT_STREQ("helium.workspaces.list", kHeliumWorkspacesList);
++}
++
++// PrefService stores user values by DOTTED PATH -- JsonPrefStore calls
++// SetByDottedPath -- so pref names are nodes in one JSON tree, not opaque keys.
++// If one of these two paths were an ancestor of the other they would BE the
++// same node: reading the list would hand back {"enabled": true}, and the first
++// write of the list would delete the toggle along with it.
++//
++// Nothing else catches that. PrefRegistry::RegisterPreference DCHECKs only on
++// an exact duplicate path, and defaults live in a flat PrefValueMap where the
++// two never meet -- which is also why TestingPrefServiceSimple cannot
++// reproduce the collision, and why this test pins the rule rather than the
++// symptom.
++TEST(WorkspacePrefsTest, NeitherPrefPathIsNestedInsideTheOther) {
++  const std::string enabled(kHeliumWorkspacesEnabled);
++  const std::string list(kHeliumWorkspacesList);
++
++  EXPECT_NE(enabled, list);
++  EXPECT_FALSE(list.starts_with(enabled + "."))
++      << list << " is stored inside " << enabled;
++  EXPECT_FALSE(enabled.starts_with(list + "."))
++      << enabled << " is stored inside " << list;
++}
++
++// ------------------------------------------------------- registered default
++
++TEST(WorkspacePrefsTest, RegistersWorkspacesPref) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  EXPECT_TRUE(pref_service.FindPreference(kHeliumWorkspacesList));
++}
++
++TEST(WorkspacePrefsTest, DefaultDictCarriesCurrentSchemaVersion) {
++  EXPECT_EQ(kSchemaVersion,
++            DefaultWorkspacesDict().FindInt(kSchemaVersionKey).value_or(-1));
++}
++
++// The checkpoint for this chunk is "the list is visible at
++// chrome://prefs-internals", and it is the registered default that puts it
++// there on a profile nobody has edited.
++TEST(WorkspacePrefsTest, DefaultDictHoldsOnlyTheDefaultWorkspace) {
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GuidsOf(ParseWorkspaces(DefaultWorkspacesDict())));
++}
++
++// ------------------------------------------------------------------ parsing
++
++TEST(WorkspacePrefsTest, ParsesEntriesInStoredOrder) {
++  base::ListValue list = ListOpeningWithDefault();
++  list.Append(Entry("work", "Work"));
++  list.Append(Entry("play", "Play"));
++
++  EXPECT_EQ((std::vector<std::string>{DefaultGuid(), "work", "play"}),
++            GuidsOf(ParseWorkspaces(Stored(std::move(list)))));
++}
++
++TEST(WorkspacePrefsTest, ReadsGuidAndTitle) {
++  const std::vector<WorkspaceEntry> entries =
++      ParseWorkspaces(Stored(ListOpeningWithDefault()));
++
++  ASSERT_EQ(1u, entries.size());
++  EXPECT_EQ(DefaultGuid(), entries[0].guid);
++  EXPECT_EQ("Home", entries[0].title);
++}
++
++// A title is cosmetic and nothing draws it until the Stage 5 rail, so its
++// absence is a real entry rather than a broken one.
++TEST(WorkspacePrefsTest, MissingTitleIsAllowed) {
++  base::DictValue entry;
++  entry.Set(kGuidKey, DefaultGuid());
++  base::ListValue list;
++  list.Append(std::move(entry));
++
++  const std::vector<WorkspaceEntry> entries =
++      ParseWorkspaces(Stored(std::move(list)));
++
++  ASSERT_EQ(1u, entries.size());
++  EXPECT_EQ(DefaultGuid(), entries[0].guid);
++  EXPECT_EQ("", entries[0].title);
++}
++
++// ------------------------------------------------------- falling back safely
++
++TEST(WorkspacePrefsTest, EmptyDictFallsBackToDefaultWorkspace) {
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GuidsOf(ParseWorkspaces(base::DictValue())));
++}
++
++// An unversioned payload is not this schema, whatever its shape happens to be.
++TEST(WorkspacePrefsTest, MissingSchemaVersionFallsBackToDefaultWorkspace) {
++  base::DictValue dict;
++  base::ListValue list = ListOpeningWithDefault();
++  list.Append(Entry("work", "Work"));
++  dict.Set(kItemsKey, std::move(list));
++
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GuidsOf(ParseWorkspaces(dict)));
++}
++
++// Written by a newer build. Guessing at it would silently drop whatever it
++// added; ParseWorkspaces never writes, so refusing to read it leaves the
++// stored list untouched for that build to find again.
++TEST(WorkspacePrefsTest, NewerSchemaVersionFallsBackToDefaultWorkspace) {
++  base::DictValue dict;
++  dict.Set(kSchemaVersionKey, kSchemaVersion + 1);
++  base::ListValue list = ListOpeningWithDefault();
++  list.Append(Entry("work", "Work"));
++  dict.Set(kItemsKey, std::move(list));
++
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GuidsOf(ParseWorkspaces(dict)));
++}
++
++TEST(WorkspacePrefsTest, ListOfWrongTypeFallsBackToDefaultWorkspace) {
++  base::DictValue dict;
++  dict.Set(kSchemaVersionKey, kSchemaVersion);
++  dict.Set(kItemsKey, "not a list");
++
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GuidsOf(ParseWorkspaces(dict)));
++}
++
++TEST(WorkspacePrefsTest, AllEntriesInvalidFallsBackToDefaultWorkspace) {
++  base::ListValue list;
++  list.Append("junk");
++  list.Append(base::DictValue());
++
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GuidsOf(ParseWorkspaces(Stored(std::move(list)))));
++}
++
++// ------------------------------------------------------------ skipping junk
++
++TEST(WorkspacePrefsTest, SkipsEntriesThatAreNotDicts) {
++  base::ListValue list = ListOpeningWithDefault();
++  list.Append("junk");
++  list.Append(42);
++
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GuidsOf(ParseWorkspaces(Stored(std::move(list)))));
++}
++
++// A guid is the entry's identity; there is nothing to tag a tab with without
++// one, so the entry is not repairable.
++TEST(WorkspacePrefsTest, SkipsEntriesWithoutAGuid) {
++  base::DictValue titled;
++  titled.Set(kTitleKey, "No guid");
++  base::ListValue list = ListOpeningWithDefault();
++  list.Append(std::move(titled));
++
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GuidsOf(ParseWorkspaces(Stored(std::move(list)))));
++}
++
++// An empty guid already means "the default workspace" everywhere else
++// (IsVisibleInWorkspace), so storing it as a list entry would be a second,
++// contradictory spelling of the workspace that is always present anyway.
++TEST(WorkspacePrefsTest, SkipsEntriesWithAnEmptyGuid) {
++  base::ListValue list = ListOpeningWithDefault();
++  list.Append(Entry("", "Empty"));
++
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GuidsOf(ParseWorkspaces(Stored(std::move(list)))));
++}
++
++// Duplicates would give last_active_ two homes for one guid and make the
++// switching cycle visit the same workspace twice.
++TEST(WorkspacePrefsTest, KeepsTheFirstOfDuplicateGuids) {
++  base::ListValue list = ListOpeningWithDefault();
++  list.Append(Entry(kDefaultWorkspaceGuid, "Later"));
++
++  const std::vector<WorkspaceEntry> entries =
++      ParseWorkspaces(Stored(std::move(list)));
++
++  ASSERT_EQ(1u, entries.size());
++  EXPECT_EQ("Home", entries[0].title);
++}
++
++// ------------------------------------------------- the default always exists
++
++// Without this the visibility predicate draws every untagged tab in no
++// workspace at all, and there is no rail or shortcut to get back (design 2.4).
++TEST(WorkspacePrefsTest, PrependsTheDefaultWorkspaceWhenAbsent) {
++  base::ListValue list;
++  list.Append(Entry("work", "Work"));
++
++  EXPECT_EQ((std::vector<std::string>{DefaultGuid(), "work"}),
++            GuidsOf(ParseWorkspaces(Stored(std::move(list)))));
++}
++
++// ...but a list that already has it keeps its own order, and does not grow a
++// second copy. This is the case a blind prepend gets wrong.
++TEST(WorkspacePrefsTest, KeepsStoredOrderWhenDefaultWorkspaceIsPresent) {
++  base::ListValue list;
++  list.Append(Entry("work", "Work"));
++  list.Append(Entry(kDefaultWorkspaceGuid, "Home"));
++
++  EXPECT_EQ((std::vector<std::string>{"work", DefaultGuid()}),
++            GuidsOf(ParseWorkspaces(Stored(std::move(list)))));
++}
++
++// --------------------------------------------------------- GetWorkspaceGuids
++
++// The service holds a PrefService it declines to assume is non-null.
++TEST(WorkspacePrefsTest, GetWorkspaceGuidsToleratesNullPrefService) {
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GetWorkspaceGuids(nullptr));
++}
++
++TEST(WorkspacePrefsTest, GetWorkspaceGuidsReadsTheRegisteredDefault) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  EXPECT_EQ(std::vector<std::string>{DefaultGuid()},
++            GetWorkspaceGuids(&pref_service));
++}
++
++TEST(WorkspacePrefsTest, GetWorkspaceGuidsReadsAStoredList) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  base::ListValue list = ListOpeningWithDefault();
++  list.Append(Entry("work", "Work"));
++  pref_service.SetDict(kHeliumWorkspacesList, Stored(std::move(list)));
++
++  EXPECT_EQ((std::vector<std::string>{DefaultGuid(), "work"}),
++            GetWorkspaceGuids(&pref_service));
++}
++
+ }  // namespace
+ }  // namespace workspaces::prefs
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -29,15 +29,6 @@
+ 
+ namespace workspaces {
+ 
+-namespace {
+-
+-// Temporary, for E6b only: switching needs somewhere to switch to, and the
+-// real workspace list does not exist until E7. Deliberately not a pref, not
+-// persisted and not user-visible, so deleting it later costs nothing.
+-constexpr std::string_view kTemporarySecondWorkspaceGuid = "second";
+-
+-}  // namespace
+-
+ DEFINE_USER_DATA(WorkspaceService);
+ 
+ WorkspaceService::WorkspaceService(
+@@ -49,8 +40,6 @@ WorkspaceService::WorkspaceService(
+       browser_window_(browser_window),
+       prefs_(prefs),
+       active_guid_(kDefaultWorkspaceGuid),
+-      workspaces_({std::string(kDefaultWorkspaceGuid),
+-                   std::string(kTemporarySecondWorkspaceGuid)}),
+       scoped_data_holder_(unowned_user_data_host, *this) {
+   tab_strip_->AddObserver(this);
+ }
+@@ -159,7 +148,13 @@ void WorkspaceService::SwitchToWorkspace
+ }
+ 
+ void WorkspaceService::ActivateRelativeWorkspace(int offset) {
+-  SwitchToWorkspace(RelativeWorkspaceGuid(workspaces_, active_guid_, offset));
++  // Read per switch rather than cached in a member. This runs at keyboard
++  // rate, so the cost is irrelevant, and it means there is no stale copy to
++  // invalidate once E9 lets the user add, delete and reorder workspaces --
++  // the bug that cache would eventually cause is a switch cycling through a
++  // workspace that no longer exists.
++  SwitchToWorkspace(RelativeWorkspaceGuid(prefs::GetWorkspaceGuids(prefs_),
++                                          active_guid_, offset));
+ }
+ 
+ int WorkspaceService::TargetTabIndexForActiveWorkspace() const {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -212,12 +212,6 @@ class WorkspaceService : public TabStrip
+ 
+   std::string active_guid_;
+ 
+-  // Temporary scaffolding, in cycling order. The real list is per profile,
+-  // user-editable and persisted, and arrives with E7; two hardcoded entries
+-  // are the minimum that makes switching mean anything, and nothing else
+-  // reads this, so replacing it later is a local change.
+-  std::vector<std::string> workspaces_;
+-
+   // The tab the user was last on in each workspace, so switching back returns
+   // them to what they were reading rather than to the top of the strip -- Arc
+   // and Zen both do this.

@@ -1,0 +1,16 @@
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -2334,9 +2334,10 @@ bool ToolbarView::IsVerticalTabsRightAli
+ }
+ 
+ bool ToolbarView::ShouldShowToolbarNewTabButton() const {
+-  // TODO: Show the toolbar new tab button in Compact layout
+-  // once we improve it.
+-  return IsDynamicLayout();
++  // Helium Workspaces (wish 6c, the owner's choice): in every layout, where the
++  // saved toolbar order puts it -- its switch in Settings' Toolbar list
++  // decides. Helium showed it in the Dynamic layout only.
++  return true;
+ }
+ 
+ void ToolbarView::UpdateVerticalTabsCollapseButton() {

@@ -1,0 +1,353 @@
+--- a/chrome/browser/ui/navigator/BUILD.gn
++++ b/chrome/browser/ui/navigator/BUILD.gn
+@@ -101,6 +101,9 @@ source_set("impl") {
+       # The omnibox rule in NormalizeDisposition asks WorkspaceService one
+       # question; the answer depends on the feature gate, so not the leaf.
+       "//chrome/browser/ui/tabs/workspaces",
++
++      # LogsAddresses(), for that rule's log line (R2-9).
++      "//chrome/browser/ui/tabs/workspaces:tab_data",
+       "//chrome/browser/ui/web_applications",
+       "//chrome/browser/ui/web_applications:launch_utils",
+       "//chrome/browser/ui/window_feature_controller",
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -47,6 +47,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/toasts/api/toast_id.h"
+ #include "chrome/browser/ui/toasts/toast_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -518,9 +519,10 @@ void NormalizeDisposition(NavigateParams
+     if (workspace_service && workspace_service->ShouldDivertTypedNavigation(
+                                  params->source_contents, params->url)) {
+       params->disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+-      LOG(INFO)
+-          << "[workspaces] typed url diverted off anchored tab -> new tab: "
+-          << params->url.spec();
++      // The address only when asked, as every fork line (privacy F6, R2-9).
++      LOG(INFO) << "[workspaces] typed url diverted off anchored tab -> new tab"
++                << (workspaces::LogsAddresses() ? ": " + params->url.spec()
++                                                : std::string());
+     }
+   }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
+@@ -147,11 +147,12 @@ bool HasId(const std::vector<ArchiveEntr
+ }
+ 
+ // Drops every entry older than kKeepFor (design 5: at the load and before a
+-// write), a snoozed one counted from its wake (C33). True when one went.
++// write), never a snoozed one: only its wake takes it out (C33, R2-22). True
++// when one went.
+ bool Prune(std::vector<ArchiveEntry>& entries) {
+   const base::Time oldest = base::Time::Now() - kKeepFor;
+   return std::erase_if(entries, [oldest](const ArchiveEntry& entry) {
+-           return std::max(entry.archived_at, entry.wake_at) < oldest;
++           return !entry.snoozed() && entry.archived_at < oldest;
+          }) > 0;
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.h
+@@ -82,9 +82,9 @@ struct ArchiveEntry {
+   bool operator==(const ArchiveEntry&) const = default;
+ };
+ 
+-// How long an entry is kept (the owner: Arc's number), counted from the later
+-// of archived_at and wake_at: a long snooze is never dropped before it wakes
+-// (C33).
++// How long an entry is kept (the owner: Arc's number), counted from
++// archived_at. A snoozed entry is kept until it wakes, however long the
++// browser was not run (C33, R2-22).
+ inline constexpr base::TimeDelta kKeepFor = base::Days(60);
+ 
+ // The file's and the log's word for a reason: "manual", "window", "auto".
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
+@@ -470,24 +470,24 @@ TEST_F(ArchiveStoreTest, RemoveSinceLeav
+   EXPECT_EQ(Ids(store->entries()), (IdList{"snoozed"}));
+ }
+ 
+-// C33: a snooze longer than the keep is never dropped before it wakes; the
+-// keep counts from the wake.
+-TEST_F(ArchiveStoreTest, ASnoozedEntryIsKeptSixtyDaysFromItsWake) {
++// C33, R2-22: a snoozed entry is never dropped, however long the browser was
++// not run after its wake time: only waking takes it out.
++TEST_F(ArchiveStoreTest, ASnoozedEntryIsKeptUntilItWakes) {
+   std::unique_ptr<ArchiveStore> store = LoadedStore();
+   ArchiveEntry snoozed = Entry("snoozed", "https://s.example/");
+   snoozed.wake_at = base::Time::Now() + base::Days(10);
+   ASSERT_TRUE(store->Add(snoozed));
+   ASSERT_TRUE(store->Add(Entry("plain", "https://p.example/")));
+ 
+-  // Archived 65 days ago, woke 55 days ago: kept; the plain one goes.
++  // Archived 65 days ago: the plain one goes, the snoozed one stays.
+   task_environment_.FastForwardBy(base::Days(65));
+   ASSERT_TRUE(store->Add(Entry("b", "https://b.example/")));
+   EXPECT_EQ(Ids(store->entries()), (IdList{"snoozed", "b"}));
+ 
+-  // Woke 61 days ago: gone.
++  // Due 61 days ago and never woken: still kept.
+   task_environment_.FastForwardBy(base::Days(6));
+   ASSERT_TRUE(store->Add(Entry("c", "https://c.example/")));
+-  EXPECT_EQ(Ids(store->entries()), (IdList{"b", "c"}));
++  EXPECT_EQ(Ids(store->entries()), (IdList{"snoozed", "b", "c"}));
+ }
+ 
+ // The screen draws nothing before the load, so a clear then is not one it
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -2248,8 +2248,9 @@ void WorkspaceService::CarryTagAcrossRep
+   const std::string old_title = CustomTitleForTab(replace->old_contents);
+   const std::string old_pin_item = PinItemForTab(replace->old_contents);
+   const std::string old_emoji = EmojiForTab(replace->old_contents);
++  const std::string old_arc_id = ArcIdForTab(replace->old_contents);
+   if (old_guid.empty() && old_anchor.empty() && old_title.empty() &&
+-      old_pin_item.empty() && old_emoji.empty()) {
++      old_pin_item.empty() && old_emoji.empty() && old_arc_id.empty()) {
+     return;
+   }
+   // The anchor first, so the SetTag below persists both in one write. This is
+@@ -2276,6 +2277,12 @@ void WorkspaceService::CarryTagAcrossRep
+     WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
+         ->set_pin_item(old_pin_item);
+   }
++  // And an imported tab's Arc id (C2): an import cut off by Exit knows its
++  // tabs by it alone, so a tab put to sleep would be imported again (R2-7).
++  if (!old_arc_id.empty()) {
++    WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
++        ->set_arc_id(old_arc_id);
++  }
+ 
+   // Through SetTag rather than straight onto the new contents, because the
+   // replacement gets a brand new SessionTabHelper and therefore a brand new
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -431,15 +431,19 @@ int FolderColor(const PinNode& folder, i
+   return folder.color >= 0 ? folder.color : workspace_color;
+ }
+ 
+-// The tab of `model` that is the page of item `id`, or null. The strip's own
+-// iterator, never GetTabAtIndex(i): an index lookup walks the collection tree
+-// from the start, so a loop of them is ~n^2/2 steps (R2-6).
+-tabs::TabInterface* LinkedTab(TabStripModel* model, std::string_view id) {
++// The tab of `model` that is the page of item `id`, or null; a favorite only
++// when `favorites_too` (a page pinned while Workspaces was off keeps its link).
++// The strip's own iterator, never GetTabAtIndex(i): an index lookup walks the
++// collection tree from the start, so a loop of them is ~n^2/2 steps (R2-6).
++tabs::TabInterface* LinkedTab(TabStripModel* model,
++                              std::string_view id,
++                              bool favorites_too = true) {
+   if (!model) {
+     return nullptr;
+   }
+   for (tabs::TabInterface* const tab : *model) {
+-    if (workspaces::PinItemForTab(tab->GetContents()) == id) {
++    if ((favorites_too || !tab->IsPinned()) &&
++        workspaces::PinItemForTab(tab->GetContents()) == id) {
+       return tab;
+     }
+   }
+@@ -574,10 +578,13 @@ void UnlinkItem(BrowserWindowInterface*
+     for (tabs::TabInterface* const tab : tabs) {
+       const int from = model->GetIndexOfTab(tab);
+       const int final_index = from < to ? to - 1 : to;
+-      if (dropped_here && group) {
++      // A favorite is only unlinked: it keeps its place among its window's
++      // favorites (R2-13).
++      const bool moves = !tab->IsPinned();
++      if (moves && dropped_here && group) {
+         model->MoveWebContentsAt(from, final_index,
+                                  /*select_after_move=*/false, group);
+-      } else if (to >= 0 && final_index != from) {
++      } else if (moves && to >= 0 && final_index != from) {
+         model->MoveWebContentsAt(from, final_index,
+                                  /*select_after_move=*/false);
+       }
+@@ -3552,8 +3559,9 @@ void WorkspacePinnedSectionView::UnpinIt
+       }
+       TabStripModel* const there = window->GetTabStripModel();
+       for (const PinNode& page : split.children) {
+-        tabs::TabInterface* const tab = LinkedTab(there, page.id);
+-        if (!tab || tab->IsPinned()) {
++        tabs::TabInterface* const tab =
++            LinkedTab(there, page.id, /*favorites_too=*/false);
++        if (!tab) {
+           continue;
+         }
+         const std::optional<split_tabs::SplitTabId> joined = tab->GetSplit();
+@@ -3578,8 +3586,8 @@ void WorkspacePinnedSectionView::UnpinIt
+       }
+     }
+     // In the row's workspace, as ShowSplit opens one (review #42); here, the
+-    // workspace on screen.
+-    OpenSplit(browser_, split, drawn_guid_);
++    // workspace on screen. A selection's Unpin opens it behind (R2-14).
++    OpenSplit(browser_, split, drawn_guid_, select);
+     if (before) {
+       index = here->GetIndexOfTab(before);
+     } else if (to_end) {
+@@ -3601,10 +3609,11 @@ void WorkspacePinnedSectionView::UnpinIt
+   if (!LinkedTab(here, id)) {
+     TabStripModel* there = nullptr;
+     tabs::TabInterface* page = nullptr;
++    // Never a favorite, as the split above (R2-13): it stays in its window.
+     for (BrowserWindowInterface* const window :
+          WindowsOf(browser_->GetProfile())) {
+       there = window->GetTabStripModel();
+-      if ((page = LinkedTab(there, id))) {
++      if ((page = LinkedTab(there, id, /*favorites_too=*/false))) {
+         break;
+       }
+     }
+@@ -3615,7 +3624,7 @@ void WorkspacePinnedSectionView::UnpinIt
+       here->InsertDetachedTabAt(
+           here->count(),
+           there->DetachTabAtForInsertion(there->GetIndexOfTab(page)),
+-          AddTabTypes::ADD_ACTIVE);
++          select ? AddTabTypes::ADD_ACTIVE : AddTabTypes::ADD_NONE);
+       LOG(INFO) << "[workspaces] pins: brought the page of '" << id
+                 << "' from another window";
+     }
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -2627,11 +2627,40 @@ std::unique_ptr<views::Background> Works
+ }
+ 
+ void WorkspaceRailView::PlaceInParent() {
+-  if (auto* const box = views::AsViewClass<views::FlexLayoutView>(parent())) {
+-    box->SetMainAxisAlignment(collapsed_ && GetVisible()
+-                                  ? views::LayoutAlignment::kEnd
+-                                  : views::LayoutAlignment::kStart);
++  auto* const box = views::AsViewClass<views::FlexLayoutView>(parent());
++  if (!box) {
++    return;
++  }
++  box->SetMainAxisAlignment(collapsed_ && GetVisible()
++                                ? views::LayoutAlignment::kEnd
++                                : views::LayoutAlignment::kStart);
++  // Helium's container never shrinks below its own height
++  // (vertical_tab_strip_region_view.cc), so a column of many chips ran off the
++  // window (R2-21). While the rail is shown it may, but it still gets its own
++  // height before the tab list (order 0, the tab list's is 1), as it did: only
++  // what does not fit at all is taken from the rail's scroller. Hidden
++  // (Workspaces off), Helium's own rule is put back. Only on a change: this
++  // runs at every rebuild. A rebase tripwire stops if Helium sets the rule
++  // anywhere else (rebase-overnight.ps1).
++  if (GetVisible() == helium_flex_.has_value()) {
++    return;
++  }
++  if (helium_flex_) {
++    box->SetProperty(views::kFlexBehaviorKey, *helium_flex_);
++    helium_flex_.reset();
++    return;
++  }
++  const views::FlexSpecification* const own =
++      box->GetProperty(views::kFlexBehaviorKey);
++  if (!own) {
++    return;
+   }
++  helium_flex_ = *own;
++  box->SetProperty(views::kFlexBehaviorKey,
++                   views::FlexSpecification(
++                       views::MinimumFlexSizeRule::kScaleToMinimum,
++                       views::MaximumFlexSizeRule::kUnbounded)
++                       .WithOrder(0));
+ }
+ 
+ void WorkspaceRailView::OnCollapseStateChanged(
+@@ -2648,10 +2677,10 @@ void WorkspaceRailView::OnCollapseStateC
+   SetOrientation(orientation);
+   scroll_contents_->SetOrientation(orientation);
+ 
+-  // Only the row can run out of room. The column shows every button, so it
+-  // neither scrolls nor has arrows, and nothing in it flexes. The row shows
+-  // its arrows only when the chips overflow, which the next layout decides
+-  // (ShowArrowsOnOverflow).
++  // Both shapes can run out of room. The row slides sideways, with arrows
++  // shown only when the chips overflow, which the next layout decides
++  // (ShowArrowsOnOverflow). The column scrolls up and down by the wheel, with
++  // no arrows (R2-21: it ran off the window).
+   if (collapsed) {
+     back_button_->SetVisible(false);
+     forward_button_->SetVisible(false);
+@@ -2659,6 +2688,12 @@ void WorkspaceRailView::OnCollapseStateC
+   scroll_view_->SetHorizontalScrollBarMode(
+       collapsed ? views::ScrollView::ScrollBarMode::kDisabled
+                 : views::ScrollView::ScrollBarMode::kHiddenButEnabled);
++  // This first: any change of it turns vertical scrolling off again
++  // (scroll_view.cc), and a DCHECK refuses vertical scrolling while it is on.
++  scroll_view_->SetTreatAllScrollEventsAsHorizontal(!collapsed);
++  scroll_view_->SetVerticalScrollBarMode(
++      collapsed ? views::ScrollView::ScrollBarMode::kHiddenButEnabled
++                : views::ScrollView::ScrollBarMode::kDisabled);
+ 
+   // At the bottom of the strip in both shapes (E17a). Helium's bottom
+   // container fills everything under the tab list, so a rail left at its
+@@ -2672,26 +2707,26 @@ void WorkspaceRailView::OnCollapseStateC
+   SetMainAxisAlignment(collapsed ? views::LayoutAlignment::kEnd
+                                  : views::LayoutAlignment::kStart);
+   PlaceInParent();
+-  if (collapsed) {
+-    ClearProperty(views::kCrossAxisAlignmentKey);
+-    ClearProperty(views::kFlexBehaviorKey);
+-    scroll_view_->ClearProperty(views::kFlexBehaviorKey);
+-    return;
+-  }
+-  SetProperty(views::kCrossAxisAlignmentKey, views::LayoutAlignment::kEnd);
+-  // The rail fills the bottom row and may shrink to its fixed parts; the
+-  // scroller is the part that gives, which is the whole fix (LOCAL.md 33).
+-  // It grows no wider than the chips: the spacers take the rest (MakeSpacer).
+-  SetProperty(
+-      views::kFlexBehaviorKey,
+-      views::FlexSpecification(views::LayoutOrientation::kHorizontal,
+-                               views::MinimumFlexSizeRule::kScaleToMinimum,
+-                               views::MaximumFlexSizeRule::kUnbounded));
++  // In both shapes the rail may shrink to its fixed parts, and the scroller
++  // is the part that gives, which is the whole fix (LOCAL.md 33). It grows no
++  // longer than the chips: in the row the spacers take the rest (MakeSpacer).
+   scroll_view_->SetProperty(
+       views::kFlexBehaviorKey,
+-      views::FlexSpecification(views::LayoutOrientation::kHorizontal,
++      views::FlexSpecification(orientation,
+                                views::MinimumFlexSizeRule::kScaleToZero,
+                                views::MaximumFlexSizeRule::kPreferred));
++  // The rail fills the bottom row; the column it never outgrows: stretched,
++  // it drew its hairline under the last tab (above).
++  SetProperty(views::kFlexBehaviorKey,
++              views::FlexSpecification(
++                  orientation, views::MinimumFlexSizeRule::kScaleToMinimum,
++                  collapsed ? views::MaximumFlexSizeRule::kPreferred
++                            : views::MaximumFlexSizeRule::kUnbounded));
++  if (collapsed) {
++    ClearProperty(views::kCrossAxisAlignmentKey);
++  } else {
++    SetProperty(views::kCrossAxisAlignmentKey, views::LayoutAlignment::kEnd);
++  }
+ }
+ 
+ BEGIN_METADATA(WorkspaceRailView)
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -29,6 +29,7 @@
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/drag_controller.h"
++#include "ui/views/layout/flex_layout_types.h"
+ #include "ui/views/layout/flex_layout_view.h"
+ #include "ui/views/view_tracker.h"
+ 
+@@ -410,6 +411,9 @@ class WorkspaceRailView : public views::
+ 
+   // Whether the strip is collapsed, for PlaceInParent().
+   bool collapsed_ = false;
++  // Helium's own flex rule for the container, kept aside while PlaceInParent()
++  // replaces it (R2-21): set exactly while the rail is shown.
++  std::optional<views::FlexSpecification> helium_flex_;
+ 
+   // Which workspace the open context menu belongs to. A menu is modal to the
+   // user but not to this class: the menu runs, this returns, and ExecuteCommand

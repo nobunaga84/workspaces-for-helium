@@ -1,0 +1,22 @@
+--- a/components/favicon/core/favicon_database.cc
++++ b/components/favicon/core/favicon_database.cc
+@@ -740,6 +740,9 @@ FaviconDatabase::FindBestPageURLForHost(
+   // If PageUrlType is ever changed the ORDER BY clause for page_url_type may
+   // need to be revised.
+   CHECK_EQ(PageUrlType::kRedirect, PageUrlType::kMaxValue);
++  // Helium Workspaces: a tie goes to the page mapped last, so a site's
++  // current icon wins over one imported years ago -- otherwise the index
++  // order decides, and every http:// page sorts before every https:// one.
+   sql::Statement statement(
+       db_.GetCachedStatement(SQL_FROM_HERE,
+                              "SELECT icon_mapping.page_url, "
+@@ -750,7 +753,8 @@ FaviconDatabase::FindBestPageURLForHost(
+                              "WHERE (page_url >= ? AND page_url < ?) "
+                              "OR (page_url >= ? AND page_url < ?) "
+                              "ORDER BY icon_mapping.page_url_type ASC, "
+-                             "favicons.icon_type DESC"));
++                             "favicons.icon_type DESC, "
++                             "icon_mapping.id DESC"));
+ 
+   // This is an optimization to avoid using the LIKE operator which can be
+   // expensive. This statement finds all rows where page_url starts from either

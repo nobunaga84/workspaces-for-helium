@@ -1,0 +1,45 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -846,6 +846,20 @@ int WorkspaceService::CloseTabs(std::vec
+     PutLast(doomed, active->GetHandle());
+   }
+ 
++  // Every tab of the window (R2-1): an emptied strip closes the window
++  // (Browser::TabStripEmpty), and the browser with it if it was the last. A
++  // New Tab first keeps it, as Arc's Clear leaves one, stamped into the
++  // workspace on screen as it lands (StampInsertedTab); in the background, so
++  // the page in front still closes last, onto it. Only Close all and Clear
++  // Today get here: Delete switches away first, which opens a tab, snooze
++  // refuses, and Close duplicates keeps the page in front.
++  if (std::ssize(doomed) >= tab_strip_->count()) {
++    LOG(INFO) << "[workspaces] close: the window's last tabs, a New Tab opened "
++                 "first";
++    tab_strip_->delegate()->AddTabAt(GURL(), /*index=*/-1,
++                                     /*foreground=*/false);
++  }
++
+   // CLOSE_CREATE_HISTORICAL_TAB so they land in Recently Closed. Each one still
+   // carries its guid in its session data, so reopening one lands back in this
+   // workspace -- or, if the workspace was deleted meanwhile, resolves through
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -287,7 +287,8 @@ class WorkspaceService : public TabStrip
+   // -- Ctrl+Shift+T is the undo -- and answers how many it closed. The
+   // workspace itself stays; DeleteWorkspace() is this plus the pref write.
+   // Closing out the active workspace leaves nothing on screen, and the removal
+-  // path then spawns a fresh tab into it (EnsureActiveTabVisible, E9f).
++  // path then spawns a fresh tab into it (EnsureActiveTabVisible, E9f) -- or,
++  // when those were the window's last tabs, CloseTabs() opened it first.
+   //
+   // With `today_only` (C22, Arc's "Clear"), an open pinned page's tab is kept
+   // too: only the tabs the Today list draws close. An anchored tab is kept
+@@ -732,7 +733,8 @@ class WorkspaceService : public TabStrip
+ 
+ 
+   // Closes `doomed` with CLOSE_CREATE_HISTORICAL_TAB, the active tab last,
+-  // re-resolving each handle on the way past; answers the closes asked. The
++  // re-resolving each handle on the way past; answers the closes asked. Every
++  // tab of the window: a New Tab first, so the window stays (R2-1). The
+   // one loop CloseWorkspaceTabs() and CloseDuplicateTabs() share (C32). ONLY
+   // FROM A MENU OR COMMAND HANDLER: it closes tabs.
+   int CloseTabs(std::vector<tabs::TabHandle> doomed);

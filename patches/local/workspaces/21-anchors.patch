@@ -1,0 +1,616 @@
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -48,6 +48,7 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/reading_list/reading_list_model_factory.h"
+ #include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"
++#include "chrome/browser/resource_coordinator/tab_manager.h"
+ #include "chrome/browser/search/search.h"
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+ #include "chrome/browser/send_tab_to_self/send_tab_to_self_util.h"
+@@ -126,6 +127,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_selection_state.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -1515,6 +1517,22 @@ void CloseTab(BrowserWindowInterface* br
+     return;
+   }
+ 
++  // Helium Workspaces: an anchored tab hibernates at its anchor instead of
++  // closing (design 5, E10 spec). Single-tab selections only, so Ctrl+W over
++  // a multi-selection still closes the selection. The discard is handed in
++  // from here because TabManager is out of the workspaces target's reach.
++  if (browser->GetTabStripModel()->selection_model().size() == 1) {
++    workspaces::WorkspaceService* const workspace_service =
++        workspaces::WorkspaceService::From(browser);
++    if (workspace_service && workspace_service->HibernateAnchoredTab(
++                                 active_tab, [](content::WebContents* contents) {
++                                   return g_browser_process->GetTabManager()
++                                       ->DiscardTabByExtension(contents);
++                                 })) {
++      return;
++    }
++  }
++
+ #if !BUILDFLAG(IS_ANDROID)
+   if (base::FeatureList::IsEnabled(
+           contextual_tasks::kContextualTasksCloseTabExpandsSidePanel)) {
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -170,6 +170,8 @@ if (!is_android) {
+     sources = [
+       "existing_workspace_sub_menu_model.cc",
+       "existing_workspace_sub_menu_model.h",
++      "workspace_anchor_sub_menu_model.cc",
++      "workspace_anchor_sub_menu_model.h",
+       "glic_tab_sub_menu_model.cc",
+       "tab_menu_model.cc",
+     ]
+--- a/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
+@@ -54,6 +54,9 @@ class ExistingBaseSubMenuModel : public
+   // by the same id. Registered here so the next range added does not overlap
+   // it.
+   static constexpr int kMinExistingWorkspaceCommandId = 2101;
++  // Helium Workspaces: the anchor submenu (workspace_anchor_sub_menu_model.h),
++  // three fixed items.
++  static constexpr int kMinWorkspaceAnchorCommandId = 2201;
+ 
+   ExistingBaseSubMenuModel(const ExistingBaseSubMenuModel&) = delete;
+   ExistingBaseSubMenuModel& operator=(const ExistingBaseSubMenuModel&) = delete;
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/existing_tab_group_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h"
++#include "chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/existing_window_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/glic_tab_sub_menu_model.h"
+@@ -452,6 +453,18 @@ void TabMenuModel::Build(int index) {
+                            move_to_workspace_submenu_.get());
+   }
+ 
++  // Helium Workspaces: the anchor submenu (design 5, E10 spec), right beside
++  // the one above -- both are "what this tab is, in the workspace sense".
++  if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
++          tab_strip_->delegate()->GetBrowserWindowInterface())) {
++    anchor_submenu_ = std::make_unique<WorkspaceAnchorSubMenuModel>(
++        tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
++        index);
++    AddSubMenuWithStringId(TabStripModel::CommandAnchorTab,
++                           IDS_HELIUM_WORKSPACE_ANCHOR_SUBMENU,
++                           anchor_submenu_.get());
++  }
++
+   if (ExistingTabGroupSubMenuModel::ShouldShowSubmenu(
+           tab_strip_, index, tab_menu_model_delegate_)) {
+     // Create submenu with existing groups
+--- a/chrome/browser/ui/tabs/tab_menu_model.h
++++ b/chrome/browser/ui/tabs/tab_menu_model.h
+@@ -94,6 +94,7 @@ class TabMenuModel : public ui::SimpleMe
+   // Helium Workspaces. Held as the base type like every sibling here, so
+   // this header needs no include and no forward declaration for it.
+   std::unique_ptr<ui::SimpleMenuModel> move_to_workspace_submenu_;
++  std::unique_ptr<ui::SimpleMenuModel> anchor_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_group_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_window_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel>
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2756,6 +2756,7 @@ bool TabStripModel::IsContextMenuCommand
+ 
+   switch (command_id) {
+     case CommandMoveToWorkspace:
++    case CommandAnchorTab:
+       // Helium Workspaces. The submenu decides per item whether a destination
+       // makes sense; the parent is enabled whenever it exists at all, and
+       // ExistingWorkspaceSubMenuModel::ShouldShowSubmenu() is what decides
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
+@@ -0,0 +1,115 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h"
++
++#include <string>
++
++#include "chrome/browser/ui/tabs/existing_base_sub_menu_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++
++namespace {
++
++// Three fixed items in the registry range ExistingBaseSubMenuModel keeps
++// (LOCAL.md 21 is why a submenu never picks its own ids).
++constexpr int kToggleAnchor =
++    ExistingBaseSubMenuModel::kMinWorkspaceAnchorCommandId;
++constexpr int kResetToAnchor = kToggleAnchor + 1;
++constexpr int kReplaceAnchor = kToggleAnchor + 2;
++
++// Whether the tab has wandered off its anchor -- the only state in which
++// "go back" and "move anchor here" do anything.
++bool HasDrifted(const tabs::TabInterface* tab) {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return false;
++  }
++  const std::string anchor = workspaces::AnchorUrlForTab(contents);
++  return !anchor.empty() && contents->GetLastCommittedURL().spec() != anchor;
++}
++
++}  // namespace
++
++WorkspaceAnchorSubMenuModel::WorkspaceAnchorSubMenuModel(
++    BrowserWindowInterface* browser,
++    TabStripModel* tab_strip,
++    int context_index)
++    : ui::SimpleMenuModel(this),
++      browser_(browser),
++      tab_strip_(tab_strip),
++      context_index_(context_index) {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  const bool anchored = service && service->IsAnchored(ContextTab());
++  AddItemWithStringId(kToggleAnchor, anchored
++                                         ? IDS_HELIUM_WORKSPACE_UNANCHOR_TAB
++                                         : IDS_HELIUM_WORKSPACE_ANCHOR_TAB);
++  AddItemWithStringId(kResetToAnchor, IDS_HELIUM_WORKSPACE_RESET_TO_ANCHOR);
++  AddItemWithStringId(kReplaceAnchor, IDS_HELIUM_WORKSPACE_REPLACE_ANCHOR);
++}
++
++WorkspaceAnchorSubMenuModel::~WorkspaceAnchorSubMenuModel() = default;
++
++// static
++bool WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
++    BrowserWindowInterface* browser) {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  return service && service->IsEnabled();
++}
++
++tabs::TabInterface* WorkspaceAnchorSubMenuModel::ContextTab() const {
++  return tab_strip_->ContainsIndex(context_index_)
++             ? tab_strip_->GetTabAtIndex(context_index_)
++             : nullptr;
++}
++
++bool WorkspaceAnchorSubMenuModel::IsCommandIdEnabled(int command_id) const {
++  tabs::TabInterface* const tab = ContextTab();
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!tab || !service) {
++    return false;
++  }
++  switch (command_id) {
++    case kToggleAnchor:
++      // Unanchoring is always allowed; anchoring declines a split, as Ctrl+W
++      // on a split closes rather than hibernates (design 5).
++      return service->IsAnchored(tab) || !tab->IsSplit();
++    case kResetToAnchor:
++    case kReplaceAnchor:
++      return HasDrifted(tab);
++    default:
++      return false;
++  }
++}
++
++void WorkspaceAnchorSubMenuModel::ExecuteCommand(int command_id,
++                                                 int event_flags) {
++  tabs::TabInterface* const tab = ContextTab();
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!tab || !service) {
++    return;
++  }
++  switch (command_id) {
++    case kToggleAnchor:
++      service->SetAnchored(tab, !service->IsAnchored(tab));
++      break;
++    case kResetToAnchor:
++      service->ResetToAnchor(tab);
++      break;
++    case kReplaceAnchor:
++      // Re-anchoring at the current page is exactly "anchor here".
++      service->SetAnchored(tab, true);
++      break;
++    default:
++      break;
++  }
++}
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACE_ANCHOR_SUB_MENU_MODEL_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACE_ANCHOR_SUB_MENU_MODEL_H_
++
++#include "base/memory/raw_ptr.h"
++#include "ui/menus/simple_menu_model.h"
++
++class BrowserWindowInterface;
++class TabStripModel;
++
++namespace tabs {
++class TabInterface;
++}
++
++// The "Anchor" tab-menu submenu (design 5, E10 spec): anchor the right-clicked
++// tab at its page or unanchor it, go back to the anchor, or move the anchor to
++// the page it is showing now. Its own delegate, like
++// ExistingWorkspaceSubMenuModel, so TabStripModel needs no command plumbing
++// beyond the parent id. Acts on the right-clicked tab only: an anchor is a
++// property of one tab, not of a selection.
++class WorkspaceAnchorSubMenuModel : public ui::SimpleMenuModel,
++                                    public ui::SimpleMenuModel::Delegate {
++ public:
++  WorkspaceAnchorSubMenuModel(BrowserWindowInterface* browser,
++                              TabStripModel* tab_strip,
++                              int context_index);
++  WorkspaceAnchorSubMenuModel(const WorkspaceAnchorSubMenuModel&) = delete;
++  WorkspaceAnchorSubMenuModel& operator=(const WorkspaceAnchorSubMenuModel&) =
++      delete;
++  ~WorkspaceAnchorSubMenuModel() override;
++
++  static bool ShouldShowSubmenu(BrowserWindowInterface* browser);
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override;
++  bool IsCommandIdEnabled(int command_id) const override;
++
++ private:
++  tabs::TabInterface* ContextTab() const;
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  const raw_ptr<TabStripModel> tab_strip_;
++  const int context_index_;
++};
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACE_ANCHOR_SUB_MENU_MODEL_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+@@ -32,7 +33,11 @@
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/common/referrer.h"
++#include "ui/base/page_transition_types.h"
+ #include "url/gurl.h"
+ 
+ namespace workspaces {
+@@ -956,9 +961,18 @@ void WorkspaceService::CarryTagAcrossRep
+     return;
+   }
+   const std::string old_guid = WorkspaceGuidForTab(replace->old_contents);
+-  if (old_guid.empty()) {
++  const std::string old_anchor = AnchorUrlForTab(replace->old_contents);
++  if (old_guid.empty() && old_anchor.empty()) {
+     return;
+   }
++  // The anchor first, so the SetTag below persists both in one write. This is
++  // the path a hibernating anchor takes -- DiscardTabByExtension replaces the
++  // contents -- and an anchor that did not survive it would forget it was one
++  // the moment it went to sleep.
++  if (!old_anchor.empty()) {
++    WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
++        ->set_anchor_url(old_anchor);
++  }
+ 
+   // Through SetTag rather than straight onto the new contents, because the
+   // replacement gets a brand new SessionTabHelper and therefore a brand new
+@@ -973,7 +987,8 @@ void WorkspaceService::CarryTagAcrossRep
+   // discard is user-initiated, so a silent failure here would surface days
+   // later as "workspaces forgets tabs sometimes".
+   LOG(INFO) << "[workspaces] tab contents replaced at index " << replace->index
+-            << " -> carried workspace '" << old_guid << "'";
++            << " -> carried workspace '" << old_guid << "'"
++            << (old_anchor.empty() ? "" : ", anchor '" + old_anchor + "'");
+ }
+ 
+ std::string WorkspaceService::GuidOf(tabs::TabInterface* tab) const {
+@@ -1084,6 +1099,11 @@ void WorkspaceService::PersistTag(conten
+   session_service->AddTabExtraData(
+       session_tab_helper->window_id(), session_tab_helper->session_id(),
+       kWorkspaceExtraDataKey, WorkspaceGuidForTab(contents));
++  // The anchor rides the same write, under the same rule: an empty value is
++  // written rather than skipped, so unanchoring outlives a restart.
++  session_service->AddTabExtraData(
++      session_tab_helper->window_id(), session_tab_helper->session_id(),
++      kAnchorUrlExtraDataKey, AnchorUrlForTab(contents));
+ }
+ 
+ void WorkspaceService::ApplyCollectionGuid(
+@@ -1124,4 +1144,98 @@ void WorkspaceService::StampInsertedTab(
+             << "' (active '" << active_guid_ << "')";
+ }
+ 
++bool WorkspaceService::IsAnchored(const tabs::TabInterface* tab) const {
++  return tab && !AnchorUrlForTab(tab->GetContents()).empty();
++}
++
++void WorkspaceService::SetAnchored(tabs::TabInterface* tab, bool anchored) {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return;
++  }
++  WorkspaceTabData* const data =
++      WorkspaceTabData::GetOrCreateForWebContents(contents);
++  data->set_anchor_url(anchored ? contents->GetLastCommittedURL().spec()
++                                : std::string());
++  PersistTag(contents);
++  LOG(INFO) << "[workspaces] anchor at index " << tab_strip_->GetIndexOfTab(tab)
++            << " -> '" << data->anchor_url() << "'";
++}
++
++void WorkspaceService::ResetToAnchor(tabs::TabInterface* tab) {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return;
++  }
++  const GURL anchor(AnchorUrlForTab(contents));
++  if (!anchor.is_valid() || contents->GetLastCommittedURL() == anchor) {
++    return;
++  }
++  contents->GetController().LoadURL(anchor, content::Referrer(),
++                                    ui::PAGE_TRANSITION_TYPED, std::string());
++  LOG(INFO) << "[workspaces] reset to anchor '" << anchor.spec() << "'";
++}
++
++bool WorkspaceService::HibernateAnchoredTab(tabs::TabInterface* tab,
++                                            DiscardFn discard) {
++  if (!tab || !IsAnchored(tab) || tab->IsSplit()) {
++    return false;
++  }
++  content::WebContents* const contents = tab->GetContents();
++  const int index = tab_strip_->GetIndexOfTab(tab);
++  if (!contents || index == TabStripModel::kNoTab) {
++    return false;
++  }
++  if (contents->WasDiscarded()) {
++    // Already asleep. Consumed rather than closed: an anchor leaves only by
++    // being unanchored.
++    return true;
++  }
++
++  // Move activation away first, from this command, never from an observer
++  // (design 2.2). Candidates are the other tabs drawn in the active
++  // workspace, outside collapsed groups; the walk is the tested helper
++  // SelectRelativeTab used before M153 gave it its own bounded loop.
++  if (index == tab_strip_->active_index()) {
++    std::vector<bool> selectable;
++    selectable.reserve(static_cast<size_t>(tab_strip_->count()));
++    for (int i = 0; i < tab_strip_->count(); ++i) {
++      selectable.push_back(i != index && !tab_strip_->IsTabCollapsed(i) &&
++                           IsTabVisible(tab_strip_->GetTabAtIndex(i)));
++    }
++    const int fallback = NextVisibleTabIndex(selectable, index, 1);
++    if (fallback == index) {
++      // Nothing else to show in this workspace: spawn one, the way switching
++      // into an empty workspace does. StampInsertedTab tags it as it lands.
++      tab_strip_->delegate()->AddTabAt(GURL(), -1, /*foreground=*/true);
++    } else {
++      tab_strip_->ActivateTabAt(
++          fallback, TabStripUserGestureDetails(
++                        TabStripUserGestureDetails::GestureType::kOther));
++    }
++    if (tab_strip_->active_index() == index) {
++      return false;
++    }
++  }
++
++  // Copied out before the discard: `contents` does not survive it. The
++  // replacement observer carries tag and anchor onto the new contents.
++  const GURL anchor(AnchorUrlForTab(contents));
++  content::WebContents* const discarded = discard(contents);
++  if (!discarded) {
++    LOG(INFO) << "[workspaces] anchored tab at index " << index
++              << " could not be discarded; kept live";
++    return true;
++  }
++  if (content::NavigationEntry* const entry =
++          discarded->GetController().GetLastCommittedEntry();
++      entry && anchor.is_valid()) {
++    entry->SetURL(anchor);
++    entry->SetVirtualURL(anchor);
++  }
++  LOG(INFO) << "[workspaces] hibernated anchored tab at index " << index
++            << " -> '" << anchor.spec() << "'";
++  return true;
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -13,6 +13,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/callback_forward.h"
++#include "base/functional/function_ref.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ref.h"
+ #include "base/memory/weak_ptr.h"
+@@ -256,6 +257,35 @@ class WorkspaceService : public TabStrip
+   // tree, and the answer changes whenever the active workspace does.
+   bool IsTabVisible(const tabs::TabInterface* tab) const;
+ 
++  // Stage 5 anchors (design 5, E10 spec). An anchored tab remembers a home
++  // URL; Ctrl+W puts it to sleep there instead of closing it.
++  bool IsAnchored(const tabs::TabInterface* tab) const;
++
++  // Anchors `tab` at the page it is showing, or clears its anchor. Persisted
++  // through the same session write as the tag.
++  void SetAnchored(tabs::TabInterface* tab, bool anchored);
++
++  // Navigates an anchored tab back to its anchor. No-op when it is there.
++  void ResetToAnchor(tabs::TabInterface* tab);
++
++  // The Ctrl+W behaviour for an anchored tab: move activation to another tab
++  // of the active workspace first (spawning one when there is no other),
++  // discard the tab through `discard`, and point the discarded entry at the
++  // anchor so the next activation reloads the anchor rather than the drift.
++  //
++  // `discard` is passed in because the unconditional discard lives on
++  // TabManager in //chrome/browser, which this target cannot depend on
++  // without a GN cycle; browser_commands.cc, which can, hands it over.
++  //
++  // Returns false when `tab` is not an anchored tab the caller should keep --
++  // not anchored, in a split, or activation could not be moved off it -- in
++  // which case the caller closes as it always did. Returns true when the tab
++  // was hibernated, or was already asleep: an anchor is never closed by
++  // Ctrl+W, only by unanchoring it first (the Zen rule, design 5).
++  using DiscardFn =
++      base::FunctionRef<content::WebContents*(content::WebContents*)>;
++  bool HibernateAnchoredTab(tabs::TabInterface* tab, DiscardFn discard);
++
+  private:
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
+@@ -21,17 +21,31 @@ std::string WorkspaceGuidForTab(content:
+   return tab_data ? tab_data->guid() : std::string();
+ }
+ 
++std::string AnchorUrlForTab(content::WebContents* contents) {
++  if (!contents) {
++    return std::string();
++  }
++  const WorkspaceTabData* tab_data =
++      WorkspaceTabData::FromWebContents(contents);
++  return tab_data ? tab_data->anchor_url() : std::string();
++}
++
+ void PopulateWorkspaceExtraData(
+     content::WebContents* contents,
+     std::map<std::string, std::string>* extra_data) {
+   if (!extra_data) {
+     return;
+   }
++  // Each key independently: a tab can be anchored in the default workspace,
++  // where the guid is empty, and must not lose its anchor for it.
+   std::string guid = WorkspaceGuidForTab(contents);
+-  if (guid.empty()) {
+-    return;
++  if (!guid.empty()) {
++    (*extra_data)[kWorkspaceExtraDataKey] = std::move(guid);
++  }
++  std::string anchor = AnchorUrlForTab(contents);
++  if (!anchor.empty()) {
++    (*extra_data)[kAnchorUrlExtraDataKey] = std::move(anchor);
+   }
+-  (*extra_data)[kWorkspaceExtraDataKey] = std::move(guid);
+ }
+ 
+ void RestoreWorkspaceFromExtraData(
+@@ -40,16 +54,24 @@ void RestoreWorkspaceFromExtraData(
+   if (!contents) {
+     return;
+   }
+-  const auto it = extra_data.find(kWorkspaceExtraDataKey);
+-  if (it == extra_data.end()) {
++  const auto guid_it = extra_data.find(kWorkspaceExtraDataKey);
++  const auto anchor_it = extra_data.find(kAnchorUrlExtraDataKey);
++  if (guid_it == extra_data.end() && anchor_it == extra_data.end()) {
+     return;
+   }
+-
+   // Set even when the stored value is empty. An empty tag is a real state --
+   // it is what pinning a tab leaves behind -- and the session file records it
+   // by writing the key with an empty value over the older one, so honouring it
+-  // here is what makes unpin-then-restart agree with unpin-then-reopen.
+-  WorkspaceTabData::GetOrCreateForWebContents(contents)->set_guid(it->second);
++  // here is what makes unpin-then-restart agree with unpin-then-reopen. The
++  // anchor follows the same rule: unanchoring writes an empty value.
++  WorkspaceTabData* const data =
++      WorkspaceTabData::GetOrCreateForWebContents(contents);
++  if (guid_it != extra_data.end()) {
++    data->set_guid(guid_it->second);
++  }
++  if (anchor_it != extra_data.end()) {
++    data->set_anchor_url(anchor_it->second);
++  }
+ }
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
+@@ -49,11 +49,18 @@ namespace workspaces {
+ // everything exactly once, on the build that renamed it.
+ inline constexpr char kWorkspaceExtraDataKey[] = "helium.workspace";
+ 
++// The anchor URL of an anchored tab (design 5, E10 spec). Same carrier, same
++// rules as the guid: written empty to clear, absent means "not anchored".
++inline constexpr char kAnchorUrlExtraDataKey[] = "helium.anchor_url";
++
+ // The workspace `contents` is tagged for, or empty for a tab that has never
+ // been stamped, a pinned tab (pinning clears the tag), or a null argument.
+ // Empty means the implicit default workspace, never "no workspace".
+ std::string WorkspaceGuidForTab(content::WebContents* contents);
+ 
++// The anchor URL stored on `contents`, or empty when it is not anchored.
++std::string AnchorUrlForTab(content::WebContents* contents);
++
+ // Adds the tag to the map the tab-restore service captures when a tab is
+ // closed, so reopening it with Ctrl+Shift+T puts it back in its workspace.
+ //
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -39,6 +39,15 @@ class WorkspaceTabData : public content:
+   const std::string& guid() const { return guid_; }
+   void set_guid(std::string guid) { guid_ = std::move(guid); }
+ 
++  // Stage 5 anchors (design 5, E10 spec). An anchored tab has a home URL:
++  // Ctrl+W puts it to sleep and points it back there instead of closing it.
++  // One field, not two -- "anchored" simply means the URL is non-empty, so the
++  // two can never disagree. Kept as a string so :tab_data stays free of //url;
++  // the service validates it at the one place it is navigated to.
++  const std::string& anchor_url() const { return anchor_url_; }
++  void set_anchor_url(std::string url) { anchor_url_ = std::move(url); }
++  bool anchored() const { return !anchor_url_.empty(); }
++
+  private:
+   friend class content::WebContentsUserData<WorkspaceTabData>;
+ 
+@@ -47,6 +56,7 @@ class WorkspaceTabData : public content:
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+ 
+   std::string guid_;
++  std::string anchor_url_;
+ };
+ 
+ }  // namespace workspaces
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -47,6 +47,7 @@ enum TabContextMenuCommand {
+   // delegate and its item ids are local to it
+   // (existing_workspace_sub_menu_model.h).
+   CommandMoveToWorkspace,
++  CommandAnchorTab,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 

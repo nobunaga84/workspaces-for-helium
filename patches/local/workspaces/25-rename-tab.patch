@@ -1,0 +1,429 @@
+--- a/chrome/browser/ui/tab_ui_helper.cc
++++ b/chrome/browser/ui/tab_ui_helper.cc
+@@ -13,6 +13,7 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_forward.h"
+ #include "base/process/kill.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/favicon/favicon_utils.h"
+ #include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
+@@ -25,6 +26,7 @@
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_web_contents_listener.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/ui/web_applications/web_app_browser_controller.h"
+ #include "chrome/common/webui_url_constants.h"
+@@ -138,6 +140,15 @@ std::u16string TabUIHelper::GetTitle() c
+     }
+   }
+ 
++  // Helium Workspaces (E11): a title the user typed wins over the page's own.
++  // One hook here rather than one per consumer -- tab_data.cc, tab search and
++  // the hover card all read this function.
++  if (const workspaces::WorkspaceTabData* const workspace_data =
++          workspaces::WorkspaceTabData::FromWebContents(web_contents());
++      workspace_data && !workspace_data->custom_title().empty()) {
++    return base::UTF8ToUTF16(workspace_data->custom_title());
++  }
++
+   const std::u16string& contents_title = web_contents()->GetTitle();
+   if (!contents_title.empty()) {
+     return contents_title;
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -205,6 +205,7 @@ if (!is_android) {
+       "//chrome/browser/user_education",
+       "//components/commerce/core:commerce_constants",
+       "//components/commerce/core:feature_list",
++      "//components/constrained_window",
+       "//components/feed:feature_list",
+     ]
+   }
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -453,6 +453,14 @@ void TabMenuModel::Build(int index) {
+                            move_to_workspace_submenu_.get());
+   }
+ 
++  // Helium Workspaces (E11): rename, as a plain item where the owner looks
++  // for it. Shown under the same gate as the submenus below.
++  if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
++          tab_strip_->delegate()->GetBrowserWindowInterface())) {
++    AddItemWithStringId(TabStripModel::CommandRenameTab,
++                        IDS_HELIUM_WORKSPACE_RENAME_TAB);
++  }
++
+   // Helium Workspaces: the anchor submenu (design 5, E10 spec), right beside
+   // the one above -- both are "what this tab is, in the workspace sense".
+   if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2757,6 +2757,7 @@ bool TabStripModel::IsContextMenuCommand
+   switch (command_id) {
+     case CommandMoveToWorkspace:
+     case CommandAnchorTab:
++    case CommandRenameTab:
+       // Helium Workspaces. The submenu decides per item whether a destination
+       // makes sense; the parent is enabled whenever it exists at all, and
+       // ExistingWorkspaceSubMenuModel::ShouldShowSubmenu() is what decides
+@@ -2910,6 +2911,14 @@ void TabStripModel::ExecuteContextMenuCo
+     return;
+   }
+   switch (command_id) {
++    // Helium Workspaces: the two submenu parents are never executed (E9d),
++    // and CommandRenameTab is run by BrowserTabStripController before it
++    // gets here (E11). Listed so that -Wswitch stays quiet.
++    case CommandMoveToWorkspace:
++    case CommandAnchorTab:
++    case CommandRenameTab:
++      break;
++
+     case CommandNewTabToRight: {
+       base::UmaHistogramCounts1000(
+           "Tab.ContextMenu.NewTabToRight.SelectedTabsCount",
+--- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
+@@ -4,12 +4,26 @@
+ 
+ #include "chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h"
+ 
++#include <memory>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/memory/weak_ptr.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/ui/tabs/existing_base_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/grit/generated_resources.h"
++#include "components/constrained_window/constrained_window_views.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/models/dialog_model.h"
+ 
+ namespace {
+ 
+@@ -20,8 +34,67 @@ constexpr int kToggleAnchor =
+ constexpr int kResetToAnchor = kToggleAnchor + 1;
+ constexpr int kReplaceAnchor = kToggleAnchor + 2;
+ 
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kTabTitleFieldId);
++
++// Holds the tab by WeakPtr and finds the service at OK time: the menu model
++// that opened the dialog is gone by then, and the dialog is tab-modal, so it
++// goes away with its tab and never outlives what it points at.
++class TabTitleDialogDelegate : public ui::DialogModelDelegate {
++ public:
++  explicit TabTitleDialogDelegate(base::WeakPtr<content::WebContents> contents)
++      : contents_(contents) {}
++
++  void OnAccepted() {
++    ui::DialogModelTextfield* const field =
++        dialog_model()->GetTextfieldByUniqueId(kTabTitleFieldId);
++    tabs::TabInterface* const tab =
++        contents_ ? tabs::TabInterface::MaybeGetFromContents(contents_.get())
++                  : nullptr;
++    workspaces::WorkspaceService* const service =
++        tab ? workspaces::WorkspaceService::From(
++                  tab->GetBrowserWindowInterface())
++            : nullptr;
++    if (field && service) {
++      // Trimmed, so a title of spaces clears rather than blanking the tab.
++      std::u16string title;
++      base::TrimWhitespace(field->text(), base::TRIM_ALL, &title);
++      service->SetCustomTitle(tab, base::UTF16ToUTF8(title));
++    }
++  }
++
++ private:
++  base::WeakPtr<content::WebContents> contents_;
++};
++
+ }  // namespace
+ 
++// The rail's one-textfield bubble, as a tab-modal dialog: this file is not a
++// view and cannot anchor a bubble, and ShowWebModal takes the DialogModel as
++// is. Empty text restores the page's own title.
++void ShowRenameTabDialog(tabs::TabInterface* tab) {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return;
++  }
++  auto delegate =
++      std::make_unique<TabTitleDialogDelegate>(contents->GetWeakPtr());
++  TabTitleDialogDelegate* const delegate_ptr = delegate.get();
++  constrained_window::ShowWebModal(
++      ui::DialogModel::Builder(std::move(delegate))
++          .SetTitle(l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_RENAME_TAB))
++          .AddOkButton(base::BindOnce(&TabTitleDialogDelegate::OnAccepted,
++                                      base::Unretained(delegate_ptr)))
++          .AddCancelButton(base::DoNothing())
++          .AddTextfield(
++              kTabTitleFieldId,
++              l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_TAB_TITLE_LABEL),
++              base::UTF8ToUTF16(workspaces::CustomTitleForTab(contents)),
++              ui::DialogModelTextfield::Params())
++          .SetInitiallyFocusedField(kTabTitleFieldId)
++          .Build(),
++      contents);
++}
++
+ WorkspaceAnchorSubMenuModel::WorkspaceAnchorSubMenuModel(
+     BrowserWindowInterface* browser,
+     TabStripModel* tab_strip,
+--- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h
+@@ -15,6 +15,12 @@ namespace tabs {
+ class TabInterface;
+ }
+ 
++// E11 "Rename tab": a tab-modal one-textfield dialog on `tab` that sets its
++// custom title (empty restores the page's own). Declared here because this
++// target is the one both the tab menu and the tab strip controller can reach;
++// the item itself is a plain TabMenuModel entry, CommandRenameTab.
++void ShowRenameTabDialog(tabs::TabInterface* tab);
++
+ // The "Anchor" tab-menu submenu (design 5, E10 spec): anchor the right-clicked
+ // tab at its page or unanchor it, go back to the anchor, or move the anchor to
+ // the page it is showing now. Its own delegate, like
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -1012,7 +1012,8 @@ void WorkspaceService::CarryTagAcrossRep
+   }
+   const std::string old_guid = WorkspaceGuidForTab(replace->old_contents);
+   const std::string old_anchor = AnchorUrlForTab(replace->old_contents);
+-  if (old_guid.empty() && old_anchor.empty()) {
++  const std::string old_title = CustomTitleForTab(replace->old_contents);
++  if (old_guid.empty() && old_anchor.empty() && old_title.empty()) {
+     return;
+   }
+   // The anchor first, so the SetTag below persists both in one write. This is
+@@ -1023,6 +1024,12 @@ void WorkspaceService::CarryTagAcrossRep
+     WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
+         ->set_anchor_url(old_anchor);
+   }
++  // The custom title rides the same way, for the same reason: a renamed tab
++  // that hibernates would otherwise wake up under the page's own name.
++  if (!old_title.empty()) {
++    WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
++        ->set_custom_title(old_title);
++  }
+ 
+   // Through SetTag rather than straight onto the new contents, because the
+   // replacement gets a brand new SessionTabHelper and therefore a brand new
+@@ -1224,6 +1231,21 @@ void WorkspaceService::SetAnchored(tabs:
+             << " -> '" << data->anchor_url() << "'";
+ }
+ 
++void WorkspaceService::SetCustomTitle(tabs::TabInterface* tab,
++                                      const std::string& title) {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return;
++  }
++  WorkspaceTabData::GetOrCreateForWebContents(contents)->set_custom_title(title);
++  PersistTag(contents);
++  // Nothing about the page changed, so nothing would repaint the tab on its
++  // own -- the same lesson as the hibernated anchor's title (LOCAL.md 30).
++  contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TITLE);
++  LOG(INFO) << "[workspaces] custom title at index "
++            << tab_strip_->GetIndexOfTab(tab) << " -> '" << title << "'";
++}
++
+ void WorkspaceService::ResetToAnchor(tabs::TabInterface* tab) {
+   content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
+   if (!contents) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -315,6 +315,12 @@ class WorkspaceService : public TabStrip
+   // through the same session write as the tag.
+   void SetAnchored(tabs::TabInterface* tab, bool anchored);
+ 
++  // Gives `tab` a title of the user's choosing, or restores the page's own
++  // with an empty string (E11). Persisted through the same session write as
++  // the tag. Not gated on IsEnabled(): a name is not a workspace behaviour,
++  // and the only way to set one is a menu that is.
++  void SetCustomTitle(tabs::TabInterface* tab, const std::string& title);
++
+   // Navigates an anchored tab back to its anchor. No-op when it is there.
+   void ResetToAnchor(tabs::TabInterface* tab);
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
+@@ -7,6 +7,7 @@
+ #include <map>
+ #include <string>
+ 
++#include "base/logging.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/gurl.h"
+@@ -31,6 +32,15 @@ std::string AnchorUrlForTab(content::Web
+   return tab_data ? tab_data->anchor_url() : std::string();
+ }
+ 
++std::string CustomTitleForTab(content::WebContents* contents) {
++  if (!contents) {
++    return std::string();
++  }
++  const WorkspaceTabData* tab_data =
++      WorkspaceTabData::FromWebContents(contents);
++  return tab_data ? tab_data->custom_title() : std::string();
++}
++
+ bool HasDriftedFrom(content::WebContents* contents, const GURL& url) {
+   const std::string anchor = AnchorUrlForTab(contents);
+   return !anchor.empty() && anchor != url.spec();
+@@ -56,6 +66,10 @@ void PopulateWorkspaceExtraData(
+   if (!anchor.empty()) {
+     (*extra_data)[kAnchorUrlExtraDataKey] = std::move(anchor);
+   }
++  std::string title = CustomTitleForTab(contents);
++  if (!title.empty()) {
++    (*extra_data)[kCustomTitleExtraDataKey] = std::move(title);
++  }
+ }
+ 
+ void RestoreWorkspaceFromExtraData(
+@@ -66,7 +80,9 @@ void RestoreWorkspaceFromExtraData(
+   }
+   const auto guid_it = extra_data.find(kWorkspaceExtraDataKey);
+   const auto anchor_it = extra_data.find(kAnchorUrlExtraDataKey);
+-  if (guid_it == extra_data.end() && anchor_it == extra_data.end()) {
++  const auto title_it = extra_data.find(kCustomTitleExtraDataKey);
++  if (guid_it == extra_data.end() && anchor_it == extra_data.end() &&
++      title_it == extra_data.end()) {
+     return;
+   }
+   // Set even when the stored value is empty. An empty tag is a real state --
+@@ -82,6 +98,13 @@ void RestoreWorkspaceFromExtraData(
+   if (anchor_it != extra_data.end()) {
+     data->set_anchor_url(anchor_it->second);
+   }
++  if (title_it != extra_data.end()) {
++    data->set_custom_title(title_it->second);
++    // The one line that proves a rename survived a restart or Ctrl+Shift+T;
++    // the title itself is drawn by a repaint nothing else logs.
++    LOG(INFO) << "[workspaces] restored custom title '" << title_it->second
++              << "'";
++  }
+ }
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
+@@ -55,6 +55,10 @@ inline constexpr char kWorkspaceExtraDat
+ // rules as the guid: written empty to clear, absent means "not anchored".
+ inline constexpr char kAnchorUrlExtraDataKey[] = "helium.anchor_url";
+ 
++// The title the user gave a renamed tab (E11). Same carrier, same rules:
++// written empty to clear, absent means "not renamed".
++inline constexpr char kCustomTitleExtraDataKey[] = "helium.custom_title";
++
+ // The workspace `contents` is tagged for, or empty for a tab that has never
+ // been stamped, a pinned tab (pinning clears the tag), or a null argument.
+ // Empty means the implicit default workspace, never "no workspace".
+@@ -63,6 +67,9 @@ std::string WorkspaceGuidForTab(content:
+ // The anchor URL stored on `contents`, or empty when it is not anchored.
+ std::string AnchorUrlForTab(content::WebContents* contents);
+ 
++// The title the user typed for `contents`, or empty when it has none.
++std::string CustomTitleForTab(content::WebContents* contents);
++
+ // Whether an anchored `contents` would be away from home at `url`. False for a
+ // tab that is not anchored: a tab with no home cannot be away from it.
+ //
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -48,6 +48,12 @@ class WorkspaceTabData : public content:
+   void set_anchor_url(std::string url) { anchor_url_ = std::move(url); }
+   bool anchored() const { return !anchor_url_.empty(); }
+ 
++  // A title the user typed over the page's own (E11, "Rename tab"). Empty
++  // means "show the page title". Read in TabUIHelper::GetTitle(), so every
++  // place that draws a title sees it without a hook of its own.
++  const std::string& custom_title() const { return custom_title_; }
++  void set_custom_title(std::string title) { custom_title_ = std::move(title); }
++
+  private:
+   friend class content::WebContentsUserData<WorkspaceTabData>;
+ 
+@@ -57,6 +63,7 @@ class WorkspaceTabData : public content:
+ 
+   std::string guid_;
+   std::string anchor_url_;
++  std::string custom_title_;
+ };
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -39,6 +39,7 @@
+ #include "chrome/browser/ui/tabs/tab_menu_model.h"
+ #include "chrome/browser/ui/tabs/tab_menu_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_muted_utils.h"
++#include "chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -902,6 +903,13 @@ void BrowserTabStripController::ExecuteC
+     tabs::TabInterface* tab,
+     TabStripModel::ContextMenuCommand command_id,
+     int event_flags) {
++  // Helium Workspaces (E11): handled here, not in the model, because the
++  // dialog is a views concern and this is the first views-layer hand the
++  // command passes through.
++  if (command_id == TabStripModel::CommandRenameTab) {
++    ShowRenameTabDialog(tab);
++    return;
++  }
+   model_->ExecuteContextMenuCommand(model_->GetIndexOfTab(tab), command_id);
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -28,6 +28,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+@@ -537,6 +538,14 @@ void TabStripCollectionController::Execu
+     tabs::TabInterface* tab,
+     TabStripModel::ContextMenuCommand command_id,
+     int event_flags) {
++  // Helium Workspaces (E11): the same intercept as BrowserTabStripController's
++  // -- this is the controller the collection-based strip (and so the vertical
++  // layout) actually runs the menu through. Either way the model never sees
++  // CommandRenameTab.
++  if (command_id == TabStripModel::CommandRenameTab) {
++    ShowRenameTabDialog(tab);
++    return;
++  }
+   model_->ExecuteContextMenuCommand(model_->GetIndexOfTab(tab), command_id);
+ }
+ 
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -48,6 +48,9 @@ enum TabContextMenuCommand {
+   // (existing_workspace_sub_menu_model.h).
+   CommandMoveToWorkspace,
+   CommandAnchorTab,
++  // E11: a plain item, executed by BrowserTabStripController before the
++  // model sees it -- the dialog needs the window, which the model has not.
++  CommandRenameTab,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 

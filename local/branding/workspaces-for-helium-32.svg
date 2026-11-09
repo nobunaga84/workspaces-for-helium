@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <!-- 32 px, on whole pixels: a 2 px outline, the dots as 2-pixel marks. -->
+  <rect x="11" y="2" width="19" height="15" rx="4" fill="#7D84FB"/>
+  <rect x="7" y="8" width="19" height="15" rx="4" fill="#4FC1E5"/>
+  <rect x="3" y="14" width="19" height="15" rx="4" fill="#3A4566"/>
+  <rect x="5" y="16" width="15" height="11" rx="2.5" fill="#FFFFFF"/>
+  <rect x="7" y="18" width="4" height="7" rx="1.5" fill="#3A4566" fill-opacity=".14"/>
+  <rect x="8" y="19" width="2" height="1.5" fill="#E2457A"/>
+  <rect x="8" y="21" width="2" height="1.5" fill="#4FC1E5"/>
+  <rect x="8" y="23" width="2" height="1.5" fill="#7D84FB"/>
+</svg>

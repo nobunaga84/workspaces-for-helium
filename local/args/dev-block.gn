@@ -1,0 +1,24 @@
+
+# --- dev overrides (applied 2026-09-08; last assignment wins in args.gn) ---
+# is_component_build MUST be false on Windows: abseil's component build needs a
+# pre-generated symbols_x64_rel.def, and those .def files are generated from a
+# stock Chromium build. Helium compiles out safe_browsing/reporting/mdns/remoting,
+# so the code instantiating those absl templates is gone and lld-link fails with
+# hundreds of "<root>: undefined symbol". The .def cannot be regenerated here -
+# generate_def_files.py asserts sys.platform != 'win32' (crbug.com/379023022).
+is_component_build=false
+# PGO exists for release performance and costs hours; pointless for a dev build.
+chrome_pgo_phase=0
+# Faster compiles, far less disk.
+symbol_level=0
+blink_symbol_level=0
+v8_symbol_level=0
+# PCH is enabled by build/config/pch.gni only when !is_official_build, i.e. only in
+# --dev builds. But build/toolchain/win/toolchain.gni adds -fmodule-name to EVERY
+# clang compile unconditionally, and with /std:c++23preview that makes the PCH
+# translation unit parse as a C++20 module interface:
+#   build/precompile.cc(1,1): error: missing 'export module' declaration in
+#   module interface unit
+# Official builds never hit this because PCH is off there. Turn PCH off explicitly.
+enable_precompiled_headers=false
+

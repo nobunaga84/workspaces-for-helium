@@ -1,0 +1,2050 @@
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan.cc
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.cc
+@@ -223,6 +223,16 @@ class Walker {
+       }
+       ArcUnit tabs;
+       AppendItem(*child, tabs);
++      // A split arrives as one item of two tabs (AppendItem): one split row,
++      // with the split view's own Arc id (E19).
++      const bool split =
++          tabs.items.size() == 1 && tabs.items[0].tabs.size() == 2;
++      std::vector<pins::PinNode>& pages =
++          split ? rows.emplace_back().children : rows;
++      if (split) {
++        rows.back().type = pins::PinNode::Type::kSplit;
++        rows.back().id = StringOr(*child, "id", "");
++      }
+       for (ArcItem& item : tabs.items) {
+         for (ArcTab& tab : item.tabs) {
+           pins::PinNode row;
+@@ -231,7 +241,7 @@ class Walker {
+           row.title = std::move(tab.title);
+           row.custom_title = std::move(tab.custom_title);
+           row.last_active = tab.last_active;
+-          rows.push_back(std::move(row));
++          pages.push_back(std::move(row));
+           created.push_back(tab.created);
+         }
+       }
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan.h
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.h
+@@ -68,8 +68,8 @@ struct ArcWorkspace {
+   std::string icon;
+   // The space's pinned container as Arc keeps it -- folders nested, folders
+   // and tabs in Arc's own order, ids Arc's own -- as rows of the workspace's
+-  // pinned section: data, not tabs (E15b, design 5). A split's two tabs are
+-  // two items.
++  // pinned section: data, not tabs (E15b, design 5). A split view is one
++  // split row, its two tabs its pages (E19).
+   std::vector<pins::PinNode> pinned;
+   // Arc's createdAt of each pinned item, in walk order. A row does not carry
+   // it (the pins file has no use for it); a re-run needs it only to COUNT the
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan_unittest.cc
+@@ -79,13 +79,16 @@ std::string Shape(const std::vector<ArcU
+   return out;
+ }
+ 
+-// "t1 A{B{t3} t2}": rows by id, a folder as its title and its rows in braces.
++// "t1 A{B{t3} t2} s[t4 t5]": rows by id, a folder as its title and its rows in
++// braces, a split as its id and its two pages in brackets.
+ std::string RowShape(const std::vector<pins::PinNode>& rows) {
+   std::string out;
+   for (const pins::PinNode& row : rows) {
+     out += out.empty() ? "" : " ";
+     if (row.type == pins::PinNode::Type::kFolder) {
+       base::StrAppend(&out, {row.title, "{", RowShape(row.children), "}"});
++    } else if (row.type == pins::PinNode::Type::kSplit) {
++      base::StrAppend(&out, {row.id, "[", RowShape(row.children), "]"});
+     } else {
+       out += row.id;
+     }
+@@ -143,8 +146,9 @@ TEST(ArcImportPlanTest, WalksSpacesFolde
+   EXPECT_EQ(first.arc_space_id, "s1");
+   EXPECT_EQ(first.title, "First");
+   EXPECT_EQ(first.icon, "\xF0\x9F\x9A\x80");
+-  // Nested as in Arc; a pinned split is two rows, a half-web split one.
+-  EXPECT_EQ(RowShape(first.pinned), "t1 A{B{t3 t5 t6} t2} t4 t7");
++  // Nested as in Arc; a pinned split stays one row of its two pages (E19), a
++  // half-web split is one plain row.
++  EXPECT_EQ(RowShape(first.pinned), "t1 A{B{t3 spB[t5 t6]} t2} t4 t7");
+   EXPECT_EQ(first.pinned[0].url, "https://one.example/");
+   EXPECT_EQ(first.pinned[0].title, "One");
+   EXPECT_EQ(first.pinned[0].last_active, FromArcSeconds(10));
+@@ -370,16 +374,22 @@ TEST(ArcImportPlanTest, CountsFromARealS
+     int pinned = 0, folders = 0, today = 0, groups = 0, splits = 0,
+         renamed = 0;
+     // Recursive, so a std::function-free lambda that takes itself.
++    // A pinned split is one row of two pages (E19): both counted, and the
++    // split too, as before E15b.
+     const auto count_rows = [&](const auto& self,
+                                 const std::vector<pins::PinNode>& rows) -> void {
+       for (const pins::PinNode& row : rows) {
++        if (row.type == pins::PinNode::Type::kItem) {
++          ++pinned;
++          renamed += row.custom_title.empty() ? 0 : 1;
++          continue;
++        }
+         if (row.type == pins::PinNode::Type::kFolder) {
+           ++folders;
+-          self(self, row.children);
+         } else {
+-          ++pinned;
+-          renamed += row.custom_title.empty() ? 0 : 1;
++          ++splits;
+         }
++        self(self, row.children);
+       }
+     };
+     count_rows(count_rows, workspace.pinned);
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ 
++#include <algorithm>
+ #include <set>
+ #include <utility>
+ 
+@@ -33,6 +34,7 @@ constexpr char kCustomTitleKey[] = "cust
+ constexpr char kLastActiveKey[] = "last_active";
+ constexpr char kFolderType[] = "folder";
+ constexpr char kItemType[] = "item";
++constexpr char kSplitType[] = "split";
+ 
+ // A folder's colours: tab_groups::TabGroupColorId's nine (E17b).
+ constexpr int kFolderColorCount = 9;
+@@ -44,11 +46,15 @@ base::DictValue NodeToValue(const PinNod
+   base::DictValue dict;
+   dict.Set(kIdKey, node.id);
+   dict.Set(kTitleKey, node.title);
+-  if (node.type == PinNode::Type::kFolder) {
+-    dict.Set(kTypeKey, kFolderType);
+-    dict.Set(kOpenKey, node.open);
+-    if (node.color >= 0) {
+-      dict.Set(kColorKey, node.color);
++  if (node.type != PinNode::Type::kItem) {
++    if (node.type == PinNode::Type::kSplit) {
++      dict.Set(kTypeKey, kSplitType);
++    } else {
++      dict.Set(kTypeKey, kFolderType);
++      dict.Set(kOpenKey, node.open);
++      if (node.color >= 0) {
++        dict.Set(kColorKey, node.color);
++      }
+     }
+     base::ListValue children;
+     for (const PinNode& child : node.children) {
+@@ -90,8 +96,11 @@ std::optional<PinNode> NodeFromValue(con
+     node.title = *title;
+   }
+ 
+-  if (*type == kFolderType) {
+-    node.type = PinNode::Type::kFolder;
++  // A split's two pages are its children too (E19); that it has exactly two
++  // items is checked with the ids (AddSavable).
++  if (*type == kFolderType || *type == kSplitType) {
++    node.type = *type == kFolderType ? PinNode::Type::kFolder
++                                     : PinNode::Type::kSplit;
+     node.open = dict->FindBool(kOpenKey).value_or(false);
+     // Only a look: a colour this version does not know is drawn as unset,
+     // never a reason to refuse the file (E17b).
+@@ -148,6 +157,7 @@ std::optional<std::vector<PinNode>> Node
+ 
+ // JSONReader and JSONWriter stop at 200 levels, and a folder costs two (its
+ // dict and its children list): deeper than this could be kept but never saved.
++// A split costs two more, once, at the bottom: its pages are not folders.
+ constexpr int kMaxFolderDepth = 64;
+ 
+ // What NodeFromValue accepts, not too deep to write, and every id new to
+@@ -165,9 +175,18 @@ bool AddSavable(const std::vector<PinNod
+     if (node.id.empty() || !ids.insert(node.id).second) {
+       return false;
+     }
+-    const bool ok = node.type == PinNode::Type::kFolder
+-                        ? AddSavable(node.children, ids, depth + 1)
+-                        : !node.url.empty();
++    bool ok = !node.url.empty();
++    if (node.type == PinNode::Type::kFolder) {
++      ok = AddSavable(node.children, ids, depth + 1);
++    } else if (node.type == PinNode::Type::kSplit) {
++      // Exactly two pages (E19): a split of one or three is not a split.
++      ok = node.children.size() == 2 &&
++           std::ranges::all_of(node.children,
++                               [](const PinNode& page) {
++                                 return page.type == PinNode::Type::kItem;
++                               }) &&
++           AddSavable(node.children, ids, depth);
++    }
+     if (!ok) {
+       return false;
+     }
+@@ -192,7 +211,9 @@ PinNode* FindNode(std::vector<PinNode>&
+   return const_cast<PinNode*>(FindNode(std::as_const(nodes), id));
+ }
+ 
+-// Erases the row with `id` from `nodes` or below. True when it was there.
++// Erases the row with `id` from `nodes` or below. True when it was there. A
++// split left with one page is that page again (E19), never a split of one the
++// next load would refuse.
+ bool EraseNode(std::vector<PinNode>& nodes, std::string_view id) {
+   for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+     if (it->id == id) {
+@@ -200,6 +221,10 @@ bool EraseNode(std::vector<PinNode>& nod
+       return true;
+     }
+     if (EraseNode(it->children, id)) {
++      if (it->type == PinNode::Type::kSplit && it->children.size() == 1) {
++        PinNode page = std::move(it->children.front());
++        *it = std::move(page);
++      }
+       return true;
+     }
+   }
+@@ -265,12 +290,14 @@ bool Place(PinTree& tree,
+ 
+ void CountRows(const std::vector<PinNode>& rows, int& items, int& folders) {
+   for (const PinNode& row : rows) {
++    if (row.type == PinNode::Type::kItem) {
++      ++items;
++      continue;
++    }
+     if (row.type == PinNode::Type::kFolder) {
+       ++folders;
+-      CountRows(row.children, items, folders);
+-    } else {
+-      ++items;
+     }
++    CountRows(row.children, items, folders);
+   }
+ }
+ 
+@@ -297,7 +324,9 @@ base::DictValue PinTreeToValue(const Pin
+ }
+ 
+ std::optional<PinTree> PinTreeFromValue(const base::DictValue& value) {
+-  if (value.FindInt(kVersionKey) != kPinFileVersion) {
++  // Version 1 has no splits, and is read as it is (E19).
++  const std::optional<int> version = value.FindInt(kVersionKey);
++  if (!version || *version < 1 || *version > kPinFileVersion) {
+     return std::nullopt;
+   }
+   const base::DictValue* workspaces = value.FindDict(kWorkspacesKey);
+@@ -381,6 +410,8 @@ FileRead ReadStoreFile(const base::FileP
+ struct PinStore::LoadResult {
+   FileRead status = FileRead::kMissing;
+   PinTree tree;
++  // The loaded file's "version".
++  int version = 0;
+ };
+ 
+ // static
+@@ -460,6 +491,41 @@ bool PinStore::Move(std::string_view id,
+          Commit(std::move(tree));
+ }
+ 
++bool PinStore::PairAsSplit(std::string_view first,
++                           std::string_view second,
++                           std::string split_id) {
++  if (!loaded_ || read_only_ || first == second) {
++    return false;
++  }
++  PinTree tree = tree_;
++  for (auto& [guid, roots] : tree) {
++    size_t left = 0;
++    std::vector<PinNode>* const list = ListOf(roots, first, left);
++    if (!list) {
++      continue;
++    }
++    const auto right = std::ranges::find(*list, second, &PinNode::id);
++    // Two pages already in a split are found in the split's list: the split
++    // made of them would sit inside the old one, which Commit refuses.
++    if (right == list->end() || (*list)[left].type != PinNode::Type::kItem ||
++        right->type != PinNode::Type::kItem) {
++      return false;
++    }
++    PinNode split;
++    split.type = PinNode::Type::kSplit;
++    split.id = std::move(split_id);
++    split.children = {(*list)[left], *right};
++    // The right page above the left one moves it up by one as it goes.
++    if (right < list->begin() + left) {
++      --left;
++    }
++    list->erase(right);
++    (*list)[left] = std::move(split);
++    return Commit(std::move(tree));
++  }
++  return false;
++}
++
+ bool PinStore::Rename(std::string_view id, std::string name) {
+   if (!loaded_ || read_only_) {
+     return false;
+@@ -609,6 +675,7 @@ PinStore::LoadResult PinStore::ReadFile(
+         std::optional<PinTree> tree = PinTreeFromValue(dict);
+         if (tree) {
+           result.tree = std::move(*tree);
++          result.version = dict.FindInt(kVersionKey).value_or(0);
+         }
+         return tree.has_value();
+       });
+@@ -631,6 +698,16 @@ void PinStore::OnLoaded(LoadResult resul
+       LOG(INFO) << "[workspaces] pins: loaded " << items + folders
+                 << " row(s) in "
+                 << tree_.size() << " workspace(s) from " << writer_.path();
++      // Left as it is until a change writes it as this version: the cue
++      // comes again at every load until then, so an interrupted repair is
++      // tried again, and a launch that changes nothing keeps the file
++      // readable by a build before E19 (review).
++      if (result.version < kPinFileVersion) {
++        loaded_old_version_ = true;
++        LOG(INFO) << "[workspaces] pins: the file is version "
++                  << result.version << "; the next change writes it as "
++                  << kPinFileVersion;
++      }
+       break;
+     }
+     case FileRead::kMovedAside:
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -10,6 +10,7 @@
+ #include <optional>
+ #include <string>
+ #include <string_view>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/files/file_path.h"
+@@ -39,7 +40,9 @@ namespace workspaces::pins {
+ 
+ // One row of a pinned section.
+ struct PinNode {
+-  enum class Type { kFolder, kItem };
++  // A split (E19) is one row with two pages, as Arc keeps a pinned split
++  // view: a node whose children are exactly two items, left then right.
++  enum class Type { kFolder, kItem, kSplit };
+ 
+   Type type = Type::kItem;
+   // Stable across restarts: an open item's tab points back at it by this id
+@@ -53,6 +56,7 @@ struct PinNode {
+   // A tab group colour, 0-8 (tab_groups::TabGroupColorId); -1 draws the
+   // folder in its workspace's colour (E17b).
+   int color = -1;
++  // A folder's rows, or a split's two items.
+   std::vector<PinNode> children;
+ 
+   // Item only. The item's saved address -- its anchor.
+@@ -76,12 +80,14 @@ enum class Where { kBefore, kAfter, kInt
+ 
+ // The file's JSON, and back. std::nullopt when `value` is not a pin file this
+ // version can read; the store then keeps the file aside rather than write over
+-// it.
+-inline constexpr int kPinFileVersion = 1;
++// it. Version 2 has splits (E19) and reads version 1's files; a build before
++// it leaves a version-2 file alone (read-only) rather than set it aside.
++inline constexpr int kPinFileVersion = 2;
+ base::DictValue PinTreeToValue(const PinTree& tree);
+ std::optional<PinTree> PinTreeFromValue(const base::DictValue& value);
+ 
+-// Adds how many items and folders `rows` holds, all the way down.
++// Adds how many items and folders `rows` holds, all the way down; a split is
++// its two items.
+ void CountRows(const std::vector<PinNode>& rows, int& items, int& folders);
+ 
+ // How many items `rows` holds, all the way down: CountRows for a caller that
+@@ -177,9 +183,24 @@ class PinStore : public base::SupportsUs
+   // its item, and how a row's menu reads it at click time.
+   const PinNode* Find(std::string_view id) const;
+   // Removes the row with `id` -- a folder with everything in it -- and a
+-  // workspace left without rows. False when there is no such row, before the
+-  // load, or while read-only.
++  // workspace left without rows. A split's page removed alone leaves the
++  // other page as a plain item in the split's place (E19). False when there
++  // is no such row, before the load, or while read-only.
+   bool Remove(std::string_view id);
++  // Makes the items `first` and `second`, rows of one list, a split with id
++  // `split_id` in `first`'s place, `first` on the left (E19: the repair of
++  // splits imported as two items). False, and nothing changes, when either is
++  // not such an item -- a split's page is not -- or for SetRoots' reasons.
++  bool PairAsSplit(std::string_view first,
++                   std::string_view second,
++                   std::string split_id);
++  // True once per load of a version-1 file, which a build before E19 wrote,
++  // splits as two items: the Arc split repair's cue. The file stays version 1
++  // until a change writes it -- the repair's own joins do -- so a repair that
++  // did not run or found nothing is cued again at the next load.
++  bool TakeLoadedOldVersion() {
++    return std::exchange(loaded_old_version_, false);
++  }
+   // When the item's page was last shown (design 5, from Arc's own file).
+   // Written to the file like every change, but observers are NOT told:
+   // nothing drawn depends on it, and every window would draw its section
+@@ -225,6 +246,7 @@ class PinStore : public base::SupportsUs
+   PinTree tree_;
+   bool loaded_ = false;
+   bool read_only_ = false;
++  bool loaded_old_version_ = false;
+   base::ImportantFileWriter writer_;
+   base::ObserverList<Observer> observers_;
+   base::WeakPtrFactory<PinStore> weak_factory_{this};
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -46,6 +46,15 @@ PinNode Folder(std::string id,
+   return node;
+ }
+ 
++// A split (E19): one row, two pages.
++PinNode Split(std::string id, std::vector<PinNode> pages) {
++  PinNode node;
++  node.type = PinNode::Type::kSplit;
++  node.id = std::move(id);
++  node.children = std::move(pages);
++  return node;
++}
++
+ // Three folder levels, every field set somewhere, two workspaces.
+ PinTree SampleTree() {
+   PinNode deep = Item("c", "https://c.example/");
+@@ -143,10 +152,48 @@ TEST(WorkspacePinsTest, CountPagesCounts
+   EXPECT_EQ(pages, 4);  // a, b, c, d -- the folders are not pages
+ }
+ 
++// E19: a split keeps its pages, nested anywhere, and counts as two pages.
++TEST(WorkspacePinsTest, ASplitRoundTripsAndCountsAsItsTwoPages) {
++  PinNode right = Item("r", "https://r.example/");
++  right.custom_title = "Right";
++  PinTree tree;
++  tree["default"] = {
++      Split("s1", {Item("l", "https://l.example/"), right}),
++      Folder("f", "Folder",
++             {Split("s2", {Item("m", "https://m.example/"),
++                           Item("n", "https://n.example/")})}),
++  };
++  EXPECT_EQ(PinTreeFromValue(PinTreeToValue(tree)), tree);
++
++  int items = 0;
++  int folders = 0;
++  CountRows(tree.at("default"), items, folders);
++  EXPECT_EQ(items, 4);
++  EXPECT_EQ(folders, 1);
++  EXPECT_EQ(CountPages(tree.at("default")), 4);
++}
++
++// E19: the files every build before E19 wrote still load.
++TEST(WorkspacePinsTest, AVersionOneFileStillLoads) {
++  std::optional<base::DictValue> dict = base::JSONReader::ReadDict(
++      R"({"version":1,"workspaces":{"default":[{"type":"item","id":"a","url":"https://a/"}]}})",
++      base::JSON_PARSE_RFC);
++  ASSERT_TRUE(dict);
++  std::optional<PinTree> tree = PinTreeFromValue(*dict);
++  ASSERT_TRUE(tree);
++  EXPECT_EQ(RootCount(*tree, "default"), 1u);
++}
++
+ TEST(WorkspacePinsTest, RefusesFilesItDidNotWrite) {
+   for (std::string_view json : {
+            R"({"workspaces":{}})",
+-           R"({"version":2,"workspaces":{}})",
++           R"({"version":3,"workspaces":{}})",
++           R"({"version":0,"workspaces":{}})",
++           R"({"version":2,"workspaces":{"default":[{"type":"split","id":"s"}]}})",
++           R"({"version":2,"workspaces":{"default":[{"type":"split","id":"s","children":[{"type":"item","id":"a","url":"https://a/"}]}]}})",
++           R"({"version":2,"workspaces":{"default":[{"type":"split","id":"s","children":[{"type":"item","id":"a","url":"https://a/"},{"type":"item","id":"b","url":"https://b/"},{"type":"item","id":"c","url":"https://c/"}]}]}})",
++           R"({"version":2,"workspaces":{"default":[{"type":"split","id":"s","children":[{"type":"folder","id":"f","children":[]},{"type":"item","id":"b","url":"https://b/"}]}]}})",
++           R"({"version":2,"workspaces":{"default":[{"type":"split","id":"s","children":[{"type":"item","id":"a","url":"https://a/"},{"type":"item","id":"s","url":"https://b/"}]}]}})",
+            R"({"version":1})",
+            R"({"version":1,"workspaces":{"default":{}}})",
+            R"({"version":1,"workspaces":{"default":[{"type":"item","id":"a"}]}})",
+@@ -300,7 +347,7 @@ TEST_F(PinStoreTest, ABrokenFileIsKeptAs
+ }
+ 
+ TEST_F(PinStoreTest, AFileFromANewerVersionIsReadOnly) {
+-  const std::string newer = R"({"version":2,"workspaces":{}})";
++  const std::string newer = R"({"version":3,"workspaces":{}})";
+   ASSERT_TRUE(base::WriteFile(file(), newer));
+   std::unique_ptr<PinStore> store = LoadedStore();
+   EXPECT_TRUE(store->loaded());
+@@ -617,6 +664,125 @@ TEST_F(PinStoreTest, RenameNamesAFolderO
+   EXPECT_EQ(again->Find("c")->title, "C page");
+ }
+ 
++// E19: a file written before splits cues the Arc split repair once per load,
++// and stays version 1 -- every load cued again -- until a change writes it.
++TEST_F(PinStoreTest, AVersionOneFileCuesTheRepairUntilAChangeWritesIt) {
++  const std::string old =
++      R"({"version":1,"workspaces":{"default":[{"type":"item","id":"a","url":"https://a/"}]}})";
++  ASSERT_TRUE(base::WriteFile(file(), old));
++  std::unique_ptr<PinStore> store = LoadedStore();
++  EXPECT_FALSE(store->read_only());
++  EXPECT_EQ(RootCount(store->tree(), "default"), 1u);
++  EXPECT_TRUE(store->TakeLoadedOldVersion());
++  EXPECT_FALSE(store->TakeLoadedOldVersion());
++
++  // No change, no write: the next load is cued again.
++  store.reset();
++  task_environment_.FastForwardBy(PinStore::kSaveDelay * 2);
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(Contents(file()), old);
++  store = LoadedStore();
++  EXPECT_TRUE(store->TakeLoadedOldVersion());
++
++  // A change writes this version, and the cue stops.
++  ASSERT_TRUE(store->Insert("default", Item("b", "https://b/"), "",
++                            Where::kAfter));
++  store.reset();
++  task_environment_.RunUntilIdle();
++  std::optional<base::DictValue> written =
++      base::JSONReader::ReadDict(Contents(file()), base::JSON_PARSE_RFC);
++  ASSERT_TRUE(written);
++  EXPECT_EQ(written->FindInt("version"), kPinFileVersion);
++  std::unique_ptr<PinStore> again = LoadedStore();
++  EXPECT_EQ(RootCount(again->tree(), "default"), 2u);
++  EXPECT_FALSE(again->TakeLoadedOldVersion());
++}
++
++// E19 review: a split at the bottom of the deepest folder chain the file keeps
++// is kept too -- its pages are not another folder level.
++TEST_F(PinStoreTest, ASplitAtTheDeepestFolderIsKept) {
++  PinNode nested = Split("s", {Item("l", "https://l.example/"),
++                               Item("r", "https://r.example/")});
++  for (int i = 0; i < 64; ++i) {
++    nested = Folder("f" + base::NumberToString(i), "F", {nested});
++  }
++  std::unique_ptr<PinStore> store = LoadedStore();
++  EXPECT_TRUE(store->SetRoots("default", {nested}));
++  // One folder more is still one too many.
++  EXPECT_FALSE(store->SetRoots("default", {Folder("top", "F", {nested})}));
++}
++
++// E19: two items of one list become one split, left page first, in the left
++// page's place -- whichever of the two is higher up.
++TEST_F(PinStoreTest, PairAsSplitJoinsTwoItemsOfOneList) {
++  using RowList = std::vector<std::string>;
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots(
++      "default",
++      {Item("a", "https://a.example/"), Item("b", "https://b.example/"),
++       Item("c", "https://c.example/"),
++       Folder("f", "F",
++              {Item("d", "https://d.example/"),
++               Item("e", "https://e.example/")}),
++       Item("g", "https://g.example/")}));
++
++  EXPECT_TRUE(store->PairAsSplit("a", "b", "s1"));
++  EXPECT_TRUE(store->PairAsSplit("e", "d", "s2"));
++  // A page already in a split, rows of two lists, one row twice, a folder, a
++  // row that is not there, an id the tree holds: all refused.
++  EXPECT_FALSE(store->PairAsSplit("a", "c", "x"));
++  EXPECT_FALSE(store->PairAsSplit("a", "b", "x"));
++  EXPECT_FALSE(store->PairAsSplit("c", "e", "x"));
++  EXPECT_FALSE(store->PairAsSplit("c", "c", "x"));
++  EXPECT_FALSE(store->PairAsSplit("c", "f", "x"));
++  EXPECT_FALSE(store->PairAsSplit("c", "nope", "x"));
++  EXPECT_FALSE(store->PairAsSplit("c", "g", "a"));
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->tree().contains("default"));
++  EXPECT_EQ(RowIds(again->tree().at("default")),
++            (RowList{"s1", "c", "f", "g"}));
++  ASSERT_TRUE(again->Find("s1"));
++  EXPECT_EQ(again->Find("s1")->type, PinNode::Type::kSplit);
++  EXPECT_EQ(RowIds(again->Find("s1")->children), (RowList{"a", "b"}));
++  EXPECT_EQ(RowIds(again->Find("f")->children), (RowList{"s2"}));
++  EXPECT_EQ(RowIds(again->Find("s2")->children), (RowList{"e", "d"}));
++}
++
++// E19: a split of one page is no split -- removing a page leaves the other as
++// an item in the split's place -- and nothing makes a split of one or three.
++TEST_F(PinStoreTest, ASplitKeepsExactlyTwoPages) {
++  using RowList = std::vector<std::string>;
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots(
++      "default",
++      {Split("s1", {Item("a", "https://a.example/"),
++                    Item("b", "https://b.example/")}),
++       Item("c", "https://c.example/"),
++       Split("s2", {Item("d", "https://d.example/"),
++                    Item("e", "https://e.example/")})}));
++  EXPECT_FALSE(store->SetRoots(
++      "work", {Split("s3", {Item("x", "https://x.example/")})}));
++  EXPECT_FALSE(store->Insert("default", Item("z", "https://z.example/"), "a",
++                             Where::kAfter));
++  EXPECT_FALSE(store->Insert("default", Item("z", "https://z.example/"), "s1",
++                             Where::kInto));
++
++  EXPECT_TRUE(store->Remove("a"));
++  EXPECT_TRUE(store->Remove("s2"));
++  EXPECT_FALSE(store->Find("d"));
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->tree().contains("default"));
++  EXPECT_EQ(RowIds(again->tree().at("default")), (RowList{"b", "c"}));
++  ASSERT_TRUE(again->Find("b"));
++  EXPECT_EQ(again->Find("b")->type, PinNode::Type::kItem);
++}
++
+ TEST_F(PinStoreTest, ASecondBrokenFileDoesNotReplaceTheFirst) {
+   ASSERT_TRUE(base::WriteFile(file(), "first"));
+   LoadedStore();
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
+@@ -180,6 +180,53 @@ void WritePinnedRows(workspaces::pins::P
+   result.folders += folders;
+ }
+ 
++// Every split row under `rows`, inside folders too (E19).
++void CollectSplits(const std::vector<workspaces::pins::PinNode>& rows,
++                   std::vector<const workspaces::pins::PinNode*>& splits) {
++  for (const workspaces::pins::PinNode& row : rows) {
++    if (row.type == workspaces::pins::PinNode::Type::kSplit) {
++      splits.push_back(&row);
++    } else {
++      CollectSplits(row.children, splits);
++    }
++  }
++}
++
++// RepairSplits' reply, back on the UI thread.
++void PairArcSplits(base::WeakPtr<Profile> profile,
++                   std::optional<ArcImportPlan> plan) {
++  if (!profile || !plan) {
++    LOG(INFO) << "[workspaces] pins: split repair -- "
++              << (plan ? "the profile is gone" : "no readable Arc sidebar");
++    return;
++  }
++  workspaces::pins::PinStore* const store =
++      workspaces::pins::PinStore::GetOrCreate(profile.get(),
++                                              profile->GetPath());
++  int found = 0;
++  int paired = 0;
++  for (const ArcWorkspace& workspace : plan->workspaces) {
++    std::vector<const workspaces::pins::PinNode*> splits;
++    CollectSplits(workspace.pinned, splits);
++    // Left then right, as Arc shows them. PairAsSplit refuses what it cannot
++    // join safely -- pages moved into different lists since, or a split
++    // already -- so a second run changes nothing.
++    for (const workspaces::pins::PinNode* const split : splits) {
++      ++found;
++      if (store->PairAsSplit(split->children[0].id, split->children[1].id,
++                             split->id)) {
++        ++paired;
++      } else {
++        LOG(INFO) << "[workspaces] pins: split repair -- Arc split '"
++                  << split->id << "' not joined (its pages are not two "
++                  << "pinned pages of one list here)";
++      }
++    }
++  }
++  LOG(INFO) << "[workspaces] pins: re-paired " << paired << " of " << found
++            << " Arc pinned split(s)";
++}
++
+ }  // namespace
+ 
+ WorkspaceArcImporter::WorkspaceArcImporter(BrowserWindowInterface* browser)
+@@ -187,6 +234,17 @@ WorkspaceArcImporter::WorkspaceArcImport
+ 
+ WorkspaceArcImporter::~WorkspaceArcImporter() = default;
+ 
++// static
++void WorkspaceArcImporter::RepairSplits(Profile* profile) {
++  LOG(INFO) << "[workspaces] pins: split repair -- reading Arc's sidebar";
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++      base::BindOnce(&ReadAndParse, ArcSidebarPath()),
++      base::BindOnce(&PairArcSplits, profile->GetWeakPtr()));
++}
++
+ void WorkspaceArcImporter::Start(DoneCallback done) {
+   if (running_) {
+     return;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h
+@@ -19,6 +19,7 @@
+ 
+ class BrowserWindowInterface;
+ class PrefService;
++class Profile;
+ 
+ // "Import from Arc...": turns an ArcImportPlan (E14b) into sleeping tabs in the
+ // window whose rail was clicked (design 5, E14 spec) -- favorites and Today --
+@@ -80,6 +81,14 @@ class WorkspaceArcImporter {
+   // (design 2.2). `done` runs on this sequence, never if `this` is destroyed.
+   void Start(DoneCallback done);
+ 
++  // E19, until it has joined something: the pins file was written before
++  // splits were kept (PinStore::TakeLoadedOldVersion), so an Arc split view
++  // pinned at the import is two items there. Arc's file is read off the UI thread, and
++  // each pinned split view in it whose two tabs are still two items of one
++  // list becomes one split row again. Arc is the reference: the rows kept
++  // Arc's ids at the import (E15b), so nothing is guessed. Only data changes.
++  static void RepairSplits(Profile* profile);
++
+  private:
+   // One thing the strip takes as a whole: a tab, or a split view's two tabs,
+   // with everything AddRestoredTab needs to place it.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -57,6 +57,7 @@
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+ #include "chrome/browser/ui/views/tabs/new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -66,6 +67,8 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/split_tabs/split_tab_id.h"
++#include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tab_groups/tab_group_color.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/vector_icons/vector_icons.h"
+@@ -84,6 +87,7 @@
+ #include "ui/color/color_id.h"
+ #include "ui/color/color_provider.h"
+ #include "ui/compositor/layer.h"
++#include "ui/display/screen.h"
+ #include "ui/events/event.h"
+ #include "ui/events/event_handler.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
+@@ -97,7 +101,9 @@
+ #include "ui/gfx/font.h"
+ #include "ui/gfx/font_list.h"
+ #include "ui/gfx/image/image_skia.h"
++#include "ui/gfx/image/image_skia_operations.h"
+ #include "ui/gfx/text_utils.h"
++#include "ui/strings/grit/ui_strings.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/animation/animation_delegate_views.h"
+ #include "ui/views/background.h"
+@@ -178,6 +184,12 @@ constexpr int kIndent = 16;
+ constexpr int kRowInset = 8;
+ // The close and back buttons of an open item.
+ constexpr int kRowButtonIconSize = 12;
++// Between a split row's two pages (E19).
++constexpr int kSplitGap = kRowInset;
++// A closed page of a split whose other page is open: its icon at this opacity,
++// its title in the disabled text colour (E19, the owner's check: the row
++// looked the same with a page closed).
++constexpr double kClosedPageIconAlpha = 0.5;
+ // The active item's highlight and the card under the rows, as round as a
+ // vertical tab's (LayoutConstant::kVerticalTabCornerRadius; 6 before E17b).
+ constexpr float kActiveRowRadius = 8;
+@@ -250,12 +262,13 @@ const char* WhereName(Where where) {
+ }
+ 
+ // Whether `tab` can become an item: a web page drawn in the list -- not a
+-// favorite, grouped or split (the tab menu's rule), not a tab this window
+-// hides, which a shift-click range can hold (E13), not an item's page.
++// favorite or grouped (the tab menu's rule), not a tab this window hides,
++// which a shift-click range can hold (E13), not an item's page. A split's
++// tab only with its other tab, as one split row (E19, PinTabs).
+ bool CanPin(const workspaces::WorkspaceService& service,
+             tabs::TabInterface* tab) {
+   content::WebContents* const contents = tab->GetContents();
+-  return contents && !tab->IsPinned() && !tab->GetGroup() && !tab->IsSplit() &&
++  return contents && !tab->IsPinned() && !tab->GetGroup() &&
+          service.IsTabOnScreen(tab) && !service.IsPinItemTab(tab) &&
+          workspaces::WorkspaceTabData::IsAnchorableUrl(
+              contents->GetLastCommittedURL());
+@@ -276,6 +289,15 @@ std::vector<tabs::TabInterface*> Pinnabl
+     }
+     tabs.push_back(tab);
+   }
++  // A split goes whole (E19): its tab only with its other tab.
++  for (tabs::TabInterface* const tab : tabs) {
++    if (tab->IsSplit() &&
++        std::ranges::count_if(tabs, [tab](tabs::TabInterface* other) {
++          return other->GetSplit() == tab->GetSplit();
++        }) != 2) {
++      return {};
++    }
++  }
+   return tabs;
+ }
+ 
+@@ -291,6 +313,66 @@ std::u16string RowText(const PinNode& no
+                                          node.url);
+ }
+ 
++// A split row's name, for a screen reader and the hands-free checks (E19):
++// its pages' titles, left first. The store keeps every split at two pages.
++std::u16string SplitText(const PinNode& split) {
++  return base::StrCat(
++      {RowText(split.children[0]), u" | ", RowText(split.children[1])});
++}
++
++// The items a row stands for: an item itself, a split's two pages (E19), a
++// folder none.
++std::vector<std::string> PageIds(const PinNode& row) {
++  if (row.type == PinNode::Type::kItem) {
++    return {row.id};
++  }
++  std::vector<std::string> ids;
++  if (row.type == PinNode::Type::kSplit) {
++    for (const PinNode& page : row.children) {
++      ids.push_back(page.id);
++    }
++  }
++  return ids;
++}
++
++// The split holding page `id` under `rows`, or null (E19).
++const PinNode* SplitOf(const std::vector<PinNode>& rows, std::string_view id) {
++  for (const PinNode& row : rows) {
++    if (row.type == PinNode::Type::kSplit) {
++      if (std::ranges::contains(row.children, id, &PinNode::id)) {
++        return &row;
++      }
++    } else if (const PinNode* const split = SplitOf(row.children, id)) {
++      return split;
++    }
++  }
++  return nullptr;
++}
++
++// The split holding page `id` in any workspace of `tree`, or null (E19).
++const PinNode* SplitOfPage(const workspaces::pins::PinTree& tree,
++                           std::string_view id) {
++  for (const auto& [workspace, roots] : tree) {
++    if (const PinNode* const split = SplitOf(roots, id)) {
++      return split;
++    }
++  }
++  return nullptr;
++}
++
++// `index` moved back to the first tab of the split view it falls inside, if
++// any (E19): a split moved into another one would break it, and MoveSplitTo
++// CHECKs (19-reconcile).
++int SplitStart(TabStripModel* model, int index) {
++  while (index > 0 && index < model->count() &&
++         model->GetSplitForTab(index).has_value() &&
++         model->GetSplitForTab(index) == model->GetSplitForTab(index - 1)) {
++    --index;
++  }
++  return index;
++}
++
++
+ // The colour a folder is drawn and ticked in: its own, else its workspace's
+ // -- never its parent folder's (design 5 "E17 spec" 3).
+ int FolderColor(const PinNode& folder, int workspace_color) {
+@@ -308,6 +390,13 @@ tabs::TabInterface* LinkedTab(TabStripMo
+   return nullptr;
+ }
+ 
++// Whether a page of `split` is open in `window` (E19).
++bool HasPageOf(BrowserWindowInterface* window, const PinNode& split) {
++  return std::ranges::any_of(split.children, [window](const PinNode& page) {
++    return LinkedTab(window->GetTabStripModel(), page.id) != nullptr;
++  });
++}
++
+ // Every window of `profile`, this one included, that has a tab strip.
+ std::vector<BrowserWindowInterface*> WindowsOf(Profile* profile) {
+   std::vector<BrowserWindowInterface*> windows;
+@@ -319,32 +408,79 @@ std::vector<BrowserWindowInterface*> Win
+   return windows;
+ }
+ 
++// The window a page of `split` is open in, `browser` first; `browser` when
++// none (E19): a split's pages are opened, shown and unpinned in one place.
++BrowserWindowInterface* WindowOfSplit(BrowserWindowInterface* browser,
++                                      const PinNode& split) {
++  if (HasPageOf(browser, split)) {
++    return browser;
++  }
++  for (BrowserWindowInterface* const window :
++       WindowsOf(browser->GetProfile())) {
++    if (HasPageOf(window, split)) {
++      return window;
++    }
++  }
++  return browser;
++}
++
+ // Unpin's second half, once item `id`'s page is open in a window (UnpinItem,
+ // the Pin shortcut): every page of it goes to the top of its window's list --
+ // to `index` of `here`, in `group` if given, when it was dropped there -- and
+-// becomes an ordinary tab; then the row goes.
++// becomes an ordinary tab; then the row goes. A split's two pages go as one
++// split view (E19).
+ void UnlinkItem(BrowserWindowInterface* here,
+                 workspaces::pins::PinStore& store,
+                 const std::string& id,
+                 int index,
+                 std::optional<tab_groups::TabGroupId> group) {
++  const PinNode* const row = store.Find(id);
++  const std::vector<std::string> pages =
++      row ? PageIds(*row) : std::vector<std::string>{id};
+   for (BrowserWindowInterface* const window :
+        WindowsOf(here->GetProfile())) {
+     workspaces::WorkspaceService* const service =
+         workspaces::WorkspaceService::From(window);
+     TabStripModel* const model = window->GetTabStripModel();
+-    if (tabs::TabInterface* const tab = LinkedTab(model, id); tab && service) {
+-      // Moved while still linked, THEN unlinked: the list scrolls to an active
+-      // tab that moves, but not to a pinned page's (TabStripView::OnTabChanged,
+-      // E15c), so it stays where it is (the owner, E15d). A page's tab never
+-      // sits in a group, and the top of the list is the first tab of a unit,
+-      // so that move joins no group (GetGroupToAssign looks at the new
+-      // neighbours). A drop into a group is told which group: the drop's
+-      // place is inside it or at its first tab, so the group stays whole.
+-      const bool dropped_here = window == here && index >= 0;
++    std::vector<tabs::TabInterface*> tabs;
++    for (const std::string& page : pages) {
++      if (tabs::TabInterface* const tab = LinkedTab(model, page)) {
++        tabs.push_back(tab);
++      }
++    }
++    if (tabs.empty() || !service) {
++      continue;
++    }
++    // Moved while still linked, THEN unlinked: the list scrolls to an active
++    // tab that moves, but not to a pinned page's (TabStripView::OnTabChanged,
++    // E15c), so it stays where it is (the owner, E15d). A page's tab never
++    // sits in a group, and the top of the list is the first tab of a unit,
++    // so that move joins no group (GetGroupToAssign looks at the new
++    // neighbours). A drop into a group is told which group: the drop's
++    // place is inside it or at its first tab, so the group stays whole.
++    const bool dropped_here = window == here && index >= 0;
++    const int to =
++        dropped_here ? index : service->TopOfListIndex(/*opener=*/nullptr);
++    const std::optional<split_tabs::SplitTabId> split =
++        tabs.size() == 2 ? tabs.front()->GetSplit() : std::nullopt;
++    if (split && tabs.back()->GetSplit() == split) {
++      const int from = model->GetIndexOfTab(tabs.front());
++      const int start = SplitStart(model, to);
++      const int final_index = from < start ? start - 2 : start;
++      // Into the group it was dropped in even where it already is, as a
++      // single page goes (review).
++      if (start >= 0 && (final_index != from || (dropped_here && group))) {
++        model->MoveSplitTo(*split, final_index, /*pinned=*/false,
++                           dropped_here ? group : std::nullopt);
++      }
++      for (tabs::TabInterface* const tab : tabs) {
++        service->SetPinItem(tab, std::string());
++        service->SetAnchored(tab, false);
++      }
++      continue;
++    }
++    for (tabs::TabInterface* const tab : tabs) {
+       const int from = model->GetIndexOfTab(tab);
+-      const int to =
+-          dropped_here ? index : service->TopOfListIndex(/*opener=*/nullptr);
+       const int final_index = from < to ? to - 1 : to;
+       if (dropped_here && group) {
+         model->MoveWebContentsAt(from, final_index,
+@@ -500,7 +636,7 @@ class WorkspaceHeaderView : public views
+     // Only when the text outgrows the room the name left it, and only this
+     // view lays out again: its size does not change, and InvalidateLayout
+     // would climb to the section and have the list measure every row (as
+-    // PinRow::SetItemState).
++    // PinRow::SetPageState).
+     if (!size().IsEmpty() && CountsWidth() > counts_width_) {
+       DeprecatedLayoutImmediately();
+     }
+@@ -647,17 +783,136 @@ class WorkspaceHeaderView : public views
+ BEGIN_METADATA(WorkspaceHeaderView)
+ END_METADATA
+ 
++// Asks for the icon of the page at `url`, at twice the icon size so it is
++// crisp at 200 %, and hands it to `done` decoded; nothing when there is none.
++// With fallback_to_host: most items were never visited in this profile, but
++// another page of the same site often was (LOCAL.md 43). `tracker` cancels
++// the request when its owner goes first.
++void RequestFavicon(Profile* profile,
++                    const std::string& url,
++                    base::OnceCallback<void(const gfx::ImageSkia&)> done,
++                    base::CancelableTaskTracker* tracker) {
++  favicon::FaviconService* const favicons =
++      FaviconServiceFactory::GetForProfile(profile,
++                                           ServiceAccessType::EXPLICIT_ACCESS);
++  if (!favicons) {
++    return;
++  }
++  favicons->GetRawFaviconForPageURL(
++      GURL(url), {favicon_base::IconType::kFavicon}, gfx::kFaviconSize * 2,
++      /*fallback_to_host=*/true,
++      base::BindOnce(
++          [](base::OnceCallback<void(const gfx::ImageSkia&)> done,
++             const favicon_base::FaviconRawBitmapResult& result) {
++            if (!result.is_valid()) {
++              return;
++            }
++            const SkBitmap bitmap = gfx::PNGCodec::Decode(
++                base::span<const uint8_t>(*result.bitmap_data));
++            if (bitmap.isNull()) {
++              return;
++            }
++            std::move(done).Run(gfx::ImageSkia::CreateFromBitmap(
++                bitmap,
++                static_cast<float>(bitmap.width()) / gfx::kFaviconSize));
++          },
++          std::move(done)),
++      tracker);
++}
++
++// One page of a split row (E19): its icon and its title, nothing else. It
++// takes no events -- a press, a drag, the mouse over it are all the row's,
++// which tells its two pages apart by where the pointer is -- and a screen
++// reader hears the row, named after both pages.
++class SplitPage : public views::View {
++  METADATA_HEADER(SplitPage, views::View)
++
++ public:
++  // `font` and `spacing` are the row's own, so a page reads as a row does.
++  SplitPage(const PinNode& page,
++            Profile* profile,
++            const gfx::FontList& font,
++            int spacing) {
++    auto* const layout = SetLayoutManager(std::make_unique<views::BoxLayout>(
++        views::BoxLayout::Orientation::kHorizontal));
++    layout->set_cross_axis_alignment(views::LayoutAlignment::kCenter);
++    layout->set_between_child_spacing(spacing);
++    icon_ = AddChildView(std::make_unique<views::ImageView>());
++    title_ = AddChildView(std::make_unique<views::Label>(RowText(page)));
++    title_->SetFontList(font);
++    title_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    // No opaque background under the text, as on the rows; and the colours
++    // set are the ones drawn.
++    title_->SetSubpixelRenderingEnabled(false);
++    title_->SetAutoColorReadabilityEnabled(false);
++    // A long title elides inside its half.
++    layout->SetFlexForView(title_.get(), 1);
++    SetCanProcessEventsWithinSubtree(false);
++    GetViewAccessibility().SetIsIgnored(true);
++    // Unretained: `favicon_tasks_` is a member, so a page destroyed first
++    // cancels its own request.
++    RequestFavicon(
++        profile, page.url,
++        base::BindOnce(&SplitPage::OnFavicon, base::Unretained(this)),
++        &favicon_tasks_);
++  }
++  SplitPage(const SplitPage&) = delete;
++  SplitPage& operator=(const SplitPage&) = delete;
++  ~SplitPage() override = default;
++
++  // The title's colour -- the globe's too, until the page's own icon arrives
++  // -- and whether the page is drawn closed: its icon fainter. Made again
++  // only when it changes.
++  void SetLook(ui::ColorId color, bool closed) {
++    title_->SetEnabledColor(color);
++    if (favicon_.isNull()) {
++      icon_->SetImage(ui::ImageModel::FromVectorIcon(
++          vector_icons::kGlobeIcon, color, gfx::kFaviconSize));
++    } else if (closed != closed_ || icon_->GetImageModel().IsEmpty()) {
++      icon_->SetImage(ui::ImageModel::FromImageSkia(
++          closed ? gfx::ImageSkiaOperations::CreateTransparentImage(
++                       favicon_, kClosedPageIconAlpha)
++                 : favicon_));
++    }
++    closed_ = closed;
++  }
++
++ private:
++  void OnFavicon(const gfx::ImageSkia& image) {
++    favicon_ = image;
++    icon_->SetImage(ui::ImageModel::FromImageSkia(
++        closed_ ? gfx::ImageSkiaOperations::CreateTransparentImage(
++                      favicon_, kClosedPageIconAlpha)
++                : favicon_));
++  }
++
++  raw_ptr<views::ImageView> icon_ = nullptr;
++  raw_ptr<views::Label> title_ = nullptr;
++  // The page's own icon once it arrived; null until then.
++  gfx::ImageSkia favicon_;
++  bool closed_ = false;
++  base::CancelableTaskTracker favicon_tasks_;
++};
++
++BEGIN_METADATA(SplitPage)
++END_METADATA
++
+ // One row: a folder (a solid folder in its colour, after a chevron that shows
+-// it open or closed, E17b) or an item (its page's icon, a globe until one is
+-// found). Only the icon of a DRAWN row is looked up, so a closed folder asks
+-// nothing. `icon_only`: the collapsed strip's row, its icon centred and its
+-// title kept as its name and tooltip (E17b); an item there never shows its
+-// buttons. A row given no `on_drag` is not dragged.
++// it open or closed, E17b), an item (its page's icon, a globe until one is
++// found), or a split (E19: its two pages side by side, each its own icon,
++// title and buttons; one button for both, which tells them apart by where it
++// is pressed). Only the icon of a DRAWN row is looked up, so a closed folder
++// asks nothing. `icon_only`: the collapsed strip's row, its icon centred --
++// a split's left page's -- and its title kept as its name and tooltip
++// (E17b); an item there never shows its buttons. A row given no `on_drag` is
++// not dragged.
+ class PinRow : public views::LabelButton {
+   METADATA_HEADER(PinRow, views::LabelButton)
+ 
+  public:
+   enum class ItemState { kSleeping, kOpen, kActive };
++  // A page's close or back button, told which page (E19: a split has two).
++  using PageCallback = base::RepeatingCallback<void(const std::string& id)>;
+ 
+   // `color` is a folder's colour id as drawn: its own, else its workspace's.
+   PinRow(const PinNode& node,
+@@ -667,10 +922,12 @@ class PinRow : public views::LabelButton
+          Profile* profile,
+          bool frame_active,
+          views::Button::PressedCallback callback,
+-         base::RepeatingClosure on_close,
+-         base::RepeatingClosure on_reset,
++         PageCallback on_close,
++         PageCallback on_reset,
+          DragCallback on_drag)
+-      : views::LabelButton(std::move(callback), RowText(node)),
++      : views::LabelButton(std::move(callback),
++                           node.type == PinNode::Type::kSplit ? SplitText(node)
++                                                              : RowText(node)),
+         id_(node.id),
+         folder_(node.type == PinNode::Type::kFolder),
+         open_(node.open),
+@@ -678,17 +935,36 @@ class PinRow : public views::LabelButton
+         color_(color),
+         icon_only_(icon_only),
+         frame_active_(frame_active),
+-        on_close_(std::move(on_close)),
+-        on_reset_(std::move(on_reset)),
+         on_drag_(std::move(on_drag)) {
++    // Its pages: an item is its own, a split its two (E19), a folder none.
++    std::vector<const PinNode*> pages;
++    if (node.type == PinNode::Type::kItem) {
++      pages.push_back(&node);
++    } else if (node.type == PinNode::Type::kSplit) {
++      for (const PinNode& page : node.children) {
++        pages.push_back(&page);
++      }
++    }
++    for (const PinNode* const page : pages) {
++      Page& added = pages_.emplace_back();
++      added.id = page->id;
++      // Binding a null callback CHECK-fails.
++      if (!on_close.is_null() && !on_reset.is_null()) {
++        added.on_close = base::BindRepeating(on_close, page->id);
++        added.on_reset = base::BindRepeating(on_reset, page->id);
++      }
++    }
+     // A folder in the open strip gets its tooltip once, below, with its count
+     // (E18): a button whose name equals its OLD tooltip takes the new one as
+     // its name (Button::OnTooltipTextChanged), and the tests find a folder by
+     // its name.
+     if (!folder_ || icon_only_) {
+-      SetTooltipText(folder_ ? RowText(node)
+-                             : base::StrCat({RowText(node), u"\n",
+-                                             base::UTF8ToUTF16(node.url)}));
++      std::vector<std::u16string> lines;
++      for (const PinNode* const page : pages) {
++        lines.push_back(RowText(*page));
++        lines.push_back(base::UTF8ToUTF16(page->url));
++      }
++      SetTooltipText(folder_ ? RowText(node) : base::JoinString(lines, u"\n"));
+     }
+     SetBorder(views::CreateEmptyBorder(
+         icon_only_ ? gfx::Insets()
+@@ -737,9 +1013,9 @@ class PinRow : public views::LabelButton
+         // label takes no clicks either: the press and the drag stay the
+         // row's). A screen reader hears it in the tooltip, the row's
+         // description. Not in the collapsed column (D7).
+-        const int pages = workspaces::pins::CountPages(node.children);
++        const int count = workspaces::pins::CountPages(node.children);
+         count_ = AddChildView(
+-            std::make_unique<views::Label>(base::FormatNumber(pages)));
++            std::make_unique<views::Label>(base::FormatNumber(count)));
+         count_->SetFontList(label()->font_list());
+         count_->SetSubpixelRenderingEnabled(false);
+         count_->SetAutoColorReadabilityEnabled(false);
+@@ -747,25 +1023,27 @@ class PinRow : public views::LabelButton
+         SetTooltipText(base::StrCat(
+             {RowText(node), u"\n",
+              l10n_util::GetPluralStringFUTF16(IDS_HELIUM_PINNED_PAGE_COUNT,
+-                                              pages)}));
++                                              count)}));
+       }
+       UpdateColors();
+       return;
+     }
+     vector_icon_ = &vector_icons::kGlobeIcon;
++    // A split in the open strip draws its pages instead of its own icon and
++    // title (CalculateProposedLayout), which stay its name.
++    if (pages_.size() == 2 && !icon_only_) {
++      for (const PinNode* const page : pages) {
++        split_pages_.push_back(AddChildView(std::make_unique<SplitPage>(
++            *page, profile, label()->font_list(), GetImageLabelSpacing())));
++      }
++    }
+     UpdateColors();
+-    // With fallback_to_host: most items were never visited in this profile,
+-    // but another page of the same site often was (LOCAL.md 43).
+-    if (favicon::FaviconService* const favicons =
+-            FaviconServiceFactory::GetForProfile(
+-                profile, ServiceAccessType::EXPLICIT_ACCESS)) {
+-      favicons->GetRawFaviconForPageURL(
+-          GURL(node.url), {favicon_base::IconType::kFavicon},
+-          gfx::kFaviconSize * 2, /*fallback_to_host=*/true,
+-          // Unretained: `favicon_tasks_` is a member, so a row destroyed first
+-          // cancels its own request.
+-          base::BindOnce(&PinRow::OnFavicon, base::Unretained(this)),
+-          &favicon_tasks_);
++    if (split_pages_.empty()) {
++      // Unretained: `favicon_tasks_` is a member, so a row destroyed first
++      // cancels its own request.
++      RequestFavicon(profile, pages.front()->url,
++                     base::BindOnce(&PinRow::OnFavicon, base::Unretained(this)),
++                     &favicon_tasks_);
+     }
+   }
+   PinRow(const PinRow&) = delete;
+@@ -781,32 +1059,66 @@ class PinRow : public views::LabelButton
+   bool peek() const { return peek_; }
+   void MarkPeek() { peek_ = true; }
+ 
++  // The pages it shows (E19): an item one, its own id; a split two, left
++  // first; a folder none.
++  size_t page_count() const { return pages_.size(); }
++  const std::string& page_id(size_t page) const { return pages_[page].id; }
++  // Whether this row is drawn for `id`: its own, or one of its pages -- a
++  // split's row is both of them (E19).
++  bool Holds(std::string_view id) const {
++    return id == id_ || std::ranges::any_of(pages_, [id](const Page& page) {
++             return page.id == id;
++           });
++  }
++  // The page at the row's own `x` (E19): the right one only past the middle
++  // of the room the halves share (CalculateProposedLayout) -- never in the
++  // collapsed column, which draws the left one. Strictly past: a screen
++  // reader's press and the keyboard's menu come at the row's centre, which is
++  // the left page, as Enter is (review).
++  size_t PageAt(int x) const {
++    if (split_pages_.empty()) {
++      return 0;
++    }
++    gfx::Rect inner = GetLocalBounds();
++    inner.Inset(GetInsets());
++    return x > inner.x() + inner.width() / 2 ? 1 : 0;
++  }
++  // The page the last press was on: a split's two pages are one button. The
++  // keyboard and a screen reader press the left one.
++  const std::string& pressed_page() const {
++    return pages_.empty() ? id_ : pages_[pressed_page_].id;
++  }
++
+   // Tabs dim in a window that is not the active one, and so do the rows.
+   void SetFrameActive(bool active) {
+     frame_active_ = active;
+     UpdateColors();
+   }
+ 
+-  // An item's page: none (sleeping), open, or the active tab -- and, while
++  // A page's state: none (sleeping), open, or the active tab -- and, while
+   // open, whether it has left the item's address (the back arrow). The two
+-  // buttons are made the first time the item opens and kept, hidden, when it
+-  // sleeps again: only rows that were ever open pay for them.
+-  void SetItemState(ItemState state, bool drifted) {
+-    if (folder_ || (state == state_ && drifted == drifted_)) {
++  // buttons are made the first time the page opens and kept, hidden, when it
++  // sleeps again: only pages that were ever open pay for them.
++  void SetPageState(size_t index, ItemState state, bool drifted) {
++    if (index >= pages_.size()) {
++      return;
++    }
++    Page& page = pages_[index];
++    if (state == page.state && drifted == page.drifted) {
+       return;
+     }
+-    state_ = state;
+-    drifted_ = drifted;
+-    if (state_ != ItemState::kSleeping && !close_ && !icon_only_) {
+-      close_ = AddChildView(views::CreateVectorImageButtonWithNativeTheme(
+-          on_close_, vector_icons::kCloseSmallIcon, kRowButtonIconSize));
+-      close_->SetTooltipText(
++    page.state = state;
++    page.drifted = drifted;
++    if (state != ItemState::kSleeping && !page.close && !icon_only_) {
++      page.close = AddChildView(views::CreateVectorImageButtonWithNativeTheme(
++          page.on_close, vector_icons::kCloseSmallIcon, kRowButtonIconSize));
++      page.close->SetTooltipText(
+           l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_ITEM_CLOSE));
+-      reset_ = AddChildView(views::CreateVectorImageButtonWithNativeTheme(
+-          on_reset_, vector_icons::kArrowBackIcon, kRowButtonIconSize));
+-      reset_->SetTooltipText(
++      page.reset = AddChildView(views::CreateVectorImageButtonWithNativeTheme(
++          page.on_reset, vector_icons::kArrowBackIcon, kRowButtonIconSize));
++      page.reset->SetTooltipText(
+           l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_ITEM_RESET));
+-      UpdateCloseImage();
++      UpdateCloseImages();
+     }
+     UpdateColors();
+     // The layout decides which buttons show (CalculateProposedLayout). Only
+@@ -823,8 +1135,9 @@ class PinRow : public views::LabelButton
+   //
+   // A folder's chevron sits in the room its border keeps before the icon, and
+   // its number at the right edge (E18). An open item's buttons sit there --
+-  // the close button last. The title ends before either. Collapsed, the icon
+-  // alone, centred.
++  // the close button last. The title ends before either. A split's two pages
++  // share the room in halves, each page's buttons at the right of its half
++  // (E19). Collapsed, the icon alone, centred.
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override {
+     views::ProposedLayout layouts =
+@@ -858,29 +1171,30 @@ class PinRow : public views::LabelButton
+       EndTitleAt(layouts, count_x - kCountGap);
+       return layouts;
+     }
+-    if (!close_) {
++    if (pages_.empty()) {
+       return layouts;
+     }
+-    const bool open = state_ != ItemState::kSleeping;
+-    int right = layouts.host_size.width() - kRowInset;
+-    for (views::View* const button : {static_cast<views::View*>(close_.get()),
+-                                       static_cast<views::View*>(reset_.get())}) {
+-      // The x keeps its place on every open row; it is PAINTED only while the
+-      // mouse is over the row (C26, UpdateCloseImage). Nothing moves: a click
+-      // meant for the back arrow cannot land on a just-drawn x (design review).
+-      const bool placed = open && (button == close_.get() || drifted_);
+-      if (!placed) {
+-        layouts.child_layouts.emplace_back(button, false, gfx::Rect());
+-        continue;
++    if (split_pages_.empty()) {
++      EndTitleAt(layouts, PlaceButtons(layouts, pages_.front(),
++                                       layouts.host_size.width() - kRowInset));
++      return layouts;
++    }
++    for (views::ChildLayout& child : layouts.child_layouts) {
++      if (child.child_view == label() ||
++          child.child_view == image_container_view()) {
++        child.visible = false;
+       }
+-      const gfx::Size size = button->GetPreferredSize();
+-      right -= size.width();
++    }
++    gfx::Rect inner(layouts.host_size);
++    inner.Inset(GetInsets());
++    const int half = std::max(0, (inner.width() - kSplitGap) / 2);
++    for (size_t i = 0; i < split_pages_.size(); ++i) {
++      const int x = i == 0 ? inner.x() : inner.right() - half;
++      const int right = PlaceButtons(layouts, pages_[i], x + half);
+       layouts.child_layouts.emplace_back(
+-          button, true,
+-          gfx::Rect(right, (layouts.host_size.height() - size.height()) / 2,
+-                    size.width(), size.height()));
++          split_pages_[i].get(), true,
++          gfx::Rect(x, 0, std::max(0, right - x), layouts.host_size.height()));
+     }
+-    EndTitleAt(layouts, right);
+     return layouts;
+   }
+ 
+@@ -913,6 +1227,7 @@ class PinRow : public views::LabelButton
+         }
+         return true;
+       default:
++        pressed_page_ = 0;
+         return views::LabelButton::OnKeyPressed(event);
+     }
+   }
+@@ -933,6 +1248,7 @@ class PinRow : public views::LabelButton
+   // wherever the pointer goes.
+   bool OnMousePressed(const ui::MouseEvent& event) override {
+     press_point_ = event.location();
++    pressed_page_ = PageAt(event.x());
+     return views::LabelButton::OnMousePressed(event);
+   }
+   bool OnMouseDragged(const ui::MouseEvent& event) override {
+@@ -967,36 +1283,99 @@ class PinRow : public views::LabelButton
+   void OnThemeChanged() override {
+     views::LabelButton::OnThemeChanged();
+     // After the x's own (a view's children hear first): it sets its colours.
+-    UpdateCloseImage();
++    UpdateCloseImages();
+   }
++  // From the cursor: entered through a child (the x), the event comes in the
++  // root view's coordinates (RootView::NotifyEnterExitOfDescendant; review).
+   void OnMouseEntered(const ui::MouseEvent& event) override {
+     views::LabelButton::OnMouseEntered(event);
+-    SetHovered(true);
++    gfx::Point cursor = display::Screen::Get()->GetCursorScreenPoint();
++    views::View::ConvertPointFromScreen(this, &cursor);
++    SetHoveredPage(static_cast<int>(PageAt(cursor.x())));
++  }
++  // A split's x follows the mouse from one page to the other (E19).
++  void OnMouseMoved(const ui::MouseEvent& event) override {
++    views::LabelButton::OnMouseMoved(event);
++    SetHoveredPage(static_cast<int>(PageAt(event.x())));
+   }
+   void OnMouseExited(const ui::MouseEvent& event) override {
+     views::LabelButton::OnMouseExited(event);
+-    SetHovered(false);
++    SetHoveredPage(-1);
+   }
+ 
+  private:
+-  void SetHovered(bool hovered) {
+-    if (hovered_ != hovered) {
+-      hovered_ = hovered;
+-      UpdateCloseImage();
++  // One page the row shows (E19): an item has one, a split two.
++  struct Page {
++    std::string id;
++    ItemState state = ItemState::kSleeping;
++    bool drifted = false;
++    base::RepeatingClosure on_close;
++    base::RepeatingClosure on_reset;
++    raw_ptr<views::ImageButton> close = nullptr;
++    raw_ptr<views::ImageButton> reset = nullptr;
++  };
++
++  // The row's state for its colours: active when a page is, open when a page
++  // is open.
++  ItemState RowState() const {
++    ItemState state = ItemState::kSleeping;
++    for (const Page& page : pages_) {
++      state = std::max(state, page.state);
+     }
++    return state;
+   }
+ 
+-  // C26: the x is painted only while the mouse is over the row, see-through
++  void SetHoveredPage(int page) {
++    if (hovered_page_ != page) {
++      hovered_page_ = page;
++      UpdateCloseImages();
++    }
++  }
++
++  // C26: an x is painted only while the mouse is over its page, see-through
+   // otherwise -- a repaint, no layout. It keeps its place, its name for a
+   // screen reader and the hands-free checks, and its stop for the Tab key.
+-  void UpdateCloseImage() {
+-    if (!close_) {
+-      return;
++  void UpdateCloseImages() {
++    for (size_t i = 0; i < pages_.size(); ++i) {
++      if (!pages_[i].close) {
++        continue;
++      }
++      views::SetImageFromVectorIconWithColor(
++          pages_[i].close, vector_icons::kCloseSmallIcon, kRowButtonIconSize,
++          hovered_page_ == static_cast<int>(i)
++              ? views::IconColors(ui::kColorIcon, ui::kColorIconDisabled)
++              : views::IconColors(SK_ColorTRANSPARENT, SK_ColorTRANSPARENT));
+     }
+-    views::SetImageFromVectorIconWithColor(
+-        close_, vector_icons::kCloseSmallIcon, kRowButtonIconSize,
+-        hovered_ ? views::IconColors(ui::kColorIcon, ui::kColorIconDisabled)
+-                 : views::IconColors(SK_ColorTRANSPARENT, SK_ColorTRANSPARENT));
++  }
++
++  // Lays out `page`'s back arrow and x leftward from `right`, and answers
++  // where they begin. The x keeps its place on every open page; it is PAINTED
++  // only while the mouse is over it (C26, UpdateCloseImages). Nothing moves: a
++  // click meant for the back arrow cannot land on a just-drawn x (design
++  // review).
++  int PlaceButtons(views::ProposedLayout& layouts,
++                   const Page& page,
++                   int right) const {
++    if (!page.close) {
++      return right;
++    }
++    const bool open = page.state != ItemState::kSleeping;
++    for (views::View* const button :
++         {static_cast<views::View*>(page.close.get()),
++          static_cast<views::View*>(page.reset.get())}) {
++      const bool placed = open && (button == page.close.get() || page.drifted);
++      if (!placed) {
++        layouts.child_layouts.emplace_back(button, false, gfx::Rect());
++        continue;
++      }
++      const gfx::Size size = button->GetPreferredSize();
++      right -= size.width();
++      layouts.child_layouts.emplace_back(
++          button, true,
++          gfx::Rect(right, (layouts.host_size.height() - size.height()) / 2,
++                    size.width(), size.height()));
++    }
++    return right;
+   }
+ 
+   // The title ends at `right` at the latest: before what sits at the row's
+@@ -1015,34 +1394,41 @@ class PinRow : public views::LabelButton
+     return point;
+   }
+ 
+-  // Asked for at twice the icon size, so it is crisp at 200 %.
+-  void OnFavicon(const favicon_base::FaviconRawBitmapResult& result) {
+-    if (!result.is_valid()) {
+-      return;
+-    }
+-    const SkBitmap bitmap = gfx::PNGCodec::Decode(
+-        base::span<const uint8_t>(*result.bitmap_data));
+-    if (bitmap.isNull()) {
+-      return;
+-    }
+-    // The page's own icon from now on: UpdateColors leaves it alone.
++  // The page's own icon from now on: UpdateColors leaves it alone.
++  void OnFavicon(const gfx::ImageSkia& image) {
+     vector_icon_ = nullptr;
+     SetImageModel(views::Button::STATE_NORMAL,
+-                  ui::ImageModel::FromImageSkia(gfx::ImageSkia::CreateFromBitmap(
+-                      bitmap, static_cast<float>(bitmap.width()) /
+-                                  gfx::kFaviconSize)));
++                  ui::ImageModel::FromImageSkia(image));
+   }
+ 
+   // The tab colours: the active item's as the active tab's, every other row's
+-  // as an inactive tab's, each dimmed in an inactive window.
++  // as an inactive tab's, each dimmed in an inactive window. A split's row is
++  // the active tab's while a page of it is; its other page's title keeps the
++  // inactive colour (E19).
+   void UpdateColors() {
+-    const bool active = state_ == ItemState::kActive;
+-    const ui::ColorId text =
+-        active ? (frame_active_ ? kColorTabForegroundActiveFrameActive
+-                                : kColorTabForegroundActiveFrameInactive)
+-               : (frame_active_ ? kColorTabForegroundInactiveFrameActive
+-                                : kColorTabForegroundInactiveFrameInactive);
++    const auto text_color = [this](bool active) {
++      if (active) {
++        return frame_active_ ? kColorTabForegroundActiveFrameActive
++                             : kColorTabForegroundActiveFrameInactive;
++      }
++      return frame_active_ ? kColorTabForegroundInactiveFrameActive
++                           : kColorTabForegroundInactiveFrameInactive;
++    };
++    const bool active = RowState() == ItemState::kActive;
++    const ui::ColorId text = text_color(active);
+     SetEnabledTextColors(text);
++    // A split with a page open draws its closed page fainter (E19); a split
++    // with none open looks like any closed pinned page.
++    const bool split_open = RowState() != ItemState::kSleeping;
++    for (size_t i = 0; i < split_pages_.size(); ++i) {
++      const bool closed =
++          split_open && pages_[i].state == ItemState::kSleeping;
++      split_pages_[i]->SetLook(
++          closed ? ui::ColorId{ui::kColorLabelForegroundDisabled}
++                 : ui::ColorId{text_color(pages_[i].state ==
++                                          ItemState::kActive)},
++          closed);
++    }
+     if (vector_icon_) {
+       // A folder in its colour, as the strip draws that tab-group colour --
+       // a ColorId, so no provider is needed (E17b); the globe in the text's.
+@@ -1079,17 +1465,16 @@ class PinRow : public views::LabelButton
+   const int color_;
+   const bool icon_only_;
+   bool frame_active_;
+-  ItemState state_ = ItemState::kSleeping;
+-  bool drifted_ = false;
+-  const base::RepeatingClosure on_close_;
+-  const base::RepeatingClosure on_reset_;
++  std::vector<Page> pages_;
++  // A split's two pages as drawn, in the open strip only (E19).
++  std::vector<raw_ptr<SplitPage>> split_pages_;
+   const DragCallback on_drag_;
+   gfx::Point press_point_;
++  size_t pressed_page_ = 0;
++  // The page under the mouse, -1 for none.
++  int hovered_page_ = -1;
+   bool dragging_ = false;
+-  bool hovered_ = false;
+   bool peek_ = false;
+-  raw_ptr<views::ImageButton> close_ = nullptr;
+-  raw_ptr<views::ImageButton> reset_ = nullptr;
+   // A folder's, except collapsed; and its number of pages (E18).
+   raw_ptr<views::ImageView> chevron_ = nullptr;
+   raw_ptr<views::Label> count_ = nullptr;
+@@ -1377,6 +1762,11 @@ gfx::Size WorkspacePinnedSectionView::Ca
+ }
+ 
+ void WorkspacePinnedSectionView::OnPinsChanged() {
++  // E19, once per profile: a pins file from before splits gets Arc's pinned
++  // splits put back together. The first window to hear the load asks.
++  if (store_ && store_->TakeLoadedOldVersion()) {
++    WorkspaceArcImporter::RepairSplits(browser_->GetProfile());
++  }
+   ScheduleRebuild();
+ }
+ 
+@@ -1755,14 +2145,19 @@ void WorkspacePinnedSectionView::ApplySt
+                                              const Links& links) {
+   for (views::View* const child : list.children()) {
+     auto* const row = views::AsViewClass<PinRow>(child);
+-    const auto it = links.open.find(row->id());
+-    if (it == links.open.end()) {
+-      row->SetItemState(PinRow::ItemState::kSleeping, false);
+-      continue;
++    // Each page of it: an item's own, a split's two (E19).
++    for (size_t page = 0; page < row->page_count(); ++page) {
++      const auto it = links.open.find(row->page_id(page));
++      if (it == links.open.end()) {
++        row->SetPageState(page, PinRow::ItemState::kSleeping, false);
++        continue;
++      }
++      row->SetPageState(page,
++                        it->second == links.active
++                            ? PinRow::ItemState::kActive
++                            : PinRow::ItemState::kOpen,
++                        workspaces::HasDrifted(it->second->GetContents()));
+     }
+-    row->SetItemState(it->second == links.active ? PinRow::ItemState::kActive
+-                                                 : PinRow::ItemState::kOpen,
+-                      workspaces::HasDrifted(it->second->GetContents()));
+   }
+ }
+ 
+@@ -1784,15 +2179,16 @@ size_t WorkspacePinnedSectionView::AddRo
+     callback = base::BindRepeating(&WorkspacePinnedSectionView::ShowFolderPages,
+                                    base::Unretained(this), row.id);
+   }
+-  base::RepeatingClosure on_close;
+-  base::RepeatingClosure on_reset;
++  // Told the page: a split's row has two (E19).
++  PinRow::PageCallback on_close;
++  PinRow::PageCallback on_reset;
+   if (!folder) {
+     on_close = base::BindRepeating(
+         &WorkspacePinnedSectionView::OnItemClosePressed,
+-        base::Unretained(this), row.id);
++        base::Unretained(this));
+     on_reset = base::BindRepeating(
+         &WorkspacePinnedSectionView::OnItemResetPressed,
+-        base::Unretained(this), row.id);
++        base::Unretained(this));
+   }
+   // Nothing is dragged in the collapsed column (E17b): its rows get no drag
+   // callback.
+@@ -1846,7 +2242,7 @@ bool WorkspacePinnedSectionView::SyncPee
+       links.open.contains(active_id) &&
+       std::ranges::none_of(list.children(), [&](const views::View* child) {
+         const auto* const row = views::AsViewClass<PinRow>(child);
+-        return row->id() == active_id && !row->peek();
++        return row->Holds(active_id) && !row->peek();
+       })) {
+     for (const views::View* const child : list.children()) {
+       const auto* const row = views::AsViewClass<PinRow>(child);
+@@ -1884,8 +2280,10 @@ bool WorkspacePinnedSectionView::SyncPee
+   for (size_t i = 0; i < rows.size(); ++i) {
+     const auto* const row = views::AsViewClass<PinRow>(rows[i].get());
+     if (row->id() == folder_id) {
+-      AddRow(list, *store_->Find(want), row->level() + 1, IsFrameActive(),
+-             i + 1);
++      // A split's page peeks as its split's row (E19).
++      const PinNode* const split = SplitOfPage(store_->tree(), want);
++      AddRow(list, split ? *split : *store_->Find(want), row->level() + 1,
++             IsFrameActive(), i + 1);
+       break;
+     }
+   }
+@@ -1947,6 +2345,15 @@ void WorkspacePinnedSectionView::ShowFol
+ }
+ 
+ void WorkspacePinnedSectionView::OnItemPressed(const std::string& id) {
++  // A split's row is one button for its two pages: the page pressed is shown,
++  // the other beside it (E19).
++  const PinNode* const row = store_ ? store_->Find(id) : nullptr;
++  if (row && row->type == PinNode::Type::kSplit) {
++    if (const auto* const pin_row = views::AsViewClass<PinRow>(RowFor(id))) {
++      ShowItem(browser_, pin_row->pressed_page());
++    }
++    return;
++  }
+   ShowItem(browser_, id);
+ }
+ 
+@@ -2017,12 +2424,126 @@ void WorkspacePinnedSectionView::OpenIte
+   LOG(INFO) << "[workspaces] pins: opened item '" << item.id << "'";
+ }
+ 
++// static
++void WorkspacePinnedSectionView::OpenSplit(BrowserWindowInterface* browser,
++                                           const PinNode& split,
++                                           std::string_view guid) {
++  TabStripModel* const model = browser->GetTabStripModel();
++  for (const PinNode& page : split.children) {
++    if (!LinkedTab(model, page.id)) {
++      OpenItem(browser, page, guid);
++    }
++  }
++  tabs::TabInterface* const left = LinkedTab(model, split.children[0].id);
++  tabs::TabInterface* const right = LinkedTab(model, split.children[1].id);
++  // A page with no address a tab can open stays closed (OpenItem logs it).
++  if (!left || !right) {
++    return;
++  }
++  // A favorite -- a page pinned while Workspaces was off keeps its link -- is
++  // not moved among the pinned tabs (review).
++  if (left->IsPinned() || right->IsPinned()) {
++    LOG(INFO) << "[workspaces] pins: a split's page is a favorite; not joined";
++    return;
++  }
++  // A page in a split view with some other tab is left as it is: that split
++  // is the user's.
++  if (left->IsSplit() || right->IsSplit()) {
++    if (left->GetSplit() != right->GetSplit()) {
++      LOG(INFO) << "[workspaces] pins: a split's page is in another split "
++                   "view; left as it is";
++    }
++    return;
++  }
++  // Side by side first. Neither page is in a group -- an item's page never
++  // is -- so the move beside `left` joins none.
++  const int l = model->GetIndexOfTab(left);
++  const int r = model->GetIndexOfTab(right);
++  if (r != l + 1) {
++    model->MoveWebContentsAt(r, r > l ? l + 1 : l,
++                             /*select_after_move=*/false);
++  }
++  const int first = model->GetIndexOfTab(left);
++  if (first + 1 >= model->count() || model->GetTabAtIndex(first + 1) != right) {
++    LOG(WARNING) << "[workspaces] pins: a split's pages could not be put side "
++                    "by side; not joined";
++    return;
++  }
++  // RestoreSplit, not AddToNewSplit: no promo and no metrics, as the importer
++  // makes Arc's splits (36).
++  model->RestoreSplit(split_tabs::SplitTabId::GenerateNew(), {first, first + 1},
++                      split_tabs::SplitTabVisualData());
++  LOG(INFO) << "[workspaces] pins: a split's pages joined as one split view";
++}
++
++// static
++bool WorkspacePinnedSectionView::ShowSplit(BrowserWindowInterface* browser,
++                                           const PinNode& split,
++                                           std::string_view page_id,
++                                           std::string_view key) {
++  // Checked before any workspace is entered: a refusal changes nothing (C1).
++  for (const PinNode& page : split.children) {
++    if (!GURL(page.url).is_valid()) {
++      LOG(WARNING) << "[workspaces] pins: item '" << page.id
++                   << "' has no address a tab can open";
++      return false;
++    }
++  }
++  // One place, as for an item: the window that has a page of it open, this
++  // one first. ponytail: a page open in a third window stays there and a
++  // second one opens -- a split's pages open and close together, so it is not
++  // seen; bringing a page across is UnpinItem's detach, if it ever is.
++  BrowserWindowInterface* const window = WindowOfSplit(browser, split);
++  // A page to open is opened in the split's own workspace, entered first --
++  // Home for a deleted one, as the section draws its rows (design 2.4).
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(window);
++  const std::string guid(
++      service ? workspaces::ResolveTabGuid(key, service->known_guids())
++              : std::string_view());
++  TabStripModel* const model = window->GetTabStripModel();
++  const bool opens = std::ranges::any_of(
++      split.children,
++      [model](const PinNode& page) { return !LinkedTab(model, page.id); });
++  if (service && opens) {
++    service->EnterWorkspaceForInsert(guid);
++  }
++  OpenSplit(window, split, guid);
++  tabs::TabInterface* const tab = LinkedTab(model, page_id);
++  return tab && ShowTab(browser, *tab);
++}
++
+ void WorkspacePinnedSectionView::UnpinItem(
+     const std::string& id,
+     int index,
+     std::optional<tab_groups::TabGroupId> group) {
+   const PinNode* const found = store_ ? store_->Find(id) : nullptr;
+-  if (!found || found->type != PinNode::Type::kItem) {
++  if (!found || found->type == PinNode::Type::kFolder) {
++    return;
++  }
++  if (found->type == PinNode::Type::kSplit) {
++    // Both pages, as one split view (E19): the page not open is opened first,
++    // beside the open one, so no page is lost with the row (review: a split
++    // half-open in another window lost its closed page). Unpinned where it is
++    // open. ponytail: a split open in another window is unpinned there even
++    // when it was dropped here; bringing a split across windows is
++    // DetachSplitTabForInsertion's work, not needed yet.
++    const PinNode split = *found;
++    BrowserWindowInterface* const window = WindowOfSplit(browser_, split);
++    // The drop's place, by the tab it is before: opening the missing page
++    // beside the other shifts the indices under it (review: the split landed
++    // one off, or CHECK-crashed at a group's first tab).
++    TabStripModel* const here = browser_->GetTabStripModel();
++    const bool to_end = index >= here->count();
++    tabs::TabInterface* const before =
++        index >= 0 && !to_end ? here->GetTabAtIndex(index) : nullptr;
++    OpenSplit(window, split);
++    if (before) {
++      index = here->GetIndexOfTab(before);
++    } else if (to_end) {
++      index = here->count();
++    }
++    UnlinkItem(browser_, *store_, id, index, group);
+     return;
+   }
+   // The page first, the row after, so that nothing is lost in between: an open
+@@ -2160,7 +2681,7 @@ views::View* WorkspacePinnedSectionView:
+     return nullptr;
+   }
+   for (views::View* const child : list_->children()) {
+-    if (views::AsViewClass<PinRow>(child)->id() == id) {
++    if (views::AsViewClass<PinRow>(child)->Holds(id)) {
+       return child;
+     }
+   }
+@@ -2254,31 +2775,53 @@ void WorkspacePinnedSectionView::PinTabs
+       after = roots.back()->id;
+     }
+   }
+-  for (tabs::TabInterface* const tab : tabs) {
+-    if (!CanPin(*service, tab)) {
++  for (size_t i = 0; i < tabs.size(); ++i) {
++    // A split's two tabs -- side by side in the list's order -- are one split
++    // row of two items (E19); never one of them alone.
++    std::vector<tabs::TabInterface*> pages = {tabs[i]};
++    if (tabs[i]->IsSplit()) {
++      if (i + 1 >= tabs.size() ||
++          tabs[i + 1]->GetSplit() != tabs[i]->GetSplit()) {
++        continue;
++      }
++      pages.push_back(tabs[++i]);
++    }
++    if (!std::ranges::all_of(pages, [service](tabs::TabInterface* page) {
++          return CanPin(*service, page);
++        })) {
+       continue;
+     }
+-    content::WebContents* const contents = tab->GetContents();
+-    PinNode item;
+-    item.id = NewRowId();
+-    item.url = contents->GetLastCommittedURL().spec();
+-    item.title = base::UTF16ToUTF8(contents->GetTitle());
+-    item.custom_title = workspaces::CustomTitleForTab(contents);
+-    const std::string id = item.id;
++    PinNode row;
++    for (tabs::TabInterface* const page : pages) {
++      content::WebContents* const contents = page->GetContents();
++      PinNode& item = pages.size() == 2 ? row.children.emplace_back() : row;
++      item.id = NewRowId();
++      item.url = contents->GetLastCommittedURL().spec();
++      item.title = base::UTF16ToUTF8(contents->GetTitle());
++      item.custom_title = workspaces::CustomTitleForTab(contents);
++    }
++    if (pages.size() == 2) {
++      row.type = PinNode::Type::kSplit;
++      row.id = NewRowId();
++    }
++    const std::string id = row.id;
++    const std::vector<std::string> page_ids = PageIds(row);
+     // The row first: a link to an item the store does not hold is dropped by
+     // the next state pass (ReadLinks).
+-    if (!store->Insert(service->active_guid(), std::move(item), after,
+-                       where)) {
++    if (!store->Insert(service->active_guid(), std::move(row), after, where)) {
+       LOG(WARNING) << "[workspaces] pins: could not pin a tab; the row it "
+                       "was dropped by is gone, or the pins file is not loaded "
+                       "yet or is read-only";
+       return;
+     }
+-    service->SetPinItem(tab, id);
+-    // Anchored at the page it shows, as an opened item is at its address.
+-    service->SetAnchored(tab, true);
+-    LOG(INFO) << "[workspaces] pins: pinned a tab as item '" << id << "' "
+-              << WhereName(where) << " '" << after << "'";
++    for (size_t p = 0; p < pages.size(); ++p) {
++      service->SetPinItem(pages[p], page_ids[p]);
++      // Anchored at the page it shows, as an opened item is at its address.
++      service->SetAnchored(pages[p], true);
++    }
++    LOG(INFO) << "[workspaces] pins: pinned "
++              << (pages.size() == 2 ? "a split" : "a tab") << " as item '"
++              << id << "' " << WhereName(where) << " '" << after << "'";
+     after = id;
+     where = Where::kAfter;
+   }
+@@ -2297,6 +2840,13 @@ void WorkspacePinnedSectionView::ToggleP
+     workspaces::pins::PinStore* const store =
+         workspaces::pins::PinStore::GetOrCreate(profile, profile->GetPath());
+     const std::string id = workspaces::PinItemForTab(tab->GetContents());
++    // A split's page unpins its split (E19): both pages, one split view.
++    if (const PinNode* const split = SplitOfPage(store->tree(), id)) {
++      const PinNode copy = *split;
++      OpenSplit(browser, copy);
++      UnlinkItem(browser, *store, copy.id, /*index=*/-1, std::nullopt);
++      return;
++    }
+     if (const PinNode* const item = store->Find(id);
+         item && item->type == PinNode::Type::kItem) {
+       UnlinkItem(browser, *store, id, /*index=*/-1, std::nullopt);
+@@ -2305,11 +2855,21 @@ void WorkspacePinnedSectionView::ToggleP
+   }
+   if (!CanPin(*service, tab)) {
+     LOG(INFO) << "[workspaces] shortcut: pin -- the page in front cannot be "
+-                 "pinned (a favorite, in a group or a split, or not a web "
+-                 "page)";
++                 "pinned (a favorite, in a group, or not a web page)";
+     return;
+   }
+-  PinTabs(browser, {tab});
++  // A split's tab pins with its other tab, as one split row (E19).
++  std::vector<tabs::TabInterface*> tabs = {tab};
++  if (const std::optional<split_tabs::SplitTabId> split = tab->GetSplit()) {
++    TabStripModel* const model = browser->GetTabStripModel();
++    for (int i = 0; i < model->count(); ++i) {
++      tabs::TabInterface* const other = model->GetTabAtIndex(i);
++      if (other != tab && other->GetSplit() == split) {
++        tabs.push_back(other);
++      }
++    }
++  }
++  PinTabs(browser, std::move(tabs));
+ }
+ 
+ // static
+@@ -2328,6 +2888,15 @@ bool WorkspacePinnedSectionView::ShowIte
+   if (!found) {
+     return false;
+   }
++  // A split's page is shown with its other page, as one split view (E19). A
++  // copy, as below.
++  if (const auto roots = store->tree().find(key);
++      roots != store->tree().end()) {
++    if (const PinNode* const split = SplitOf(roots->second, id)) {
++      const PinNode copy = *split;
++      return ShowSplit(browser, copy, id, key);
++    }
++  }
+   // A copy: entering a workspace below runs its observers, and nothing reads
+   // the store's rows after anything changed.
+   const PinNode item = *found;
+@@ -2623,9 +3192,9 @@ WorkspacePinnedSectionView::DropTarget W
+ 
+ WorkspacePinnedSectionView::DropTarget WorkspacePinnedSectionView::ListTargetAt(
+     const gfx::Point& point_in_screen) {
+-  // A folder does not become tabs.
++  // A folder does not become tabs; an item or a split does (E19).
+   const PinNode* const dragged = store_ ? store_->Find(drag_id_) : nullptr;
+-  if (!dragged || dragged->type != PinNode::Type::kItem) {
++  if (!dragged || dragged->type == PinNode::Type::kFolder) {
+     return DropTarget();
+   }
+   UnpinnedTabContainerView* container = nullptr;
+@@ -2831,14 +3400,27 @@ void WorkspacePinnedSectionView::ShowCon
+     context_menu_model_ = std::make_unique<NewTabButtonMenuModel>(browser_);
+   } else if (const auto* const row = views::AsViewClass<PinRow>(source)) {
+     context_menu_id_ = row->id();
++    // A split's row is both its pages (E19): Rename names the one the menu was
++    // opened on; everything else is the split's.
++    gfx::Point in_row = point;
++    views::View::ConvertPointFromScreen(row, &in_row);
++    context_menu_page_id_ = row->page_count() == 2
++                                ? row->page_id(row->PageAt(in_row.x()))
++                                : row->id();
+     context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+     // An open page's Close, first (C26): with the x drawn only on mouse-over,
+     // the keyboard's and a screen reader's way to close a page in the
+-    // background (design review).
+-    if (!row->folder() &&
+-        LinkedTab(browser_->GetTabStripModel(), row->id())) {
+-      context_menu_model_->AddItemWithStringId(kCommandClose,
+-                                               IDS_HELIUM_PINNED_ITEM_CLOSE);
++    // background (design review). A split's closes each page of it that is
++    // open (E19).
++    bool any_open = false;
++    for (size_t page = 0; page < row->page_count(); ++page) {
++      any_open = any_open ||
++                 LinkedTab(browser_->GetTabStripModel(), row->page_id(page));
++    }
++    if (any_open) {
++      context_menu_model_->AddItemWithStringId(
++          kCommandClose, row->page_count() == 2 ? IDS_APP_CLOSE
++                                                : IDS_HELIUM_PINNED_ITEM_CLOSE);
+     }
+     if (!row->folder()) {
+       context_menu_model_->AddItemWithStringId(kCommandUnpin,
+@@ -2921,13 +3503,17 @@ void WorkspacePinnedSectionView::Execute
+       UnpinItem(id);
+       break;
+     case kCommandClose:
+-      OnItemClosePressed(id);
++      if (const PinNode* const row = store_ ? store_->Find(id) : nullptr) {
++        for (const std::string& page : PageIds(*row)) {
++          OnItemClosePressed(page);
++        }
++      }
+       break;
+     case kCommandDelete:
+       DeleteRow(id);
+       break;
+     case kCommandRename:
+-      ShowRenameBubble(id);
++      ShowRenameBubble(context_menu_page_id_);
+       break;
+     case kCommandNewFolder: {
+       // Just below the row, at its level (the owner's choice, E15d), and
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -163,7 +163,8 @@ class WorkspacePinnedSectionView
+ 
+   // The tab menu's "Pin to workspace" and a tab drop (E15d): each of `tabs`
+   // that is a web page drawn in the list becomes an item, in the list's
+-  // order, and stays open as that item's page. The first goes `where` the row
++  // order, and stays open as that item's page; a split's two tabs become one
++  // split row of two items, and one of them alone nothing (E19). The first goes `where` the row
+   // `to` is (PinStore::Insert), each next one after it; with no `to`, at the
+   // end of the section. Static: the menu is run by
+   // TabStripCollectionController, which does not hold the section it made.
+@@ -186,7 +187,8 @@ class WorkspacePinnedSectionView
+   // SwitchToWorkspace: it would activate a tab, or spawn a New Tab, first.
+   // False, with nothing changed, while Workspaces is off in `browser`, for a
+   // folder or no such row, and for an item whose address is not one a tab
+-  // can open. ONLY FROM A MENU, BUTTON OR COMMAND HANDLER.
++  // can open. A split's page is shown with its other page beside it, as one
++  // split view (E19, ShowSplit). ONLY FROM A MENU, BUTTON OR COMMAND HANDLER.
+   static bool ShowItem(BrowserWindowInterface* browser, std::string_view id);
+   // Activates `tab` in its own window, `browser` or another of its profile:
+   // that window enters the tab's workspace first (EnterWorkspaceForInsert, so
+@@ -274,6 +276,20 @@ class WorkspacePinnedSectionView
+   static void OpenItem(BrowserWindowInterface* browser,
+                        const workspaces::pins::PinNode& item,
+                        std::string_view guid = {});
++  // E19: opens whatever page of `split` is not open in `browser` (OpenItem),
++  // then makes its two pages one split view there, its left page on the
++  // left -- unless a page is in a split view with another tab.
++  static void OpenSplit(BrowserWindowInterface* browser,
++                        const workspaces::pins::PinNode& split,
++                        std::string_view guid = {});
++  // ShowItem's road for a page of `split` (E19): in the window that has a page
++  // of it open, this one first, the missing page is opened -- in workspace
++  // `key`, the store's key for the split's rows, entered first -- the two are
++  // one split view, and page `page_id` is shown.
++  static bool ShowSplit(BrowserWindowInterface* browser,
++                        const workspaces::pins::PinNode& split,
++                        std::string_view page_id,
++                        std::string_view key);
+   // The item becomes a Today tab: its page if it has one, opened first
+   // otherwise. At model index `index` of this window, in `group` if given,
+   // when it was dropped there (E15d) -- a page open in another window comes
+@@ -424,6 +440,9 @@ class WorkspacePinnedSectionView
+   // (E17b). A collapsed folder's menu of pages runs on the same model and
+   // runner; its items are these ids, in order.
+   std::string context_menu_id_;
++  // The page the menu was opened on: a split's row has two (E19), any other
++  // row is its own.
++  std::string context_menu_page_id_;
+   std::unique_ptr<ui::SimpleMenuModel> color_menu_model_;
+   std::vector<std::string> menu_page_ids_;
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;

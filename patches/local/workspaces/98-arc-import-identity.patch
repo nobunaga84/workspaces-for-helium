@@ -1,0 +1,1336 @@
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan.cc
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.cc
+@@ -86,7 +86,7 @@ class Walker {
+  public:
+   explicit Walker(const ItemIndex& items) : items_(items) {}
+ 
+-  int skipped() const { return skipped_; }
++  const std::vector<std::string>& skipped() const { return skipped_; }
+ 
+   // The tree under a space's root container, flattened into strip order. Root
+   // level keeps Arc's order, loose tabs and folders interleaved.
+@@ -111,10 +111,10 @@ class Walker {
+   // The tree under a space's pinned container as pinned-section rows, nothing
+   // flattened: folders nest as deep as Arc's (to the same cap), and a folder's
+   // tabs and subfolders keep Arc's order. The rows take Arc's ids, which are
+-  // unique because Visit() refuses a second visit. `created` gets each item's
+-  // createdAt, in the same walk order.
++  // unique because Visit() refuses a second visit. `created` gets each page's
++  // createdAt by its id.
+   std::vector<pins::PinNode> Rows(std::string_view container_id,
+-                                  std::vector<base::Time>& created) {
++                                  std::map<std::string, base::Time>& created) {
+     std::vector<pins::PinNode> rows;
+     if (const base::DictValue* const root = Visit(container_id)) {
+       AppendRows(*root, /*depth=*/1, rows, created);
+@@ -156,7 +156,7 @@ class Walker {
+       return nullptr;
+     }
+     if (!visited_.insert(found->first).second) {
+-      ++skipped_;
++      skipped_.emplace_back(found->first);
+       return nullptr;
+     }
+     return found->second;
+@@ -184,7 +184,7 @@ class Walker {
+                   int depth,
+                   std::vector<ArcUnit>& out) {
+     if (depth > kMaxDepth) {
+-      ++skipped_;
++      skipped_.push_back(StringOr(folder, "id", ""));
+       return;
+     }
+     const std::vector<const base::DictValue*> children = Children(folder);
+@@ -209,11 +209,11 @@ class Walker {
+   void AppendRows(const base::DictValue& parent,
+                   int depth,
+                   std::vector<pins::PinNode>& rows,
+-                  std::vector<base::Time>& created) {
++                  std::map<std::string, base::Time>& created) {
+     for (const base::DictValue* child : Children(parent)) {
+       if (IsFolder(*child)) {
+         if (depth > kMaxDepth) {
+-          ++skipped_;
++          skipped_.push_back(StringOr(*child, "id", ""));
+           continue;
+         }
+         pins::PinNode folder;
+@@ -238,6 +238,7 @@ class Walker {
+       }
+       for (ArcItem& item : tabs.items) {
+         for (ArcTab& tab : item.tabs) {
++          created[tab.arc_id] = tab.created;
+           pins::PinNode row;
+           row.id = std::move(tab.arc_id);
+           row.url = std::move(tab.url);
+@@ -245,7 +246,6 @@ class Walker {
+           row.custom_title = std::move(tab.custom_title);
+           row.last_active = tab.last_active;
+           pages.push_back(std::move(row));
+-          created.push_back(tab.created);
+         }
+       }
+     }
+@@ -290,7 +290,7 @@ class Walker {
+     }
+     const std::string* const url = saved->FindString("savedURL");
+     if (!url || !IsWebUrl(*url)) {
+-      ++skipped_;
++      skipped_.push_back(StringOr(item, "id", ""));
+       return std::nullopt;
+     }
+     ArcTab tab;
+@@ -312,7 +312,7 @@ class Walker {
+ 
+   const ItemIndex& items_;
+   std::set<std::string_view> visited_;
+-  int skipped_ = 0;
++  std::vector<std::string> skipped_;
+ };
+ 
+ // A space names its two root containers as [tag, id, tag, id], the tag a
+@@ -351,6 +351,39 @@ std::string SpaceIcon(const base::DictVa
+   return utf8;
+ }
+ 
++bool IsKnown(const std::set<std::string>& known, const std::string& id) {
++  return !id.empty() && known.contains(id);
++}
++
++// `rows` without the known, as WithoutKnown says: a page, or a split with
++// either page known, goes; a known folder's remaining rows take its place.
++std::vector<pins::PinNode> UnknownRows(std::vector<pins::PinNode> rows,
++                                       const std::set<std::string>& known) {
++  std::vector<pins::PinNode> out;
++  for (pins::PinNode& row : rows) {
++    if (row.type != pins::PinNode::Type::kFolder) {
++      if (!IsKnown(known, row.id) &&
++          std::ranges::none_of(row.children, [&known](const pins::PinNode& page) {
++            return IsKnown(known, page.id);
++          })) {
++        out.push_back(std::move(row));
++      }
++      continue;
++    }
++    std::vector<pins::PinNode> children =
++        UnknownRows(std::move(row.children), known);
++    if (IsKnown(known, row.id)) {
++      for (pins::PinNode& child : children) {
++        out.push_back(std::move(child));
++      }
++    } else if (!children.empty()) {
++      row.children = std::move(children);
++      out.push_back(std::move(row));
++    }
++  }
++  return out;
++}
++
+ }  // namespace
+ 
+ ArcReadResult ParseArcSidebarJson(std::string_view json) {
+@@ -427,26 +460,46 @@ base::Time FromArcSeconds(double seconds
+                                                kArcEpochOffsetSeconds);
+ }
+ 
+-ArcImportPlan KeepCreatedAfter(ArcImportPlan plan, base::Time last_import) {
+-  if (last_import.is_null()) {
+-    return plan;
+-  }
+-  // A tab with no createdAt has a null time and so counts as old.
+-  const auto is_old = [last_import](const ArcTab& tab) {
+-    return tab.created <= last_import;
++std::set<std::string> CreatedBy(const ArcImportPlan& plan, base::Time time) {
++  std::set<std::string> ids;
++  // A tab with no createdAt has a null time and so counts as old, as it did.
++  const auto add = [&ids, time](const std::string& id, base::Time created) {
++    if (!id.empty() && created <= time) {
++      ids.insert(id);
++    }
++  };
++  for (const ArcTab& tab : plan.favorites) {
++    add(tab.arc_id, tab.created);
++  }
++  for (const ArcWorkspace& workspace : plan.workspaces) {
++    for (const auto& [id, created] : workspace.pinned_created) {
++      add(id, created);
++    }
++    for (const ArcUnit& unit : workspace.today) {
++      for (const ArcItem& item : unit.items) {
++        for (const ArcTab& tab : item.tabs) {
++          add(tab.arc_id, tab.created);
++        }
++      }
++    }
++  }
++  return ids;
++}
++
++ArcImportPlan WithoutKnown(ArcImportPlan plan,
++                           const std::set<std::string>& known) {
++  const auto is_known = [&known](const ArcTab& tab) {
++    return IsKnown(known, tab.arc_id);
+   };
+-  std::erase_if(plan.favorites, is_old);
++  std::erase_if(plan.favorites, is_known);
++  std::erase_if(plan.skipped, [&known](const std::string& id) {
++    return IsKnown(known, id);
++  });
+   for (ArcWorkspace& workspace : plan.workspaces) {
+-    workspace.pinned_left_out = static_cast<int>(
+-        std::ranges::count_if(workspace.pinned_created, [last_import](
+-                                                            base::Time t) {
+-          return t > last_import;
+-        }));
+-    workspace.pinned.clear();
+-    workspace.pinned_created.clear();
++    workspace.pinned = UnknownRows(std::move(workspace.pinned), known);
+     for (ArcUnit& unit : workspace.today) {
+       for (ArcItem& item : unit.items) {
+-        std::erase_if(item.tabs, is_old);
++        std::erase_if(item.tabs, is_known);
+       }
+       std::erase_if(unit.items,
+                     [](const ArcItem& item) { return item.tabs.empty(); });
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan.h
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.h
+@@ -6,6 +6,8 @@
+ #define CHROME_BROWSER_UI_TABS_WORKSPACES_ARC_IMPORT_PLAN_H_
+ 
+ #include <cstddef>
++#include <map>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -40,7 +42,8 @@ struct ArcTab {
+   // timeLastActiveAt, else createdAt -- 40% of Today tabs have no
+   // timeLastActiveAt. Seeds auto-archive's countdown.
+   base::Time last_active;
+-  // createdAt, which every Arc item has. What a re-import filters on.
++  // createdAt, which every Arc item has. Only a profile imported before Arc's
++  // ids were kept (C2) is judged by it, once (CreatedBy).
+   base::Time created;
+ 
+   bool operator==(const ArcTab&) const = default;
+@@ -65,6 +68,9 @@ struct ArcUnit {
+ };
+ 
+ struct ArcWorkspace {
++  // Arc's id for the space: the workspace keeps it, and a re-run finds the
++  // workspace by it, never by the title, which the user may change or repeat
++  // (C2, the negative review's arc-import F6).
+   std::string arc_space_id;
+   std::string title;
+   // Arc's emoji as UTF-8, or empty.
+@@ -74,13 +80,9 @@ struct ArcWorkspace {
+   // pinned section: data, not tabs (E15b, design 5). A split view is one
+   // split row, its two tabs its pages (E19).
+   std::vector<pins::PinNode> pinned;
+-  // Arc's createdAt of each pinned item, in walk order. A row does not carry
+-  // it (the pins file has no use for it); a re-run needs it only to COUNT the
+-  // pinned tabs Arc gained, which it leaves out.
+-  std::vector<base::Time> pinned_created;
+-  // Set by KeepCreatedAfter: pinned tabs created after the last import, left
+-  // out because pinned rows are imported once.
+-  int pinned_left_out = 0;
++  // Arc's createdAt of each pinned page, by its Arc id. A row does not carry
++  // it (the pins file has no use for it); only CreatedBy reads it.
++  std::map<std::string, base::Time> pinned_created;
+   // Its Today tabs.
+   std::vector<ArcUnit> today;
+ 
+@@ -91,8 +93,10 @@ struct ArcImportPlan {
+   // Arc's favorites, shared by every space: become Chrome-pinned tabs.
+   std::vector<ArcTab> favorites;
+   std::vector<ArcWorkspace> workspaces;
+-  // Tabs left out: no URL, not http(s), or reached through a cycle.
+-  int skipped = 0;
++  // The Arc ids of the tabs left out -- no URL, not http(s), reached a second
++  // time (a cycle) or nested past the cap -- so that a re-run counts only the
++  // ones it has not seen (the negative review's arc-import F7).
++  std::vector<std::string> skipped;
+ 
+   bool operator==(const ArcImportPlan&) const = default;
+ };
+@@ -125,13 +129,22 @@ ArcReadResult ReadArcSidebar(const base:
+ // Arc stamps seconds since 2001-01-01 UTC.
+ base::Time FromArcSeconds(double seconds);
+ 
+-// `plan` without the tabs created at or before `last_import`, for a re-run:
+-// a tab closed or archived here since then stays gone. A null time keeps
+-// everything. A split left with one tab stays as a plain tab; emptied items
+-// and units are dropped, workspaces are kept. Pinned rows are imported once: a
+-// re-run has none, since the first import's rows are the user's to change from
+-// then on (re-importing into folders is a later stage, design 5).
+-ArcImportPlan KeepCreatedAfter(ArcImportPlan plan, base::Time last_import);
++// The Arc ids in `plan` of the tabs and pinned pages created at or before
++// `time`: what an import before C2, which kept no ids, took (its clock was
++// the only record). Folders and splits have no createdAt here; a folder whose
++// pages are all old is left empty by WithoutKnown and dropped.
++std::set<std::string> CreatedBy(const ArcImportPlan& plan, base::Time time);
++
++// `plan` without what `known` names -- the Arc ids this profile already has,
++// or had: a tab closed or archived here since stays gone (LOCAL.md 39), and a
++// tab Arc gained later is new whatever its createdAt (the negative review's
++// arc-import F5). A split left with one tab stays as a plain tab; emptied
++// items and units are dropped, workspaces are kept. In the pinned rows, a
++// known page or split is dropped (a split when either page is known); a known
++// folder is not made again, its new rows taking its place; a folder left
++// without rows is dropped. Known skipped ids are dropped too.
++ArcImportPlan WithoutKnown(ArcImportPlan plan,
++                           const std::set<std::string>& known);
+ 
+ }  // namespace workspaces::arc_import
+ 
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan_unittest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <iostream>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -174,7 +175,7 @@ TEST(ArcImportPlanTest, WalksSpacesFolde
+   EXPECT_EQ(RowShape(second.pinned), "");
+   EXPECT_EQ(Shape(second.today), "[v1]");
+ 
+-  EXPECT_EQ(plan->skipped, 1);  // t8
++  EXPECT_EQ(plan->skipped, std::vector<std::string>{"t8"});
+ }
+ 
+ TEST(ArcImportPlanTest, ALittleArcWindowListedFirstIsNotTheSidebar) {
+@@ -210,7 +211,7 @@ TEST(ArcImportPlanTest, OnlyWebPagesAreI
+ 
+   ASSERT_TRUE(plan);
+   EXPECT_EQ(RowShape(plan->workspaces[0].pinned), "a");
+-  EXPECT_EQ(plan->skipped, 4);
++  EXPECT_EQ(plan->skipped, (std::vector<std::string>{"b", "c", "d", "e"}));
+ }
+ 
+ TEST(ArcImportPlanTest, ANameIsCustomOnlyWhenItDiffersFromThePageTitle) {
+@@ -270,7 +271,7 @@ TEST(ArcImportPlanTest, ACycleEndsAndIsC
+ 
+   ASSERT_TRUE(plan);
+   EXPECT_EQ(RowShape(plan->workspaces[0].pinned), "A{B{t2} t1}");
+-  EXPECT_EQ(plan->skipped, 1);
++  EXPECT_EQ(plan->skipped, std::vector<std::string>{"A"});
+ }
+ 
+ TEST(ArcImportPlanTest, AFolderChainDeeperThanTheCapIsCutOff) {
+@@ -298,7 +299,7 @@ TEST(ArcImportPlanTest, AFolderChainDeep
+     ++depth;
+   }
+   EXPECT_EQ(depth, 64);
+-  EXPECT_EQ(plan->skipped, 1);
++  EXPECT_EQ(plan->skipped, std::vector<std::string>{"f64"});
+   // The two caps agree: what the parser keeps, the pins file can hold.
+   pins::PinTree tree;
+   tree["s"] = plan->workspaces[0].pinned;
+@@ -359,45 +360,94 @@ TEST(ArcImportPlanTest, EachReadProblemH
+   EXPECT_EQ(ProblemOf(ReadArcSidebar(file)), ArcReadProblem::kTooBig);
+ }
+ 
+-TEST(ArcImportPlanTest, AReimportKeepsOnlyWhatArcGainedSince) {
++// Favorites f1 (old) and f2 (new), pinned t9 (new) and t8 (old), Today:
++// folder A[t1], a split t4+t5, t3, and a page that is not a web page.
++ArcImportPlan ReimportPlan() {
+   const ArcReadResult plan = ParseArcSidebarJson(Sidebar(
+       base::StrCat({Parent("fav", "itemContainer", R"(["f1","f2"])"), ",",
+                     Tab("f1", "https://f1.example/", "F1", 10), ",",
+                     Tab("f2", "https://f2.example/", "F2", 500), ",",
+-                    Parent("p", "itemContainer", R"(["t9"])"), ",",
++                    Parent("p", "itemContainer", R"(["t9","t8"])"), ",",
+                     Tab("t9", "https://nine.example/", "Nine", 500), ",",
+-                    Parent("u", "itemContainer", R"(["A","sp","t3"])"), ",",
+-                    Parent("A", "list", R"(["t1"])", "A"), ",",
++                    Tab("t8", "https://eight.example/", "Eight", 10), ",",
++                    Parent("u", "itemContainer", R"(["A","sp","t3","x"])"),
++                    ",", Parent("A", "list", R"(["t1"])", "A"), ",",
+                     Tab("t1", "https://one.example/", "One", 10), ",",
+                     Parent("sp", "splitView", R"(["t4","t5"])"), ",",
+                     Tab("t4", "https://four.example/", "Four", 10), ",",
+                     Tab("t5", "https://five.example/", "Five", 500), ",",
+-                    Tab("t3", "https://three.example/", "Three", 100)}),
++                    Tab("t3", "https://three.example/", "Three", 100), ",",
++                    Tab("x", "arc://boost", "Boost", 10)}),
+       Space("s1", "S", kOneSpace), R"([{"default":true},"fav"])"));
+-  ASSERT_TRUE(plan);
+-  ASSERT_EQ(Shape(plan->workspaces[0].today), "A[t1] [t4+t5 t3]");
+-  ASSERT_EQ(RowShape(plan->workspaces[0].pinned), "t9");
+-
+-  // First import: nothing to compare against, everything stays.
+-  EXPECT_EQ(KeepCreatedAfter(*plan, base::Time()), *plan);
++  return plan.has_value() ? *plan : ArcImportPlan();
++}
+ 
+-  // Imported at second 100: `t3` was created AT that second and is old.
+-  const ArcImportPlan later = KeepCreatedAfter(*plan, FromArcSeconds(100));
++TEST(ArcImportPlanTest, AReimportLeavesOutWhatIsKnownWhateverItsDate) {
++  const ArcImportPlan plan = ReimportPlan();
++  ASSERT_EQ(Shape(plan.workspaces[0].today), "A[t1] [t4+t5 t3]");
++  ASSERT_EQ(RowShape(plan.workspaces[0].pinned), "t9 t8");
++  ASSERT_EQ(plan.skipped, std::vector<std::string>{"x"});
++
++  // First import: nothing known, everything stays.
++  EXPECT_EQ(WithoutKnown(plan, {}), plan);
++
++  // t1 is as old as anything here, but no import had it: it comes (the
++  // negative review's arc-import F5). The split is down to its unknown half,
++  // and the skipped page, seen before, is not counted again (F7).
++  const ArcImportPlan later =
++      WithoutKnown(plan, {"f1", "t4", "t3", "t8", "x"});
+   ASSERT_EQ(later.favorites.size(), 1u);
+   EXPECT_EQ(later.favorites[0].arc_id, "f2");
+-  ASSERT_EQ(later.workspaces.size(), 1u);  // kept even when it empties
+-  // Folder A is gone with its only tab; the split is down to its new half.
+-  EXPECT_EQ(Shape(later.workspaces[0].today), "[t5]");
+-  // Pinned rows are imported once, however new: t9 is not brought back, but it
+-  // is counted, so the importer can say so.
+-  EXPECT_EQ(RowShape(later.workspaces[0].pinned), "");
+-  EXPECT_EQ(later.workspaces[0].pinned_left_out, 1);
+-  EXPECT_TRUE(later.workspaces[0].pinned_created.empty());
++  ASSERT_EQ(later.workspaces.size(), 1u);
++  EXPECT_EQ(Shape(later.workspaces[0].today), "A[t1] [t5]");
++  // Pinned rows are no longer "imported once": a new one comes (F1).
++  EXPECT_EQ(RowShape(later.workspaces[0].pinned), "t9");
++  EXPECT_TRUE(later.skipped.empty());
+ 
+-  const ArcImportPlan nothing = KeepCreatedAfter(*plan, FromArcSeconds(9999));
++  const ArcImportPlan nothing = WithoutKnown(
++      plan, {"f1", "f2", "t9", "t8", "t1", "t4", "t5", "t3", "x"});
+   EXPECT_TRUE(nothing.favorites.empty());
++  ASSERT_EQ(nothing.workspaces.size(), 1u);  // kept even when it empties
+   EXPECT_EQ(Shape(nothing.workspaces[0].today), "");
+-  EXPECT_EQ(nothing.workspaces[0].pinned_left_out, 0);
++  EXPECT_EQ(RowShape(nothing.workspaces[0].pinned), "");
++}
++
++TEST(ArcImportPlanTest, AKnownPinnedFolderIsNotMadeAgain) {
++  const ArcReadResult plan = ParseArcSidebarJson(Sidebar(
++      base::StrCat({Parent("p", "itemContainer", R"(["t1","A","sp","B"])"),
++                    ",", Tab("t1", "https://one.example/", "One", 10), ",",
++                    Parent("A", "list", R"(["t2","C"])", "A"), ",",
++                    Tab("t2", "https://two.example/", "Two", 10), ",",
++                    Parent("C", "list", R"(["t3"])", "C"), ",",
++                    Tab("t3", "https://three.example/", "Three", 10), ",",
++                    Parent("sp", "splitView", R"(["t4","t5"])"), ",",
++                    Tab("t4", "https://four.example/", "Four", 10), ",",
++                    Tab("t5", "https://five.example/", "Five", 10), ",",
++                    Parent("B", "list", R"(["t6"])", "B"), ",",
++                    Tab("t6", "https://six.example/", "Six", 10)}),
++      Space("s1", "S", kOneSpace)));
++  ASSERT_TRUE(plan);
++  ASSERT_EQ(RowShape(plan->workspaces[0].pinned),
++            "t1 A{t2 C{t3}} sp[t4 t5] B{t6}");
++
++  // A known folder's new rows take its place; a split goes with either known
++  // page; a folder with nothing new goes. A row id appears once in the pins
++  // file, so a known one is never written twice.
++  EXPECT_EQ(RowShape(WithoutKnown(*plan, {"t1", "A", "t2", "t5", "t6"})
++                         .workspaces[0]
++                         .pinned),
++            "C{t3}");
++  EXPECT_EQ(RowShape(WithoutKnown(*plan, {"C"}).workspaces[0].pinned),
++            "t1 A{t2 t3} sp[t4 t5] B{t6}");
++}
++
++TEST(ArcImportPlanTest, CreatedByListsWhatAnImportBeforeIdsTook) {
++  const ArcImportPlan plan = ReimportPlan();
++  // Created at or before second 100, t3 AT it: favorites, Today and pinned
++  // pages alike. Not the skipped page: the plan has no createdAt for it.
++  EXPECT_EQ(CreatedBy(plan, FromArcSeconds(100)),
++            (std::set<std::string>{"f1", "t8", "t1", "t4", "t3"}));
++  EXPECT_TRUE(CreatedBy(plan, FromArcSeconds(1)).empty());
+ }
+ 
+ // Not a test of the code above but of my reading of Arc's format: every
+@@ -418,7 +468,7 @@ TEST(ArcImportPlanTest, CountsFromARealS
+ 
+   std::cout << "ARC favorites=" << plan->favorites.size()
+             << " workspaces=" << plan->workspaces.size()
+-            << " skipped=" << plan->skipped << "\n";
++            << " skipped=" << plan->skipped.size() << "\n";
+   int index = 0;
+   for (const ArcWorkspace& workspace : plan->workspaces) {
+     int pinned = 0, folders = 0, today = 0, groups = 0, splits = 0,
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -58,6 +58,7 @@ void RegisterProfilePrefs(PrefRegistrySi
+ 
+   // Null until the first import, which therefore takes everything.
+   registry->RegisterTimePref(kHeliumWorkspacesArcImportedAt, base::Time());
++  registry->RegisterListPref(kHeliumWorkspacesArcImportedIds);
+ 
+   // Never (the owner, design 5 "Auto-archive").
+   registry->RegisterIntegerPref(kHeliumWorkspacesArchiveAfterMinutes, 0);
+@@ -98,7 +99,8 @@ ImportedValues ApplyImportedValues(PrefS
+   // leaves the profile's own.
+   const auto kept = [](std::string_view key) {
+     return key == "enabled" || key == "arc_imported_at" ||
+-           key == "toolbar_order" || key == "little_window";
++           key == "arc_imported_ids" || key == "toolbar_order" ||
++           key == "little_window";
+   };
+   const base::DictValue current = ExportableValues(*prefs);
+   ImportedValues result;
+@@ -189,6 +191,9 @@ std::vector<WorkspaceEntry> ParseWorkspa
+         }
+       }
+     }
++    if (const std::string* const arc_space = entry->FindString(kArcSpaceKey)) {
++      entries.back().arc_space = *arc_space;
++    }
+   }
+ 
+   if (entries.empty()) {
+@@ -247,6 +252,38 @@ std::vector<WorkspaceEntry> SetWorkspace
+   return entries;
+ }
+ 
++std::string FindImportWorkspace(const std::vector<WorkspaceEntry>& entries,
++                                std::string_view arc_space,
++                                std::string_view title,
++                                bool match_title) {
++  for (const WorkspaceEntry& entry : entries) {
++    if (!arc_space.empty() && entry.arc_space == arc_space) {
++      return entry.guid;
++    }
++  }
++  if (match_title) {
++    for (const WorkspaceEntry& entry : entries) {
++      if (entry.arc_space.empty() && entry.title == title) {
++        return entry.guid;
++      }
++    }
++  }
++  return std::string();
++}
++
++std::vector<WorkspaceEntry> SetWorkspaceArcSpace(
++    std::vector<WorkspaceEntry> entries,
++    std::string_view guid,
++    std::string arc_space) {
++  for (WorkspaceEntry& entry : entries) {
++    if (entry.guid == guid) {
++      entry.arc_space = std::move(arc_space);
++      break;
++    }
++  }
++  return entries;
++}
++
+ bool IsWorkspaceSymbol(std::string_view symbol) {
+   return std::ranges::find(kWorkspaceSymbols, symbol) !=
+          kWorkspaceSymbols.end();
+@@ -448,6 +485,9 @@ base::DictValue SerializeWorkspaces(
+       }
+       item.Set(kSitesKey, std::move(sites));
+     }
++    if (!entry.arc_space.empty()) {
++      item.Set(kArcSpaceKey, entry.arc_space);
++    }
+     list.Append(std::move(item));
+   }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -54,12 +54,23 @@ inline constexpr char kHeliumWorkspacesE
+ // accident even if someone later wants it to be.
+ inline constexpr char kHeliumWorkspacesList[] = "helium.workspaces.list";
+ 
+-// When "Import from Arc..." last ran (E14c). A re-run imports only what Arc
+-// created after it, so a tab closed here since then stays gone. A sibling of
+-// the two above for the reason above, and pinned by the same test.
++// When "Import from Arc..." last brought something (E14c): the auto-archive
++// counts no tab's age from before it. Before C2 it was also the only record
++// of what was imported -- a re-run took what Arc created after it -- and a
++// profile imported then is judged by it once more (arc_import::CreatedBy). A
++// sibling of the two above for the reason above, and pinned by the same test.
+ inline constexpr char kHeliumWorkspacesArcImportedAt[] =
+     "helium.workspaces.arc_imported_at";
+ 
++// The Arc ids this profile has had from "Import from Arc..." (C2): pinned
++// rows, tabs, and what was skipped as not a web page. A re-run leaves them
++// out, whatever their date, so a tab closed here stays gone. A list of
++// strings, about 38 bytes an id in Preferences; it grows only on an import.
++// State like the pref above, never an Import's to set (ApplyImportedValues).
++// A sibling of the prefs above, pinned by the same test.
++inline constexpr char kHeliumWorkspacesArcImportedIds[] =
++    "helium.workspaces.arc_imported_ids";
++
+ // How long a tab may go unlooked-at before the auto-archive moves it to the
+ // Archive (E14d.3, design 5 "Auto-archive"): minutes, 0 = Never, the default
+ // (the owner). The setting offers 1440, 10080 and 43200 (1, 7 and 30 days);
+@@ -147,6 +158,9 @@ inline constexpr char kSymbolKey[] = "sy
+ // SiteFromHost() leaves them. Optional, as above; an older build ignores the
+ // key, and its next write of the list drops it (D8).
+ inline constexpr char kSitesKey[] = "sites";
++// The Arc space a workspace was imported from (C2): its id in Arc's file.
++// Optional, as above.
++inline constexpr char kArcSpaceKey[] = "arc_space";
+ 
+ // A colour is a tab_groups::TabGroupColorId, 0-8 (grey, blue, red, yellow,
+ // green, pink, purple, cyan, orange), stored as a plain int: :prefs must not
+@@ -187,6 +201,9 @@ struct WorkspaceEntry {
+   // C5: the sites that always open here, in the order they were added.
+   // Appended last for the brace-inits, as `color` was.
+   std::vector<std::string> sites;
++  // C2: the Arc space this workspace was imported from, or empty. Appended
++  // last, as above.
++  std::string arc_space;
+ };
+ 
+ void RegisterProfilePrefs(PrefRegistrySimple* registry);
+@@ -279,6 +296,23 @@ std::vector<WorkspaceEntry> SetSiteWorks
+ std::vector<WorkspaceEntry> RemoveSite(std::vector<WorkspaceEntry> entries,
+                                        std::string_view site);
+ 
++// C2: the guid of the workspace "Import from Arc..." fills for the Arc space
++// `arc_space`, or empty when there is none yet: the entry with that Arc id.
++// `match_title` is for a profile imported before C2, whose workspaces carry
++// no Arc id: then an entry titled `title` WITHOUT an Arc id is taken too (the
++// caller gives it the id). Never by title otherwise -- a workspace the user
++// named the same would swallow the space (the negative review's arc-import
++// F6). An empty `arc_space` matches no entry by id.
++std::string FindImportWorkspace(const std::vector<WorkspaceEntry>& entries,
++                                std::string_view arc_space,
++                                std::string_view title,
++                                bool match_title);
++// The same shape as SetWorkspaceIcon.
++std::vector<WorkspaceEntry> SetWorkspaceArcSpace(
++    std::vector<WorkspaceEntry> entries,
++    std::string_view guid,
++    std::string arc_space);
++
+ // C5: every workspace's sites as the rules WorkspaceForHost() takes, in list
+ // order.
+ std::vector<SiteRule> SiteRules(const std::vector<WorkspaceEntry>& entries);
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -127,6 +127,7 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+   // a pref named inside another would be eaten by the first write of its
+   // parent (15).
+   const std::string imported_at(kHeliumWorkspacesArcImportedAt);
++  const std::string imported_ids(kHeliumWorkspacesArcImportedIds);
+   const std::string archive_after(kHeliumWorkspacesArchiveAfterMinutes);
+   const std::string tab_row_height(kHeliumWorkspacesTabRowHeight);
+   const std::string smooth_scrolling(kHeliumWorkspacesSmoothScrolling);
+@@ -135,12 +136,13 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+   const std::string pins_folded(kHeliumWorkspacesPinsFolded);
+   const std::string little_window(kHeliumWorkspacesLittleWindow);
+   for (const std::string& later :
+-       {imported_at, archive_after, tab_row_height, smooth_scrolling,
+-        wide_sidebar, toolbar_order, pins_folded, little_window}) {
++       {imported_at, imported_ids, archive_after, tab_row_height,
++        smooth_scrolling, wide_sidebar, toolbar_order, pins_folded,
++        little_window}) {
+     for (const std::string& other :
+-         {enabled, list, imported_at, archive_after, tab_row_height,
+-          smooth_scrolling, wide_sidebar, toolbar_order, pins_folded,
+-          little_window}) {
++         {enabled, list, imported_at, imported_ids, archive_after,
++          tab_row_height, smooth_scrolling, wide_sidebar, toolbar_order,
++          pins_folded, little_window}) {
+       if (other == later) {
+         continue;
+       }
+@@ -1047,6 +1049,36 @@ TEST(WorkspacePrefsTest, SiteRulesListEv
+   EXPECT_EQ("work", rules[2].guid);
+ }
+ 
++// C2: the Arc space a workspace was imported from.
++
++TEST(WorkspaceWriteTest, ArcSpaceRoundTripsAndIsWrittenOnlyWhenSet) {
++  std::vector<WorkspaceEntry> e = TwoWorkspaces();
++  e = SetWorkspaceArcSpace(std::move(e), "work", "S1");
++  const base::DictValue dict = SerializeWorkspaces(e);
++  EXPECT_FALSE((*dict.FindList(kItemsKey))[0].GetDict().contains(kArcSpaceKey));
++  const std::vector<WorkspaceEntry> after = ParseWorkspaces(dict);
++  ASSERT_EQ(2u, after.size());
++  EXPECT_EQ("S1", after[1].arc_space);
++  EXPECT_EQ("", after[0].arc_space);
++}
++
++TEST(WorkspacePrefsTest, AnImportFindsItsWorkspaceByArcSpaceNotTitle) {
++  std::vector<WorkspaceEntry> e = TwoWorkspaces();  // "work", titled Work
++  e = AddWorkspace(std::move(e), "job", "Job");
++  e = SetWorkspaceArcSpace(std::move(e), "job", "S1");
++  // Imported from S1 and since renamed: still found (arc-import F6).
++  EXPECT_EQ("job", FindImportWorkspace(e, "S1", "Work", false));
++  // The user's own Work does not swallow Arc's (F6), nor does the
++  // nameless default workspace match an empty id.
++  EXPECT_EQ("", FindImportWorkspace(e, "S2", "Work", false));
++  EXPECT_EQ("", FindImportWorkspace(e, "", "", false));
++  // A profile imported before C2: a title, but only onto an entry with no
++  // Arc space of its own -- a second space of the same name gets its own
++  // workspace (F1's two same-named spaces).
++  EXPECT_EQ("work", FindImportWorkspace(e, "S2", "Work", true));
++  EXPECT_EQ("", FindImportWorkspace(e, "S3", "Job", true));
++}
++
+ TEST(WorkspacePrefsTest, EffectiveColorsGiveHomeGreyAndOthersTheFirstFreeColour) {
+   std::vector<WorkspaceEntry> e = TwoWorkspaces();
+   e.push_back(WorkspaceEntry{"a", "A"});
+@@ -1105,6 +1137,9 @@ TEST(WorkspacePrefsTest, AnImportSetsCle
+   // The state flags are the profile's own.
+   file.Set("enabled", true);
+   file.Set("arc_imported_at", "13435442523223578");
++  base::ListValue arc_ids;
++  arc_ids.Append("A1");
++  file.Set("arc_imported_ids", std::move(arc_ids));
+   // No such preference here; and a value of the wrong type.
+   file.Set("from_a_newer_version", 1);
+   file.Set("wide_sidebar", "not a bool");
+@@ -1123,6 +1158,8 @@ TEST(WorkspacePrefsTest, AnImportSetsCle
+   EXPECT_FALSE(pref_service.GetBoolean(kHeliumWorkspacesEnabled));
+   EXPECT_TRUE(pref_service.FindPreference(kHeliumWorkspacesArcImportedAt)
+                   ->IsDefaultValue());
++  EXPECT_TRUE(pref_service.FindPreference(kHeliumWorkspacesArcImportedIds)
++                  ->IsDefaultValue());
+   EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesWideSidebar));
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -560,13 +560,14 @@ std::string WorkspaceService::CreateWork
+ }
+ 
+ std::string WorkspaceService::EnsureWorkspaceForImport(
++    const std::string& arc_space,
+     const std::string& title,
+     const std::string& icon) {
+   const std::vector<prefs::WorkspaceEntry> entries = GetWorkspaces();
+-  for (const prefs::WorkspaceEntry& entry : entries) {
+-    if (entry.title == title) {
+-      return entry.guid;
+-    }
++  const std::string found = prefs::FindImportWorkspace(
++      entries, arc_space, title, /*match_title=*/false);
++  if (!found.empty()) {
++    return found;
+   }
+   std::string guid = base::Uuid::GenerateRandomV4().AsLowercaseString();
+   // One write, so the list observer runs once and the guid is known before
+@@ -574,9 +575,11 @@ std::string WorkspaceService::EnsureWork
+   // A list from a newer version is never written (data-files F1): the import
+   // goes to Home rather than to a guid no list holds.
+   if (!prefs::WriteWorkspaces(
+-          prefs_,
+-          prefs::SetWorkspaceIcon(prefs::AddWorkspace(entries, guid, title),
+-                                  guid, icon))) {
++          prefs_, prefs::SetWorkspaceArcSpace(
++                      prefs::SetWorkspaceIcon(
++                          prefs::AddWorkspace(entries, guid, title), guid,
++                          icon),
++                      guid, arc_space))) {
+     return std::string(kDefaultWorkspaceGuid);
+   }
+   LOG(INFO) << "[workspaces] created workspace '" << guid << "' for an import";
+@@ -610,7 +613,7 @@ void WorkspaceService::MakeGroupAWorkspa
+   // ONE write, named and coloured -- a TabGroupColorId is the 0-8 a workspace
+   // colour stores -- so the list observers run once and know the guid before
+   // the first tab is tagged with it (see CreateWorkspace()). Not
+-  // EnsureWorkspaceForImport(): it hands back a workspace of the same title.
++  // EnsureWorkspaceForImport(): that one is for an Arc space.
+   // A list from a newer version is never written (data-files F1): the group
+   // stays where it is rather than retagged to a guid no list holds.
+   if (!prefs::WriteWorkspaces(
+@@ -2351,6 +2354,13 @@ void WorkspaceService::PersistTag(conten
+   session_service->AddTabExtraData(
+       session_tab_helper->window_id(), session_tab_helper->session_id(),
+       kEmojiExtraDataKey, EmojiForTab(contents));
++  // And an imported tab's Arc id (C2), only when it has one: it never
++  // changes, so there is no older value to write over.
++  if (const std::string arc_id = ArcIdForTab(contents); !arc_id.empty()) {
++    session_service->AddTabExtraData(session_tab_helper->window_id(),
++                                     session_tab_helper->session_id(),
++                                     kArcIdExtraDataKey, arc_id);
++  }
+ }
+ 
+ void WorkspaceService::PersistFolders() {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -175,12 +175,15 @@ class WorkspaceService : public TabStrip
+   // ends in SwitchToWorkspace().
+   std::string CreateWorkspace(const std::string& title);
+ 
+-  // The guid of the workspace titled `title`, adding it (with `icon`) when
+-  // there is none. For "Import from Arc..." (E14c): unlike CreateWorkspace()
+-  // it neither switches nor spawns a tab, so a space can be filled while the
++  // The guid of the workspace made for the Arc space `arc_space` -- found by
++  // that id, never by the title (C2) -- else a new one with `title`, `icon`
++  // and the id. For "Import from Arc..." (E14c): unlike CreateWorkspace() it
++  // neither switches nor spawns a tab, so a space can be filled while the
+   // user stays where they are, and running an import twice reuses the
+-  // workspace it made the first time. Pref-only: safe from anywhere.
+-  std::string EnsureWorkspaceForImport(const std::string& title,
++  // workspace it made the first time, renamed or not. Pref-only: safe from
++  // anywhere.
++  std::string EnsureWorkspaceForImport(const std::string& arc_space,
++                                       const std::string& title,
+                                        const std::string& icon);
+ 
+   // C11a: whether "Make this group a workspace" can take `group`: Workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
+@@ -62,6 +62,15 @@ std::string PinItemForTab(content::WebCo
+   return tab_data ? tab_data->pin_item() : std::string();
+ }
+ 
++std::string ArcIdForTab(content::WebContents* contents) {
++  if (!contents) {
++    return std::string();
++  }
++  const WorkspaceTabData* tab_data =
++      WorkspaceTabData::FromWebContents(contents);
++  return tab_data ? tab_data->arc_id() : std::string();
++}
++
+ std::string ArchiveIdForTab(content::WebContents* contents) {
+   if (!contents) {
+     return std::string();
+@@ -126,6 +135,10 @@ void PopulateWorkspaceExtraData(
+   if (!pin_item.empty()) {
+     (*extra_data)[kPinItemExtraDataKey] = std::move(pin_item);
+   }
++  std::string arc_id = ArcIdForTab(contents);
++  if (!arc_id.empty()) {
++    (*extra_data)[kArcIdExtraDataKey] = std::move(arc_id);
++  }
+ }
+ 
+ void RestoreWorkspaceFromExtraData(
+@@ -139,9 +152,10 @@ void RestoreWorkspaceFromExtraData(
+   const auto title_it = extra_data.find(kCustomTitleExtraDataKey);
+   const auto pin_it = extra_data.find(kPinItemExtraDataKey);
+   const auto emoji_it = extra_data.find(kEmojiExtraDataKey);
++  const auto arc_it = extra_data.find(kArcIdExtraDataKey);
+   if (guid_it == extra_data.end() && anchor_it == extra_data.end() &&
+       title_it == extra_data.end() && pin_it == extra_data.end() &&
+-      emoji_it == extra_data.end()) {
++      emoji_it == extra_data.end() && arc_it == extra_data.end()) {
+     return;
+   }
+   // Set even when the stored value is empty. An empty tag is a real state --
+@@ -162,6 +176,9 @@ void RestoreWorkspaceFromExtraData(
+   if (pin_it != extra_data.end()) {
+     data->set_pin_item(pin_it->second);
+   }
++  if (arc_it != extra_data.end()) {
++    data->set_arc_id(arc_it->second);
++  }
+   if (title_it != extra_data.end()) {
+     data->set_custom_title(title_it->second);
+     // The one line that proves a rename survived a restart or Ctrl+Shift+T;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
+@@ -73,6 +73,10 @@ inline constexpr char kEmojiExtraDataKey
+ // rules: written empty to clear, absent means "an ordinary tab".
+ inline constexpr char kPinItemExtraDataKey[] = "helium.pin_item";
+ 
++// The Arc id of an imported tab (C2). Same carrier; written only when set, as
++// it never changes after the import.
++inline constexpr char kArcIdExtraDataKey[] = "helium.arc_id";
++
+ // A closed tab's id in the archive (E14d.1, design 5 "E14d spec"). CHOSEN
+ // ONCE, like the keys above: it is written into the Tabs file's Recently
+ // Closed entries, which outlive the build that wrote them. The reopen path
+@@ -120,6 +124,9 @@ std::string EmojiForTab(content::WebCont
+ // The pinned item `contents` is the open page of, or empty for an ordinary tab.
+ std::string PinItemForTab(content::WebContents* contents);
+ 
++// The Arc id `contents` was imported from (C2), or empty.
++std::string ArcIdForTab(content::WebContents* contents);
++
+ // The id `contents`'s close is kept under in the archive and in its Recently
+ // Closed entry, or empty for a null argument. Minted the FIRST time it is
+ // asked for, not at the door, because the door is not always first: a window
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -89,6 +89,13 @@ class WorkspaceTabData : public content:
+   const std::string& pin_item() const { return pin_item_; }
+   void set_pin_item(std::string id) { pin_item_ = std::move(id); }
+ 
++  // C2: the Arc id of the tab "Import from Arc..." made this from, or empty.
++  // Set once, at the import. While the import has not finished, it is how a
++  // re-run knows this tab is already here (the negative review's arc-import
++  // F2: an import cut off by Exit, its tabs restored).
++  const std::string& arc_id() const { return arc_id_; }
++  void set_arc_id(std::string id) { arc_id_ = std::move(id); }
++
+   // This tab's id in the archive (E14d.1, design 5 "E14d spec"), minted by
+   // ArchiveIdForTab() the first time it is asked for; empty until then. Never
+   // written to the session: a restored or reopened tab's next close is a new
+@@ -144,6 +151,7 @@ class WorkspaceTabData : public content:
+   std::string custom_title_;
+   std::string emoji_;
+   std::string pin_item_;
++  std::string arc_id_;
+   std::string archive_id_;
+   base::Time left_at_;
+   bool auto_archived_ = false;
+--- a/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
++++ b/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
+@@ -173,6 +173,12 @@
+   <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_UNKNOWN_FORMAT" desc="Title of the bubble shown when the Arc browser's data file was read but is laid out in a way this browser does not know, for example after an Arc update. Nothing was imported.">
+     Arc's data is in a format Helium can't read
+   </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_NEW_FOLDER" desc="Name of the folder that the pinned tabs Arc gained since the last import go into, at the bottom of a workspace's pinned section that already has pinned tabs, when Import from Arc runs again.">
++    New from Arc
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_PINNED_LEFT_OUT" desc="Extra line in the import bubble when some of Arc's pinned tabs could not be saved, because the file that keeps the pinned tabs was still loading or cannot be changed. Running the import again adds them.">
++    <ph name="COUNT">$1<ex>12</ex></ph> pinned tabs could not be saved just now. Import from Arc again to add them.
++  </message>
+   <message name="IDS_HELIUM_WORKSPACE_ARCHIVE" desc="Item on the workspace rail's + menu, and the title of the screen it opens: the tabs the user closed, kept for 60 days, which can be searched and reopened.">
+     Archive
+   </message>
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
+@@ -6,6 +6,8 @@
+ 
+ #include <algorithm>
+ #include <map>
++#include <memory>
++#include <set>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -19,9 +21,11 @@
+ #include "base/notreached.h"
+ #include "base/path_service.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/supports_user_data.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/timer/elapsed_timer.h"
++#include "base/uuid.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/prefs/session_startup_pref.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -29,6 +33,7 @@
+ #include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_ui_controller/browser_ui_controller.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/status_bubble.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -39,6 +44,7 @@
+ #include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
+@@ -60,6 +66,9 @@ using workspaces::arc_import::ArcTab;
+ using workspaces::arc_import::ArcUnit;
+ using workspaces::arc_import::ArcWorkspace;
+ 
++// The profile user data whose presence says an import runs (IsRunning).
++constexpr char kRunningKey[] = "helium_workspaces_arc_import_running";
++
+ // How long one slice may keep the UI thread. Long enough that a slice does
+ // real work, short enough that the window keeps painting between slices.
+ constexpr base::TimeDelta kSliceBudget = base::Milliseconds(40);
+@@ -127,6 +136,11 @@ content::WebContents* AddSleepingTab(Bro
+   if (!tab.custom_title.empty()) {
+     extra_data[workspaces::kCustomTitleExtraDataKey] = tab.custom_title;
+   }
++  // C2: until the import finishes, the tab's own Arc id is how a re-run
++  // knows it is here (an import cut off by Exit, its tabs restored: F2).
++  if (!tab.arc_id.empty()) {
++    extra_data[workspaces::kArcIdExtraDataKey] = tab.arc_id;
++  }
+ 
+   // No age from Arc: an imported tab's clock starts at its import (the owner,
+   // E14d.3), so nothing imported is auto-archived before the chosen time has
+@@ -149,36 +163,79 @@ content::WebContents* AddSleepingTab(Bro
+       chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
+ }
+ 
++// Every row id under `rows`, folders' and splits' too.
++void RowIds(const std::vector<workspaces::pins::PinNode>& rows,
++            std::vector<std::string>& ids) {
++  for (const workspaces::pins::PinNode& row : rows) {
++    ids.push_back(row.id);
++    RowIds(row.children, ids);
++  }
++}
++
++// Adds `ids` to the Arc ids this profile has had (C2), each once.
++void Remember(PrefService* prefs, const std::vector<std::string>& ids) {
++  if (ids.empty()) {
++    return;
++  }
++  ScopedListPrefUpdate update(
++      prefs, workspaces::prefs::kHeliumWorkspacesArcImportedIds);
++  std::set<std::string> have;
++  for (const base::Value& id : *update) {
++    if (id.is_string()) {
++      have.insert(id.GetString());
++    }
++  }
++  for (const std::string& id : ids) {
++    if (!id.empty() && have.insert(id).second) {
++      update->Append(id);
++    }
++  }
++}
++
+ // A space's pinned container goes to the pins file as rows, not tabs (E15b):
+ // nothing is created in the strip and nothing loads, however big a folder is.
+ // Never over rows the workspace already has: from the first import on they
+-// are the user's.
++// are the user's, so a re-run's new rows go below them, in a folder of their
++// own (C2, the owner). Rows written are remembered in `settled`; rows the
++// pins file refuses are not, so a later import tries them again.
+ void WritePinnedRows(workspaces::pins::PinStore& store,
+                      const std::string& guid,
+                      std::vector<workspaces::pins::PinNode> rows,
+-                     WorkspaceArcImporter::Result& result) {
++                     WorkspaceArcImporter::Result& result,
++                     std::vector<std::string>& settled) {
+   if (rows.empty()) {
+     return;
+   }
+   int items = 0;
+   int folders = 0;
+   workspaces::pins::CountRows(rows, items, folders);
+-  // Rows left out here are NOT counted as skipped: the bubble says a skipped
+-  // tab is "not a web page", which these are not. The log says why.
+-  if (store.tree().contains(guid)) {
+-    LOG(INFO) << "[workspaces] arc import: '" << guid
+-              << "' already has pinned rows; " << items << " left out";
+-    return;
++  std::vector<std::string> ids;
++  RowIds(rows, ids);
++  std::vector<workspaces::pins::PinNode> roots;
++  const auto have = store.tree().find(guid);
++  if (have != store.tree().end() && !have->second.empty()) {
++    roots = have->second;
++    workspaces::pins::PinNode& folder = roots.emplace_back();
++    folder.type = workspaces::pins::PinNode::Type::kFolder;
++    folder.id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++    folder.title =
++        l10n_util::GetStringUTF8(IDS_HELIUM_WORKSPACE_IMPORT_ARC_NEW_FOLDER);
++    folder.children = std::move(rows);
++    ++folders;
++  } else {
++    roots = std::move(rows);
+   }
+-  if (!store.SetRoots(guid, std::move(rows))) {
++  if (!store.SetRoots(guid, std::move(roots))) {
+     LOG(WARNING) << "[workspaces] arc import: pinned rows of '" << guid
+                  << "' not written (the pins file is still loading, "
+                     "read-only, or refused them); "
+                  << items << " left out";
++    result.pinned_left_out += items;
+     return;
+   }
+   result.pinned += items;
+   result.folders += folders;
++  settled.insert(settled.end(), ids.begin(), ids.end());
+ }
+ 
+ // Every split row under `rows`, inside folders too (E19).
+@@ -233,7 +290,17 @@ void PairArcSplits(base::WeakPtr<Profile
+ WorkspaceArcImporter::WorkspaceArcImporter(BrowserWindowInterface* browser)
+     : browser_(browser) {}
+ 
+-WorkspaceArcImporter::~WorkspaceArcImporter() = default;
++WorkspaceArcImporter::~WorkspaceArcImporter() {
++  // Its window is closing mid-import: the next import may start.
++  if (running_in_) {
++    running_in_->RemoveUserData(kRunningKey);
++  }
++}
++
++// static
++bool WorkspaceArcImporter::IsRunning(Profile* profile) {
++  return profile && profile->GetUserData(kRunningKey);
++}
+ 
+ // static
+ void WorkspaceArcImporter::RepairSplits(Profile* profile) {
+@@ -247,10 +314,13 @@ void WorkspaceArcImporter::RepairSplits(
+ }
+ 
+ void WorkspaceArcImporter::Start(DoneCallback done) {
+-  if (running_) {
++  Profile* const profile = browser_->GetProfile();
++  if (!profile || IsRunning(profile)) {
+     return;
+   }
+-  running_ = true;
++  profile->SetUserData(kRunningKey,
++                       std::make_unique<base::SupportsUserData::Data>());
++  running_in_ = profile->GetWeakPtr();
+   done_ = std::move(done);
+   result_ = Result();
+   window_ = nullptr;
+@@ -286,13 +356,82 @@ void WorkspaceArcImporter::OnPlanReady(b
+   }
+   result_.found = true;
+   prefs_ = profile->GetPrefs();
++  workspaces::pins::PinStore* const pin_store =
++      workspaces::pins::PinStore::GetOrCreate(profile, profile->GetPath());
+ 
+-  // A re-run adds only what Arc gained since the last one (owner's choice,
+-  // LOCAL.md 39): a tab closed or archived here since then stays gone.
+-  const ArcImportPlan todo = workspaces::arc_import::KeepCreatedAfter(
+-      *std::move(plan),
+-      prefs_->GetTime(workspaces::prefs::kHeliumWorkspacesArcImportedAt));
+-  result_.skipped = todo.skipped;
++  // A re-run adds only what this profile never had (owner's choice, LOCAL.md
++  // 39): a tab closed or archived here since stays gone. Known by Arc's own
++  // ids, never by a title or a date (C2, the negative review's arc-import F1
++  // F5 F6): the ids remembered by earlier imports, ...
++  std::set<std::string> known;
++  for (const base::Value& id :
++       prefs_->GetList(workspaces::prefs::kHeliumWorkspacesArcImportedIds)) {
++    if (id.is_string()) {
++      known.insert(id.GetString());
++    }
++  }
++  // ... and, remembered now, so that an import cut off later still knows
++  // them: ...
++  std::vector<std::string> settled;
++  // ... for a profile imported before C2, which kept only the time of its
++  // last import, what Arc had made by then -- once. Its workspaces carry no
++  // Arc id either: each space's, found by its title this once, takes it,
++  // also a space with nothing new, whose next news must find it.
++  const base::Time imported_at =
++      prefs_->GetTime(workspaces::prefs::kHeliumWorkspacesArcImportedAt);
++  const bool before_ids = known.empty() && !imported_at.is_null();
++  if (before_ids) {
++    for (const std::string& id :
++         workspaces::arc_import::CreatedBy(*plan, imported_at)) {
++      known.insert(id);
++      settled.push_back(id);
++    }
++    std::vector<workspaces::prefs::WorkspaceEntry> entries =
++        service->GetWorkspaces();
++    for (const ArcWorkspace& space : plan->workspaces) {
++      const std::string guid = workspaces::prefs::FindImportWorkspace(
++          entries, space.arc_space_id, space.title, /*match_title=*/true);
++      if (!guid.empty()) {
++        entries = workspaces::prefs::SetWorkspaceArcSpace(
++            std::move(entries), guid, space.arc_space_id);
++      }
++    }
++    workspaces::prefs::WriteWorkspaces(prefs_, entries);
++  }
++  // ... the tabs of an import that never finished, restored after an Exit
++  // (F2): each still wears its Arc id ...
++  int on_tabs = 0;
++  for (BrowserWindowInterface* const window : GetAllBrowserWindowInterfaces()) {
++    TabStripModel* const model = window->GetProfile() == profile
++                                     ? window->GetTabStripModel()
++                                     : nullptr;
++    for (int i = 0; model && i < model->count(); ++i) {
++      std::string id = workspaces::ArcIdForTab(model->GetWebContentsAt(i));
++      if (!id.empty() && known.insert(id).second) {
++        settled.push_back(std::move(id));
++        ++on_tabs;
++      }
++    }
++  }
++  // ... and rows already in the pins file, from another import or a
++  // workspace transfer: a row id appears there once.
++  std::vector<std::string> row_ids;
++  for (const ArcWorkspace& space : plan->workspaces) {
++    RowIds(space.pinned, row_ids);
++  }
++  for (const std::string& id : row_ids) {
++    if (pin_store->Find(id) && known.insert(id).second) {
++      settled.push_back(id);
++    }
++  }
++  LOG(INFO) << "[workspaces] arc import: " << known.size()
++            << " Arc id(s) already here, " << on_tabs << " on open tabs"
++            << (before_ids ? ", the old import's time read once" : "");
++  const ArcImportPlan todo =
++      workspaces::arc_import::WithoutKnown(*std::move(plan), known);
++  // Only what this run had not seen (F7).
++  result_.skipped = static_cast<int>(todo.skipped.size());
++  skipped_ids_ = todo.skipped;
+ 
+   // The plan, flattened into the order the strip gets it: favorites first,
+   // while the strip is short (a pinned insert is the one insert here that is
+@@ -300,25 +439,19 @@ void WorkspaceArcImporter::OnPlanReady(b
+   // go to the pins file here and now. A folder's group id is made here and
+   // travels with its items, so a group may straddle slices: a later tab with
+   // the same id is inserted into the group's range, which stays contiguous.
+-  workspaces::pins::PinStore* const pin_store =
+-      workspaces::pins::PinStore::GetOrCreate(profile, profile->GetPath());
+   for (const ArcTab& tab : todo.favorites) {
+     items_.push_back(Item{{tab}, std::string(), std::nullopt, std::string(),
+                           /*pin=*/true});
+   }
+-  int pinned_left_out = 0;
+   for (const ArcWorkspace& workspace : todo.workspaces) {
+-    // Counted before the skip below: a workspace whose only news is pinned
+-    // tabs is exactly the one that skip would hide.
+-    pinned_left_out += workspace.pinned_left_out;
+     if (workspace.pinned.empty() && workspace.today.empty()) {
+       continue;  // a re-run with nothing new: no empty workspace appears
+     }
+     // Never CreateWorkspace(): it switches, and spawns a loaded tab.
+-    const std::string guid =
+-        service->EnsureWorkspaceForImport(workspace.title, workspace.icon);
++    const std::string guid = service->EnsureWorkspaceForImport(
++        workspace.arc_space_id, workspace.title, workspace.icon);
+     ++result_.workspaces;
+-    WritePinnedRows(*pin_store, guid, workspace.pinned, result_);
++    WritePinnedRows(*pin_store, guid, workspace.pinned, result_, settled);
+     for (const ArcUnit& unit : workspace.today) {
+       std::optional<tab_groups::TabGroupId> group;
+       if (!unit.group_title.empty()) {
+@@ -337,15 +470,10 @@ void WorkspaceArcImporter::OnPlanReady(b
+   for (const Item& item : items_) {
+     result_.planned += static_cast<int>(item.tabs.size());
+   }
++  Remember(prefs_, settled);
+   LOG(INFO) << "[workspaces] arc import: start: " << result_.planned
+             << " tab(s) planned, " << result_.pinned << " pinned row(s) in "
+             << result_.folders << " folder(s) written";
+-  if (pinned_left_out) {
+-    LOG(INFO) << "[workspaces] arc import: " << pinned_left_out
+-              << " pinned tab(s) Arc gained since the last import left out: "
+-                 "pinned rows are imported once (re-importing into folders "
+-                 "is a later stage)";
+-  }
+ 
+   // This window, held weakly: a slice may run after the user closed it.
+   window_ = browser_->GetWeakPtr();
+@@ -353,9 +481,9 @@ void WorkspaceArcImporter::OnPlanReady(b
+ }
+ 
+ void WorkspaceArcImporter::ImportSlice() {
+-  // Closing the window is how an import is cancelled: whatever arrived went
+-  // with it, and the import time is not recorded, so the next run starts over
+-  // rather than skipping what was lost.
++  // Closing the window is how an import is cancelled. Its tabs are not
++  // remembered (Finish), so the next run brings again what went with the
++  // window -- and leaves out, by the Arc id each wears, what came back (C2).
+   BrowserWindowInterface* const window = window_.get();
+   TabStripModel* const model = window ? window->GetTabStripModel() : nullptr;
+   if (!model || window->IsDeleteScheduled() || model->closing_all()) {
+@@ -467,8 +595,18 @@ void WorkspaceArcImporter::Finish() {
+   //   the next launch (LOCAL.md 37). A policy-managed setting is not ours to
+   //   change, and the bubble must not say it was changed.
+   if (result_.found && !result_.aborted && prefs_) {
++    // Every tab of this import is settled now -- arrived, or skipped as
++    // unusable -- and remembered. Until here each one's Arc id on the tab
++    // spoke for it, so a cut-off import whose tabs were lost brings them again.
++    std::vector<std::string> ids = std::move(skipped_ids_);
++    for (const Item& item : items_) {
++      for (const ArcTab& tab : item.tabs) {
++        ids.push_back(tab.arc_id);
++      }
++    }
++    Remember(prefs_, ids);
+     // `started_`, not now: a tab Arc gains while this runs must count as new.
+-    // Pinned rows count too: they are imported once.
++    // Pinned rows count too.
+     if (result_.tabs > 0 || result_.pinned > 0) {
+       prefs_->SetTime(workspaces::prefs::kHeliumWorkspacesArcImportedAt,
+                       started_);
+@@ -493,10 +631,14 @@ void WorkspaceArcImporter::Finish() {
+               << ", " << result_.elapsed.InMilliseconds() << " ms"
+               << (result_.aborted ? ", aborted" : "");
+   }
+-  running_ = false;
++  if (running_in_) {
++    running_in_->RemoveUserData(kRunningKey);
++    running_in_ = nullptr;
++  }
+   prefs_ = nullptr;
+   items_.clear();
+   groups_made_.clear();
++  skipped_ids_.clear();
+   if (done_) {
+     std::move(done_).Run(result_);
+   }
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h
+@@ -59,6 +59,9 @@ class WorkspaceArcImporter {
+     // Pinned-section rows written: items, and folders among the rows.
+     int pinned = 0;
+     int folders = 0;
++    // Pinned items the pins file refused -- still loading, or read-only --
++    // and so not remembered: a later import tries them again.
++    int pinned_left_out = 0;
+     int groups = 0;
+     int splits = 0;
+     int workspaces = 0;
+@@ -77,10 +80,12 @@ class WorkspaceArcImporter {
+   WorkspaceArcImporter& operator=(const WorkspaceArcImporter&) = delete;
+   ~WorkspaceArcImporter();
+ 
+-  // True from Start() until `done` has run: the file is read off-thread and
+-  // the tabs arrive over many tasks, and a second click must not start a
+-  // second import.
+-  bool running() const { return running_; }
++  // True from an import's Start() in ANY window of `profile` until its `done`
++  // has run or its importer is gone: the file is read off-thread and the tabs
++  // arrive over many tasks, and a second click -- in this window or another
++  // (the negative review's arc-import F3) -- must not start a second import,
++  // which would bring every tab again.
++  static bool IsRunning(Profile* profile);
+ 
+   // Only from a menu or command handler: it ends in TabStripModel inserts
+   // (design 2.2). `done` runs on this sequence, never if `this` is destroyed.
+@@ -115,7 +120,9 @@ class WorkspaceArcImporter {
+   const raw_ptr<BrowserWindowInterface> browser_;
+   // The same window, as a WeakPtr: a slice may run after it was closed.
+   base::WeakPtr<BrowserWindowInterface> window_;
+-  bool running_ = false;
++  // The profile this importer's running import marks (IsRunning), from Start()
++  // to Finish() or the destructor.
++  base::WeakPtr<Profile> running_in_;
+   DoneCallback done_;
+   Result result_;
+   base::Time started_;
+@@ -125,6 +132,9 @@ class WorkspaceArcImporter {
+   // Groups that received at least one tab: only these exist in the model.
+   // A vector: TabGroupId has no ordering, and there are a few dozen.
+   std::vector<tab_groups::TabGroupId> groups_made_;
++  // The Arc ids this run skipped, remembered with its tabs at the end: an
++  // item Arc lists twice is a tab (its first visit) and skipped (its second).
++  std::vector<std::string> skipped_ids_;
+   int color_ = 0;
+   base::WeakPtrFactory<WorkspaceArcImporter> weak_factory_{this};
+ };
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -2186,9 +2186,10 @@ void WorkspaceRailView::ShowWorkspaceMen
+ 
+ bool WorkspaceRailView::IsCommandIdEnabled(int command_id) const {
+   // Arc's file is read off-thread, so a second click could arrive before the
+-  // first import has inserted anything.
++  // first import has inserted anything -- here or in another window of the
++  // profile (the negative review's arc-import F3).
+   if (command_id == kMenuCommandImportArc) {
+-    return !arc_importer_.running();
++    return !WorkspaceArcImporter::IsRunning(browser_->GetProfile());
+   }
+ 
+   // The default workspace cannot be deleted -- ParseWorkspaces() puts it back
+@@ -2453,6 +2454,11 @@ void WorkspaceRailView::OnArcImportDone(
+         base::NumberToString16(result.pinned),
+         base::NumberToString16(result.folders),
+         base::NumberToString16(result.skipped))));
++    if (result.pinned_left_out) {
++      builder.AddParagraph(ui::DialogModelLabel(l10n_util::GetStringFUTF16(
++          IDS_HELIUM_WORKSPACE_IMPORT_ARC_PINNED_LEFT_OUT,
++          base::FormatNumber(result.pinned_left_out))));
++    }
+     if (result.startup_changed) {
+       builder.AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(
+           IDS_HELIUM_WORKSPACE_IMPORT_ARC_STARTUP)));

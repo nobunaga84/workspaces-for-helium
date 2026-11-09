@@ -1,0 +1,293 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -303,6 +303,7 @@ WorkspaceService::WorkspaceService(
+       site_rules_(prefs::SiteRules(prefs::GetWorkspaces(prefs))),
+       folders_(unowned_user_data_host),
+       scoped_data_holder_(unowned_user_data_host, *this) {
++  enabled_pref_ = prefs_ && prefs_->GetBoolean(prefs::kHeliumWorkspacesEnabled);
+   folders_.persist = base::BindRepeating(&WorkspaceService::PersistFolders,
+                                          base::Unretained(this));
+   tab_strip_->AddObserver(this);
+@@ -378,7 +379,7 @@ bool WorkspaceService::IsEnabled() const
+   if (!browser_window_ || !prefs_) {
+     return false;
+   }
+-  if (!prefs_->GetBoolean(prefs::kHeliumWorkspacesEnabled)) {
++  if (!enabled_pref_) {
+     return false;
+   }
+ 
+@@ -1573,6 +1574,7 @@ void WorkspaceService::OnEnabledChanged(
+   // reports the pref and the branch that acts on it cannot come from two
+   // different reads.
+   const bool enabled = prefs_->GetBoolean(prefs::kHeliumWorkspacesEnabled);
++  enabled_pref_ = enabled;  // first: everything below may ask IsEnabled()
+ 
+   LOG(INFO) << "[workspaces] enabled pref -> " << (enabled ? "true" : "false")
+             << ", feature " << (IsEnabled() ? "on" : "off")
+@@ -2637,6 +2639,19 @@ bool WorkspaceService::IsDrawnAsPinnedRo
+   return IsPinItemTab(tab);
+ }
+ 
++bool WorkspaceService::IsTabInList(const tabs::TabInterface* tab) const {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return true;  // as IsTabVisible(); IsPinItemTab() is false without one
++  }
++  const WorkspaceTabData* const tab_data =
++      WorkspaceTabData::FromWebContents(contents);
++  return IsListedInWorkspace(
++      tab_data ? std::string_view(tab_data->guid()) : std::string_view(),
++      tab_data ? std::string_view(tab_data->pin_item()) : std::string_view(),
++      tab->IsPinned(), active_guid_, known_guids_, IsEnabled());
++}
++
+ int WorkspaceService::TopOfListIndex(const tabs::TabInterface* opener) const {
+   if (!IsEnabled()) {
+     return -1;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -580,6 +580,11 @@ class WorkspaceService : public TabStrip
+   // the scroll guard and the commands that follow the list ask.
+   bool IsDrawnAsPinnedRow(const tabs::TabInterface* tab) const;
+ 
++  // IsTabVisible() && !IsDrawnAsPinnedRow(), with one IsEnabled() and one tab
++  // data lookup instead of two each (I1): what the tab list asks of every tab,
++  // the hidden ones too, on every layout pass.
++  bool IsTabInList(const tabs::TabInterface* tab) const;
++
+   // Where a tab added with no index goes, as Arc places it (E15c.1, read from
+   // the owner's own Arc sidebar file): a new tab at the top of the list; a
+   // link from a page drawn as a pinned row at the top too, after the tabs that
+@@ -1034,6 +1039,11 @@ class WorkspaceService : public TabStrip
+   // here (review 2).
+   bool vertical_ = false;
+ 
++  // prefs::kHeliumWorkspacesEnabled, kept by OnEnabledChanged() as
++  // known_guids_ is by its pref (I1): IsEnabled() is asked once per tab per
++  // layout pass, and a pref read there is not free.
++  bool enabled_pref_ = false;
++
+   // True while a repair (EnsureActiveTabVisible, MoveOffPinnedPage) moves
+   // activation: the tab it moves off was not LEFT by the user, so the
+   // observer's left_at stamp skips it (C34, review C34-2) -- else a page the
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -62,6 +62,18 @@ bool IsVisibleInWorkspace(std::string_vi
+   return ResolveTabGuid(tab_guid, known_guids) == Effective(active_guid);
+ }
+ 
++bool IsListedInWorkspace(std::string_view tab_guid,
++                         std::string_view pin_item,
++                         bool tab_pinned,
++                         std::string_view active_guid,
++                         const std::vector<std::string>& known_guids,
++                         bool workspaces_enabled) {
++  const bool drawn_as_row =
++      workspaces_enabled && !tab_pinned && !pin_item.empty();
++  return !drawn_as_row && IsVisibleInWorkspace(tab_guid, active_guid,
++                                               known_guids, workspaces_enabled);
++}
++
+ std::string_view ResolveTabGuid(std::string_view tab_guid,
+                                 const std::vector<std::string>& known_guids) {
+   if (tab_guid.empty()) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -124,6 +124,19 @@ bool IsVisibleInWorkspace(std::string_vi
+                           const std::vector<std::string>& known_guids,
+                           bool workspaces_enabled);
+ 
++// I1: whether the tab list draws a tab -- IsVisibleInWorkspace() and not an
++// open pinned item's page (WorkspaceService::IsPinItemTab: its row in the
++// pinned section draws it), in one call. The list asks it of every tab on
++// every layout pass, so the caller reads the setting and the tab's data once.
++// `pin_item` is the tab's pinned item id, empty for none; a pinned tab (a
++// favorite) is never a pinned item's page.
++bool IsListedInWorkspace(std::string_view tab_guid,
++                         std::string_view pin_item,
++                         bool tab_pinned,
++                         std::string_view active_guid,
++                         const std::vector<std::string>& known_guids,
++                         bool workspaces_enabled);
++
+ // The workspace a tag actually means, given the workspaces that exist.
+ //
+ // A tag naming a workspace that no longer exists -- an orphan -- reads as the
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -129,6 +129,37 @@ TEST(WorkspaceVisibilityTest, EnablingIs
+                                     /*workspaces_enabled=*/true));
+ }
+ 
++// I1: what the tab list draws -- the two questions it used to ask one after the
++// other (IsTabVisible, then IsDrawnAsPinnedRow), asked as one. Each case is a
++// tab the strip really holds.
++TEST(WorkspaceListTest, ListsTheTabsOfTheWorkspaceOnScreenOnly) {
++  const std::vector<std::string> known_guids = {"work", "personal"};
++  EXPECT_TRUE(IsListedInWorkspace("work", "", /*tab_pinned=*/false, "work",
++                                  known_guids, /*workspaces_enabled=*/true));
++  EXPECT_FALSE(IsListedInWorkspace("personal", "", /*tab_pinned=*/false,
++                                   "work", known_guids,
++                                   /*workspaces_enabled=*/true));
++}
++
++// An open pinned item's page is drawn as its row in the pinned section, so the
++// list leaves it out -- but only while Workspaces is on, and never a pinned tab
++// (a favorite), which IsPinItemTab does not count.
++TEST(WorkspaceListTest, PinnedItemPageIsLeftToItsRow) {
++  const std::vector<std::string> known_guids = {"work", "personal"};
++  EXPECT_FALSE(IsListedInWorkspace("work", "item-1", /*tab_pinned=*/false,
++                                   "work", known_guids,
++                                   /*workspaces_enabled=*/true));
++  EXPECT_TRUE(IsListedInWorkspace("work", "item-1", /*tab_pinned=*/true,
++                                  "work", known_guids,
++                                  /*workspaces_enabled=*/true));
++  EXPECT_TRUE(IsListedInWorkspace("work", "item-1", /*tab_pinned=*/false,
++                                  "work", known_guids,
++                                  /*workspaces_enabled=*/false));
++  EXPECT_TRUE(IsListedInWorkspace("personal", "", /*tab_pinned=*/false,
++                                  "work", known_guids,
++                                  /*workspaces_enabled=*/false));
++}
++
+ // A freshly inserted tab is always visible in the window that received it:
+ // whatever ResolveGuidForInsertedTab returns must satisfy IsVisibleInWorkspace
+ // against that window's active guid. If these two ever disagree, opening a tab
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -634,8 +634,7 @@ bool TabStripCollectionController::IsTab
+   const workspaces::WorkspaceService* service =
+       workspaces::WorkspaceService::From(browser_view_->browser());
+   // An open pinned item's page is drawn as its row instead (E15c).
+-  return !service ||
+-         (service->IsTabVisible(tab) && !service->IsDrawnAsPinnedRow(tab));
++  return !service || service->IsTabInList(tab);
+ }
+ 
+ bool TabStripCollectionController::IsTabDrawnAsPinnedRow(
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+@@ -45,6 +45,10 @@ views::ProposedLayout UnpinnedTabContain
+   if (orientation_ == TabStripOrientation::kHorizontal) {
+     return CalculateHorizontalLayout(tab_container_view, size_bounds);
+   }
++  if (const views::ProposedLayout* const layout =
++          RememberedVerticalLayout(tab_container_view, size_bounds)) {
++    return *layout;
++  }
+   return CalculateVerticalLayout(tab_container_view, size_bounds);
+ }
+ 
+@@ -62,6 +66,54 @@ gfx::Size UnpinnedTabContainerViewLayout
+   return CalculateVerticalMinimumSize(tab_container_view);
+ }
+ 
++gfx::Size UnpinnedTabContainerViewLayout::GetPreferredSize(
++    const views::View* host,
++    const views::SizeBounds& available_size) const {
++  const auto* const list = views::AsViewClass<UnpinnedTabContainerView>(host);
++  if (orientation_ == TabStripOrientation::kVertical && list) {
++    if (const views::ProposedLayout* const layout =
++            RememberedVerticalLayout(list, available_size)) {
++      return layout->host_size;  // no copy of every child's entry
++    }
++  }
++  return LayoutManagerBase::GetPreferredSize(host, available_size);
++}
++
++const views::ProposedLayout*
++UnpinnedTabContainerViewLayout::RememberedVerticalLayout(
++    const UnpinnedTabContainerView* list,
++    const views::SizeBounds& size_bounds) const {
++  // Helium Workspaces (I1): LayoutManagerBase never caches a bounded width, and
++  // the vertical strip asks this list its size 30-40 times per layout --
++  // FlexLayout, TabStripViewLayout, the ScrollView up to four times, the box --
++  // and the animating manager recomputes its target twice per change
++  // (OnLayoutChanged, LayoutImpl), each a walk over every tab view, the other
++  // workspaces' too: ~340 ms of a tab switch at 3,240 tabs. Remembered until
++  // anything in the list changes (OnLayoutChanged), as WorkspacePinnedSectionView
++  // remembers its rows' height. Not while a drag runs or a group is focused:
++  // what those draw moves without an invalidation -- the drag is why LayoutImpl
++  // recomputes at all (its TODO).
++  if (list->IsHandlingDrag() || GetFocusedGroupId(list)) {
++    layouts_.clear();
++    return nullptr;
++  }
++  for (const auto& [bounds, layout] : layouts_) {
++    if (bounds == size_bounds) {
++      return &layout;
++    }
++  }
++  if (layouts_.size() == 8) {  // a window being resized asks each width
++    layouts_.erase(layouts_.begin());
++  }
++  layouts_.emplace_back(size_bounds, CalculateVerticalLayout(list, size_bounds));
++  return &layouts_.back().second;
++}
++
++void UnpinnedTabContainerViewLayout::OnLayoutChanged() {
++  layouts_.clear();
++  LayoutManagerBase::OnLayoutChanged();
++}
++
+ int UnpinnedTabContainerViewLayout::GetUnconstrainedPreferredWidth(
+     const UnpinnedTabContainerView* host) const {
+   if (!host->collection_node_) {
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.h
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.h
+@@ -6,6 +6,8 @@
+ #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_UNPINNED_TAB_CONTAINER_VIEW_LAYOUT_H_
+ 
+ #include <optional>
++#include <utility>
++#include <vector>
+ 
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
+ #include "components/tab_groups/tab_group_id.h"
+@@ -29,12 +31,21 @@ class UnpinnedTabContainerViewLayout : p
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override;
+   gfx::Size GetMinimumSize(const views::View* host) const override;
++  // Helium Workspaces (I1): remembered until the next invalidation.
++  using views::LayoutManagerBase::GetPreferredSize;
++  gfx::Size GetPreferredSize(
++      const views::View* host,
++      const views::SizeBounds& available_size) const override;
+ 
+   // Returns the total preferred width of all visible children at their standard
+   // unconstrained sizes, ignoring any active tab closing mode override.
+   int GetUnconstrainedPreferredWidth(
+       const UnpinnedTabContainerView* host) const;
+ 
++ protected:
++  // views::LayoutManagerBase:
++  void OnLayoutChanged() override;
++
+  private:
+   views::ProposedLayout CalculateHorizontalLayout(
+       const UnpinnedTabContainerView* host,
+@@ -42,6 +53,11 @@ class UnpinnedTabContainerViewLayout : p
+   views::ProposedLayout CalculateVerticalLayout(
+       const UnpinnedTabContainerView* host,
+       const views::SizeBounds& size_bounds) const;
++  // CalculateVerticalLayout(), remembered (I1); null while a drag runs or a
++  // group is focused. Valid until the next call.
++  const views::ProposedLayout* RememberedVerticalLayout(
++      const UnpinnedTabContainerView* list,
++      const views::SizeBounds& size_bounds) const;
+ 
+   gfx::Size CalculateHorizontalMinimumSize(
+       const UnpinnedTabContainerView* host) const;
+@@ -61,6 +77,11 @@ class UnpinnedTabContainerViewLayout : p
+       const UnpinnedTabContainerView* tab_container_view) const;
+ 
+   const TabStripOrientation orientation_;
++
++  // The vertical layouts computed since the last OnLayoutChanged(), by the size
++  // asked with (I1).
++  mutable std::vector<std::pair<views::SizeBounds, views::ProposedLayout>>
++      layouts_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_UNPINNED_TAB_CONTAINER_VIEW_LAYOUT_H_

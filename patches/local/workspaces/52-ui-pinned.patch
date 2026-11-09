@@ -1,0 +1,1341 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -26,6 +26,7 @@ constexpr char kTypeKey[] = "type";
+ constexpr char kIdKey[] = "id";
+ constexpr char kTitleKey[] = "title";
+ constexpr char kOpenKey[] = "open";
++constexpr char kColorKey[] = "color";
+ constexpr char kChildrenKey[] = "children";
+ constexpr char kUrlKey[] = "url";
+ constexpr char kCustomTitleKey[] = "custom_title";
+@@ -33,6 +34,9 @@ constexpr char kLastActiveKey[] = "last_
+ constexpr char kFolderType[] = "folder";
+ constexpr char kItemType[] = "item";
+ 
++// A folder's colours: tab_groups::TabGroupColorId's nine (E17b).
++constexpr int kFolderColorCount = 9;
++
+ // Its address is the store's key among its profile's user data.
+ constexpr char kUserDataKey[] = "helium_workspace_pins";
+ 
+@@ -43,6 +47,9 @@ base::DictValue NodeToValue(const PinNod
+   if (node.type == PinNode::Type::kFolder) {
+     dict.Set(kTypeKey, kFolderType);
+     dict.Set(kOpenKey, node.open);
++    if (node.color >= 0) {
++      dict.Set(kColorKey, node.color);
++    }
+     base::ListValue children;
+     for (const PinNode& child : node.children) {
+       children.Append(NodeToValue(child));
+@@ -86,6 +93,12 @@ std::optional<PinNode> NodeFromValue(con
+   if (*type == kFolderType) {
+     node.type = PinNode::Type::kFolder;
+     node.open = dict->FindBool(kOpenKey).value_or(false);
++    // Only a look: a colour this version does not know is drawn as unset,
++    // never a reason to refuse the file (E17b).
++    if (std::optional<int> color = dict->FindInt(kColorKey);
++        color && *color >= 0 && *color < kFolderColorCount) {
++      node.color = *color;
++    }
+     const base::ListValue* children = dict->FindList(kChildrenKey);
+     if (!children) {
+       return std::nullopt;
+@@ -484,6 +497,25 @@ bool PinStore::SetFolderOpen(std::string
+         Changed();
+       }
+       return true;
++    }
++  }
++  return false;
++}
++
++bool PinStore::SetFolderColor(std::string_view id, int color) {
++  if (!loaded_ || read_only_ || color < -1 || color >= kFolderColorCount) {
++    return false;
++  }
++  for (auto& [guid, roots] : tree_) {
++    if (PinNode* node = FindNode(roots, id)) {
++      if (node->type != PinNode::Type::kFolder) {
++        return false;
++      }
++      if (node->color != color) {
++        node->color = color;
++        Changed();
++      }
++      return true;
+     }
+   }
+   return false;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -50,6 +50,9 @@ struct PinNode {
+ 
+   // Folder only.
+   bool open = false;
++  // A tab group colour, 0-8 (tab_groups::TabGroupColorId); -1 draws the
++  // folder in its workspace's colour (E17b).
++  int color = -1;
+   std::vector<PinNode> children;
+ 
+   // Item only. The item's saved address -- its anchor.
+@@ -161,6 +164,10 @@ class PinStore : public base::SupportsUs
+   // Opens the folder if it is closed, closes it if open -- its state as the
+   // store has it NOW, which another window may have changed. Same refusals.
+   bool ToggleFolder(std::string_view id);
++  // Gives the folder with this id colour `color` (0-8, PinNode::color), or
++  // its workspace's again with -1 (E17b). SetFolderOpen's refusals, and false
++  // for any other colour.
++  bool SetFolderColor(std::string_view id, int color);
+ 
+   // The row with `id` in any workspace, or null (E15c): how an open tab finds
+   // its item, and how a row's menu reads it at click time.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -53,13 +53,14 @@ PinTree SampleTree() {
+   deep.custom_title = "Renamed C";
+   deep.last_active = base::Time::FromSecondsSinceUnixEpoch(1'758'000'000);
+ 
++  PinNode middle =
++      Folder("f2", "Middle", {Folder("f3", "Inner", {deep})}, /*open=*/true);
++  middle.color = 4;
++
+   PinTree tree;
+   tree["default"] = {
+       Item("a", "https://a.example/"),
+-      Folder("f1", "Outer",
+-             {Item("b", "https://b.example/"),
+-              Folder("f2", "Middle", {Folder("f3", "Inner", {deep})},
+-                     /*open=*/true)}),
++      Folder("f1", "Outer", {Item("b", "https://b.example/"), middle}),
+   };
+   tree["work"] = {Item("d", "https://d.example/")};
+   return tree;
+@@ -73,6 +74,36 @@ size_t RootCount(const PinTree& tree, st
+   return it == tree.end() ? 0 : it->second.size();
+ }
+ 
++// The first folder of SampleTree()'s "default" workspace (f1), in the file's
++// JSON and in a tree: null when it is not there, so a test fails, not crashes.
++base::DictValue* FirstFolderDict(base::DictValue& file) {
++  base::ListValue* roots = file.FindListByDottedPath("workspaces.default");
++  if (!roots) {
++    return nullptr;
++  }
++  for (base::Value& row : *roots) {
++    base::DictValue* dict = row.GetIfDict();
++    const std::string* type = dict ? dict->FindString("type") : nullptr;
++    if (type && *type == "folder") {
++      return dict;
++    }
++  }
++  return nullptr;
++}
++
++const PinNode* FirstFolder(const PinTree& tree) {
++  auto it = tree.find("default");
++  if (it == tree.end()) {
++    return nullptr;
++  }
++  for (const PinNode& row : it->second) {
++    if (row.type == PinNode::Type::kFolder) {
++      return &row;
++    }
++  }
++  return nullptr;
++}
++
+ std::vector<std::string> RowIds(const std::vector<PinNode>& rows) {
+   std::vector<std::string> ids;
+   for (const PinNode& row : rows) {
+@@ -126,6 +157,23 @@ TEST(WorkspacePinsTest, RefusesFilesItDi
+   }
+ }
+ 
++// E17b: a folder's colour is only a look, so a bad one is dropped, never a
++// reason to send the whole file to .bad.
++TEST(WorkspacePinsTest, ABadFolderColourLoadsAsUnsetNeverRefusesTheFile) {
++  for (const base::Value& bad :
++       {base::Value(9), base::Value(-3), base::Value("red")}) {
++    SCOPED_TRACE(bad.DebugString());
++    base::DictValue value = PinTreeToValue(SampleTree());
++    base::DictValue* folder = FirstFolderDict(value);
++    ASSERT_TRUE(folder);
++    folder->Set("color", bad.Clone());
++    const std::optional<PinTree> tree = PinTreeFromValue(value);
++    ASSERT_TRUE(tree.has_value());
++    ASSERT_TRUE(FirstFolder(*tree));
++    EXPECT_EQ(-1, FirstFolder(*tree)->color);
++  }
++}
++
+ TEST(WorkspacePinsTest, RowsOfADeletedWorkspaceShowUnderDefaultUntilItReturns) {
+   PinTree tree;
+   tree["default"] = {Item("d", "https://d.example/")};
+@@ -332,6 +380,34 @@ TEST_F(PinStoreTest, AFolderOpensAndClos
+   EXPECT_TRUE(again.find("default")->second[1].children[1].children[0].open);
+ }
+ 
++// E17b: a folder's colour is saved like its open state; an item has none, and
++// a colour outside the nine is refused.
++TEST_F(PinStoreTest, AFolderColourIsSavedAndSurvivesAReload) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", SampleTree().at("default")));
++  CountingObserver observer;
++  store->AddObserver(&observer);
++
++  EXPECT_TRUE(store->SetFolderColor("f3", 6));
++  EXPECT_FALSE(store->SetFolderColor("c", 3));
++  EXPECT_FALSE(store->SetFolderColor("f3", 9));
++  EXPECT_FALSE(store->SetFolderColor("f3", -2));
++  EXPECT_FALSE(store->SetFolderColor("nope", 3));
++  // The same colour again: nothing to tell anyone.
++  EXPECT_TRUE(store->SetFolderColor("f3", 6));
++  // -1 hands f2 back to its workspace's colour.
++  EXPECT_TRUE(store->SetFolderColor("f2", -1));
++  EXPECT_EQ(observer.calls, 2);
++  store->RemoveObserver(&observer);
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->Find("f2") && again->Find("f3"));
++  EXPECT_EQ(again->Find("f3")->color, 6);
++  EXPECT_EQ(again->Find("f2")->color, -1);
++}
++
+ // E15c: an item is found at any depth, a folder goes with everything in it,
+ // and a workspace left empty goes too; each removal is announced and saved.
+ TEST_F(PinStoreTest, FindAndRemoveReachAnyDepth) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -1623,8 +1623,9 @@ bool WorkspaceService::IsPinItemTab(cons
+ 
+ bool WorkspaceService::IsDrawnAsPinnedRow(
+     const tabs::TabInterface* tab) const {
+-  const tabs::VerticalTabStripStateController* const vertical = VerticalTabs();
+-  return IsPinItemTab(tab) && !(vertical && vertical->IsCollapsed());
++  // Collapsed too since E17b: the section stays as a column of icons, so a
++  // page drawn there as a tab of the list would show twice.
++  return IsPinItemTab(tab);
+ }
+ 
+ int WorkspaceService::TopOfListIndex(const tabs::TabInterface* opener) const {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -392,10 +392,11 @@ class WorkspaceService : public TabStrip
+   // the link waits, kept, for the feature to come back.
+   bool IsPinItemTab(const tabs::TabInterface* tab) const;
+ 
+-  // IsPinItemTab(), and the section is there to draw it: while the strip is
+-  // collapsed the section hides, so the page is drawn as a tab of the list
+-  // again rather than nowhere (E15c review #4). What the list, the scroll
+-  // guard and the commands that follow the list ask.
++  // IsPinItemTab(): the section draws it, so the list does not. Until E17b
++  // a collapsed strip hid the section and drew the page as a tab of the list
++  // (E15c review #4); the section now stays there as a column of icons, and a
++  // page inside a folder is reached through the folder's menu. What the list,
++  // the scroll guard and the commands that follow the list ask.
+   bool IsDrawnAsPinnedRow(const tabs::TabInterface* tab) const;
+ 
+   // Where a tab added with no index goes, as Arc places it (E15c.1, read from
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -23,6 +23,7 @@
+ #include "base/time/time.h"
+ #include "base/timer/elapsed_timer.h"
+ #include "base/uuid.h"
++#include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/favicon/favicon_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_tabrestore.h"
+@@ -31,9 +32,11 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_group_theme.h"
+ #include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+@@ -56,24 +59,30 @@
+ #include "components/keyed_service/core/service_access_type.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/tab_groups/tab_group_color.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/vector_icons/vector_icons.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/web_contents.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkColor.h"
+ #include "ui/accessibility/ax_enums.mojom.h"
+ #include "ui/base/base_window.h"
+ #include "ui/base/l10n/l10n_util.h"
++#include "ui/base/menu_source_utils.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/models/dialog_model.h"
+ #include "ui/base/models/image_model.h"
+ #include "ui/base/mojom/menu_source_type.mojom-shared.h"
+ #include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/events/event.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
+ #include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/color_utils.h"
+ #include "ui/gfx/favicon_size.h"
++#include "ui/gfx/font.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/background.h"
+@@ -83,11 +92,14 @@
+ #include "ui/views/controls/button/image_button.h"
+ #include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/button/label_button.h"
++#include "ui/views/controls/button/menu_button_controller.h"
+ #include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/controls/label.h"
+ #include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/controls/scroll_view.h"
+-#include "ui/views/controls/separator.h"
+ #include "ui/views/focus/focus_manager.h"
++#include "ui/views/interaction/element_tracker_views.h"
+ #include "ui/views/layout/box_layout.h"
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view_class_properties.h"
+@@ -134,8 +146,31 @@ constexpr int kIndent = 16;
+ constexpr int kRowInset = 8;
+ // The close and back buttons of an open item.
+ constexpr int kRowButtonIconSize = 12;
+-// The active item's highlight, as round as a vertical tab's.
+-constexpr float kActiveRowRadius = 6;
++// The active item's highlight and the card under the rows, as round as a
++// vertical tab's (LayoutConstant::kVerticalTabCornerRadius; 6 before E17b).
++constexpr float kActiveRowRadius = 8;
++
++// A folder's chevron (E17b), in the room it takes before the folder's icon.
++// That room is one indent, so the rows a folder holds start under its icon.
++constexpr int kChevronSize = 12;
++constexpr int kChevronSpace = kIndent;
++
++// The card (E17b, design 5 "E17 spec" 3): the text colour at a whisper,
++// a little more on a dark strip, where the same alpha reads fainter; 8 px in
++// from the strip's sides and 4 px above and below the rows.
++constexpr SkAlpha kCardAlphaDark = 0x0B;
++constexpr SkAlpha kCardAlphaLight = 0x09;
++constexpr int kCardMargin = 8;
++constexpr int kCardPadding = 4;
++
++// The header (E17b): 34 px, the workspace's mark -- the size of its chip on
++// the bar, with its 16 px icon -- then the name, which starts where the rows'
++// titles do.
++constexpr int kHeaderHeight = 34;
++constexpr int kHeaderInset = 8;
++constexpr int kHeaderMarkSize = 28;
++constexpr int kHeaderIconSize = 16;
++constexpr int kHeaderSpacing = 4;
+ 
+ // The row menu.
+ constexpr int kCommandUnpin = 1;
+@@ -143,6 +178,12 @@ constexpr int kCommandDelete = 2;
+ constexpr int kCommandDeleteFolder = 3;
+ constexpr int kCommandRename = 4;
+ constexpr int kCommandNewFolder = 5;
++// A folder's Colour submenu (E17b): one item per colour id, 0-8.
++constexpr int kCommandColor = 6;
++constexpr int kCommandFirstColor = 20;
++// A collapsed folder's pages (E17b): one item per page, in order.
++constexpr int kCommandFirstPage = 100;
++constexpr int kMenuIconSize = 16;
+ 
+ // How the log says where a row went.
+ const char* WhereName(Where where) {
+@@ -194,6 +235,12 @@ std::u16string RowText(const PinNode& no
+   return base::UTF8ToUTF16(text);
+ }
+ 
++// The colour a folder is drawn and ticked in: its own, else its workspace's
++// -- never its parent folder's (design 5 "E17 spec" 3).
++int FolderColor(const PinNode& folder, int workspace_color) {
++  return folder.color >= 0 ? folder.color : workspace_color;
++}
++
+ // The tab of `model` that is the page of item `id`, or null.
+ tabs::TabInterface* LinkedTab(TabStripModel* model, std::string_view id) {
+   for (int i = 0; model && i < model->count(); ++i) {
+@@ -216,28 +263,153 @@ std::vector<BrowserWindowInterface*> Win
+   return windows;
+ }
+ 
+-// `row`'s id if it is an item, or the ids of every item under it.
+-void CollectItemIds(const PinNode& row, std::vector<std::string>& ids) {
++// `row` if it is an item, else every item under it, in the order the rows
++// draw them: what Delete closes, and the pages a collapsed folder lists.
++void CollectItems(const PinNode& row, std::vector<const PinNode*>& items) {
+   if (row.type == PinNode::Type::kItem) {
+-    ids.push_back(row.id);
++    items.push_back(&row);
+     return;
+   }
+   for (const PinNode& child : row.children) {
+-    CollectItemIds(child, ids);
++    CollectItems(child, items);
+   }
+ }
+ 
+-// One row: a folder (its icon shows open or closed) or an item (its page's
+-// icon, a globe until one is found). Only the icon of a DRAWN row is looked
+-// up, so a closed folder asks nothing.
++// The workspace the section shows (E17b, design 5 "E17 spec" 3): its mark --
++// its symbol, else its emoji or letter, on the fill its chip has on the bar
++// -- then its name, 12 px semibold. Made once, by the section; each rebuild
++// only says what it shows. Its right-click is the section's to route: the
++// bar's menu for the workspace. Collapsed, the mark alone, centred.
++class WorkspaceHeaderView : public views::View {
++  METADATA_HEADER(WorkspaceHeaderView, views::View)
++
++ public:
++  WorkspaceHeaderView() {
++    layout_ = SetLayoutManager(std::make_unique<views::BoxLayout>(
++        views::BoxLayout::Orientation::kHorizontal));
++    layout_->set_minimum_cross_axis_size(kHeaderHeight);
++    layout_->set_cross_axis_alignment(views::LayoutAlignment::kCenter);
++    layout_->set_between_child_spacing(kHeaderSpacing);
++    // One heading named after the workspace; what it is drawn with is not
++    // read again.
++    GetViewAccessibility().SetRole(ax::mojom::Role::kHeading);
++    icon_ = AddChildView(std::make_unique<views::ImageView>());
++    icon_->SetPreferredSize(gfx::Size(kHeaderMarkSize, kHeaderMarkSize));
++    glyph_ = AddChildView(std::make_unique<views::Label>());
++    glyph_->SetPreferredSize(gfx::Size(kHeaderMarkSize, kHeaderMarkSize));
++    glyph_->SetHorizontalAlignment(gfx::ALIGN_CENTER);
++    name_ = AddChildView(std::make_unique<views::Label>());
++    name_->SetFontList(
++        name_->font_list().DeriveWithWeight(gfx::Font::Weight::SEMIBOLD));
++    name_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    // A long name elides instead of widening the strip.
++    layout_->SetFlexForView(name_.get(), 1);
++    for (views::Label* const label : {glyph_.get(), name_.get()}) {
++      // No opaque background under the text, as on the rows; and the colours
++      // set are the ones drawn.
++      label->SetSubpixelRenderingEnabled(false);
++      label->SetAutoColorReadabilityEnabled(false);
++      label->GetViewAccessibility().SetIsIgnored(true);
++    }
++    icon_->GetViewAccessibility().SetIsIgnored(true);
++  }
++  WorkspaceHeaderView(const WorkspaceHeaderView&) = delete;
++  WorkspaceHeaderView& operator=(const WorkspaceHeaderView&) = delete;
++  ~WorkspaceHeaderView() override = default;
++
++  // `color` is the effective one (prefs::EffectiveColors); `index` the
++  // workspace's place in the list, which ButtonText falls back on.
++  void SetWorkspace(const workspaces::prefs::WorkspaceEntry& entry,
++                    size_t index,
++                    int color,
++                    bool collapsed) {
++    const std::u16string name = WorkspaceRailView::DisplayName(entry);
++    GetViewAccessibility().SetName(name);
++    name_->SetText(name);
++    name_->SetVisible(!collapsed);
++    symbol_ = WorkspaceRailView::SymbolIcon(
++        workspaces::prefs::EffectiveSymbol(entry));
++    icon_->SetVisible(symbol_ != nullptr);
++    glyph_->SetVisible(symbol_ == nullptr);
++    if (!symbol_) {
++      glyph_->SetText(WorkspaceRailView::ButtonText(entry, index));
++    }
++    // A letter is drawn in the colour, an emoji in its own (the bar's rule).
++    tint_glyph_ = entry.icon.empty();
++    color_ = color;
++    layout_->set_main_axis_alignment(
++        collapsed ? views::LayoutAlignment::kCenter
++                  : views::LayoutAlignment::kStart);
++    layout_->set_inside_border_insets(
++        gfx::Insets::VH(0, collapsed ? 0 : kHeaderInset));
++    UpdateColors();
++  }
++
++  // Never in the constructor -- no provider before the widget. Run again by
++  // the section when the window's active state changes, which is not a theme
++  // change.
++  void UpdateColors() {
++    const ui::ColorProvider* const provider = GetColorProvider();
++    if (!provider) {
++      return;
++    }
++    const bool frame_active = GetWidget() && GetWidget()->ShouldPaintAsActive();
++    const SkColor color =
++        WorkspaceRailView::WorkspaceColor(*provider, color_, frame_active);
++    const ui::ColorId text = frame_active
++                                 ? kColorTabForegroundActiveFrameActive
++                                 : kColorTabForegroundActiveFrameInactive;
++    if (symbol_) {
++      icon_->SetImage(
++          ui::ImageModel::FromVectorIcon(*symbol_, color, kHeaderIconSize));
++    } else if (tint_glyph_) {
++      glyph_->SetEnabledColor(color);
++    } else {
++      // An emoji draws in its own colours; a text-style one in the name's,
++      // never in the tint a previous workspace's letter left (E17b review).
++      glyph_->SetEnabledColor(text);
++    }
++    icon_->SetBackground(WorkspaceRailView::CurrentFill(*provider, color));
++    glyph_->SetBackground(WorkspaceRailView::CurrentFill(*provider, color));
++    name_->SetEnabledColor(text);
++  }
++
++  // views::View:
++  void OnThemeChanged() override {
++    views::View::OnThemeChanged();
++    UpdateColors();
++  }
++
++ private:
++  raw_ptr<views::BoxLayout> layout_ = nullptr;
++  raw_ptr<views::ImageView> icon_ = nullptr;
++  raw_ptr<views::Label> glyph_ = nullptr;
++  raw_ptr<views::Label> name_ = nullptr;
++  raw_ptr<const gfx::VectorIcon> symbol_ = nullptr;
++  bool tint_glyph_ = true;
++  int color_ = workspaces::prefs::kGreyColor;
++};
++
++BEGIN_METADATA(WorkspaceHeaderView)
++END_METADATA
++
++// One row: a folder (a solid folder in its colour, after a chevron that shows
++// it open or closed, E17b) or an item (its page's icon, a globe until one is
++// found). Only the icon of a DRAWN row is looked up, so a closed folder asks
++// nothing. `icon_only`: the collapsed strip's row, its icon centred and its
++// title kept as its name and tooltip (E17b); an item there never shows its
++// buttons. A row given no `on_drag` is not dragged.
+ class PinRow : public views::LabelButton {
+   METADATA_HEADER(PinRow, views::LabelButton)
+ 
+  public:
+   enum class ItemState { kSleeping, kOpen, kActive };
+ 
++  // `color` is a folder's colour id as drawn: its own, else its workspace's.
+   PinRow(const PinNode& node,
+          int level,
++         int color,
++         bool icon_only,
+          Profile* profile,
+          bool frame_active,
+          views::Button::PressedCallback callback,
+@@ -249,6 +421,8 @@ class PinRow : public views::LabelButton
+         folder_(node.type == PinNode::Type::kFolder),
+         open_(node.open),
+         level_(level),
++        color_(color),
++        icon_only_(icon_only),
+         frame_active_(frame_active),
+         on_close_(std::move(on_close)),
+         on_reset_(std::move(on_reset)),
+@@ -257,7 +431,11 @@ class PinRow : public views::LabelButton
+                            : base::StrCat({RowText(node), u"\n",
+                                            base::UTF8ToUTF16(node.url)}));
+     SetBorder(views::CreateEmptyBorder(
+-        gfx::Insets::TLBR(0, kRowInset + level * kIndent, 0, kRowInset)));
++        icon_only_ ? gfx::Insets()
++                   : gfx::Insets::TLBR(0,
++                                       kRowInset + level * kIndent +
++                                           (folder_ ? kChevronSpace : 0),
++                                       0, kRowInset)));
+     SetMinSize(
+         gfx::Size(0, GetLayoutConstant(LayoutConstant::kVerticalTabHeight)));
+     // No opaque background under the text, as on the rail's buttons.
+@@ -271,13 +449,23 @@ class PinRow : public views::LabelButton
+     GetViewAccessibility().SetHierarchicalLevel(level + 1);
+ 
+     if (folder_) {
+-      if (open_) {
+-        GetViewAccessibility().SetIsExpanded();
+-      } else {
+-        GetViewAccessibility().SetIsCollapsed();
++      // In the collapsed column a folder opens a menu of its pages and never
++      // expands in place, so it says neither (E17b review).
++      if (!icon_only_) {
++        if (open_) {
++          GetViewAccessibility().SetIsExpanded();
++        } else {
++          GetViewAccessibility().SetIsCollapsed();
++        }
++      }
++      // The state shows on the chevron, so the folder is one solid icon
++      // (E17b). Made here, off the widget, like the row itself.
++      vector_icon_ = &vector_icons::kFolderFilledIcon;
++      if (!icon_only_) {
++        chevron_ = AddChildView(std::make_unique<views::ImageView>());
++        chevron_->SetCanProcessEventsWithinSubtree(false);
++        chevron_->GetViewAccessibility().SetIsIgnored(true);
+       }
+-      vector_icon_ = open_ ? &vector_icons::kFolderOpenIcon
+-                           : &vector_icons::kFolderFlippableIcon;
+       UpdateColors();
+       return;
+     }
+@@ -322,7 +510,7 @@ class PinRow : public views::LabelButton
+     }
+     state_ = state;
+     drifted_ = drifted;
+-    if (state_ != ItemState::kSleeping && !close_) {
++    if (state_ != ItemState::kSleeping && !close_ && !icon_only_) {
+       close_ = AddChildView(views::CreateVectorImageButtonWithNativeTheme(
+           on_close_, vector_icons::kCloseSmallIcon, kRowButtonIconSize));
+       close_->SetTooltipText(
+@@ -345,13 +533,34 @@ class PinRow : public views::LabelButton
+ 
+   // views::LabelButton:
+   //
+-  // An open item's buttons sit at the right edge -- the close button last --
+-  // and the title ends before them.
++  // A folder's chevron sits in the room its border keeps before the icon. An
++  // open item's buttons sit at the right edge -- the close button last --
++  // and the title ends before them. Collapsed, the icon alone, centred.
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override {
+     views::ProposedLayout layouts =
+         views::LabelButton::CalculateProposedLayout(size_bounds);
+-    if (!close_ || !size_bounds.is_fully_bounded()) {
++    if (!size_bounds.is_fully_bounded()) {
++      return layouts;
++    }
++    if (icon_only_) {
++      for (views::ChildLayout& child : layouts.child_layouts) {
++        if (child.child_view == label()) {
++          child.visible = false;
++        } else if (child.child_view == image_container_view()) {
++          child.bounds.set_x(
++              (layouts.host_size.width() - child.bounds.width()) / 2);
++        }
++      }
++    }
++    if (chevron_) {
++      layouts.child_layouts.emplace_back(
++          chevron_.get(), true,
++          gfx::Rect(GetInsets().left() - kChevronSpace,
++                    (layouts.host_size.height() - kChevronSize) / 2,
++                    kChevronSize, kChevronSize));
++    }
++    if (!close_) {
+       return layouts;
+     }
+     const bool open = state_ != ItemState::kSleeping;
+@@ -400,7 +609,9 @@ class PinRow : public views::LabelButton
+       }
+       case ui::VKEY_LEFT:
+       case ui::VKEY_RIGHT:
+-        if (folder_ && open_ == (event.key_code() == ui::VKEY_LEFT)) {
++        // Not collapsed, where a folder's press lists its pages instead.
++        if (folder_ && !icon_only_ &&
++            open_ == (event.key_code() == ui::VKEY_LEFT)) {
+           NotifyClick(event);
+         }
+         return true;
+@@ -413,8 +624,9 @@ class PinRow : public views::LabelButton
+   // a folder moved the focus instead of opening or closing it (the owner's
+   // check of E15b). Up and Down stay the pane's, which carry on into the tabs.
+   bool SkipDefaultKeyEventProcessing(const ui::KeyEvent& event) override {
+-    return (folder_ && (event.key_code() == ui::VKEY_LEFT ||
+-                        event.key_code() == ui::VKEY_RIGHT)) ||
++    return (folder_ && !icon_only_ &&
++            (event.key_code() == ui::VKEY_LEFT ||
++             event.key_code() == ui::VKEY_RIGHT)) ||
+            views::LabelButton::SkipDefaultKeyEventProcessing(event);
+   }
+ 
+@@ -427,7 +639,7 @@ class PinRow : public views::LabelButton
+     return views::LabelButton::OnMousePressed(event);
+   }
+   bool OnMouseDragged(const ui::MouseEvent& event) override {
+-    if (!dragging_ && event.IsOnlyLeftMouseButton() &&
++    if (!dragging_ && !on_drag_.is_null() && event.IsOnlyLeftMouseButton() &&
+         ExceededDragThreshold(event.location() - press_point_)) {
+       dragging_ = true;
+     }
+@@ -492,10 +704,23 @@ class PinRow : public views::LabelButton
+                                 : kColorTabForegroundInactiveFrameInactive);
+     SetEnabledTextColors(text);
+     if (vector_icon_) {
++      // A folder in its colour, as the strip draws that tab-group colour --
++      // a ColorId, so no provider is needed (E17b); the globe in the text's.
++      const ui::ColorId icon =
++          folder_ ? GetTabGroupTabStripColorId(
++                        static_cast<tab_groups::TabGroupColorId>(color_),
++                        frame_active_)
++                  : text;
+       SetImageModel(views::Button::STATE_NORMAL,
+-                    ui::ImageModel::FromVectorIcon(*vector_icon_, text,
++                    ui::ImageModel::FromVectorIcon(*vector_icon_, icon,
+                                                    gfx::kFaviconSize));
+     }
++    if (chevron_) {
++      chevron_->SetImage(ui::ImageModel::FromVectorIcon(
++          open_ ? vector_icons::kKeyboardArrowDownIcon
++                : kKeyboardArrowRightIcon,
++          text, kChevronSize));
++    }
+     const ui::ColorId background = frame_active_
+                                        ? kColorTabBackgroundActiveFrameActive
+                                        : kColorTabBackgroundActiveFrameInactive;
+@@ -508,6 +733,8 @@ class PinRow : public views::LabelButton
+   const bool folder_;
+   const bool open_;
+   const int level_;
++  const int color_;
++  const bool icon_only_;
+   bool frame_active_;
+   ItemState state_ = ItemState::kSleeping;
+   bool drifted_ = false;
+@@ -518,7 +745,10 @@ class PinRow : public views::LabelButton
+   bool dragging_ = false;
+   raw_ptr<views::ImageButton> close_ = nullptr;
+   raw_ptr<views::ImageButton> reset_ = nullptr;
+-  // The icon drawn in the text color; null once the page's own icon arrived.
++  // A folder's, except collapsed.
++  raw_ptr<views::ImageView> chevron_ = nullptr;
++  // The icon drawn in the text color (a folder's in its own); null once the
++  // page's own icon arrived.
+   raw_ptr<const gfx::VectorIcon> vector_icon_ = nullptr;
+   base::CancelableTaskTracker favicon_tasks_;
+ };
+@@ -542,11 +772,14 @@ WorkspacePinnedSectionView::WorkspacePin
+                        views::BoxLayout::Orientation::kVertical))
+       ->set_inside_border_insets(gfx::Insets::TLBR(0, 0, 4, 0));
+   SetVisible(false);
+-  // Below the rows: their line, then "+ New Tab" at the top of the list, as
+-  // in Arc (E15c.1). Helium's own button: the same action as Ctrl+T, and the
+-  // bottom one is hidden while Workspaces is on (the rail, E13). Made once and
+-  // off the widget; a rebuild replaces only the rows above them.
+-  separator_ = AddChildView(std::make_unique<views::Separator>());
++  // The workspace's header first (E17b), then -- once Rebuild() makes it --
++  // the card of rows, then "+ New Tab" at the top of the list, as in Arc
++  // (E15c.1). The card's edge parts it from the list; the line that did
++  // before E17b is gone. Helium's own button: the same action as Ctrl+T, and
++  // the bottom one is hidden while Workspaces is on (the rail, E13). Made once
++  // and off the widget; a rebuild replaces only the card.
++  header_ = AddChildView(std::make_unique<WorkspaceHeaderView>());
++  header_->set_context_menu_controller(this);
+   new_tab_button_ =
+       AddChildView(std::make_unique<VerticalNewTabButton>(browser_));
+   new_tab_button_->set_context_menu_controller(this);
+@@ -589,6 +822,8 @@ void WorkspacePinnedSectionView::AddedTo
+       GetWidget()->RegisterPaintAsActiveChangedCallback(base::BindRepeating(
+           &WorkspacePinnedSectionView::UpdateRowColors,
+           base::Unretained(this)));
++  // The window may be inactive already: a second one opened behind.
++  UpdateRowColors();
+   ScheduleRebuild();
+ }
+ 
+@@ -599,11 +834,29 @@ void WorkspacePinnedSectionView::Removed
+ 
+ void WorkspacePinnedSectionView::OnThemeChanged() {
+   views::View::OnThemeChanged();
++  if (list_) {
++    list_->SetBackground(CardBackground());
++  }
+   // A font change is a theme change: measure again.
+   preferred_height_.reset();
+   PreferredSizeChanged();
+ }
+ 
++std::unique_ptr<views::Background>
++WorkspacePinnedSectionView::CardBackground() const {
++  const ui::ColorProvider* const provider = GetColorProvider();
++  if (!provider) {
++    return nullptr;
++  }
++  // The rows' own text colour; light text says the strip is dark.
++  const SkColor text =
++      provider->GetColor(kColorTabForegroundInactiveFrameActive);
++  return views::CreateRoundedRectBackground(
++      SkColorSetA(text, color_utils::IsDark(text) ? kCardAlphaLight
++                                                  : kCardAlphaDark),
++      kActiveRowRadius);
++}
++
+ gfx::Size WorkspacePinnedSectionView::CalculatePreferredSize(
+     const views::SizeBounds& available_size) const {
+   // Measured once per rebuild: every row is one line at a fixed height, so the
+@@ -701,20 +954,38 @@ void WorkspacePinnedSectionView::Rebuild
+ 
+   workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
+-  // Shown with no rows as well: "+ New Tab" is the list's (E15c.1).
+-  const bool shown = service && service->IsEnabled() &&
+-                     !(state_controller_ && state_controller_->IsCollapsed());
++  // Shown with no rows as well: the header, and "+ New Tab" is the list's
++  // (E15c.1). Collapsed too since E17b: a column of icons ("E17 spec" 6).
++  const bool shown = service && service->IsEnabled();
++  collapsed_ = state_controller_ && state_controller_->IsCollapsed();
+   std::vector<const PinNode*> roots;
+   if (shown && store_ && store_->loaded()) {
+     roots = workspaces::pins::RootsForWorkspace(
+         store_->tree(), service->active_guid(), service->known_guids());
+   }
+   SetVisible(shown);
+-  separator_->SetVisible(!roots.empty());
+   if (!shown) {
+     return;
+   }
+   drawn_guid_ = service->active_guid();
++  // The header, from the list: a rename, a colour or a symbol arrives here
++  // through the list-changed callback. The colours are the whole list's
++  // (a default depends on what the others hold).
++  const std::vector<workspaces::prefs::WorkspaceEntry> entries =
++      service->GetWorkspaces();
++  const std::vector<int> colors = workspaces::prefs::EffectiveColors(entries);
++  drawn_color_ = workspaces::prefs::kGreyColor;
++  for (size_t i = 0; i < entries.size(); ++i) {
++    if (entries[i].guid == drawn_guid_) {
++      drawn_color_ = colors[i];
++      views::AsViewClass<WorkspaceHeaderView>(header_.get())
++          ->SetWorkspace(entries[i], i, colors[i], collapsed_);
++      break;
++    }
++  }
++  LOG(INFO) << "[workspaces] pins: header '" << drawn_guid_ << "'";
++  // The bar's + has New tab in the column, which has no room for a title.
++  new_tab_button_->SetVisible(!collapsed_);
+   if (roots.empty()) {
+     return;
+   }
+@@ -726,16 +997,25 @@ void WorkspacePinnedSectionView::Rebuild
+   // added one by one cost rows x everything: 1,313 rows took 5.3 s at the E15b
+   // gate. Detached, an add walks nothing; attached once, the walk runs once.
+   // The open items' buttons are made here too, for the same reason.
++  //
++  // The list is its own card (E17b): a plain Background, no layer, so the
++  // drop indicator still draws above it and the tabs. The column of the
++  // collapsed strip is too narrow for side margins.
+   auto list = std::make_unique<views::View>();
+   list->SetLayoutManager(std::make_unique<views::BoxLayout>(
+       views::BoxLayout::Orientation::kVertical));
++  list->SetProperty(views::kMarginsKey,
++                    gfx::Insets::VH(0, collapsed_ ? 0 : kCardMargin));
++  list->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(kCardPadding, 0)));
++  list->SetBackground(CardBackground());
+   const bool frame_active = IsFrameActive();
+   size_t rows = 0;
+   for (const PinNode* root : roots) {
+     rows += AddRow(*list, *root, /*level=*/0, frame_active);
+   }
+   ApplyStates(*list, ReadLinks());
+-  list_ = AddChildViewAt(std::move(list), 0);
++  // After the header.
++  list_ = AddChildViewAt(std::move(list), 1);
+   LOG(INFO) << "[workspaces] pins: drew " << rows << " row(s) of '"
+             << drawn_guid_ << "' in " << timer.Elapsed().InMilliseconds()
+             << " ms";
+@@ -887,6 +1167,12 @@ size_t WorkspacePinnedSectionView::AddRo
+       folder ? &WorkspacePinnedSectionView::OnFolderPressed
+              : &WorkspacePinnedSectionView::OnItemPressed,
+       base::Unretained(this), row.id);
++  const bool lists_pages = folder && collapsed_;
++  if (lists_pages) {
++    // One icon with nothing drawn under it: its press lists its pages.
++    callback = base::BindRepeating(&WorkspacePinnedSectionView::ShowFolderPages,
++                                   base::Unretained(this), row.id);
++  }
+   base::RepeatingClosure on_close;
+   base::RepeatingClosure on_reset;
+   if (!folder) {
+@@ -897,14 +1183,30 @@ size_t WorkspacePinnedSectionView::AddRo
+         &WorkspacePinnedSectionView::OnItemResetPressed,
+         base::Unretained(this), row.id);
+   }
+-  views::View* const added = list.AddChildView(std::make_unique<PinRow>(
+-      row, level, browser_->GetProfile(), frame_active, std::move(callback),
++  // Nothing is dragged in the collapsed column (E17b): its rows get no drag
++  // callback.
++  auto pin_row = std::make_unique<PinRow>(
++      row, level, FolderColor(row, drawn_color_), collapsed_,
++      browser_->GetProfile(), frame_active,
++      lists_pages ? views::Button::PressedCallback() : std::move(callback),
+       std::move(on_close), std::move(on_reset),
+-      base::BindRepeating(&WorkspacePinnedSectionView::OnRowDrag,
+-                          base::Unretained(this), row.id)));
++      collapsed_ ? DragCallback()
++                 : base::BindRepeating(&WorkspacePinnedSectionView::OnRowDrag,
++                                       base::Unretained(this), row.id));
++  if (lists_pages) {
++    // A menu button, as the bar's "+" is: clicking the icon again to close
++    // its menu would otherwise reopen it -- Windows replays that click to the
++    // window, and a plain button takes it as a new press (E17b final review).
++    PinRow* const button = pin_row.get();
++    button->SetButtonController(std::make_unique<views::MenuButtonController>(
++        button, std::move(callback),
++        std::make_unique<views::Button::DefaultButtonControllerDelegate>(
++            button)));
++  }
++  views::View* const added = list.AddChildView(std::move(pin_row));
+   added->set_context_menu_controller(this);
+   size_t count = 1;
+-  if (folder && row.open) {
++  if (folder && row.open && !collapsed_) {
+     for (const PinNode& child : row.children) {
+       count += AddRow(list, child, level + 1, frame_active);
+     }
+@@ -918,6 +1220,52 @@ void WorkspacePinnedSectionView::OnFolde
+   }
+ }
+ 
++void WorkspacePinnedSectionView::ShowFolderPages(const std::string& id,
++                                                 const ui::Event& event) {
++  const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
++  const views::View* const row = RowFor(id);
++  if (!folder || !row) {
++    return;
++  }
++  // Every page under it, sub-folders' included, by its title only: the
++  // favicons would be one lookup each, for a menu that can hold a thousand.
++  // ponytail: one flat, unbounded menu; submenus per sub-folder if a long one
++  // is hard to use.
++  std::vector<const PinNode*> items;
++  CollectItems(*folder, items);
++  LOG(INFO) << "[workspaces] pins: folder '" << id << "' lists "
++            << items.size() << " page(s)";
++  if (items.empty()) {
++    return;
++  }
++  menu_page_ids_.clear();
++  context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  for (const PinNode* const item : items) {
++    context_menu_model_->AddItem(
++        kCommandFirstPage + static_cast<int>(menu_page_ids_.size()),
++        RowText(*item));
++    // A menu item's accessible name drops "&" even under NO_FLAGS: give it the
++    // page's whole title, so "Q&A" is found as itself (E17b review).
++    context_menu_model_->SetAccessibleNameAt(menu_page_ids_.size(),
++                                             RowText(*item));
++    menu_page_ids_.push_back(item->id);
++  }
++  context_menu_runner_ = std::make_unique<views::MenuRunner>(
++      context_menu_model_.get(), views::MenuRunner::NO_FLAGS);
++  // Beside the column, level with the folder, so it covers no other icon.
++  // The icon's own controller (AddRow gives every collapsed folder one):
++  // with it the menu knows a click on the icon closes it.
++  const views::Button* const button = views::AsViewClass<views::Button>(row);
++  context_menu_runner_->RunMenuAt(
++      GetWidget(),
++      button ? static_cast<views::MenuButtonController*>(
++                   button->button_controller())
++             : nullptr,
++      gfx::Rect(row->GetBoundsInScreen().top_right(), gfx::Size()),
++      views::MenuAnchorPosition::kTopLeft,
++      ui::GetMenuSourceTypeForEvent(event));
++}
++
+ void WorkspacePinnedSectionView::OnItemPressed(const std::string& id) {
+   const PinNode* const item = store_ ? store_->Find(id) : nullptr;
+   if (!item || item->type != PinNode::Type::kItem) {
+@@ -1084,8 +1432,13 @@ void WorkspacePinnedSectionView::DeleteR
+   if (!row) {
+     return;
+   }
++  std::vector<const PinNode*> items;
++  CollectItems(*row, items);
++  // Copied now: closing a page may change the store under the pointers.
+   std::vector<std::string> ids;
+-  CollectItemIds(*row, ids);
++  for (const PinNode* const item : items) {
++    ids.push_back(item->id);
++  }
+   // Their open pages close with them. A page that asks "Leave site?" and is
+   // kept loses its link with the row, and joins the list (ReadLinks).
+   int closed = 0;
+@@ -1440,7 +1793,7 @@ WorkspacePinnedSectionView::DropTarget W
+   DropTarget target;
+   gfx::Rect in_list;
+   if (r == rows.size()) {
+-    // Under the last row -- over the line or "+ New Tab": the end.
++    // Under the last row -- over the card's edge or "+ New Tab": the end.
+     target = to_end();
+     in_list = line_at(list_->height(), 0);
+   } else if (const PinRow* const row = row_at(r); row->folder() &&
+@@ -1553,8 +1906,9 @@ bool WorkspacePinnedSectionView::InZone(
+     const gfx::Point& point_in_screen) const {
+   const gfx::Point point =
+       views::View::ConvertPointFromScreen(this, point_in_screen);
+-  return list_ && IsDrawn() && GetVisibleBounds().Contains(point) &&
+-         point.y() < new_tab_button_->y();
++  // Never in the collapsed column (E17b), whose "+ New Tab" is hidden.
++  return list_ && !collapsed_ && IsDrawn() &&
++         GetVisibleBounds().Contains(point) && point.y() < new_tab_button_->y();
+ }
+ 
+ TabDragContext* WorkspacePinnedSectionView::DragContext() {
+@@ -1655,6 +2009,19 @@ void WorkspacePinnedSectionView::ShowCon
+     views::View* source,
+     const gfx::Point& point,
+     ui::mojom::MenuSourceType source_type) {
++  if (source == header_) {
++    // The workspace's own menu, as its chip on the bar has it (E17b): one
++    // menu, run by the bar, which knows the list. Found by the id it sets on
++    // itself; none in a window without the bar.
++    if (WorkspaceRailView* const rail =
++            views::ElementTrackerViews::GetInstance()
++                ->GetFirstMatchingViewAs<WorkspaceRailView>(
++                    kWorkspaceRailElementId,
++                    views::ElementTrackerViews::GetContextForView(this))) {
++      rail->ShowWorkspaceMenuFor(drawn_guid_, source, point, source_type);
++    }
++    return;
++  }
+   if (source == new_tab_button_) {
+     // Helium's New Tab menu, as the bottom button has it -- that one is hidden
+     // while Workspaces is on (E15c.1 review #8).
+@@ -1676,6 +2043,23 @@ void WorkspacePinnedSectionView::ShowCon
+     context_menu_model_->AddItemWithStringId(kCommandNewFolder,
+                                              IDS_HELIUM_PINNED_NEW_FOLDER);
+     if (row->folder()) {
++      // Each folder its own colour (E17b): Chromium's nine, named and drawn
++      // as its tab-group menu draws them, the one drawn ticked.
++      color_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++      for (int c = 0; c < workspaces::prefs::kWorkspaceColorCount; ++c) {
++        const auto color = static_cast<tab_groups::TabGroupColorId>(c);
++        color_menu_model_->AddCheckItem(
++            kCommandFirstColor + c,
++            tab_groups::GetTabGroupColorLabelMap().at(color));
++        color_menu_model_->SetIconForCommandId(
++            kCommandFirstColor + c,
++            ui::ImageModel::FromVectorIcon(
++                kCircleFilledIcon, GetTabGroupContextMenuColorId(color),
++                kMenuIconSize));
++      }
++      context_menu_model_->AddSubMenuWithStringId(
++          kCommandColor, IDS_HELIUM_WORKSPACE_EDIT_COLOR,
++          color_menu_model_.get());
+       context_menu_model_->AddItemWithStringId(kCommandDeleteFolder,
+                                                IDS_HELIUM_PINNED_FOLDER_DELETE);
+     } else {
+@@ -1695,7 +2079,31 @@ void WorkspacePinnedSectionView::ShowCon
+ 
+ void WorkspacePinnedSectionView::ExecuteCommand(int command_id,
+                                                 int event_flags) {
++  if (command_id >= kCommandFirstPage) {
++    // A collapsed folder's page: opened as its row's click opens it.
++    const size_t page = static_cast<size_t>(command_id - kCommandFirstPage);
++    if (page < menu_page_ids_.size()) {
++      OnItemPressed(menu_page_ids_[page]);
++    }
++    return;
++  }
+   const std::string id = context_menu_id_;
++  if (const int picked = command_id - kCommandFirstColor;
++      picked >= 0 && picked < workspaces::prefs::kWorkspaceColorCount) {
++    // The ticked colour again: a folder's own hands it back to its
++    // workspace's (-1); the workspace's, on a folder following it already,
++    // changes nothing.
++    const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
++    if (!folder || (folder->color < 0 && picked == drawn_color_)) {
++      return;
++    }
++    const int color = picked == folder->color ? -1 : picked;
++    // The rows are drawn again through the store's observer, posted.
++    if (store_->SetFolderColor(id, color)) {
++      LOG(INFO) << "[workspaces] pins: folder colour -> " << color;
++    }
++    return;
++  }
+   switch (command_id) {
+     case kCommandUnpin:
+       UnpinItem(id);
+@@ -1742,15 +2150,30 @@ void WorkspacePinnedSectionView::Execute
+   }
+ }
+ 
++bool WorkspacePinnedSectionView::IsCommandIdChecked(int command_id) const {
++  // Read at the moment the menu asks: another window may have changed it.
++  const PinNode* const folder =
++      store_ ? store_->Find(context_menu_id_) : nullptr;
++  return folder &&
++         command_id - kCommandFirstColor == FolderColor(*folder, drawn_color_);
++}
++
+ bool WorkspacePinnedSectionView::IsFrameActive() const {
+   return GetWidget() ? GetWidget()->ShouldPaintAsActive() : true;
+ }
+ 
+ void WorkspacePinnedSectionView::UpdateRowColors() {
++  const bool frame_active = IsFrameActive();
++  views::AsViewClass<WorkspaceHeaderView>(header_.get())->UpdateColors();
++  // At the tab text's full contrast, not Helium's faint #686969 (E17b); its +
++  // takes the same colour, since the button draws both from one id.
++  const ui::ColorId new_tab_color =
++      frame_active ? kColorTabForegroundInactiveFrameActive
++                   : kColorTabForegroundInactiveFrameInactive;
++  new_tab_button_->SetForegroundColorId(new_tab_color);
+   if (!list_) {
+     return;
+   }
+-  const bool frame_active = IsFrameActive();
+   for (views::View* const child : list_->children()) {
+     views::AsViewClass<PinRow>(child)->SetFrameActive(frame_active);
+   }
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -31,6 +31,7 @@
+ #include "ui/views/view_tracker.h"
+ 
+ class BrowserWindowInterface;
++class VerticalNewTabButton;
+ 
+ namespace tabs {
+ class TabInterface;
+@@ -38,7 +39,12 @@ class VerticalTabStripStateController;
+ enum class VerticalTabStripCollapseState;
+ }  // namespace tabs
+ 
++namespace ui {
++class Event;
++}  // namespace ui
++
+ namespace views {
++class Background;
+ class MenuRunner;
+ class ScrollView;
+ }  // namespace views
+@@ -60,13 +66,21 @@ class ScrollView;
+ // a folder -- or, an item, into the tab list below as a Today tab; and a
+ // Today tab dragged over the rows is pinned where it is dropped (E15d).
+ //
+-// Below the rows, their line and then "+ New Tab", at the top of the list as
+-// in Arc (E15c.1); the line only while there are rows. Right-click on it:
+-// Helium's New Tab menu.
++// Since E17b (design 5 "E17 spec" 3) the workspace's header comes first --
++// its symbol in its colour and its name; right-click: the bar's menu for it
++// -- and the rows sit on a soft rounded card, which only rows make. A folder
++// is solid, in its own colour or the workspace's, after a chevron that shows
++// it open or closed.
++//
++// Below the card, "+ New Tab", at the top of the list as in Arc (E15c.1).
++// Right-click on it: Helium's New Tab menu.
+ //
+ // Made by TabStripCollectionController for every vertical strip of a regular
+ // profile, and mounted by the one hunk in TabStripView::AddScrollViewContents.
+-// It hides itself while Workspaces is off and while the strip is collapsed.
++// It hides itself while Workspaces is off. With the strip collapsed it stays,
++// as a column of icons (E17b, "E17 spec" 6): the header's symbol, then the
++// top-level rows without titles -- a folder's press lists its pages -- and
++// no "+ New Tab" (the bar's + has it); nothing is dragged there.
+ class WorkspacePinnedSectionView
+     : public views::View,
+       public workspaces::pins::PinStore::Observer,
+@@ -120,9 +134,11 @@ class WorkspacePinnedSectionView
+ 
+   // ui::SimpleMenuModel::Delegate:
+   void ExecuteCommand(int command_id, int event_flags) override;
++  // The folder menu's Colour ticks the folder's colour as drawn (E17b).
++  bool IsCommandIdChecked(int command_id) const override;
+ 
+   // This section as the target of a tab drag at the point (E15d): over its
+-  // rows and their line (InZone), when every dragged tab can be pinned --
++  // header and the card (InZone), when every dragged tab can be pinned --
+   // any other drag is the list's to place (E15d review #1, #5). A drag not
+   // attached to this window yet is claimed, to attach it here; its tabs are
+   // judged once they are.
+@@ -188,13 +204,19 @@ class WorkspacePinnedSectionView
+   // Sets each item row of `list` sleeping, open or active.
+   void ApplyStates(views::View& list, const Links& links);
+ 
+-  // Adds `row` to `list`, then its children if it is an open folder. Returns
+-  // how many rows that made.
++  // Adds `row` to `list`, then its children if it is an open folder -- not
++  // while collapsed, where a folder is one icon. Returns how many rows that
++  // made.
+   size_t AddRow(views::View& list,
+                 const workspaces::pins::PinNode& row,
+                 int level,
+                 bool frame_active);
+   void OnFolderPressed(const std::string& id);
++  // Collapsed, a folder's press: a menu of every page under it, by title,
++  // each opened as its row would be (E17b).
++  void ShowFolderPages(const std::string& id, const ui::Event& event);
++  // The card the rows sit on, in this theme; null before there is one.
++  std::unique_ptr<views::Background> CardBackground() const;
+   // Shows the item's page: activates it here, or in the window of this
+   // profile that has it open (one place), or opens it.
+   void OnItemPressed(const std::string& id);
+@@ -251,8 +273,9 @@ class WorkspacePinnedSectionView
+   DropTarget TargetAt(const gfx::Point& point_in_screen);
+   // Where dragged tabs would be pinned: among the rows only.
+   DropTarget TabTargetAt(const gfx::Point& point_in_screen);
+-  // Over the rows and their line, while there are rows. "+ New Tab" below
+-  // them is the list's: a tab dragged there goes to the top of the list.
++  // Over the header and the card, while there are rows and the strip is not
++  // collapsed. "+ New Tab" below them is the list's: a tab dragged there goes
++  // to the top of the list.
+   bool InZone(const gfx::Point& point_in_screen) const;
+   // This window's tab drag context: the list's, which a drag attaches to.
+   TabDragContext* DragContext();
+@@ -267,7 +290,8 @@ class WorkspacePinnedSectionView
+   views::View* DropIndicator();
+ 
+   void OnCollapseChanged(tabs::VerticalTabStripCollapseState state);
+-  // Whether the window paints as active: the rows dim with the tabs when not.
++  // Whether the window paints as active: the rows dim with the tabs when not,
++  // and so do the header and "+ New Tab".
+   bool IsFrameActive() const;
+   void UpdateRowColors();
+ 
+@@ -282,13 +306,20 @@ class WorkspacePinnedSectionView
+   base::CallbackListSubscription workspace_list_changed_subscription_;
+   base::CallbackListSubscription collapse_changed_subscription_;
+   base::CallbackListSubscription paint_as_active_subscription_;
+-  // The rows' container, made by each Rebuild(); every child is a row.
++  // The workspace's header, the first child; made once (E17b).
++  raw_ptr<views::View> header_ = nullptr;
++  // The rows' container and their card, made by each Rebuild() after the
++  // header; every child is a row.
+   raw_ptr<views::View> list_ = nullptr;
+-  // The line under the rows, and "+ New Tab" after it.
+-  raw_ptr<views::View> separator_ = nullptr;
+-  raw_ptr<views::View> new_tab_button_ = nullptr;
++  // Below the card.
++  raw_ptr<VerticalNewTabButton> new_tab_button_ = nullptr;
+   // The workspace the rows are of; empty while the section is hidden.
+   std::string drawn_guid_;
++  // Its effective colour (prefs::EffectiveColors): a folder's without one of
++  // its own (E17b).
++  int drawn_color_ = 0;
++  // The rows are the collapsed strip's column of icons (E17b).
++  bool collapsed_ = false;
+   // The item whose page was last seen active: its row is scrolled into view
+   // and its last-used time stamped once per activation, not per tab change.
+   std::string active_id_;
+@@ -320,8 +351,13 @@ class WorkspacePinnedSectionView
+   // A tab drag holding this as its target lets go of it (TabDragTarget).
+   base::OnceClosureList will_destroy_callbacks_;
+ 
+-  // The row menu, and the row it was opened on.
++  // The row menu, and the row it was opened on. A folder's menu holds the
++  // Colour submenu, declared first so it outlives the menu that points at it
++  // (E17b). A collapsed folder's menu of pages runs on the same model and
++  // runner; its items are these ids, in order.
+   std::string context_menu_id_;
++  std::unique_ptr<ui::SimpleMenuModel> color_menu_model_;
++  std::vector<std::string> menu_page_ids_;
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
+   std::unique_ptr<views::MenuRunner> context_menu_runner_;
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -68,6 +68,8 @@
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+ 
++DEFINE_ELEMENT_IDENTIFIER_VALUE(kWorkspaceRailElementId);
++
+ namespace {
+ 
+ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kWorkspaceNameFieldId);
+@@ -369,11 +371,13 @@ WorkspaceRailView::WorkspaceRailView(
+   // Workspaces switched off from seeing the rail flash on at startup.
+   SetVisible(false);
+   new_tab_button_.SetView(new_tab_button);
++  // How the pinned section's header finds this bar (E17b).
++  SetProperty(views::kElementIdentifierKey, kWorkspaceRailElementId);
+ 
+   // Centred across the bar, because the chips (28 px) are shorter than the
+   // fixed buttons (32 px) in the row and narrower in the column. The hairline
+-  // over the bar is the separator colour the pinned section's line draws
+-  // (E17a); a ColorId, so it resolves at paint time.
++  // over the bar is ui::kColorSeparator, views::Separator's colour (E17a); a
++  // ColorId, so it resolves at paint time.
+   SetCrossAxisAlignment(views::LayoutAlignment::kCenter);
+   SetBorder(views::CreateSolidSidedBorder(gfx::Insets::TLBR(1, 0, 0, 0),
+                                           ui::kColorSeparator));
+@@ -412,6 +416,9 @@ WorkspaceRailView::WorkspaceRailView(
+   scroll_view_->SetVerticalScrollBarMode(
+       views::ScrollView::ScrollBarMode::kDisabled);
+   scroll_view_->SetTreatAllScrollEventsAsHorizontal(true);
++  // No 1 px overflow line at the scroller's edge: the arrows already say
++  // there is more (E17b, from the after-e17a screenshots).
++  scroll_view_->SetDrawOverflowIndicator(false);
+   scroll_contents_ =
+       scroll_view_->SetContents(std::make_unique<views::FlexLayoutView>());
+   scroll_contents_->SetDefault(views::kMarginsKey, gfx::Insets(kChipMargin));
+@@ -726,13 +733,22 @@ void WorkspaceRailView::ShowContextMenuF
+     ui::mojom::MenuSourceType source_type) {
+   // Which workspace was right-clicked. `source` is one of `buttons_`; the "+"
+   // is not a context-menu controller client, so it cannot land here.
+-  context_menu_guid_.clear();
+   for (size_t i = 0; i < buttons_.size(); ++i) {
+     if (buttons_[i] == source) {
+-      context_menu_guid_ = guids_[i];
+-      break;
++      ShowWorkspaceMenuFor(guids_[i], source, point, source_type);
++      return;
+     }
+   }
++}
++
++void WorkspaceRailView::ShowWorkspaceMenuFor(
++    const std::string& guid,
++    views::View* source,
++    const gfx::Point& point,
++    ui::mojom::MenuSourceType source_type) {
++  // Remembered for ExecuteCommand, which gets only a command id. The pinned
++  // header passes the workspace it draws (E17b); a chip, its own.
++  context_menu_guid_ = guid;
+   if (context_menu_guid_.empty()) {
+     return;
+   }
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -15,6 +15,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h"
+ #include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/views/context_menu_controller.h"
+@@ -50,6 +51,11 @@ class MenuRunner;
+ class ScrollView;
+ }  // namespace views
+ 
++// The bar sets this on itself (E17b): the pinned section's header finds the
++// bar by it, to show the bar's menu for a workspace, with no pointer kept
++// between two views that are made and destroyed apart.
++DECLARE_ELEMENT_IDENTIFIER_VALUE(kWorkspaceRailElementId);
++
+ // The workspace switcher at the bottom of the vertical tab strip (design 5, and
+ // the owner request recorded there on 2026-09-10 -- "a small control at the
+ // bottom of the tab strip, to switch workspaces or add one").
+@@ -133,6 +139,15 @@ class WorkspaceRailView : public views::
+   void ExecuteCommand(int command_id, int event_flags) override;
+   bool IsCommandIdEnabled(int command_id) const override;
+ 
++  // The menu a workspace's chip opens, for workspace `guid`, at `point` (in
++  // screen coordinates) over `source`'s widget. Public for the pinned
++  // section's header, which shows the same menu for the workspace it heads
++  // (E17b), and finds this bar by kWorkspaceRailElementId.
++  void ShowWorkspaceMenuFor(const std::string& guid,
++                            views::View* source,
++                            const gfx::Point& point,
++                            ui::mojom::MenuSourceType source_type);
++
+   // Opens the one-textfield bubble New workspace uses, anchored to `anchor`.
+   // `on_accept` is run with whatever was typed, and not run at all if the
+   // bubble is dismissed. The pinned section's Rename (E15d) and the "Edit
+@@ -157,8 +172,8 @@ class WorkspaceRailView : public views::
+       size_t index);
+ 
+   // The Chromium icon for a preset symbol (prefs::kWorkspaceSymbols), or null
+-  // for "" and for anything that is not a preset. The pinned header and the
+-  // Archive draw the same icons (E17a-c).
++  // for "" and for anything that is not a preset. The editor's grid and the
++  // pinned header draw the same icons (E17a-b).
+   static const gfx::VectorIcon* SymbolIcon(std::string_view symbol);
+ 
+   // Workspace colour `color` (0-8, a tab_groups::TabGroupColorId; anything

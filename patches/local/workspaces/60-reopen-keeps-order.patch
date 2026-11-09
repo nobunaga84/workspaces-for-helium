@@ -1,0 +1,52 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -805,6 +805,7 @@ int WorkspaceService::MoveTabsToWorkspac
+ 
+ base::AutoReset<std::string> WorkspaceService::StampInsertedTabsFor(
+     std::string guid) {
++  last_rebuilt_tab_ = tabs::TabHandle();
+   return base::AutoReset<std::string>(&stamp_inserted_for_, std::move(guid));
+ }
+ 
+@@ -1687,6 +1688,9 @@ void WorkspaceService::StampInsertedTab(
+       GuidOf(tab),
+       stamp_inserted_for_.empty() ? active_guid_ : stamp_inserted_for_);
+   SetTag(tab->GetContents(), guid);
++  if (!stamp_inserted_for_.empty()) {
++    last_rebuilt_tab_ = tab->GetHandle();
++  }
+ 
+   // active_guid_ is in the line because without it this log cannot answer the
+   // question it exists for. "-> workspace 'default'" is the same text whether
+@@ -1747,6 +1751,18 @@ bool WorkspaceService::IsTabAtTopOfList(
+ }
+ 
+ int WorkspaceService::IndexForNewTab(bool from_link) const {
++  // A saved group being rebuilt from Recently Closed (patch 58's scope): the
++  // first tab goes to the top of the list like any new tab, each next one
++  // right after it. Each at the top instead reversed a group reopened into
++  // the workspace on screen (E18.3, LOCAL.md 68).
++  if (IsEnabled() && !stamp_inserted_for_.empty()) {
++    if (const tabs::TabInterface* const previous = last_rebuilt_tab_.Get()) {
++      const int index = tab_strip_->GetIndexOfTab(previous);
++      if (index != TabStripModel::kNoTab) {
++        return index + 1;
++      }
++    }
++  }
+   const tabs::TabInterface* const opener =
+       from_link ? tab_strip_->GetActiveTab() : nullptr;
+   if (from_link && !IsDrawnAsPinnedRow(opener)) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -725,6 +725,10 @@ class WorkspaceService : public TabStrip
+   // StampInsertedTabsFor() lives; empty: the workspace on screen.
+   std::string stamp_inserted_for_;
+ 
++  // The tab this StampInsertedTabsFor() scope inserted last: IndexForNewTab()
++  // puts the next one after it, so a rebuilt group keeps its order (E18.3).
++  tabs::TabHandle last_rebuilt_tab_;
++
+   // ExpectClosedTabData()'s tabs (TabHandle raw values), cleared by a task
+   // posted when they are remembered: a restore runs in one task.
+   std::set<int32_t> rebuilt_tabs_;

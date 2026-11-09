@@ -1,0 +1,194 @@
+--- a/chrome/browser/extensions/BUILD.gn
++++ b/chrome/browser/extensions/BUILD.gn
+@@ -972,6 +972,7 @@ source_set("extensions") {
+       "//chrome/browser/ui/tabs",
+       "//chrome/browser/ui/tabs:tab_group",
+       "//chrome/browser/ui/tabs:tab_model",
++      "//chrome/browser/ui/tabs/workspaces:prefs",
+       "//chrome/browser/ui/toolbar",
+       "//chrome/browser/ui/translate",
+       "//chrome/browser/ui/views/side_panel",
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/ui/omnibox/omnibox_everywhere/omnibox_everywhere_prefs.h"
+ #include "chrome/browser/ui/safety_hub/safety_hub_prefs.h"
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/toolbar/toolbar_pref_names.h"
+ #include "chrome/common/extensions/api/settings_private.h"
+ #include "chrome/common/pref_names.h"
+@@ -236,6 +237,17 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+   (*s_allowlist)[::prefs::kHeliumNativeFrameMaterials] =
+       settings_api::PrefType::kBoolean;
+ 
++  // Helium Workspaces. Named by the constant rather than by a second copy of
++  // the string, which is what the deps line on this target buys -- the pref is
++  // declared in the fork's own workspace_prefs.h and deliberately not in
++  // chrome/common/pref_names.h (LOCAL.md 1, "Never touch").
++  //
++  // This entry is what makes the toggle do anything at all: settings-private
++  // reads and writes only the prefs listed here, and a missing one renders a
++  // perfectly normal-looking switch that silently refuses to save.
++  (*s_allowlist)[::workspaces::prefs::kHeliumWorkspacesEnabled] =
++      settings_api::PrefType::kBoolean;
++
+   // Miscellaneous
+   (*s_allowlist)[::embedder_support::kAlternateErrorPagesEnabled] =
+       settings_api::PrefType::kBoolean;
+--- a/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
+@@ -32,6 +32,12 @@ export function getHtml(this: SettingsAp
+       pref-key="helium.browser.vertical_right_aligned"
+       label="$i18n{tabStripRightAlign}">
+   </settings-toggle-button>
++  <settings-toggle-button class="hr"
++      ?hidden="${!this.showVerticalSettings_()}"
++      pref-key="helium.workspaces.enabled"
++      label="$i18n{workspaces}"
++      sub-label="$i18n{workspacesDescription}">
++  </settings-toggle-button>
+   <settings-toggle-button class="hr" disabled
+       ?hidden="${!this.showVerticalTabsExpandOnHoverSetting_() ||
+                  !this.isExpandOnHoverForcedByZenMode_()}"
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -152,10 +152,6 @@ std::vector<WorkspaceEntry> RemoveWorksp
+ std::vector<WorkspaceEntry> MoveWorkspace(std::vector<WorkspaceEntry> entries,
+                                           std::string_view guid,
+                                           int offset) {
+-  if (offset == 0) {
+-    return entries;
+-  }
+-
+   int from = -1;
+   for (size_t i = 0; i < entries.size(); ++i) {
+     if (entries[i].guid == guid) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -61,6 +61,10 @@ WorkspaceService::WorkspaceService(
+         prefs::kHeliumWorkspacesList,
+         base::BindRepeating(&WorkspaceService::OnWorkspaceListChanged,
+                             base::Unretained(this)));
++    pref_registrar_.Add(
++        prefs::kHeliumWorkspacesEnabled,
++        base::BindRepeating(&WorkspaceService::OnEnabledChanged,
++                            base::Unretained(this)));
+   }
+ }
+ 
+@@ -235,23 +239,29 @@ void WorkspaceService::MoveWorkspace(std
+     return;
+   }
+ 
+-  const std::vector<std::string> before = known_guids_;
+-
+-  prefs::WriteWorkspaces(prefs_,
+-                         prefs::MoveWorkspace(GetWorkspaces(), guid, offset));
++  const std::vector<prefs::WorkspaceEntry> before = GetWorkspaces();
++  const std::vector<prefs::WorkspaceEntry> after =
++      prefs::MoveWorkspace(before, guid, offset);
+ 
+   // A refused move -- either end of the list, or a guid naming nothing --
+-  // writes the list back unchanged, and JsonPrefStore drops a write whose value
+-  // is equal to the stored one, so nothing downstream sees it. The guard here
+-  // is not about the pref: it is about the log line, which is how this chunk
+-  // gets verified, and "moved" printed for a keypress that did nothing is the
+-  // kind of small lie nobody ever debugs (LOCAL.md 19).
++  // hands back the list it was given, and JsonPrefStore drops a write whose
++  // value is equal to the stored one, so nothing downstream sees it either
++  // way. The guard here is not about the pref: it is about the log line, which
++  // is how this chunk gets verified, and "moved" printed for a keypress that
++  // did nothing is the kind of small lie nobody ever debugs (LOCAL.md 19).
+   //
+-  // known_guids_ is the comparison because the write above refreshes it
+-  // SYNCHRONOUSLY -- PrefChangeRegistrar notifies on the SetDict call, not on a
+-  // later task, which is the same fact CreateWorkspace() relies on to switch
+-  // into a workspace it has only just added.
+-  if (known_guids_ != before) {
++  // Compared before the write rather than against known_guids_ afterwards.
++  // That version was correct, and was watched working four times, but it
++  // leaned on PrefChangeRegistrar notifying SYNCHRONOUSLY -- a fact stated in
++  // a Chromium comment rather than enforced by anything of ours, which is a
++  // thin thing for a log line to stand on (LOCAL.md 22).
++  const bool changed = !std::ranges::equal(
++      before, after, /*pred=*/{}, &prefs::WorkspaceEntry::guid,
++      &prefs::WorkspaceEntry::guid);
++
++  prefs::WriteWorkspaces(prefs_, after);
++
++  if (changed) {
+     LOG(INFO) << "[workspaces] moved workspace '" << guid << "' by " << offset;
+   }
+ }
+@@ -419,6 +429,43 @@ void WorkspaceService::OnWorkspaceListCh
+   workspace_changed_callbacks_.Notify();
+ }
+ 
++void WorkspaceService::OnEnabledChanged() {
++  // The pref is logged, not IsEnabled(), because the two answer different
++  // questions and only one of them just changed: in a classic-layout window
++  // IsEnabled() stays false through a flip in either direction, and a line
++  // reading "enabled -> false" for a switch the user had just turned ON is
++  // exactly the class of small lie LOCAL.md 22 is about. Both are printed, so
++  // the log tells "off" apart from "on, but not vertical in this window".
++  LOG(INFO) << "[workspaces] enabled pref -> "
++            << (prefs_->GetBoolean(prefs::kHeliumWorkspacesEnabled) ? "true"
++                                                                    : "false")
++            << ", feature " << (IsEnabled() ? "on" : "off")
++            << " in this window";
++
++  // Everything that has to be re-read here is already reachable from the two
++  // notifications a list change fires: the rail re-runs IsEnabled() inside
++  // Rebuild(), and the visibility predicate re-runs per tab on the next
++  // layout. Reusing that path rather than a second one of our own keeps
++  // "something about workspaces changed, redraw" in a single place. Refreshing
++  // known_guids_ on the way through is a no-op, not a cost worth a branch.
++  OnWorkspaceListChanged();
++
++  // Switching the feature back ON can leave the active tab hidden. While it
++  // was off every tab was visible, so the user could select one belonging to
++  // some other workspace, and SetActiveWorkspace() is gated -- so active_guid_
++  // did not follow it. Nothing else re-checks afterwards: OnSelectionChanged()
++  // asks only at the moment of selection, which was while the gate was shut.
++  //
++  // Posted rather than called, for the reason OnWorkspaceListChanged() gives
++  // where it does the same thing: a pref observer can be reached from inside a
++  // TabStripModel notification, and activating a tab there would trip the
++  // re-entrancy CHECK (design 2.2). A no-op when the feature is off, when the
++  // strip is empty, or when the active tab is already on screen.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspaceService::EnsureActiveTabVisible,
++                                weak_factory_.GetWeakPtr()));
++}
++
+ int WorkspaceService::TargetTabIndexForActiveWorkspace() const {
+   // The tab the user was last on here, if it still exists and still belongs.
+   // Both have to be re-checked: the handle answers null once the tab is
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -358,6 +358,13 @@ class WorkspaceService : public TabStrip
+   // window, or by local/set-workspaces-pref.py while the browser runs.
+   void OnWorkspaceListChanged();
+ 
++  // Reacts to the feature being switched on or off from the settings page.
++  // Until E9e part 3 nothing could flip that pref while the browser ran, so
++  // IsEnabled() reading it fresh on every call was enough on its own; a toggle
++  // the user can see needs the strip to redraw at the moment it is clicked
++  // rather than at the next rebuild of the view tree (LOCAL.md 12).
++  void OnEnabledChanged();
++
+   std::string active_guid_;
+ 
+   // The guids that exist, cached because IsTabVisible() consults them once per
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -617,6 +617,8 @@ void AddAppearanceStrings(content::WebUI
+       {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
+       {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
+       {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
++      {"workspaces", IDS_SETTINGS_WORKSPACES},
++      {"workspacesDescription", IDS_SETTINGS_WORKSPACES_DESCRIPTION},
+       {"browserZenMode", IDS_SETTINGS_BROWSER_ZEN_MODE},
+       {"browserZenModeDescription", IDS_SETTINGS_BROWSER_ZEN_MODE_DESCRIPTION},
+       {"zenModePinSidebar", IDS_SETTINGS_ZEN_PIN_SIDEBAR},

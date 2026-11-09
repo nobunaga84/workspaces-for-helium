@@ -1,0 +1,1723 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -33,6 +33,10 @@ source_set("archive") {
+   deps = [
+     ":pins",
+     "//base",
++
++    # The Archive screen's search folds case as ICU does, so "ä" finds "Ä"
++    # (E14d.2). Still no //chrome: the tests reach all of it.
++    "//base:i18n",
+   ]
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
+@@ -5,14 +5,20 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <memory>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "base/i18n/case_conversion.h"
+ #include "base/json/json_writer.h"
+ #include "base/json/values_util.h"
+ #include "base/logging.h"
+ #include "base/notreached.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_split.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/strings/whitespace_constants.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+@@ -254,6 +260,7 @@ bool ArchiveStore::Add(ArchiveEntry entr
+   if (loaded_) {
+     writer_.ScheduleWrite(this);
+   }
++  changed_callbacks_.Notify();
+   return true;
+ }
+ 
+@@ -266,15 +273,39 @@ bool ArchiveStore::Remove(std::string_vi
+                       }) > 0;
+   if (!loaded_) {
+     removed_before_load_.emplace(id);
++    // Every true notifies (the header): a held close may have gone.
++    changed_callbacks_.Notify();
+     return true;
+   }
+   if (!erased) {
+     return false;
+   }
+   writer_.ScheduleWrite(this);
++  changed_callbacks_.Notify();
+   return true;
+ }
+ 
++size_t ArchiveStore::RemoveSince(base::Time since) {
++  if (read_only_ || !loaded_) {
++    return 0;
++  }
++  // base::Time() takes all: the load's prune leaves no time before it.
++  const size_t removed =
++      std::erase_if(entries_, [since](const ArchiveEntry& entry) {
++        return entry.archived_at >= since;
++      });
++  if (removed > 0) {
++    writer_.ScheduleWrite(this);
++    changed_callbacks_.Notify();
++  }
++  return removed;
++}
++
++base::CallbackListSubscription ArchiveStore::RegisterChangedCallback(
++    base::RepeatingClosure callback) {
++  return changed_callbacks_.Add(std::move(callback));
++}
++
+ // static
+ ArchiveStore::LoadResult ArchiveStore::ReadFile(const base::FilePath& file) {
+   LoadResult result;
+@@ -348,6 +379,9 @@ void ArchiveStore::OnLoaded(LoadResult r
+   if (changed) {
+     writer_.ScheduleWrite(this);
+   }
++  // Always, even with nothing loaded: a screen opened before the load waits
++  // for it to draw its rows (E14d.2).
++  changed_callbacks_.Notify();
+ }
+ 
+ std::optional<std::string> ArchiveStore::SerializeData() {
+@@ -356,4 +390,32 @@ std::optional<std::string> ArchiveStore:
+   return base::WriteJson(ArchiveToValue(entries_));
+ }
+ 
++int DaysAgo(base::Time archived_at, base::Time now) {
++  const base::Time day = archived_at.LocalMidnight();
++  const base::Time today = now.LocalMidnight();
++  if (day >= today) {
++    return 0;
++  }
++  // Rounded, not truncated: a span with a clock change in it is an hour short
++  // or long of whole days.
++  return static_cast<int>(std::lround((today - day) / base::Days(1)));
++}
++
++std::u16string SearchTextFor(const ArchiveEntry& entry) {
++  // Newlines, so a query word never matches across two fields: a word holds
++  // no whitespace.
++  return base::i18n::FoldCase(base::UTF8ToUTF16(
++      base::StrCat({entry.custom_title, "\n", entry.title, "\n", entry.url})));
++}
++
++bool MatchesQuery(std::u16string_view search_text, std::u16string_view query) {
++  const std::u16string folded = base::i18n::FoldCase(query);
++  return std::ranges::all_of(
++      base::SplitStringPiece(folded, base::kWhitespaceUTF16,
++                             base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY),
++      [search_text](std::u16string_view word) {
++        return search_text.find(word) != std::u16string_view::npos;
++      });
++}
++
+ }  // namespace workspaces::archive
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.h
+@@ -12,6 +12,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/callback_list.h"
+ #include "base/files/file_path.h"
+ #include "base/files/important_file_writer.h"
+ #include "base/memory/scoped_refptr.h"
+@@ -26,7 +27,9 @@ class SequencedTaskRunner;
+ 
+ // Arc's archive: every tab the user closes, kept per workspace for 60 days in
+ // a file of its own, so a close is never the end of a page (design 5, "E14d
+-// spec"). E14d.1 records; the screen that finds and restores is E14d.2's.
++// spec"). E14d.1 records; the screen that finds and restores is E14d.2's
++// (workspace_archive_view.h), and the rules it draws by are the free functions
++// at the end of this file, so the tests reach them.
+ //
+ // //base only, the file included, like the pins store (39): all of it is
+ // tested in workspaces_unittests, and it attaches to its profile as
+@@ -120,11 +123,27 @@ class ArchiveStore : public base::Suppor
+   // would refuse, its id already kept included.
+   bool Add(ArchiveEntry entry);
+ 
+-  // Removes the entry with `id` (a reopened close). Before the load the id is
+-  // remembered and removed from the file's entries when they arrive. False
+-  // when read_only(), and after the load when no entry has `id`.
++  // Removes the entry with `id` (a reopened close, a restore, or Delete on the
++  // Archive screen). Before the load the id is remembered and removed from the
++  // file's entries when they arrive. False when read_only(), and after the
++  // load when no entry has `id`.
+   bool Remove(std::string_view id);
+ 
++  // Removes every entry archived at or after `since` -- base::Time() for all
++  // of them: the screen's Clear all (E14d.2) and the setting's time ranges
++  // (E14d.3, design 5). Answers how many went. 0, and nothing done, when
++  // read_only() or before the load: the screen draws nothing until then, so
++  // there is nothing it could have asked to clear.
++  size_t RemoveSince(base::Time since);
++
++  // Runs `callback` after every change to entries() -- an Add, a Remove, a
++  // RemoveSince that took something, and the load -- and after a Remove
++  // before the load, which may only note the id. Not for a refused call.
++  // Add is called from inside TabStripModel's close, so a callback must not
++  // touch a tab strip or rebuild a view there: the screen posts its redraw.
++  base::CallbackListSubscription RegisterChangedCallback(
++      base::RepeatingClosure callback);
++
+  private:
+   struct LoadResult;
+   static LoadResult ReadFile(const base::FilePath& file);
+@@ -151,9 +170,29 @@ class ArchiveStore : public base::Suppor
+   // it.
+   scoped_refptr<base::SequencedTaskRunner> file_task_runner_;
+   base::ImportantFileWriter writer_;
++  base::RepeatingClosureList changed_callbacks_;
+   base::WeakPtrFactory<ArchiveStore> weak_factory_{this};
+ };
+ 
++// The Archive screen's rules (E14d.2), free functions over plain values so
++// workspaces_unittests reaches them (LOCAL.md 8).
++
++// How many local days before `now`'s day `archived_at` falls: 0 today, 1
++// yesterday, and so on -- the screen's day headers. Counted between local
++// midnights, so a 23- or 25-hour day at a clock change is still one day. A
++// time after `now` (the clock went back) is 0.
++int DaysAgo(base::Time archived_at, base::Time now);
++
++// What the search box looks in for `entry`: its custom name, its title and its
++// address, case-folded (base::i18n::FoldCase) and joined by newlines. The
++// screen makes it once per row, not once per keystroke.
++std::u16string SearchTextFor(const ArchiveEntry& entry);
++
++// Whether a row whose SearchTextFor() is `search_text` is shown for `query`:
++// every word of `query` (split on whitespace, case-folded) appears in it, in
++// any order. An empty or all-space query matches every row.
++bool MatchesQuery(std::u16string_view search_text, std::u16string_view query);
++
+ }  // namespace workspaces::archive
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_ARCHIVE_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
+@@ -17,6 +17,7 @@
+ #include "base/json/json_writer.h"
+ #include "base/supports_user_data.h"
+ #include "base/task/thread_pool.h"
++#include "base/test/bind.h"
+ #include "base/test/task_environment.h"
+ #include "base/time/time.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -161,6 +162,17 @@ class ArchiveStoreTest : public testing:
+     return contents;
+   }
+ 
++  // The file's ids, read directly: another store's load would prune it again
++  // and hide an unwritten file (review, LOCAL.md 52).
++  IdList IdsOnDisk() {
++    std::optional<base::DictValue> dict =
++        base::JSONReader::ReadDict(Contents(file()), base::JSON_PARSE_RFC);
++    std::optional<std::vector<ArchiveEntry>> entries =
++        dict ? ArchiveFromValue(*dict) : std::nullopt;
++    EXPECT_TRUE(entries);
++    return entries ? Ids(*entries) : IdList();
++  }
++
+   base::test::TaskEnvironment task_environment_{
+       base::test::TaskEnvironment::TimeSource::MOCK_TIME};
+   base::ScopedTempDir dir_;
+@@ -309,14 +321,7 @@ TEST_F(ArchiveStoreTest, TheLoadDropsEnt
+ 
+   task_environment_.FastForwardBy(ArchiveStore::kSaveDelay * 2);
+   task_environment_.RunUntilIdle();
+-  // Read directly: another store's load would prune it again and hide an
+-  // unwritten file (review, LOCAL.md 52).
+-  std::optional<base::DictValue> written =
+-      base::JSONReader::ReadDict(Contents(file()), base::JSON_PARSE_RFC);
+-  ASSERT_TRUE(written);
+-  std::optional<std::vector<ArchiveEntry>> on_disk = ArchiveFromValue(*written);
+-  ASSERT_TRUE(on_disk);
+-  EXPECT_EQ(Ids(*on_disk), (IdList{"new"}));
++  EXPECT_EQ(IdsOnDisk(), (IdList{"new"}));
+ }
+ 
+ TEST_F(ArchiveStoreTest, AnAddDropsEntriesOlderThanSixtyDays) {
+@@ -388,5 +393,142 @@ TEST_F(ArchiveStoreTest, OneStorePerProf
+   EXPECT_EQ(Ids(LoadedStore()->entries()), (IdList{"a"}));
+ }
+ 
++// The screen's Clear all (E14d.2): written by the timer, not only when the
++// store goes.
++TEST_F(ArchiveStoreTest, RemoveSinceTheBeginningClearsAllAndIsSaved) {
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  ASSERT_TRUE(store->Add(Entry("a", "https://a.example/")));
++  ASSERT_TRUE(store->Add(Entry("b", "https://b.example/")));
++  task_environment_.FastForwardBy(ArchiveStore::kSaveDelay * 2);
++  task_environment_.RunUntilIdle();
++  ASSERT_EQ(IdsOnDisk(), (IdList{"a", "b"}));
++
++  EXPECT_EQ(store->RemoveSince(base::Time()), 2u);
++  EXPECT_TRUE(store->entries().empty());
++  task_environment_.FastForwardBy(ArchiveStore::kSaveDelay * 2);
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(IdsOnDisk(), IdList());
++}
++
++// The setting's time ranges (E14d.3): "since" counts itself in.
++TEST_F(ArchiveStoreTest, RemoveSinceATimeKeepsWhatIsOlder) {
++  const base::Time now = base::Time::Now();
++  std::unique_ptr<ArchiveStore> store = LoadedStore();
++  ASSERT_TRUE(
++      store->Add(Entry("old", "https://old.example/", now - base::Hours(2))));
++  ASSERT_TRUE(store->Add(
++      Entry("since", "https://since.example/", now - base::Hours(1))));
++  ASSERT_TRUE(store->Add(Entry("new", "https://new.example/", now)));
++
++  EXPECT_EQ(store->RemoveSince(now - base::Hours(1)), 2u);
++  EXPECT_EQ(Ids(store->entries()), (IdList{"old"}));
++  EXPECT_EQ(Ids(Reloaded(std::move(store))), (IdList{"old"}));
++}
++
++// The screen draws nothing before the load, so a clear then is not one it
++// asked for: the held close stays and joins the file.
++TEST_F(ArchiveStoreTest, RemoveSinceBeforeTheLoadIsRefused) {
++  WriteArchive({Entry("a", "https://a.example/")});
++  std::unique_ptr<ArchiveStore> store = NewStore();
++  ASSERT_TRUE(store->Add(Entry("b", "https://b.example/")));
++  EXPECT_EQ(store->RemoveSince(base::Time()), 0u);
++  EXPECT_EQ(Ids(store->entries()), (IdList{"b"}));
++
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(Ids(store->entries()), (IdList{"a", "b"}));
++}
++
++// The Archive screen redraws on this callback (E14d.2), so each run must
++// already see its change -- the held ones before the load included.
++TEST_F(ArchiveStoreTest, TheChangedCallbackRunsAfterEveryChange) {
++  WriteArchive({Entry("a", "https://a.example/")});
++  std::unique_ptr<ArchiveStore> store = NewStore();
++  std::vector<IdList> seen;
++  base::CallbackListSubscription subscription =
++      store->RegisterChangedCallback(base::BindLambdaForTesting(
++          [&] { seen.push_back(Ids(store->entries())); }));
++
++  // Before the load: a held close, and a reopen of the file's entry.
++  ASSERT_TRUE(store->Add(Entry("b", "https://b.example/")));
++  EXPECT_EQ(seen, (std::vector<IdList>{IdList{"b"}}));
++  ASSERT_TRUE(store->Remove("a"));
++  EXPECT_EQ(seen.size(), 2u);
++
++  task_environment_.RunUntilIdle();
++  ASSERT_EQ(seen.size(), 3u);
++  EXPECT_EQ(seen.back(), (IdList{"b"}));
++
++  ASSERT_TRUE(store->Add(Entry("c", "https://c.example/")));
++  ASSERT_EQ(seen.size(), 4u);
++  EXPECT_EQ(seen.back(), (IdList{"b", "c"}));
++  ASSERT_TRUE(store->Remove("b"));
++  ASSERT_EQ(seen.size(), 5u);
++  EXPECT_EQ(seen.back(), (IdList{"c"}));
++  ASSERT_EQ(store->RemoveSince(base::Time()), 1u);
++  ASSERT_EQ(seen.size(), 6u);
++  EXPECT_EQ(seen.back(), IdList());
++}
++
++TEST_F(ArchiveStoreTest, TheChangedCallbackSkipsRefusedCallsButNotAnEmptyLoad) {
++  std::unique_ptr<ArchiveStore> store = NewStore();
++  int changes = 0;
++  base::CallbackListSubscription subscription = store->RegisterChangedCallback(
++      base::BindLambdaForTesting([&] { ++changes; }));
++  // No file: nothing loaded, but a screen opened before the load waits for
++  // it.
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(changes, 1);
++
++  ASSERT_TRUE(store->Add(Entry("a", "https://a.example/")));
++  EXPECT_EQ(changes, 2);
++  EXPECT_FALSE(store->Add(Entry("a", "https://a2.example/")));
++  EXPECT_FALSE(store->Remove("nope"));
++  EXPECT_EQ(store->RemoveSince(base::Time::Now() + base::Hours(1)), 0u);
++  EXPECT_EQ(changes, 2);
++}
++
++// Built on a local midnight, so the days are the machine's own whatever its
++// time zone.
++TEST(WorkspaceArchiveTest, DaysAgoCountsLocalDays) {
++  const base::Time midnight =
++      base::Time::FromSecondsSinceUnixEpoch(1'760'000'000).LocalMidnight();
++  const base::Time now = midnight + base::Hours(12);
++  EXPECT_EQ(DaysAgo(midnight, now), 0);
++  EXPECT_EQ(DaysAgo(now - base::Minutes(1), now), 0);
++  EXPECT_EQ(DaysAgo(midnight - base::Minutes(1), now), 1);
++  EXPECT_EQ(DaysAgo(midnight - base::Hours(12), now), 1);
++  EXPECT_EQ(DaysAgo(midnight - base::Days(4) - base::Hours(12), now), 5);
++  // The clock went back: a close after `now` is today's.
++  EXPECT_EQ(DaysAgo(now + base::Days(2), now), 0);
++}
++
++TEST(WorkspaceArchiveTest, SearchFindsEveryWordInAnyFieldAndCase) {
++  ArchiveEntry entry = Entry("a", "https://example.com/chromium");
++  entry.title = "GitHub Pull Requests";
++  entry.custom_title = "Weekly Review";
++  const std::u16string text = SearchTextFor(entry);
++  EXPECT_EQ(text,
++            u"weekly review\ngithub pull requests\n"
++            u"https://example.com/chromium");
++
++  EXPECT_TRUE(MatchesQuery(text, u"github"));
++  EXPECT_TRUE(MatchesQuery(text, u"GITHUB"));
++  EXPECT_TRUE(MatchesQuery(text, u"requests  pull"));
++  EXPECT_TRUE(MatchesQuery(text, u"chromium"));
++  EXPECT_TRUE(MatchesQuery(text, u"weekly"));
++  EXPECT_TRUE(MatchesQuery(text, u""));
++  EXPECT_TRUE(MatchesQuery(text, u" \t "));
++  EXPECT_FALSE(MatchesQuery(text, u"github gitlab"));
++}
++
++// ICU's folding, not ASCII's: "ä" finds "Ä".
++TEST(WorkspaceArchiveTest, SearchFoldsCaseBeyondAscii) {
++  ArchiveEntry entry = Entry("a", "https://a.example/");
++  entry.title = "\u00C4pfel";
++  const std::u16string text = SearchTextFor(entry);
++  EXPECT_TRUE(MatchesQuery(text, u"\u00E4pfel"));
++  EXPECT_TRUE(MatchesQuery(text, u"\u00C4PFEL"));
++}
++
+ }  // namespace
+ }  // namespace workspaces::archive
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -323,6 +323,22 @@ void WorkspaceService::SwitchToWorkspace
+   tab_strip_->delegate()->AddTabAt(GURL(), /*index=*/-1, /*foreground=*/true);
+ }
+ 
++void WorkspaceService::EnterWorkspaceForInsert(std::string_view guid) {
++  // Resolved as SetActiveWorkspace() resolves it: a guid that lands on this
++  // workspace is no switch, so the tab the user is on is not one being left.
++  if (!IsEnabled() ||
++      std::string_view(active_guid_) == ResolveTabGuid(guid, known_guids_)) {
++    return;
++  }
++  // SwitchToWorkspace()'s bookkeeping without its activation: coming back by
++  // the rail lands on the tab the restore took the user away from (E14d.2
++  // review). A read of the model, not a mutation (design 2.2).
++  if (tabs::TabInterface* active = tab_strip_->GetActiveTab()) {
++    last_active_[active_guid_] = active->GetHandle();
++  }
++  SetActiveWorkspace(guid);
++}
++
+ std::vector<prefs::WorkspaceEntry> WorkspaceService::GetWorkspaces() const {
+   return prefs::GetWorkspaces(prefs_);
+ }
+@@ -1643,6 +1659,20 @@ void WorkspaceService::ArchiveClosingTab
+     LOG(INFO) << "[workspaces] not archived: a pinned item's page";
+     return;
+   }
++  // Nor a favorite, a pinned tab (E14c imports Arc's favorites as these): it
++  // belongs to no workspace (design 2.5), so an entry would be filed under
++  // Home and restored there unpinned. Arc never archives one -- its archive
++  // holds tabs only, 1,757 of 1,757 (LOCAL.md 51); Recently Closed still
++  // keeps the close. A defaulted owner decision (E14d.2 review). The tab is
++  // still in its model here: DetachTabImpl asks the delegate before removing
++  // it (tab_strip_model.cc). Maybe-: a contents that is not a tab is archived
++  // as before rather than CHECK-crashing a close.
++  if (const tabs::TabInterface* const tab =
++          tabs::TabInterface::MaybeGetFromContents(contents);
++      tab && tab->IsPinned()) {
++    LOG(INFO) << "[workspaces] not archived: a favorite (a pinned tab)";
++    return;
++  }
+   // Before the window rule: a quit that skips unload handlers (a silent exit,
+   // log-off) marks no window closing, so every tab would pass as `manual`
+   // (review, LOCAL.md 52).
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -127,6 +127,15 @@ class WorkspaceService : public TabStrip
+   // WorkspaceRailView.
+   void SwitchToWorkspace(std::string_view guid);
+ 
++  // SwitchToWorkspace()'s bookkeeping without its activation: remembers the
++  // tab being left (so coming back lands on it), then SetActiveWorkspace().
++  // For a caller that inserts and selects the tab to show right after -- the
++  // Archive screen's restore (E14d.2), which must not have SwitchToWorkspace
++  // activate a tab or spawn a New Tab into an empty workspace first. Calls
++  // nothing on TabStripModel but reading its active tab; still, like the
++  // switch, ONLY FROM A MENU OR COMMAND HANDLER.
++  void EnterWorkspaceForInsert(std::string_view guid);
++
+   // Shows the workspace `offset` positions from the active one, wrapping at
+   // both ends. +1 is next, -1 is previous.
+   void ActivateRelativeWorkspace(int offset);
+@@ -412,10 +421,12 @@ class WorkspaceService : public TabStrip
+ 
+   // Arc's archive (E14d.1, design 5 "E14d spec"): keeps `contents`, which the
+   // user is closing, or logs why not. The gates, in order: nothing while the
+-  // feature is off; never a pinned item's page; nothing while `quitting`; a
+-  // committed window close only while the session commits it too -- its
+-  // service still up and another window it tracks staying open; never a tab
+-  // with no address or an untouched New Tab page (review, LOCAL.md 52).
++  // feature is off; never a pinned item's page; never a favorite (a pinned
++  // tab: Arc archives tabs only -- a defaulted owner decision, E14d.2
++  // review); nothing while `quitting`; a committed window close only while
++  // the session commits it too -- its service still up and another window it
++  // tracks staying open; never a tab with no address or an untouched New Tab
++  // page (review, LOCAL.md 52).
+   // `quitting` is browser_shutdown::HasShutdownStarted(), which this target
+   // cannot ask (a GN cycle), so the caller passes it. Called from the
+   // delegate's CreateHistoricalTab, INSIDE TabStripModel's close: it reads the
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -16,6 +16,7 @@ source_set("vertical") {
+     "vertical_tab_strip_segmented_control.h",
+     "vertical_tab_strip_top_container.h",
+     "workspace_arc_importer.h",
++    "workspace_archive_view.h",
+     "workspace_pinned_section_view.h",
+     "workspace_rail_view.h",
+   ]
+@@ -55,6 +56,7 @@ source_set("impl") {
+     "vertical_tab_strip_segmented_control.cc",
+     "vertical_tab_strip_top_container.cc",
+     "workspace_arc_importer.cc",
++    "workspace_archive_view.cc",
+     "workspace_pinned_section_view.cc",
+     "workspace_rail_view.cc",
+   ]
+@@ -83,12 +85,19 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs/workspaces:arc_import",
+     "//chrome/browser/ui/tabs/workspaces:prefs",
+ 
+-    # For workspace_arc_importer.cc (E14c) and workspace_pinned_section_view.cc
+-    # (E15b). Kept together, out of alphabetical order, so the fork's lines
+-    # stay one hunk at a rebase. The favicon HEADER target only, never
+-    # //chrome/browser/favicon:impl: that one depends on //chrome/browser/ui,
+-    # which depends on this target -- a cycle (LOCAL.md 43).
++    # For workspace_arc_importer.cc (E14c), workspace_pinned_section_view.cc
++    # (E15b) and workspace_archive_view.cc (E14d.2). Kept together, out of
++    # alphabetical order, so the fork's lines stay one hunk at a rebase. The
++    # favicon HEADER target only, never //chrome/browser/favicon:impl: that
++    # one depends on //chrome/browser/ui, which depends on this target -- a
++    # cycle (LOCAL.md 43). //chrome/browser/sessions is likewise the header
++    # target (TabRestoreServiceFactory, the archive's restore), never :impl;
++    # //chrome/browser/ui/tabs already reaches it as a public dep, so it adds
++    # no edge and no cycle.
++    "//base:i18n",
+     "//chrome/browser/favicon",
++    "//chrome/browser/sessions",
++    "//chrome/browser/ui/tabs/workspaces:archive",
+     "//chrome/browser/ui/tabs/workspaces:pins",
+     "//components/favicon/core",
+     "//components/favicon_base",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
+@@ -0,0 +1,821 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
++
++#include <algorithm>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/i18n/time_formatting.h"
++#include "base/logging.h"
++#include "base/memory/ptr_util.h"
++#include "base/strings/strcat.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/cancelable_task_tracker.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "base/timer/elapsed_timer.h"
++#include "chrome/browser/favicon/favicon_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sessions/tab_restore_service_factory.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/favicon/core/favicon_service.h"
++#include "components/favicon_base/favicon_types.h"
++#include "components/keyed_service/core/service_access_type.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/sessions/core/tab_restore_service.h"
++#include "components/sessions/core/tab_restore_types.h"
++#include "components/vector_icons/vector_icons.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/base/models/image_model.h"
++#include "ui/base/ui_base_types.h"
++#include "ui/color/color_id.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/favicon_size.h"
++#include "ui/gfx/geometry/point_f.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/strings/grit/ui_strings.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/border.h"
++#include "ui/views/bubble/bubble_border.h"
++#include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/controls/button/checkbox.h"
++#include "ui/views/controls/button/label_button.h"
++#include "ui/views/controls/button/md_text_button.h"
++#include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/menu/menu_runner.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/controls/textfield/textfield.h"
++#include "ui/views/focus/focus_manager.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/style/typography.h"
++#include "ui/views/widget/widget.h"
++#include "url/gurl.h"
++
++namespace {
++
++using workspaces::archive::ArchiveEntry;
++
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kArchiveSearchFieldId);
++
++// The screen's width (the rail's bubbles take the default 320), and how tall
++// the list grows before it scrolls.
++constexpr int kWidth = 360;
++constexpr int kListMaxHeight = 480;
++// Each side of a row and a day header, as in the pinned section (E15b).
++constexpr int kRowInset = 8;
++// Between the screen's parts, and above a day header.
++constexpr int kSpacing = 8;
++
++// The row menu.
++constexpr int kCommandRestore = 1;
++constexpr int kCommandDelete = 2;
++
++// What a row says: the name the user gave the tab, else its title, else its
++// address -- the pinned section's rule (RowText there).
++std::u16string EntryText(const ArchiveEntry& entry) {
++  return base::UTF8ToUTF16(!entry.custom_title.empty() ? entry.custom_title
++                           : !entry.title.empty()      ? entry.title
++                                                       : entry.url);
++}
++
++// "Today", "Yesterday", then the date, over the entries `days` days old.
++std::unique_ptr<views::Label> MakeDayHeader(int days, base::Time time) {
++  auto header = std::make_unique<views::Label>(
++      days == 0   ? l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_TODAY)
++      : days == 1 ? l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_YESTERDAY)
++                  : base::TimeFormatFriendlyDate(time),
++      views::style::CONTEXT_LABEL, views::style::STYLE_SECONDARY);
++  header->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  header->SetBorder(views::CreateEmptyBorder(
++      gfx::Insets::TLBR(kSpacing, kRowInset, kSpacing / 2, kRowInset)));
++  header->GetViewAccessibility().SetRole(ax::mojom::Role::kHeading);
++  return header;
++}
++
++// Clear all's question, over the `count` entries Delete all would clear.
++std::u16string ClearAllQuestion(size_t count) {
++  return l10n_util::GetPluralStringFUTF16(IDS_HELIUM_ARCHIVE_CLEAR_ALL_CONFIRM,
++                                          static_cast<int>(count));
++}
++
++// Takes the Recently Closed tab of the restored entry `id` away too, or
++// Ctrl+Shift+T opens the page a second time: E14d.1 takes a reopened close
++// out of the archive, this is the other direction (E14d.2 review). The close
++// left both with the same id (kArchiveIdExtraDataKey, 47). Nothing off the
++// record, which has no Recently Closed.
++//
++// Through DeleteNavigationEntries, the door history deletion uses, matched by
++// the ADDRESS of that tab's current navigation, so exactly one tab goes -- one
++// closed on its own, or one inside a closed window, group or split, whose other
++// tabs stay (DeleteFromTab, tab_restore_service_helper.cc). RemoveEntryById
++// could take only a whole top-level entry, and it never rewrites the saved
++// file, so the close came back at the next start (E14d.2 fix check).
++// ponytail: a split's tab inside a closed WINDOW or GROUP is kept: removing it
++// leaves that entry's split record naming a tab it no longer has, and a
++// reopened split has CHECK-crashed before (LOCAL.md 42). Take it out with its
++// split record if the owner meets it.
++void RemoveRecentlyClosedTab(Profile* profile, const std::string& id) {
++  sessions::TabRestoreService* const service =
++      TabRestoreServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return;
++  }
++  using sessions::tab_restore::Tab;
++  using sessions::tab_restore::Type;
++  const Tab* found = nullptr;
++  bool nested_split = false;
++  for (const std::unique_ptr<sessions::tab_restore::Entry>& entry :
++       service->entries()) {
++    std::vector<const Tab*> tabs;
++    // A window, a group and a split each hold their tabs as `tabs`.
++    const auto add_tabs = [&tabs](const auto& holder) {
++      for (const std::unique_ptr<Tab>& tab : holder.tabs) {
++        tabs.push_back(tab.get());
++      }
++    };
++    switch (entry->type) {
++      case Type::TAB:
++        tabs.push_back(static_cast<const Tab*>(entry.get()));
++        break;
++      case Type::WINDOW:
++        add_tabs(static_cast<const sessions::tab_restore::Window&>(*entry));
++        break;
++      case Type::GROUP:
++        add_tabs(static_cast<const sessions::tab_restore::Group&>(*entry));
++        break;
++      case Type::SPLIT:
++        add_tabs(static_cast<const sessions::tab_restore::Split&>(*entry));
++        break;
++    }
++    for (const Tab* const tab : tabs) {
++      const auto value =
++          tab->extra_data.find(workspaces::kArchiveIdExtraDataKey);
++      if (value != tab->extra_data.end() && value->second == id) {
++        found = tab;
++        nested_split = entry->type != Type::SPLIT && tab->split_id.has_value();
++        break;
++      }
++    }
++    if (found) {
++      break;
++    }
++  }
++  if (!found || nested_split || found->current_navigation_index < 0 ||
++      static_cast<size_t>(found->current_navigation_index) >=
++          found->navigations.size()) {
++    LOG(INFO)
++        << "[workspaces] archive: no Recently Closed tab of its own to remove";
++    return;
++  }
++  // DeleteFromTab drops a tab whose CURRENT navigation the predicate takes;
++  // it hands each navigation by reference, in place, so its address names this
++  // one tab and no other with the same page.
++  const sessions::SerializedNavigationEntry* const current =
++      &found->navigations[found->current_navigation_index];
++  service->DeleteNavigationEntries(base::BindRepeating(
++      [](const sessions::SerializedNavigationEntry* current,
++         const sessions::SerializedNavigationEntry& navigation) {
++        return &navigation == current;
++      },
++      base::Unretained(current)));
++  LOG(INFO) << "[workspaces] archive: its Recently Closed entry left too";
++}
++
++// One entry: its page's icon -- a globe until one is found -- and its name.
++// PinRow (workspace_pinned_section_view.cc) without folders, drag or buttons.
++class ArchiveRow : public views::LabelButton {
++  METADATA_HEADER(ArchiveRow, views::LabelButton)
++
++ public:
++  ArchiveRow(const std::u16string& text,
++             const std::u16string& tooltip,
++             const GURL& url,
++             Profile* profile,
++             views::Button::PressedCallback callback)
++      : views::LabelButton(std::move(callback), text),
++        url_(url),
++        profile_(profile) {
++    SetTooltipText(tooltip);
++    SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(0, kRowInset)));
++    SetMinSize(
++        gfx::Size(0, GetLayoutConstant(LayoutConstant::kVerticalTabHeight)));
++    // The ink drop draws the row on a layer that is not opaque, and subpixel
++    // text on one DCHECKs (the rail's E9a trap; PinRow does the same).
++    SetTextSubpixelRenderingEnabled(false);
++    // The ring drawn inside: the rows sit in a clipping scroll view (E13).
++    views::FocusRing::Get(this)->SetOutsetFocusRingDisabled(true);
++    ConfigureInkDrop(this);
++    SetImageModel(views::Button::STATE_NORMAL,
++                  ui::ImageModel::FromVectorIcon(vector_icons::kGlobeIcon,
++                                                 ui::kColorIcon,
++                                                 gfx::kFaviconSize));
++  }
++  ArchiveRow(const ArchiveRow&) = delete;
++  ArchiveRow& operator=(const ArchiveRow&) = delete;
++  ~ArchiveRow() override = default;
++
++ protected:
++  // views::Button:
++  //
++  // The icon is asked for at the row's first paint, not when it is built:
++  // every entry is built (1,750 in Arc's archive, design 5) and only those
++  // scrolled to are drawn -- the pinned section's "only a drawn row asks".
++  void PaintButtonContents(gfx::Canvas* canvas) override {
++    views::LabelButton::PaintButtonContents(canvas);
++    if (std::exchange(favicon_asked_, true)) {
++      return;
++    }
++    // With fallback_to_host: another page of the same site often has one
++    // (LOCAL.md 43).
++    if (favicon::FaviconService* const favicons =
++            FaviconServiceFactory::GetForProfile(
++                profile_, ServiceAccessType::EXPLICIT_ACCESS)) {
++      favicons->GetRawFaviconForPageURL(
++          url_, {favicon_base::IconType::kFavicon}, gfx::kFaviconSize * 2,
++          /*fallback_to_host=*/true,
++          // Unretained: `favicon_tasks_` is a member, so a row destroyed first
++          // cancels its own request.
++          base::BindOnce(&ArchiveRow::OnFavicon, base::Unretained(this)),
++          &favicon_tasks_);
++    }
++  }
++
++ private:
++  // Asked for at twice the icon size, so it is crisp at 200 %.
++  void OnFavicon(const favicon_base::FaviconRawBitmapResult& result) {
++    if (!result.is_valid()) {
++      return;
++    }
++    const SkBitmap bitmap = gfx::PNGCodec::Decode(
++        base::span<const uint8_t>(*result.bitmap_data));
++    if (bitmap.isNull()) {
++      return;
++    }
++    SetImageModel(
++        views::Button::STATE_NORMAL,
++        ui::ImageModel::FromImageSkia(gfx::ImageSkia::CreateFromBitmap(
++            bitmap, static_cast<float>(bitmap.width()) / gfx::kFaviconSize)));
++  }
++
++  const GURL url_;
++  const raw_ptr<Profile> profile_;
++  bool favicon_asked_ = false;
++  base::CancelableTaskTracker favicon_tasks_;
++};
++
++BEGIN_METADATA(ArchiveRow)
++END_METADATA
++
++}  // namespace
++
++struct WorkspaceArchiveView::Row {
++  raw_ptr<views::LabelButton> view;
++  // The day header it is drawn under; the rows of one header are adjacent.
++  raw_ptr<views::View> header;
++  std::string id;
++  // The workspace it shows in: ResolveTabGuid, so a deleted workspace's
++  // entries are Home's (design 2.4).
++  std::string guid;
++  // SearchTextFor(), made once here rather than once per keystroke.
++  std::u16string search_text;
++  // Its text, and what "All workspaces" puts before it: the workspace's rail
++  // mark and two spaces.
++  std::u16string text;
++  std::u16string prefix;
++};
++
++// static
++void WorkspaceArchiveView::Show(BrowserWindowInterface* browser,
++                                views::View* anchor) {
++  const base::ElapsedTimer timer;
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  if (!service || !service->IsEnabled()) {
++    return;
++  }
++  Profile* const profile = browser->GetProfile();
++  auto view = base::WrapUnique(new WorkspaceArchiveView(
++      browser, workspaces::archive::ArchiveStore::GetOrCreate(
++                   profile, profile->GetPath())));
++  WorkspaceArchiveView* const screen = view.get();
++
++  // No buttons: the rows, Clear all and the close button are the screen's.
++  // The search box takes the focus, so typing filters at once.
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_ARCHIVE))
++          .AddCustomField(
++              std::make_unique<views::BubbleDialogModelHost::CustomView>(
++                  std::move(view),
++                  views::BubbleDialogModelHost::FieldType::kControl,
++                  screen->search_.get()),
++              kArchiveSearchFieldId)
++          .SetInitiallyFocusedField(kArchiveSearchFieldId)
++          .Build();
++
++  // Anchored to the rail, like its other bubbles.
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), anchor, views::BubbleBorder::TOP_LEFT);
++  bubble->set_fixed_width(kWidth);
++  views::Widget* const widget =
++      views::BubbleDialogDelegate::CreateBubbleDeprecated(
++          std::move(bubble),
++          views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET);
++  widget->Show();
++  // Laid out inside the timing, so the number is what the user waited for.
++  widget->LayoutRootViewIfNecessary();
++
++  const auto shown = std::ranges::count_if(
++      screen->rows_, [](const Row& row) { return row.view->GetVisible(); });
++  LOG(INFO) << "[workspaces] archive screen: opened, " << screen->rows_.size()
++            << " entr(ies), " << shown << " shown, in "
++            << timer.Elapsed().InMilliseconds() << " ms";
++}
++
++WorkspaceArchiveView::WorkspaceArchiveView(
++    BrowserWindowInterface* browser,
++    workspaces::archive::ArchiveStore* store)
++    : browser_(browser), store_(store) {
++  SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical, gfx::Insets(), kSpacing));
++
++  auto* const top = AddChildView(std::make_unique<views::View>());
++  auto* const top_layout =
++      top->SetLayoutManager(std::make_unique<views::BoxLayout>(
++          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
++          kSpacing));
++  top_layout->set_cross_axis_alignment(
++      views::BoxLayout::CrossAxisAlignment::kCenter);
++  search_ = top->AddChildView(std::make_unique<views::Textfield>());
++  search_->SetPlaceholderText(
++      l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_SEARCH));
++  search_->GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_SEARCH));
++  search_->set_controller(this);
++  top_layout->SetFlexForView(search_, 1);
++  // Off at every open (the owner, E14d.2). Only each row's text changes on a
++  // toggle, never the rows.
++  all_workspaces_ = top->AddChildView(std::make_unique<views::Checkbox>(
++      l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_ALL_WORKSPACES),
++      base::BindRepeating(
++          [](WorkspaceArchiveView* self) {
++            const base::ElapsedTimer timer;
++            const bool all = self->all_workspaces_->GetChecked();
++            for (const Row& row : self->rows_) {
++              row.view->SetText(all ? row.prefix + row.text : row.text);
++            }
++            const int shown = self->ApplyFilter();
++            // Laid out inside the timing, as a keystroke is: on, every entry
++            // of every workspace can show at once (E14d.2 review).
++            if (views::Widget* const widget = self->GetWidget()) {
++              widget->LayoutRootViewIfNecessary();
++            }
++            LOG(INFO) << "[workspaces] archive screen: all workspaces "
++                      << (all ? "on" : "off") << " -> " << shown
++                      << " shown in " << timer.Elapsed().InMilliseconds()
++                      << " ms";
++          },
++          base::Unretained(this))));
++
++  // Without layers: a label over a layer that is not opaque DCHECKs on
++  // subpixel text (the rail's E9a trap), and scrolling repaints at most
++  // kListMaxHeight of rows, so a layer buys nothing. The bubble's own colour
++  // behind the rows keeps their text on an opaque background.
++  scroll_view_ = AddChildView(std::make_unique<views::ScrollView>(
++      views::ScrollView::ScrollWithLayers::kDisabled));
++  scroll_view_->SetBackgroundColor(ui::kColorBubbleBackground);
++  scroll_view_->SetHorizontalScrollBarMode(
++      views::ScrollView::ScrollBarMode::kDisabled);
++  scroll_view_->ClipHeightTo(0, kListMaxHeight);
++
++  // The footer: "Clear all", or in its place the question. Both built now and
++  // swapped by visibility. A second dialog would take the focus and close
++  // this bubble, so the confirm is inside it.
++  auto* const clear_all_row = AddChildView(std::make_unique<views::View>());
++  clear_all_row->SetLayoutManager(std::make_unique<views::BoxLayout>());
++  clear_all_ =
++      clear_all_row->AddChildView(std::make_unique<views::MdTextButton>(
++          base::BindRepeating(&WorkspaceArchiveView::OnClearAllPressed,
++                              base::Unretained(this)),
++          l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_CLEAR_ALL)));
++
++  confirm_ = AddChildView(std::make_unique<views::View>());
++  confirm_->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical, gfx::Insets(), kSpacing));
++  confirm_label_ = confirm_->AddChildView(std::make_unique<views::Label>());
++  confirm_label_->SetMultiLine(true);
++  confirm_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  auto* const confirm_buttons =
++      confirm_->AddChildView(std::make_unique<views::View>());
++  confirm_buttons
++      ->SetLayoutManager(std::make_unique<views::BoxLayout>(
++          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(), kSpacing))
++      ->set_main_axis_alignment(views::BoxLayout::MainAxisAlignment::kEnd);
++  confirm_buttons
++      ->AddChildView(std::make_unique<views::MdTextButton>(
++          base::BindRepeating(&WorkspaceArchiveView::OnClearAllConfirmed,
++                              base::Unretained(this)),
++          l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_CLEAR_ALL_OK)))
++      ->SetStyle(ui::ButtonStyle::kProminent);
++  cancel_ = confirm_buttons->AddChildView(std::make_unique<views::MdTextButton>(
++      base::BindRepeating(&WorkspaceArchiveView::OnClearAllCancelled,
++                          base::Unretained(this)),
++      l10n_util::GetStringUTF16(IDS_APP_CANCEL)));
++  confirm_->SetVisible(false);
++
++  // Unretained: the subscription is a member, so it ends with this view.
++  store_changed_subscription_ = store_->RegisterChangedCallback(
++      base::BindRepeating(&WorkspaceArchiveView::OnArchiveChanged,
++                          base::Unretained(this)));
++  Rebuild();
++}
++
++WorkspaceArchiveView::~WorkspaceArchiveView() = default;
++
++void WorkspaceArchiveView::ContentsChanged(views::Textfield* sender,
++                                           const std::u16string& new_contents) {
++  const base::ElapsedTimer timer;
++  const int shown = ApplyFilter();
++  // Laid out inside the timing: the layout is most of a keystroke's cost.
++  if (views::Widget* const widget = GetWidget()) {
++    widget->LayoutRootViewIfNecessary();
++  }
++  LOG(INFO) << "[workspaces] archive screen: filter of " << new_contents.size()
++            << " char(s) -> " << shown << " shown in "
++            << timer.Elapsed().InMilliseconds() << " ms";
++}
++
++void WorkspaceArchiveView::ShowContextMenuForViewImpl(
++    views::View* source,
++    const gfx::Point& point,
++    ui::mojom::MenuSourceType source_type) {
++  context_menu_id_.clear();
++  for (const Row& row : rows_) {
++    if (row.view.get() == source) {
++      context_menu_id_ = row.id;
++      break;
++    }
++  }
++  if (context_menu_id_.empty()) {
++    return;
++  }
++  context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  context_menu_model_->AddItemWithStringId(kCommandRestore,
++                                           IDS_HELIUM_ARCHIVE_RESTORE);
++  context_menu_model_->AddItemWithStringId(kCommandDelete,
++                                           IDS_HELIUM_ARCHIVE_DELETE);
++  context_menu_runner_ = std::make_unique<views::MenuRunner>(
++      context_menu_model_.get(),
++      views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU);
++  context_menu_runner_->RunMenuAt(
++      source->GetWidget(), nullptr, gfx::Rect(point, gfx::Size()),
++      views::MenuAnchorPosition::kTopLeft, source_type);
++}
++
++void WorkspaceArchiveView::ExecuteCommand(int command_id, int event_flags) {
++  // By id, not by row: a rebuild can replace the rows while the menu is open,
++  // and an id the store no longer has does nothing.
++  if (command_id == kCommandRestore) {
++    RestoreEntry(context_menu_id_);
++  } else if (command_id == kCommandDelete) {
++    DeleteEntry(context_menu_id_);
++  }
++}
++
++void WorkspaceArchiveView::Rebuild() {
++  const base::ElapsedTimer timer;
++  rebuild_posted_ = false;
++  const bool first = !scroll_view_->contents();
++  if (const views::Widget* const widget = GetWidget();
++      widget && widget->IsClosed()) {
++    // A restore closes the screen right after its Remove() posted this.
++    return;
++  }
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return;
++  }
++
++  // A row with the keyboard focus -- Delete on its menu -- hands it to the row
++  // now in its place, so the keyboard stays in the list.
++  std::optional<size_t> focused;
++  if (const views::FocusManager* const focus_manager = GetFocusManager()) {
++    const views::View* const view = focus_manager->GetFocusedView();
++    for (size_t i = 0; view && i < rows_.size(); ++i) {
++      if (rows_[i].view.get() == view) {
++        focused = i;
++        break;
++      }
++    }
++  }
++  const int offset_y = scroll_view_->GetVisibleRect().y();
++
++  // Each workspace's rail mark and name, by guid.
++  std::map<std::string, std::pair<std::u16string, std::u16string>> marks;
++  const std::vector<workspaces::prefs::WorkspaceEntry> workspace_list =
++      service->GetWorkspaces();
++  for (size_t i = 0; i < workspace_list.size(); ++i) {
++    marks[workspace_list[i].guid] = {
++        WorkspaceRailView::ButtonText(workspace_list[i], i),
++        WorkspaceRailView::DisplayName(workspace_list[i])};
++  }
++
++  // Newest first. The store keeps them in the order they were kept, which a
++  // load's merge can leave out of time order.
++  std::vector<const ArchiveEntry*> sorted;
++  sorted.reserve(store_->entries().size());
++  for (const ArchiveEntry& entry : store_->entries()) {
++    sorted.push_back(&entry);
++  }
++  std::ranges::stable_sort(
++      sorted, [](const ArchiveEntry* a, const ArchiveEntry* b) {
++        return a->archived_at > b->archived_at;
++      });
++
++  // Every row built off the widget and attached with ONE SetContents (E15b:
++  // an add under a widget walks the subtree each time). `rows_` and `empty_`
++  // let go first: they point into the contents this replaces.
++  rows_.clear();
++  auto contents = std::make_unique<views::View>();
++  contents->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical));
++  // The empty-list line is the list's first child, so showing it never changes
++  // the list's height (ApplyFilter's grow-only rule).
++  empty_ = contents->AddChildView(std::make_unique<views::Label>(
++      std::u16string(), views::style::CONTEXT_LABEL,
++      views::style::STYLE_SECONDARY));
++  empty_->SetBorder(
++      views::CreateEmptyBorder(gfx::Insets::VH(kSpacing, kRowInset)));
++  const base::Time now = base::Time::Now();
++  const bool all = all_workspaces_->GetChecked();
++  Profile* const profile = browser_->GetProfile();
++  views::View* header = nullptr;
++  int header_days = 0;
++  for (const ArchiveEntry* const entry : sorted) {
++    const int days = workspaces::archive::DaysAgo(entry->archived_at, now);
++    if (!header || days != header_days) {
++      header = contents->AddChildView(MakeDayHeader(days, entry->archived_at));
++      header_days = days;
++    }
++    Row& row = rows_.emplace_back();
++    row.header = header;
++    row.id = entry->id;
++    row.guid = std::string(
++        workspaces::ResolveTabGuid(entry->workspace, service->known_guids()));
++    row.search_text = workspaces::archive::SearchTextFor(*entry);
++    row.text = EntryText(*entry);
++    const auto mark = marks.find(row.guid);
++    std::u16string workspace_name = base::UTF8ToUTF16(row.guid);
++    if (mark != marks.end()) {
++      row.prefix = mark->second.first + u"  ";
++      workspace_name = mark->second.second;
++    }
++    auto view = std::make_unique<ArchiveRow>(
++        all ? row.prefix + row.text : row.text,
++        base::StrCat({row.text, u"\n", base::UTF8ToUTF16(entry->url), u"\n",
++                      workspace_name}),
++        GURL(entry->url), profile,
++        base::BindRepeating(&WorkspaceArchiveView::RestoreEntry,
++                            base::Unretained(this), entry->id));
++    view->set_context_menu_controller(this);
++    row.view = contents->AddChildView(std::move(view));
++  }
++  scroll_view_->SetContents(std::move(contents));
++  ApplyFilter();
++  clear_all_->SetEnabled(store_->loaded() && !store_->read_only() &&
++                         !store_->entries().empty());
++  // An open Clear all question counts what Delete all would clear NOW: a
++  // close in another window, or a row's Delete, can land while it waits
++  // (E14d.2 review). Said again, as it was when it appeared.
++  if (confirm_->GetVisible()) {
++    const std::u16string question = ClearAllQuestion(store_->entries().size());
++    if (question != confirm_label_->GetText()) {
++      confirm_label_->SetText(question);
++      GetViewAccessibility().AnnouncePolitely(question);
++    }
++  }
++  if (first) {
++    return;
++  }
++
++  // Where the list was, then laid out BEFORE the focus moves (E14d.2 review):
++  // the layout sizes the new rows and clamps the offset to the new length
++  // (ScrollView's ConstrainScrollToBounds). A row focused while still 0x0 at
++  // the top would scroll the list back to the top to show it.
++  scroll_view_->ScrollToOffset(gfx::PointF(0, offset_y));
++  if (views::Widget* const widget = GetWidget()) {
++    widget->LayoutRootViewIfNecessary();
++  }
++  if (focused) {
++    views::View* next = search_;
++    for (size_t i = *focused; i < rows_.size(); ++i) {
++      if (rows_[i].view->GetVisible()) {
++        next = rows_[i].view;
++        break;
++      }
++    }
++    next->RequestFocus();
++  }
++  LOG(INFO) << "[workspaces] archive screen: rebuilt after a change, "
++            << rows_.size() << " entr(ies) in "
++            << timer.Elapsed().InMilliseconds() << " ms";
++}
++
++int WorkspaceArchiveView::ApplyFilter() {
++  // Grow-only while the screen is open (E14d.2 review): the bubble sits above
++  // the rail with its bottom edge fixed, so a list that shrank as rows hide
++  // would move the search box being typed into. A late load or the switch may
++  // still make it taller. Taken before the rows hide: height() is the list as
++  // last laid out (0 before the first layout).
++  list_height_ = std::max(list_height_, scroll_view_->height());
++  scroll_view_->ClipHeightTo(list_height_, kListMaxHeight);
++
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  const std::string_view active = service
++                                      ? std::string_view(service->active_guid())
++                                      : workspaces::kDefaultWorkspaceGuid;
++  const bool all = all_workspaces_->GetChecked();
++  const std::u16string_view query = search_->GetText();
++  int shown = 0;
++  int in_scope = 0;
++  views::View* header = nullptr;
++  bool header_shown = false;
++  for (const Row& row : rows_) {
++    if (row.header != header) {
++      if (header) {
++        header->SetVisible(header_shown);
++      }
++      header = row.header;
++      header_shown = false;
++    }
++    const bool scoped = all || row.guid == active;
++    const bool show =
++        scoped && workspaces::archive::MatchesQuery(row.search_text, query);
++    if (scoped) {
++      ++in_scope;
++    }
++    if (show) {
++      ++shown;
++      header_shown = true;
++    }
++    row.view->SetVisible(show);
++  }
++  if (header) {
++    header->SetVisible(header_shown);
++  }
++  empty_->SetText(l10n_util::GetStringUTF16(
++      in_scope ? IDS_HELIUM_ARCHIVE_NO_MATCHES : IDS_HELIUM_ARCHIVE_EMPTY));
++  empty_->SetVisible(shown == 0);
++  return shown;
++}
++
++void WorkspaceArchiveView::OnArchiveChanged() {
++  // Posted, never run here: Add() calls this from inside TabStripModel's
++  // close (design 2.2). One rebuild however many changes come first.
++  if (rebuild_posted_) {
++    return;
++  }
++  rebuild_posted_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspaceArchiveView::Rebuild,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void WorkspaceArchiveView::RestoreEntry(const std::string& id) {
++  const auto it =
++      std::ranges::find(store_->entries(), id, &ArchiveEntry::id);
++  if (it == store_->entries().end()) {
++    return;
++  }
++  // A copy: the Remove() below changes the store's vector.
++  const ArchiveEntry entry = *it;
++  const GURL url(entry.url);
++  if (!url.is_valid()) {
++    LOG(WARNING) << "[workspaces] archive: an entry has no address a tab can "
++                    "open";
++    return;
++  }
++  // Not with Workspaces switched off while the screen stays open: the rail,
++  // its door, is gone, and a restore would land at the strip's end with its
++  // entry spent (code review).
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || !service->IsEnabled()) {
++    return;
++  }
++
++  // Home for a deleted workspace, as the list draws it (design 2.4).
++  const std::string guid(
++      workspaces::ResolveTabGuid(entry.workspace, service->known_guids()));
++  // EnterWorkspaceForInsert, not SwitchToWorkspace: the switch activates a
++  // tab of the workspace -- and spawns a New Tab into an empty one -- when the
++  // page inserted below, selected, is the tab to show. This moves only the
++  // bookkeeping, the tab being left included, so coming back by the rail
++  // lands on it (E14d.2 review), and the top of the list below is then that
++  // workspace's.
++  service->EnterWorkspaceForInsert(guid);
++  // At the top of the list, where a new tab opens (E15c.1); the end when the
++  // workspace has no tab.
++  TabStripModel* const model = browser_->GetTabStripModel();
++  int index = service->TopOfListIndex(nullptr);
++  if (index < 0) {
++    index = model->count();
++  }
++
++  // A pinned item's road (OpenItem, E15c): one history entry, and the tag and
++  // name on the contents BEFORE the insert, so the tab is never drawn in the
++  // wrong workspace. No pin item and no anchor: it comes back an ordinary tab.
++  sessions::SerializedNavigationEntry navigation;
++  navigation.set_index(0);
++  navigation.set_virtual_url(url);
++  navigation.set_title(base::UTF8ToUTF16(entry.title));
++  std::map<std::string, std::string> extra_data;
++  extra_data[workspaces::kWorkspaceExtraDataKey] = guid;
++  if (!entry.custom_title.empty()) {
++    extra_data[workspaces::kCustomTitleExtraDataKey] = entry.custom_title;
++  }
++  chrome::AddRestoredTab(
++      browser_, base::span_from_ref(navigation), index,
++      /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
++      /*group=*/std::nullopt, /*select=*/true, /*pin=*/false,
++      base::TimeTicks::Now(), base::Time::Now(),
++      /*storage_namespace=*/nullptr, sessions::SerializedUserAgentOverride(),
++      extra_data, /*from_session_restore=*/false,
++      /*is_active_browser=*/std::nullopt,
++      chrome::RestoredTabLoadPolicy::kLoadIfVisible);
++  // The page lives in one place, as in Arc: out of the archive now, and out
++  // of Recently Closed.
++  store_->Remove(id);
++  LOG(INFO) << "[workspaces] archive: restored an entry into '" << guid << "'";
++  RemoveRecentlyClosedTab(browser_->GetProfile(), id);
++  GetWidget()->Close();
++}
++
++void WorkspaceArchiveView::DeleteEntry(const std::string& id) {
++  const bool removed = store_->Remove(id);
++  LOG(INFO) << "[workspaces] archive: deleted an entry"
++            << (removed ? "" : " (refused)");
++}
++
++void WorkspaceArchiveView::OnClearAllPressed() {
++  const size_t count = store_->entries().size();
++  confirm_label_->SetText(ClearAllQuestion(count));
++  clear_all_->parent()->SetVisible(false);
++  confirm_->SetVisible(true);
++  // Cancel, not Delete all, under the keyboard: Enter must not clear.
++  cancel_->RequestFocus();
++  // Said aloud: the focus on Cancel reads only "Cancel", never that this
++  // clears every workspace's entries (E14d.2 review).
++  GetViewAccessibility().AnnounceAlert(confirm_label_->GetText());
++  LOG(INFO) << "[workspaces] archive screen: clear all asked (" << count
++            << ")";
++}
++
++void WorkspaceArchiveView::OnClearAllConfirmed() {
++  // Every workspace's entries, whatever the switch shows (the class comment).
++  const size_t cleared = store_->RemoveSince(base::Time());
++  LOG(INFO) << "[workspaces] archive: cleared " << cleared << " entr(ies)";
++  confirm_->SetVisible(false);
++  clear_all_->parent()->SetVisible(true);
++  search_->RequestFocus();
++}
++
++void WorkspaceArchiveView::OnClearAllCancelled() {
++  LOG(INFO) << "[workspaces] archive screen: clear all cancelled";
++  confirm_->SetVisible(false);
++  clear_all_->parent()->SetVisible(true);
++  clear_all_->RequestFocus();
++}
++
++BEGIN_METADATA(WorkspaceArchiveView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
+@@ -0,0 +1,205 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_ARCHIVE_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_ARCHIVE_VIEW_H_
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/menus/simple_menu_model.h"
++#include "ui/views/context_menu_controller.h"
++#include "ui/views/controls/textfield/textfield_controller.h"
++#include "ui/views/view.h"
++
++class BrowserWindowInterface;
++
++namespace views {
++class Checkbox;
++class Label;
++class MdTextButton;
++class MenuRunner;
++class ScrollView;
++class Textfield;
++}  // namespace views
++
++namespace workspaces::archive {
++class ArchiveStore;
++}  // namespace workspaces::archive
++
++// The Archive screen (E14d.2, design 5 "E14d spec"): the tabs this profile
++// closed, newest first, under a header per day (Today, Yesterday, then dates),
++// each row the page's icon and its name. Opened from "Archive" on the rail's
++// "+" menu, as a bubble on the rail (the owner's choice, 2026-09-28), like
++// the rail's other three.
++//
++//   [ Search archive              ]  [ ] All workspaces
++//   Today
++//     (icon) A page
++//   Yesterday
++//     (icon) Another page
++//   ...
++//   [ Clear all ]
++//
++// - Shows the entries of this window's workspace (ResolveTabGuid: a deleted
++//   workspace's entries are Home's, design 2.4); "All workspaces", off at every
++//   open, shows every entry, each row then led by its workspace's rail mark
++//   (WorkspaceRailView::ButtonText) and its tooltip naming the workspace.
++// - The search box filters as it is typed: MatchesQuery() over SearchTextFor()
++//   (workspace_archive.h). Rows and headers are hidden, never rebuilt, so a
++//   keystroke costs one layout.
++// - The list never gets shorter while the screen is open (ApplyFilter): the
++//   bubble sits above the rail with its bottom edge fixed, so a shrinking list
++//   would move the search box under the typing. Its empty-list line is inside
++//   the list for the same reason.
++// - A click, Enter or Space on a row, or Restore on its menu, restores the
++//   page and closes the screen: the window switches to the entry's workspace
++//   (Home for a deleted one, WorkspaceService::EnterWorkspaceForInsert), the
++//   page opens at the top of the list (E15c.1's place), selected and loaded,
++//   with its custom name -- by the road a pinned item opens
++//   (chrome::AddRestoredTab, the tag in the extra data before the insert,
++//   E15c) -- and the entry leaves the archive, and its close leaves Recently
++//   Closed, saved so, also from inside a closed window, group or split (not a
++//   split's tab inside a window or group), so Ctrl+Shift+T does not open the
++//   page twice, not even after a restart.
++// - Delete on a row's menu removes that entry; the screen stays open.
++// - Clear all asks first, inside the screen (a second dialog would take the
++//   focus and close this bubble): "Delete N archived tabs, from every
++//   workspace?" with Delete all / Cancel, said aloud as it appears, its N
++//   kept current while it waits. It clears EVERY workspace's entries
++//   (ArchiveStore::RemoveSince(base::Time())), whatever the switch shows.
++//
++// Every row of the store is built once, off the widget, and attached with one
++// SetContents (E15b: adding children under a layered ancestor walks the whole
++// subtree per add). A change to the store while the screen is open (a Delete,
++// a close in another window, the load finishing) posts ONE rebuild, never runs
++// it inside the store's callback: that can be inside TabStripModel's close. A
++// rebuild keeps the search text, the switch and the scroll offset.
++//
++// Logs, never an address, a title or the search text (47's rule: a log is
++// pasted when asking for help):
++//   "[workspaces] archive screen: opened, N entr(ies), M shown, in T ms"
++//   "[workspaces] archive screen: filter of L char(s) -> M shown in T ms"
++//   "[workspaces] archive screen: all workspaces on|off -> M shown in T ms"
++//   "[workspaces] archive screen: rebuilt after a change, N entr(ies) in T ms"
++//   "[workspaces] archive: restored an entry into '<guid>'", then (never off
++//   the record, which has no Recently Closed)
++//     "[workspaces] archive: its Recently Closed entry left too" or
++//     "[workspaces] archive: no Recently Closed tab of its own to remove"
++//   "[workspaces] archive: an entry has no address a tab can open" (a
++//   WARNING: nothing restored)
++//   "[workspaces] archive: deleted an entry" (+ " (refused)")
++//   "[workspaces] archive screen: clear all asked (N)" / "clear all cancelled"
++//   "[workspaces] archive: cleared N entr(ies)"
++//
++// Accessible names the hands-free test presses by (MSAA): the bubble's title
++// "Archive", the text field "Search archive", the check box "All workspaces",
++// each row its shown text, the headers "Today" / "Yesterday" / a date, the
++// buttons "Clear all", "Delete all", "Cancel", and the row menu's "Restore" and
++// "Delete". Empty lists say "No archived tabs" or "No matches".
++//
++// A plain view inside the rail's kind of bubble (a ui::DialogModel in a
++// views::BubbleDialogModelHost, its one custom field), not a
++// BubbleDialogDelegateView: at M153 that class's constructors are private to
++// a friend list upstream marks "DO NOT ADD", so a subclass of ours does not
++// compile without a new upstream file (E14d.2).
++class WorkspaceArchiveView : public views::View,
++                             public views::TextfieldController,
++                             public views::ContextMenuController,
++                             public ui::SimpleMenuModel::Delegate {
++  METADATA_HEADER(WorkspaceArchiveView, views::View)
++
++ public:
++  // Opens the screen for `browser`'s profile and window, anchored to `anchor`
++  // (the rail). Does nothing while Workspaces is off in `browser`.
++  static void Show(BrowserWindowInterface* browser, views::View* anchor);
++
++  WorkspaceArchiveView(const WorkspaceArchiveView&) = delete;
++  WorkspaceArchiveView& operator=(const WorkspaceArchiveView&) = delete;
++  ~WorkspaceArchiveView() override;
++
++  // views::TextfieldController:
++  void ContentsChanged(views::Textfield* sender,
++                       const std::u16string& new_contents) override;
++
++  // views::ContextMenuController:
++  void ShowContextMenuForViewImpl(
++      views::View* source,
++      const gfx::Point& point,
++      ui::mojom::MenuSourceType source_type) override;
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override;
++
++ private:
++  // One drawn entry (workspace_archive_view.cc).
++  struct Row;
++
++  WorkspaceArchiveView(BrowserWindowInterface* browser,
++                       workspaces::archive::ArchiveStore* store);
++
++  // Builds a row per entry of the store, newest first, with its day headers,
++  // off the widget, and swaps it in with one SetContents; then ApplyFilter().
++  void Rebuild();
++
++  // Shows the rows the switch and the search box let through, and the headers
++  // with a row shown under them, or the empty-list line; the list's height
++  // only grows. Answers how many rows are shown.
++  int ApplyFilter();
++
++  // The store's changed callback: posts one Rebuild(), coalesced.
++  void OnArchiveChanged();
++
++  // Restores the entry `id` (see the class comment) and closes the screen.
++  void RestoreEntry(const std::string& id);
++
++  // Removes the entry `id`; the store's callback redraws.
++  void DeleteEntry(const std::string& id);
++
++  // The footer's two states: "Clear all", and its confirm.
++  void OnClearAllPressed();
++  void OnClearAllConfirmed();
++  void OnClearAllCancelled();
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  const raw_ptr<workspaces::archive::ArchiveStore> store_;
++
++  raw_ptr<views::Textfield> search_ = nullptr;
++  raw_ptr<views::Checkbox> all_workspaces_ = nullptr;
++  raw_ptr<views::ScrollView> scroll_view_ = nullptr;
++  // "No archived tabs" / "No matches": the first child of the list's
++  // contents, remade and re-pointed by every Rebuild() before the old
++  // contents go.
++  raw_ptr<views::Label> empty_ = nullptr;
++  // The tallest the list has been laid out while the screen is open: its
++  // floor, so it only grows (ApplyFilter).
++  int list_height_ = 0;
++  // The footer's two children, one shown at a time: "Clear all", and its
++  // confirm (the question, Delete all, Cancel).
++  raw_ptr<views::MdTextButton> clear_all_ = nullptr;
++  raw_ptr<views::View> confirm_ = nullptr;
++  raw_ptr<views::Label> confirm_label_ = nullptr;
++  raw_ptr<views::MdTextButton> cancel_ = nullptr;
++
++  // The rows in drawn order, remade by every Rebuild(): cleared BEFORE the
++  // views they point at are replaced.
++  std::vector<Row> rows_;
++
++  // The entry id the open row menu belongs to (the rail's pattern: the menu
++  // runs, ExecuteCommand arrives later with a command id only).
++  std::string context_menu_id_;
++  std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
++  std::unique_ptr<views::MenuRunner> context_menu_runner_;
++
++  bool rebuild_posted_ = false;
++  base::CallbackListSubscription store_changed_subscription_;
++  base::WeakPtrFactory<WorkspaceArchiveView> weak_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_ARCHIVE_VIEW_H_
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -28,6 +28,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "chrome/browser/ui/views/tabs/vertical/top_container_button.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/l10n/l10n_util.h"
+@@ -91,6 +92,7 @@ constexpr int kMenuCommandNewTab = 17;
+ constexpr int kMenuCommandNewWorkspace = 18;
+ constexpr int kMenuCommandTabSearch = 19;
+ constexpr int kMenuCommandImportArc = 20;
++constexpr int kMenuCommandArchive = 21;
+ static_assert(kMenuCommandIconPresetFirst + std::size(kIconPresets) <=
+               kMenuCommandNewTab);
+ 
+@@ -104,7 +106,7 @@ constexpr int kRecentlyClosedLimit = 25;
+ // every pixel they do not take is a workspace button shown.
+ constexpr int kArrowWidth = 20;
+ 
+-// What a workspace's button says.
++// What a workspace's button says when it has no icon (ButtonText).
+ //
+ // TopContainerButton is a fixed square -- CalculatePreferredSize returns
+ // kVerticalTabStripCollapseButtonSize both ways and ignores the text -- so this
+@@ -129,24 +131,6 @@ std::u16string LabelForWorkspace(const s
+       0, is_lead_surrogate && display_name.size() > 1 ? 2 : 1);
+ }
+ 
+-// The name to show for a workspace: its title, or a localised "Home" for the
+-// default workspace, or the guid for anything else still unnamed.
+-//
+-// The default workspace's name lives here rather than in the model on purpose.
+-// E7c left its title empty because a user-visible string has to be localised
+-// and belongs with the thing that draws it -- this is that thing. Renaming it
+-// gives it a real stored title and this fallback stops applying.
+-std::u16string DisplayNameForWorkspace(
+-    const workspaces::prefs::WorkspaceEntry& entry) {
+-  if (!entry.title.empty()) {
+-    return base::UTF8ToUTF16(entry.title);
+-  }
+-  if (entry.guid == workspaces::kDefaultWorkspaceGuid) {
+-    return l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_DEFAULT_NAME);
+-  }
+-  return base::UTF8ToUTF16(entry.guid);
+-}
+-
+ // The entry a menu was opened on, or null if the list changed under it.
+ const workspaces::prefs::WorkspaceEntry* FindEntry(
+     const std::vector<workspaces::prefs::WorkspaceEntry>& entries,
+@@ -370,14 +354,9 @@ void WorkspaceRailView::Rebuild() {
+       service->GetWorkspaces();
+ 
+   for (size_t i = 0; i < entries.size(); ++i) {
+-    const std::u16string display_name = DisplayNameForWorkspace(entries[i]);
+-
+-    // An icon, when one has been set, replaces the first-character label
+-    // outright; the full name stays in the tooltip either way.
++    // The full name is in the tooltip, whatever the button says.
+     auto button = MakeRailButton(
+-        entries[i].icon.empty() ? LabelForWorkspace(display_name, i)
+-                                : base::UTF8ToUTF16(entries[i].icon),
+-        display_name,
++        ButtonText(entries[i], i), DisplayName(entries[i]),
+         base::BindRepeating(&WorkspaceRailView::OnWorkspacePressed,
+                             base::Unretained(this), entries[i].guid));
+     button->set_context_menu_controller(this);
+@@ -446,6 +425,8 @@ void WorkspaceRailView::OnAddPressed(con
+                                            IDS_HELIUM_WORKSPACE_NEW);
+   context_menu_model_->AddItemWithStringId(kMenuCommandTabSearch,
+                                            IDS_TAB_SEARCH_MENU);
++  context_menu_model_->AddItemWithStringId(kMenuCommandArchive,
++                                           IDS_HELIUM_WORKSPACE_ARCHIVE);
+   context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   context_menu_model_->AddItemWithStringId(kMenuCommandImportArc,
+                                            IDS_HELIUM_WORKSPACE_IMPORT_ARC);
+@@ -647,7 +628,7 @@ bool WorkspaceRailView::IsCommandIdEnabl
+ }
+ 
+ void WorkspaceRailView::ExecuteCommand(int command_id, int event_flags) {
+-  // The "+" menu's three, which act on the window rather than a workspace.
++  // The "+" menu's items, which act on the window rather than a workspace.
+   // browser_commands.h belongs to //chrome/browser/ui, which depends on this
+   // target, so no GN dep can name it; the build does not run gn check, and
+   // the include resolves. The same one-liner new_tab_button.cc uses (15).
+@@ -667,6 +648,10 @@ void WorkspaceRailView::ExecuteCommand(i
+       LOG(INFO) << "[workspaces] rail + menu: tab search";
+       chrome::ExecuteCommand(browser_, IDC_TAB_SEARCH);
+       return;
++    case kMenuCommandArchive:
++      LOG(INFO) << "[workspaces] rail + menu: archive";
++      WorkspaceArchiveView::Show(browser_, this);
++      return;
+     case kMenuCommandImportArc:
+       LOG(INFO) << "[workspaces] rail + menu: import from Arc";
+       arc_importer_.Start(base::BindOnce(&WorkspaceRailView::OnArcImportDone,
+@@ -692,7 +677,7 @@ void WorkspaceRailView::ExecuteCommand(i
+           FindEntry(entries, guid);
+       ShowNameBubble(
+           this, IDS_HELIUM_WORKSPACE_RENAME, IDS_HELIUM_WORKSPACE_NAME_LABEL,
+-          entry ? DisplayNameForWorkspace(*entry) : std::u16string(),
++          entry ? DisplayName(*entry) : std::u16string(),
+           base::BindOnce(
+               [](base::WeakPtr<WorkspaceRailView> self, const std::string& guid,
+                  const std::u16string& name) {
+@@ -899,6 +884,33 @@ void WorkspaceRailView::ShowNameBubble(
+   widget->Show();
+ }
+ 
++// static
++//
++// The default workspace's name lives here rather than in the model on purpose.
++// E7c left its title empty because a user-visible string has to be localised
++// and belongs with the thing that draws it -- this is that thing. Renaming it
++// gives it a real stored title and this fallback stops applying.
++std::u16string WorkspaceRailView::DisplayName(
++    const workspaces::prefs::WorkspaceEntry& entry) {
++  if (!entry.title.empty()) {
++    return base::UTF8ToUTF16(entry.title);
++  }
++  if (entry.guid == workspaces::kDefaultWorkspaceGuid) {
++    return l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_DEFAULT_NAME);
++  }
++  return base::UTF8ToUTF16(entry.guid);
++}
++
++// static
++//
++// An icon, when one has been set, replaces the first-character label outright.
++std::u16string WorkspaceRailView::ButtonText(
++    const workspaces::prefs::WorkspaceEntry& entry,
++    size_t index) {
++  return entry.icon.empty() ? LabelForWorkspace(DisplayName(entry), index)
++                            : base::UTF8ToUTF16(entry.icon);
++}
++
+ void WorkspaceRailView::OnCollapseStateChanged(
+     tabs::VerticalTabStripCollapseState state) {
+   // Follows the parent container: a row when the strip is expanded, a column
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -31,6 +31,10 @@ namespace ui {
+ class Event;
+ }  // namespace ui
+ 
++namespace workspaces::prefs {
++struct WorkspaceEntry;
++}  // namespace workspaces::prefs
++
+ namespace views {
+ class MenuButtonController;
+ class MenuRunner;
+@@ -124,6 +128,16 @@ class WorkspaceRailView : public views::
+       const std::u16string& initial_text,
+       base::OnceCallback<void(const std::u16string&)> on_accept);
+ 
++  // A workspace's name as the rail shows it -- its title, "Home" for the
++  // unnamed default one, else its guid -- and what its button says: its icon,
++  // else the name's first character, else its 1-based `index`. The Archive
++  // screen marks a row with the second and names it with the first (E14d.2).
++  static std::u16string DisplayName(
++      const workspaces::prefs::WorkspaceEntry& entry);
++  static std::u16string ButtonText(
++      const workspaces::prefs::WorkspaceEntry& entry,
++      size_t index);
++
+  private:
+   // Throws the buttons away and makes them again from the current list.
+   void Rebuild();

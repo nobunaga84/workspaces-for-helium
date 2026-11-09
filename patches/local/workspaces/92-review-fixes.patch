@@ -1,0 +1,580 @@
+--- a/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.cc
+@@ -62,7 +62,7 @@ ExistingWorkspaceSubMenuModel::ExistingW
+     : ui::SimpleMenuModel(this),
+       browser_(browser),
+       tab_strip_(tab_strip),
+-      context_index_(context_index) {
++      context_tab_(tab_strip->GetTabAtIndex(context_index)->GetHandle()) {
+   workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
+   if (!service) {
+@@ -93,9 +93,14 @@ std::string ExistingWorkspaceSubMenuMode
+   return index < guids_.size() ? guids_[index] : std::string();
+ }
+ 
++int ExistingWorkspaceSubMenuModel::ContextIndex() const {
++  const tabs::TabInterface* const tab = context_tab_.Get();
++  return tab ? tab_strip_->GetIndexOfTab(tab) : TabStripModel::kNoTab;
++}
++
+ bool ExistingWorkspaceSubMenuModel::IsCommandIdEnabled(int command_id) const {
+   const std::string guid = GuidForCommandId(command_id);
+-  if (guid.empty() || !tab_strip_->ContainsIndex(context_index_)) {
++  if (guid.empty() || ContextIndex() == TabStripModel::kNoTab) {
+     return false;
+   }
+ 
+@@ -105,8 +110,8 @@ bool ExistingWorkspaceSubMenuModel::IsCo
+     return false;
+   }
+ 
+-  tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(context_index_);
+-  if (!tab || !tab->GetContents()) {
++  tabs::TabInterface* const tab = context_tab_.Get();
++  if (!tab->GetContents()) {
+     return false;
+   }
+ 
+@@ -130,7 +135,8 @@ void ExistingWorkspaceSubMenuModel::Exec
+   const std::string guid = GuidForCommandId(command_id);
+   workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
+-  if (guid.empty() || !service) {
++  const int index = ContextIndex();
++  if (guid.empty() || !service || index == TabStripModel::kNoTab) {
+     return;
+   }
+ 
+@@ -144,16 +150,15 @@ void ExistingWorkspaceSubMenuModel::Exec
+   // is a friend of it. Four lines of public API is a better trade than another
+   // hunk in a header seven Helium patches already touch.
+   std::vector<tabs::TabInterface*> tabs;
+-  if (tab_strip_->IsTabSelected(context_index_)) {
++  if (tab_strip_->IsTabSelected(index)) {
+     for (tabs::TabInterface* tab :
+          tab_strip_->selection_model().selected_tabs()) {
+       if (tab) {
+         tabs.push_back(tab);
+       }
+     }
+-  } else if (tabs::TabInterface* tab =
+-                 tab_strip_->GetTabAtIndex(context_index_)) {
+-    tabs.push_back(tab);
++  } else {
++    tabs.push_back(context_tab_.Get());
+   }
+ 
+   service->MoveTabsToWorkspace(tabs, guid);
+--- a/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h
+@@ -9,6 +9,7 @@
+ #include <vector>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "ui/menus/simple_menu_model.h"
+ 
+ class BrowserWindowInterface;
+@@ -68,9 +69,16 @@ class ExistingWorkspaceSubMenuModel : pu
+   // one of ours.
+   std::string GuidForCommandId(int command_id) const;
+ 
++  // Where the right-clicked tab is NOW, or kNoTab once it closed or left this
++  // window: the menu stays open while the strip changes (review #1).
++  int ContextIndex() const;
++
+   const raw_ptr<BrowserWindowInterface> browser_;
+   const raw_ptr<TabStripModel> tab_strip_;
+-  const int context_index_;
++  // The right-clicked tab, held by handle rather than by the index it had as
++  // the menu opened: an index taken then may name another tab, or none, by
++  // the click -- and IsTabSelected() CHECKs one that is out of range.
++  const tabs::TabHandle context_tab_;
+ 
+   // Parallel to the menu items, in the order they were added.
+   std::vector<std::string> guids_;
+--- a/chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.cc
+@@ -86,17 +86,24 @@ base::Time WakeTime(base::TimeDelta dela
+   return base::Time::Now() + delay;
+ }
+ 
+-// Snoozes the ones of `handles` still open, through their window's service.
+-// They are one window's -- the menu's -- and one that moved to another window
+-// meanwhile is skipped by its CloseTabs(), which looks for it in its own strip.
+-void SnoozeLiveTabs(const std::vector<tabs::TabHandle>& handles,
+-                    base::Time wake_at) {
++// The ones of `handles` still open.
++std::vector<tabs::TabInterface*> LiveTabs(
++    const std::vector<tabs::TabHandle>& handles) {
+   std::vector<tabs::TabInterface*> tabs;
+   for (const tabs::TabHandle& handle : handles) {
+     if (tabs::TabInterface* const tab = handle.Get()) {
+       tabs.push_back(tab);
+     }
+   }
++  return tabs;
++}
++
++// Snoozes the ones of `handles` still open, through their window's service.
++// They are one window's -- the menu's -- and one that moved to another window
++// meanwhile is skipped by its CloseTabs(), which looks for it in its own strip.
++void SnoozeLiveTabs(const std::vector<tabs::TabHandle>& handles,
++                    base::Time wake_at) {
++  const std::vector<tabs::TabInterface*> tabs = LiveTabs(handles);
+   workspaces::WorkspaceService* const service =
+       tabs.empty() ? nullptr
+                    : workspaces::WorkspaceService::From(
+@@ -198,8 +205,10 @@ WorkspaceSnoozeSubMenuModel::WorkspaceSn
+     int context_index)
+     : ui::SimpleMenuModel(this),
+       browser_(browser),
+-      tab_strip_(tab_strip),
+-      context_index_(context_index) {
++      tab_strip_(tab_strip) {
++  for (tabs::TabInterface* const tab : TargetTabs(tab_strip, context_index)) {
++    targets_.push_back(tab->GetHandle());
++  }
+   // The time each choice wakes at, as the menu opens: "In 3 hours (5:40 PM)".
+   const base::Time now = base::Time::Now();
+   for (int i = 0; i < kHourItems; ++i) {
+@@ -234,8 +243,7 @@ bool WorkspaceSnoozeSubMenuModel::Should
+ 
+ void WorkspaceSnoozeSubMenuModel::ExecuteCommand(int command_id,
+                                                  int event_flags) {
+-  const std::vector<tabs::TabInterface*> tabs =
+-      TargetTabs(tab_strip_, context_index_);
++  const std::vector<tabs::TabInterface*> tabs = LiveTabs(targets_);
+   if (command_id == kCustom) {
+     ShowCustomSnoozeDialog(tab_strip_, tabs);
+     return;
+--- a/chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/workspace_snooze_sub_menu_model.h
+@@ -5,7 +5,10 @@
+ #ifndef CHROME_BROWSER_UI_TABS_WORKSPACE_SNOOZE_SUB_MENU_MODEL_H_
+ #define CHROME_BROWSER_UI_TABS_WORKSPACE_SNOOZE_SUB_MENU_MODEL_H_
+ 
++#include <vector>
++
+ #include "base/memory/raw_ptr.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "ui/menus/simple_menu_model.h"
+ 
+ class BrowserWindowInterface;
+@@ -43,7 +46,11 @@ class WorkspaceSnoozeSubMenuModel : publ
+  private:
+   const raw_ptr<BrowserWindowInterface> browser_;
+   const raw_ptr<TabStripModel> tab_strip_;
+-  const int context_index_;
++  // The tabs it acts on, by handle, taken as the menu opened: a sweep close or
++  // a wake insert under the open menu shifts the strip, and the index saved
++  // then would snooze the wrong tab (review #25), as Custom...'s box already
++  // knew.
++  std::vector<tabs::TabHandle> targets_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACE_SNOOZE_SUB_MENU_MODEL_H_
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -247,6 +247,13 @@ source_set("workspaces") {
+     # -- they are listed because this target includes their headers directly.
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/sessions",
++
++    # For the reason Unload hands DiscardPage (review #3): listed so the
++    # generated header exists before this target compiles. Mojom only, so no
++    # cycle. DiscardPage itself is in //chrome/browser, which depends on this
++    # target: no dep can name it, gn check is off here, and it links in
++    # chrome.dll (LOCAL.md 41).
++    "//chrome/browser/resource_coordinator:mojo_bindings",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs:tabs",
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -23,7 +23,9 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/uuid.h"
++#include "chrome/browser/performance_manager/public/user_tuning/user_tuning_utils.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom-shared.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection.h"
+@@ -239,6 +241,22 @@ base::WeakPtr<performance_manager::PageN
+       GetPrimaryPageNodeForWebContents(contents);
+ }
+ 
++// One tab's share of Helium's Hibernate command, whose handler takes a
++// SELECTED tab's whole selection with it (GetIndicesDiscardedByCommand), the
++// workspace on screen included (review #3): its DiscardPage call, reason and
++// flag, for this page alone. DiscardPage asks the eligibility policy itself.
++void DiscardTab(content::WebContents* contents) {
++  if (!contents || contents->WasDiscarded()) {
++    return;
++  }
++  if (const base::WeakPtr<performance_manager::PageNode> page =
++          PageNodeFor(contents)) {
++    performance_manager::user_tuning::DiscardPage(
++        page.get(), ::mojom::LifecycleUnitDiscardReason::EXTERNAL,
++        /*ignore_minimum_time_in_background=*/true);
++  }
++}
++
+ // Whether `page` is audible, or stopped being audible less than
+ // archive::kRecentlyAudibleFor ago: the node times its last change either
+ // way, so while it is not audible that change was the stop. False with no
+@@ -753,6 +771,7 @@ int WorkspaceService::CloseWorkspaceTabs
+   int pinned_kept = 0;
+   std::vector<tabs::TabHandle> doomed =
+       TabsToClose(guid, &pinned_kept, today_only);
++  const int anchored_kept = KeepAnchoredTabs(doomed);
+ 
+   // The kept count is the evidence for the pinned rule: Chromium reopens the
+   // last session's pinned tabs at startup, so how many tabs a close takes
+@@ -760,10 +779,24 @@ int WorkspaceService::CloseWorkspaceTabs
+   LOG(INFO) << "[workspaces] closing " << doomed.size()
+             << " tab(s) of workspace '" << guid << "' in this window, "
+             << pinned_kept << " pinned kept"
+-            << (today_only ? ", pinned pages kept (Clear Today)" : "");
++            << (today_only ? ", pinned pages kept (Clear Today)" : "") << ", "
++            << anchored_kept << " anchored kept";
+   return CloseTabs(std::move(doomed));
+ }
+ 
++int WorkspaceService::KeepAnchoredTabs(
++    std::vector<tabs::TabHandle>& doomed) const {
++  // An anchor leaves only by being unanchored: every other close path puts it
++  // to sleep instead (HibernateAnchoredTab), and the Archive entry a close
++  // files carries no anchor, so a restore came back unanchored (review #5).
++  // A split half is not kept, as HibernateAnchoredTab does not keep one.
++  return static_cast<int>(
++      std::erase_if(doomed, [this](const tabs::TabHandle& handle) {
++        const tabs::TabInterface* const tab = handle.Get();
++        return tab && IsAnchored(tab) && !tab->IsSplit();
++      }));
++}
++
+ int WorkspaceService::CloseTabs(std::vector<tabs::TabHandle> doomed) {
+   // Collected as handles before anything is closed, and re-resolved to an index
+   // on the way past. TabStripModel::CloseTabs() takes the whole set at once but
+@@ -964,6 +997,12 @@ std::vector<tabs::TabHandle> WorkspaceSe
+     std::string_view guid,
+     int* pinned_kept,
+     bool today_only) const {
++  // A workspace deleted meanwhile (another window) has no tabs to close, as
++  // MoveTabsToWorkspace refuses one: resolved, the orphan rule would answer
++  // Home, and Close all / Delete would take Home's tabs (review #15).
++  if (ResolveTabGuid(guid, known_guids_) != guid) {
++    return {};
++  }
+   // Pinned tabs are skipped: they have no tag, and no tag resolves to the
+   // default workspace, so "Close all tabs" on Home closed every pinned tab
+   // until E13. A pinned tab belongs to every workspace (design 2.5), the
+@@ -992,26 +1031,33 @@ std::vector<tabs::TabHandle> WorkspaceSe
+ 
+ int WorkspaceService::CountTabsToClose(std::string_view guid,
+                                        bool today_only) const {
+-  return static_cast<int>(TabsToClose(guid, nullptr, today_only).size());
++  std::vector<tabs::TabHandle> doomed = TabsToClose(guid, nullptr, today_only);
++  KeepAnchoredTabs(doomed);
++  return static_cast<int>(doomed.size());
+ }
+ 
+ int WorkspaceService::UnloadWorkspaceTabs(std::string_view guid, bool others) {
+-  // Indices are stable across a discard -- the contents is replaced in place,
+-  // nothing is inserted or removed -- so a forward index walk is safe here in
+-  // a way it is not for CloseWorkspaceTabs above.
+-  //
+-  // The foreground tab is skipped by us and not left to the gate, because
+-  // CommandDiscard invoked ON the foreground tab means "hibernate every other
+-  // tab" (GetIndicesDiscardedByCommand), which is not the question asked. A
+-  // selected background tab drags the whole selection through the command,
+-  // foreground tab included; the gate declines that one for being visible.
+-  // Pinned tabs carry no tag and belong to every workspace, so they are never
+-  // "of" one and never "other" than one.
+-  std::vector<int> candidates;
++  // Refused, as TabsToClose refuses it (review #15): "all but" a workspace
++  // deleted meanwhile would read as all but Home.
++  if (ResolveTabGuid(guid, known_guids_) != guid) {
++    return 0;
++  }
++  // Tabs are stable across a discard -- the contents is replaced in place,
++  // nothing is inserted or removed -- so they are collected first and
++  // discarded after, one at a time (DiscardTab).
++  //
++  // The foreground tab is skipped: it cannot be discarded, both halves of an
++  // active split included. Pinned tabs carry no tag and belong to every
++  // workspace, so they are never "of" one and never "other" than one.
++  //
++  // The strip's own iterator and a counter, never GetTabAtIndex(i): an index
++  // lookup walks the collection tree (review #31).
++  std::vector<tabs::TabHandle> candidates;
+   int kept_awake = 0;
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
+-    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
+-    if (!tab || tab->IsPinned() || tab_strip_->IsTabInForeground(i)) {
++  int index = -1;
++  for (tabs::TabInterface* const tab : *tab_strip_) {
++    ++index;
++    if (tab->IsPinned() || tab_strip_->IsTabInForeground(index)) {
+       continue;
+     }
+     if (IsTabOfWorkspace(tab, guid) == others) {
+@@ -1023,7 +1069,7 @@ int WorkspaceService::UnloadWorkspaceTab
+       ++kept_awake;
+       continue;
+     }
+-    candidates.push_back(i);
++    candidates.push_back(tab->GetHandle());
+   }
+   // Logged BEFORE the discards, because a discard lands synchronously and
+   // the observer logs each one as "tab contents replaced": a line written
+@@ -1032,8 +1078,11 @@ int WorkspaceService::UnloadWorkspaceTab
+             << " '" << guid << "': asking " << candidates.size()
+             << " tab(s), kept " << kept_awake
+             << " awake (a page asks before leaving)";
+-  for (int i : candidates) {
+-    tab_strip_->ExecuteContextMenuCommand(i, TabStripModel::CommandDiscard);
++  // By handle: each discard lands synchronously, observers and all.
++  for (const tabs::TabHandle& handle : candidates) {
++    if (tabs::TabInterface* const tab = handle.Get()) {
++      DiscardTab(tab->GetContents());
++    }
+   }
+   return static_cast<int>(candidates.size());
+ }
+@@ -1568,13 +1617,15 @@ int WorkspaceService::TargetTabIndexForA
+ 
+   // Falling back to any tab that is on screen, which includes a pinned tab.
+   // Landing on a pinned tab is a real answer rather than a near miss: it is
+-  // drawn in this workspace, so the user can see where they were put.
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
++  // drawn in this workspace, so the user can see where they were put. The
++  // strip's own iterator and a counter, never GetTabAtIndex(i) (review #31).
++  int index = 0;
++  for (tabs::TabInterface* const tab : *tab_strip_) {
+     // A tab of the list, not an open pinned page (E15c review #3).
+-    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
+     if (IsTabOnScreen(tab) && !IsDrawnAsPinnedRow(tab)) {
+-      return i;
++      return index;
+     }
++    ++index;
+   }
+   return TabStripModel::kNoTab;
+ }
+@@ -2013,12 +2064,11 @@ void WorkspaceService::OnSplitTabChanged
+   // an AddedChange with reason kSplitTabUpdated carries only the tab that
+   // joined and not the split it joined. Resolved once for the whole set so two
+   // tabs entering a brand new split cannot each adopt the other's tag and swap.
++  // Asked of the split itself, not of every index of the strip (review #31);
++  // it exists as this is told, so GetSplitData's CHECK holds.
+   std::vector<std::string> member_guids;
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
+-    tabs::TabInterface* candidate = tab_strip_->GetTabAtIndex(i);
+-    if (tab_strip_->GetSplitForTab(i) != change.split_id) {
+-      continue;
+-    }
++  for (tabs::TabInterface* const candidate :
++       tab_strip_->GetSplitData(change.split_id)->ListTabs()) {
+     const bool is_joining =
+         std::ranges::any_of(added->tabs(), [candidate](const auto& entry) {
+           return entry.first == candidate;
+@@ -3026,7 +3076,7 @@ bool WorkspaceService::HibernateAnchored
+     return false;
+   }
+   content::WebContents* const contents = tab->GetContents();
+-  const int index = tab_strip_->GetIndexOfTab(tab);
++  int index = tab_strip_->GetIndexOfTab(tab);
+   if (!contents || index == TabStripModel::kNoTab) {
+     return false;
+   }
+@@ -3054,9 +3104,13 @@ bool WorkspaceService::HibernateAnchored
+           fallback, TabStripUserGestureDetails(
+                         TabStripUserGestureDetails::GestureType::kOther));
+     }
+-    if (tab_strip_->active_index() == index) {
++    // By tab, not by `index`: the spawn lands AT the anchor's index (42's
++    // top-of-list rule) and pushes the anchor down one, so the index now
++    // names the new tab -- and Ctrl+W closed it instead (review #2).
++    if (tab_strip_->GetActiveTab() == tab) {
+       return false;
+     }
++    index = tab_strip_->GetIndexOfTab(tab);
+   }
+   // Put away, so no longer a tab "left last" (D17, review C34-1): the move
+   // above stamped it, and the next close would wake it again. Cleared before
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -282,7 +282,8 @@ class WorkspaceService : public TabStrip
+   // path then spawns a fresh tab into it (EnsureActiveTabVisible, E9f).
+   //
+   // With `today_only` (C22, Arc's "Clear"), an open pinned page's tab is kept
+-  // too: only the tabs the Today list draws close.
++  // too: only the tabs the Today list draws close. An anchored tab is kept
++  // either way, as every other close keeps one (review #5).
+   //
+   // ONLY CALL FROM A MENU OR COMMAND HANDLER: it closes tabs.
+   int CloseWorkspaceTabs(std::string_view guid, bool today_only = false);
+@@ -292,10 +293,12 @@ class WorkspaceService : public TabStrip
+   int CountTabsToClose(std::string_view guid, bool today_only = false) const;
+ 
+   // The tabs CloseWorkspaceTabs(guid) closes, as handles: the workspace's own,
+-  // never a pinned one. `pinned_kept`, when given, counts the pinned tabs that
+-  // would otherwise have matched. One collector, so the confirm's count and the
+-  // close cannot disagree -- and Save as bookmarks' Today is Clear Today's
+-  // (C11b).
++  // never a pinned one, none for a workspace no longer in the list.
++  // `pinned_kept`, when given, counts the pinned tabs that would otherwise have
++  // matched. One collector, so the confirm's count and the close cannot
++  // disagree -- and Save as bookmarks' Today is Clear Today's (C11b). Anchored
++  // tabs are IN it, for the bookmarks; the two closes drop them after
++  // (KeepAnchoredTabs).
+   std::vector<tabs::TabHandle> TabsToClose(std::string_view guid,
+                                            int* pinned_kept,
+                                            bool today_only) const;
+@@ -320,9 +323,11 @@ class WorkspaceService : public TabStrip
+                          const std::vector<tabs::TabHandle>& listed);
+ 
+   // Hibernates the tabs of `guid` -- or, with `others`, of every workspace
+-  // except `guid` -- through Helium's own Hibernate command, one tab at a
+-  // time, skipping pinned tabs, the foreground tab, and any page with a "Leave
+-  // site?" handler. That last skip is ours and it is needed: Helium's command
++  // except `guid` -- with the discard Helium's own Hibernate command makes, one
++  // tab at a time and never its whole selection (review #3), skipping pinned
++  // tabs, the foreground tab, and any page with a "Leave site?" handler. None
++  // for a workspace no longer in the list. That last skip is ours and it is
++  // needed: Helium's command
+   // discards with reason EXTERNAL, which Chromium's eligibility policy always
+   // allows (discard_eligibility_policy.cc), so it does NOT keep a tab with an
+   // unsaved form or playing audio awake -- earlier notes here said it did, and
+@@ -722,6 +727,11 @@ class WorkspaceService : public TabStrip
+   // FROM A MENU OR COMMAND HANDLER: it closes tabs.
+   int CloseTabs(std::vector<tabs::TabHandle> doomed);
+ 
++  // Drops from `doomed` the anchored tabs a close keeps (review #5) and
++  // answers how many: CloseWorkspaceTabs() and CountTabsToClose() both ask, so
++  // the confirm's count and the close still agree.
++  int KeepAnchoredTabs(std::vector<tabs::TabHandle>& doomed) const;
++
+   // THE ONLY PLACE A TAG IS EVER WRITTEN. Every rule in this class -- insert,
+   // pin, unpin, group, split, contents replacement -- ends here, so that
+   // "membership changed" and "membership was written down" cannot drift apart.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_link_preview.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_link_preview.cc
+@@ -82,6 +82,11 @@ const char* CannotShowReason(content::We
+   if (!tab) {
+     return "not a tab";
+   }
++  // Null for a tab mid-detach into a drag, between the menu command and the
++  // posted task (review #20).
++  if (!tab->GetBrowserWindowInterface()) {
++    return "tab detached";
++  }
+   // "Open as tab" adds a tab to the window, which an app's or a popup's
+   // window must not get.
+   if (tab->GetBrowserWindowInterface()->GetType() !=
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -3393,14 +3393,15 @@ void WorkspacePinnedSectionView::UnpinIt
+     return;
+   }
+   if (found->type == PinNode::Type::kSplit) {
+-    // Both pages, as one split view (E19): the page not open is opened first,
+-    // beside the open one, so no page is lost with the row (review: a split
+-    // half-open in another window lost its closed page). Unpinned where it is
+-    // open. ponytail: a split open in another window is unpinned there even
+-    // when it was dropped here; bringing a split across windows is
+-    // DetachSplitTabForInsertion's work, not needed yet.
++    // Both pages, as one split view (E19), in THIS window -- where the user
++    // acts, a drop or the menu's Unpin alike (the owner, try-92 2026-10-26:
++    // unpinned in the other window, it was lost from sight there). Its pages
++    // open in another window come here first: the pinned pair whole when it
++    // is joined there, a lone page alone. Never a favorite, nor a page in a
++    // split view with some other tab: that split is the user's (OpenSplit).
++    // Then the page not open is opened beside them, so no page is lost with
++    // the row (review: a half-open split lost its closed page).
+     const PinNode split = *found;
+-    BrowserWindowInterface* const window = WindowOfSplit(browser_, split);
+     // The drop's place, by the tab it is before: opening the missing page
+     // beside the other shifts the indices under it (review: the split landed
+     // one off, or CHECK-crashed at a group's first tab).
+@@ -3408,7 +3409,41 @@ void WorkspacePinnedSectionView::UnpinIt
+     const bool to_end = index >= here->count();
+     tabs::TabInterface* const before =
+         index >= 0 && !to_end ? here->GetTabAtIndex(index) : nullptr;
+-    OpenSplit(window, split);
++    for (BrowserWindowInterface* const window :
++         WindowsOf(browser_->GetProfile())) {
++      if (window == browser_) {
++        continue;
++      }
++      TabStripModel* const there = window->GetTabStripModel();
++      for (const PinNode& page : split.children) {
++        tabs::TabInterface* const tab = LinkedTab(there, page.id);
++        if (!tab || tab->IsPinned()) {
++          continue;
++        }
++        const std::optional<split_tabs::SplitTabId> joined = tab->GetSplit();
++        if (!joined) {
++          here->InsertDetachedTabAt(
++              here->count(),
++              there->DetachTabAtForInsertion(there->GetIndexOfTab(tab)),
++              AddTabTypes::ADD_NONE);
++        } else if (std::ranges::all_of(split.children, [&](const PinNode& p) {
++                     const tabs::TabInterface* const t =
++                         LinkedTab(there, p.id);
++                     return t && t->GetSplit() == joined;
++                   })) {
++          here->InsertDetachedSplitTabAt(
++              there->DetachSplitTabForInsertion(*joined), here->count(),
++              /*pinned=*/false);
++        } else {
++          continue;
++        }
++        LOG(INFO) << "[workspaces] pins: brought the page of '" << page.id
++                  << "' from another window" << (joined ? " (its split)" : "");
++      }
++    }
++    // In the row's workspace, as ShowSplit opens one (review #42); here, the
++    // workspace on screen.
++    OpenSplit(browser_, split, drawn_guid_);
+     if (before) {
+       index = here->GetIndexOfTab(before);
+     } else if (to_end) {
+@@ -3420,7 +3455,8 @@ void WorkspacePinnedSectionView::UnpinIt
+   // The page first, the row after, so that nothing is lost in between: an open
+   // page joins the list at its top, where new tabs open (E15c.1; the owner's
+   // choice, E15d). With no page here, a page open in another window comes
+-  // here when it was dropped in this list (the owner's choice, E15d review) --
++  // here, dropped in this list or unpinned from a menu (the owner's choices,
++  // E15d review and try-92 2026-10-26: left there, it was lost from sight) --
+   // the other window closes if that was its last tab, as when a tab is dragged
+   // out of it -- and with no page anywhere, one is opened here. Both STILL
+   // LINKED, then they go the way a page of this window goes, below: an
+@@ -3439,7 +3475,7 @@ void WorkspacePinnedSectionView::UnpinIt
+     if (!page) {
+       const PinNode item = *found;
+       OpenItem(browser_, item, /*guid=*/{}, select);
+-    } else if (index >= 0) {
++    } else {
+       here->InsertDetachedTabAt(
+           here->count(),
+           there->DetachTabAtForInsertion(there->GetIndexOfTab(page)),
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_quick_search_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_quick_search_view.cc
+@@ -712,8 +712,9 @@ void WorkspaceQuickSearchView::Collect()
+       continue;
+     }
+     const bool here = window == browser_;
+-    for (int i = 0; i < model->count(); ++i) {
+-      tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++    // The strip's own iterator, never GetTabAtIndex(i): an index lookup walks
++    // the collection tree, per tab of every window (review #19).
++    for (tabs::TabInterface* const tab : *model) {
+       content::WebContents* const contents = tab->GetContents();
+       if (!contents) {
+         continue;

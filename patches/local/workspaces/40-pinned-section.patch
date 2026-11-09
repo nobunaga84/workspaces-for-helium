@@ -1,0 +1,1630 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -7,13 +7,15 @@ import("//testing/test.gni")
+ # Arc's StorableSidebar.json -> a plain-value import plan (E14b, design 5).
+ # //base only, so the whole parser is tested in workspaces_unittests; the
+ # importer that acts on a plan arrives in E14c and depends on this, never the
+-# other way round.
++# other way round. ":pins" because a space's pinned container comes out as
++# pinned-section rows (E15b); it is //base-only itself, so this stays a leaf.
+ source_set("arc_import") {
+   sources = [
+     "arc_import_plan.cc",
+     "arc_import_plan.h",
+   ]
+ 
++  public_deps = [ ":pins" ]
+   deps = [ "//base" ]
+ }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan.cc
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/workspaces/arc_import_plan.h"
+ 
++#include <algorithm>
+ #include <map>
+ #include <set>
+ #include <utility>
+@@ -86,28 +87,42 @@ class Walker {
+ 
+   // The tree under a space's root container, flattened into strip order. Root
+   // level keeps Arc's order, loose tabs and folders interleaved.
+-  std::vector<ArcUnit> Units(std::string_view container_id, bool anchored) {
++  std::vector<ArcUnit> Units(std::string_view container_id) {
+     std::vector<ArcUnit> out;
+     if (const base::DictValue* const root = Visit(container_id)) {
+       ArcUnit loose;
+       for (const base::DictValue* child : Children(*root)) {
+         if (!IsFolder(*child)) {
+-          AppendItem(*child, anchored, loose);
++          AppendItem(*child, loose);
+           continue;
+         }
+         Flush(loose, out);
+-        WalkFolder(*child, StringOr(*child, "title", "Folder"), anchored,
+-                   /*depth=*/1, out);
++        WalkFolder(*child, StringOr(*child, "title", "Folder"), /*depth=*/1,
++                   out);
+       }
+       Flush(loose, out);
+     }
+     return out;
+   }
+ 
++  // The tree under a space's pinned container as pinned-section rows, nothing
++  // flattened: folders nest as deep as Arc's (to the same cap), and a folder's
++  // tabs and subfolders keep Arc's order. The rows take Arc's ids, which are
++  // unique because Visit() refuses a second visit. `created` gets each item's
++  // createdAt, in the same walk order.
++  std::vector<pins::PinNode> Rows(std::string_view container_id,
++                                  std::vector<base::Time>& created) {
++    std::vector<pins::PinNode> rows;
++    if (const base::DictValue* const root = Visit(container_id)) {
++      AppendRows(*root, /*depth=*/1, rows, created);
++    }
++    return rows;
++  }
++
+   // Favorites: every tab under the container, in order, nothing grouped.
+   std::vector<ArcTab> Tabs(std::string_view container_id) {
+     std::vector<ArcTab> out;
+-    for (ArcUnit& unit : Units(container_id, /*anchored=*/false)) {
++    for (ArcUnit& unit : Units(container_id)) {
+       for (ArcItem& item : unit.items) {
+         for (ArcTab& tab : item.tabs) {
+           out.push_back(std::move(tab));
+@@ -163,7 +178,6 @@ class Walker {
+   // are hoisted above its subfolders (owner, 2026-09-22; 5 of 28 folders).
+   void WalkFolder(const base::DictValue& folder,
+                   const std::string& path,
+-                  bool anchored,
+                   int depth,
+                   std::vector<ArcUnit>& out) {
+     if (depth > kMaxDepth) {
+@@ -175,26 +189,63 @@ class Walker {
+     own.group_title = path;
+     for (const base::DictValue* child : children) {
+       if (!IsFolder(*child)) {
+-        AppendItem(*child, anchored, own);
++        AppendItem(*child, own);
+       }
+     }
+     Flush(own, out);
+     for (const base::DictValue* child : children) {
+       if (IsFolder(*child)) {
+         WalkFolder(*child, path + " > " + StringOr(*child, "title", "Folder"),
+-                   anchored, depth + 1, out);
++                   depth + 1, out);
++      }
++    }
++  }
++
++  // `parent`'s children as rows; a folder at `depth` past the cap is skipped
++  // and counted, as WalkFolder does.
++  void AppendRows(const base::DictValue& parent,
++                  int depth,
++                  std::vector<pins::PinNode>& rows,
++                  std::vector<base::Time>& created) {
++    for (const base::DictValue* child : Children(parent)) {
++      if (IsFolder(*child)) {
++        if (depth > kMaxDepth) {
++          ++skipped_;
++          continue;
++        }
++        pins::PinNode folder;
++        folder.type = pins::PinNode::Type::kFolder;
++        folder.id = StringOr(*child, "id", "");
++        folder.title = StringOr(*child, "title", "Folder");
++        AppendRows(*child, depth + 1, folder.children, created);
++        rows.push_back(std::move(folder));
++        continue;
++      }
++      ArcUnit tabs;
++      AppendItem(*child, tabs);
++      for (ArcItem& item : tabs.items) {
++        for (ArcTab& tab : item.tabs) {
++          pins::PinNode row;
++          row.id = std::move(tab.arc_id);
++          row.url = std::move(tab.url);
++          row.title = std::move(tab.title);
++          row.custom_title = std::move(tab.custom_title);
++          row.last_active = tab.last_active;
++          rows.push_back(std::move(row));
++          created.push_back(tab.created);
++        }
+       }
+     }
+   }
+ 
+   // A tab, or a split view as one item. Anything else Arc may hold is ignored.
+-  void AppendItem(const base::DictValue& item, bool anchored, ArcUnit& unit) {
++  void AppendItem(const base::DictValue& item, ArcUnit& unit) {
+     const base::DictValue* const data = item.FindDict("data");
+     if (!data) {
+       return;
+     }
+     if (data->contains("tab")) {
+-      if (std::optional<ArcTab> tab = ToTab(item, anchored)) {
++      if (std::optional<ArcTab> tab = ToTab(item)) {
+         unit.items.push_back(ArcItem{{*std::move(tab)}});
+       }
+       return;
+@@ -204,7 +255,7 @@ class Walker {
+     }
+     ArcItem split;
+     for (const base::DictValue* child : Children(item)) {
+-      if (std::optional<ArcTab> tab = ToTab(*child, anchored)) {
++      if (std::optional<ArcTab> tab = ToTab(*child)) {
+         split.tabs.push_back(*std::move(tab));
+       }
+     }
+@@ -218,7 +269,7 @@ class Walker {
+     }
+   }
+ 
+-  std::optional<ArcTab> ToTab(const base::DictValue& item, bool anchored) {
++  std::optional<ArcTab> ToTab(const base::DictValue& item) {
+     const base::DictValue* const data = item.FindDict("data");
+     const base::DictValue* const saved = data ? data->FindDict("tab") : nullptr;
+     if (!saved) {
+@@ -237,7 +288,6 @@ class Walker {
+     if (typed != tab.title) {
+       tab.custom_title = typed;
+     }
+-    tab.anchored = anchored;
+     // FindDouble also reads an integer, should Arc ever write a whole second.
+     if (const std::optional<double> created = item.FindDouble("createdAt")) {
+       tab.created = FromArcSeconds(*created);
+@@ -323,10 +373,9 @@ std::optional<ArcImportPlan> ParseArcSid
+       workspace.arc_space_id = StringOr(*space, "id", "");
+       workspace.title = StringOr(*space, "title", "Space");
+       workspace.icon = SpaceIcon(*space);
+-      workspace.pinned =
+-          walker.Units(RootContainer(*space, "pinned"), /*anchored=*/true);
+-      workspace.today =
+-          walker.Units(RootContainer(*space, "unpinned"), /*anchored=*/false);
++      workspace.pinned = walker.Rows(RootContainer(*space, "pinned"),
++                                     workspace.pinned_created);
++      workspace.today = walker.Units(RootContainer(*space, "unpinned"));
+       plan.workspaces.push_back(std::move(workspace));
+     }
+   }
+@@ -350,17 +399,22 @@ ArcImportPlan KeepCreatedAfter(ArcImport
+   };
+   std::erase_if(plan.favorites, is_old);
+   for (ArcWorkspace& workspace : plan.workspaces) {
+-    for (std::vector<ArcUnit>* units : {&workspace.pinned, &workspace.today}) {
+-      for (ArcUnit& unit : *units) {
+-        for (ArcItem& item : unit.items) {
+-          std::erase_if(item.tabs, is_old);
+-        }
+-        std::erase_if(unit.items,
+-                      [](const ArcItem& item) { return item.tabs.empty(); });
++    workspace.pinned_left_out = static_cast<int>(
++        std::ranges::count_if(workspace.pinned_created, [last_import](
++                                                            base::Time t) {
++          return t > last_import;
++        }));
++    workspace.pinned.clear();
++    workspace.pinned_created.clear();
++    for (ArcUnit& unit : workspace.today) {
++      for (ArcItem& item : unit.items) {
++        std::erase_if(item.tabs, is_old);
+       }
+-      std::erase_if(*units,
+-                    [](const ArcUnit& unit) { return unit.items.empty(); });
++      std::erase_if(unit.items,
++                    [](const ArcItem& item) { return item.tabs.empty(); });
+     }
++    std::erase_if(workspace.today,
++                  [](const ArcUnit& unit) { return unit.items.empty(); });
+   }
+   return plan;
+ }
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan.h
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan.h
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ #include "base/time/time.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ 
+ // Arc's StorableSidebar.json turned into plain values: what "Import from
+ // Arc..." will create, in the order it will create it (design 5, E14 spec).
+@@ -33,8 +34,6 @@ struct ArcTab {
+   // the owner's 3,181 "renamed" tabs carry a copy of the page title, and a
+   // custom title would stop those ever showing the real one (LOCAL.md 37).
+   std::string custom_title;
+-  // From a space's pinned container: becomes an anchored tab.
+-  bool anchored = false;
+   // timeLastActiveAt, else createdAt -- 40% of Today tabs have no
+   // timeLastActiveAt. Seeds auto-archive's countdown.
+   base::Time last_active;
+@@ -67,8 +66,19 @@ struct ArcWorkspace {
+   std::string title;
+   // Arc's emoji as UTF-8, or empty.
+   std::string icon;
+-  // The space's pinned tabs (anchored), then its Today tabs.
+-  std::vector<ArcUnit> pinned;
++  // The space's pinned container as Arc keeps it -- folders nested, folders
++  // and tabs in Arc's own order, ids Arc's own -- as rows of the workspace's
++  // pinned section: data, not tabs (E15b, design 5). A split's two tabs are
++  // two items.
++  std::vector<pins::PinNode> pinned;
++  // Arc's createdAt of each pinned item, in walk order. A row does not carry
++  // it (the pins file has no use for it); a re-run needs it only to COUNT the
++  // pinned tabs Arc gained, which it leaves out.
++  std::vector<base::Time> pinned_created;
++  // Set by KeepCreatedAfter: pinned tabs created after the last import, left
++  // out because pinned rows are imported once.
++  int pinned_left_out = 0;
++  // Its Today tabs.
+   std::vector<ArcUnit> today;
+ 
+   bool operator==(const ArcWorkspace&) const = default;
+@@ -95,7 +105,9 @@ base::Time FromArcSeconds(double seconds
+ // `plan` without the tabs created at or before `last_import`, for a re-run:
+ // a tab closed or archived here since then stays gone. A null time keeps
+ // everything. A split left with one tab stays as a plain tab; emptied items
+-// and units are dropped, workspaces are kept.
++// and units are dropped, workspaces are kept. Pinned rows are imported once: a
++// re-run has none, since the first import's rows are the user's to change from
++// then on (re-importing into folders is a later stage, design 5).
+ ArcImportPlan KeepCreatedAfter(ArcImportPlan plan, base::Time last_import);
+ 
+ }  // namespace workspaces::arc_import
+--- a/chrome/browser/ui/tabs/workspaces/arc_import_plan_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/arc_import_plan_unittest.cc
+@@ -79,6 +79,20 @@ std::string Shape(const std::vector<ArcU
+   return out;
+ }
+ 
++// "t1 A{B{t3} t2}": rows by id, a folder as its title and its rows in braces.
++std::string RowShape(const std::vector<pins::PinNode>& rows) {
++  std::string out;
++  for (const pins::PinNode& row : rows) {
++    out += out.empty() ? "" : " ";
++    if (row.type == pins::PinNode::Type::kFolder) {
++      base::StrAppend(&out, {row.title, "{", RowShape(row.children), "}"});
++    } else {
++      out += row.id;
++    }
++  }
++  return out;
++}
++
+ constexpr char kOneSpace[] =
+     R"("containerIDs":["unpinned","u","pinned","p"])";
+ 
+@@ -90,7 +104,7 @@ TEST(ArcImportPlanTest, WalksSpacesFolde
+        // Root: a loose tab, folder A, a loose tab, a split. Arc's order stays.
+        Parent("p", "itemContainer", R"(["t1","A","t4","sp"])"), ",",
+        Tab("t1", "https://one.example/", "One", 10), ",",
+-       // A lists its subfolder BEFORE its own tab: the tab is hoisted.
++       // A lists its subfolder BEFORE its own tab, and so does its row.
+        Parent("A", "list", R"(["B","t2"])", "A"), ",",
+        Parent("B", "list", R"(["t3","spB"])", "B"), ",",
+        Tab("t2", "https://two.example/", "Two", 10), ",",
+@@ -123,22 +137,27 @@ TEST(ArcImportPlanTest, WalksSpacesFolde
+   ASSERT_TRUE(plan);
+   ASSERT_EQ(plan->favorites.size(), 1u);
+   EXPECT_EQ(plan->favorites[0].arc_id, "f1");
+-  EXPECT_FALSE(plan->favorites[0].anchored);
+ 
+   ASSERT_EQ(plan->workspaces.size(), 2u);
+   const ArcWorkspace& first = plan->workspaces[0];
+   EXPECT_EQ(first.arc_space_id, "s1");
+   EXPECT_EQ(first.title, "First");
+   EXPECT_EQ(first.icon, "\xF0\x9F\x9A\x80");
+-  EXPECT_EQ(Shape(first.pinned), "[t1] A[t2] A > B[t3 t5+t6] [t4 t7]");
++  // Nested as in Arc; a pinned split is two rows, a half-web split one.
++  EXPECT_EQ(RowShape(first.pinned), "t1 A{B{t3 t5 t6} t2} t4 t7");
++  EXPECT_EQ(first.pinned[0].url, "https://one.example/");
++  EXPECT_EQ(first.pinned[0].title, "One");
++  EXPECT_EQ(first.pinned[0].last_active, FromArcSeconds(10));
++  EXPECT_EQ(first.pinned[1].id, "A");
++  EXPECT_FALSE(first.pinned[1].open);
++  // One createdAt per pinned item (t1 t3 t5 t6 t2 t4 t7), none per folder.
++  EXPECT_EQ(first.pinned_created.size(), 7u);
+   EXPECT_EQ(Shape(first.today), "[u1]");
+-  EXPECT_TRUE(first.pinned[0].items[0].tabs[0].anchored);
+-  EXPECT_FALSE(first.today[0].items[0].tabs[0].anchored);
+ 
+   const ArcWorkspace& second = plan->workspaces[1];
+   EXPECT_EQ(second.title, "Space");
+   EXPECT_EQ(second.icon, "\xF0\x9F\x9A\x80");
+-  EXPECT_EQ(Shape(second.pinned), "");
++  EXPECT_EQ(RowShape(second.pinned), "");
+   EXPECT_EQ(Shape(second.today), "[v1]");
+ 
+   EXPECT_EQ(plan->skipped, 1);  // t8
+@@ -160,7 +179,7 @@ TEST(ArcImportPlanTest, ALittleArcWindow
+   ASSERT_TRUE(plan);
+   ASSERT_EQ(plan->workspaces.size(), 1u);
+   EXPECT_EQ(plan->workspaces[0].title, "Real");
+-  EXPECT_EQ(Shape(plan->workspaces[0].pinned), "[t1]");
++  EXPECT_EQ(RowShape(plan->workspaces[0].pinned), "t1");
+ }
+ 
+ TEST(ArcImportPlanTest, OnlyWebPagesAreImported) {
+@@ -176,7 +195,7 @@ TEST(ArcImportPlanTest, OnlyWebPagesAreI
+       Space("s1", "S", kOneSpace)));
+ 
+   ASSERT_TRUE(plan);
+-  EXPECT_EQ(Shape(plan->workspaces[0].pinned), "[a]");
++  EXPECT_EQ(RowShape(plan->workspaces[0].pinned), "a");
+   EXPECT_EQ(plan->skipped, 4);
+ }
+ 
+@@ -194,12 +213,12 @@ TEST(ArcImportPlanTest, ANameIsCustomOnl
+       Space("s1", "S", kOneSpace)));
+ 
+   ASSERT_TRUE(plan);
+-  const std::vector<ArcItem>& items = plan->workspaces[0].pinned[0].items;
+-  ASSERT_EQ(items.size(), 3u);
+-  EXPECT_EQ(items[0].tabs[0].custom_title, "");
+-  EXPECT_EQ(items[0].tabs[0].title, "Page");
+-  EXPECT_EQ(items[1].tabs[0].custom_title, "Mine");
+-  EXPECT_EQ(items[2].tabs[0].custom_title, "");
++  const std::vector<pins::PinNode>& rows = plan->workspaces[0].pinned;
++  ASSERT_EQ(rows.size(), 3u);
++  EXPECT_EQ(rows[0].custom_title, "");
++  EXPECT_EQ(rows[0].title, "Page");
++  EXPECT_EQ(rows[1].custom_title, "Mine");
++  EXPECT_EQ(rows[2].custom_title, "");
+ }
+ 
+ TEST(ArcImportPlanTest, LastActiveFallsBackToCreated) {
+@@ -236,12 +255,13 @@ TEST(ArcImportPlanTest, ACycleEndsAndIsC
+       Space("s1", "S", kOneSpace)));
+ 
+   ASSERT_TRUE(plan);
+-  EXPECT_EQ(Shape(plan->workspaces[0].pinned), "A[t1] A > B[t2]");
++  EXPECT_EQ(RowShape(plan->workspaces[0].pinned), "A{B{t2} t1}");
+   EXPECT_EQ(plan->skipped, 1);
+ }
+ 
+ TEST(ArcImportPlanTest, AFolderChainDeeperThanTheCapIsCutOff) {
+-  // 70 nested folders with one tab at the bottom: refused, not followed.
++  // 70 nested folders with one tab at the bottom: cut at the cap, the rest
++  // refused, not followed.
+   std::string items = Parent("p", "itemContainer", R"(["f0"])");
+   for (int i = 0; i < 70; ++i) {
+     const std::string child = i < 69 ? base::StrCat({"f", base::NumberToString(i + 1)})
+@@ -257,8 +277,18 @@ TEST(ArcImportPlanTest, AFolderChainDeep
+       ParseArcSidebarJson(Sidebar(items, Space("s1", "S", kOneSpace)));
+ 
+   ASSERT_TRUE(plan);
+-  EXPECT_EQ(Shape(plan->workspaces[0].pinned), "");
++  int depth = 0;
++  for (const std::vector<pins::PinNode>* rows = &plan->workspaces[0].pinned;
++       !rows->empty(); rows = &(*rows)[0].children) {
++    ASSERT_EQ((*rows)[0].type, pins::PinNode::Type::kFolder);
++    ++depth;
++  }
++  EXPECT_EQ(depth, 64);
+   EXPECT_EQ(plan->skipped, 1);
++  // The two caps agree: what the parser keeps, the pins file can hold.
++  pins::PinTree tree;
++  tree["s"] = plan->workspaces[0].pinned;
++  EXPECT_TRUE(pins::PinTreeFromValue(pins::PinTreeToValue(tree)).has_value());
+ }
+ 
+ TEST(ArcImportPlanTest, NotASidebarIsNoPlanRatherThanAnEmptyOne) {
+@@ -280,7 +310,9 @@ TEST(ArcImportPlanTest, AReimportKeepsOn
+       base::StrCat({Parent("fav", "itemContainer", R"(["f1","f2"])"), ",",
+                     Tab("f1", "https://f1.example/", "F1", 10), ",",
+                     Tab("f2", "https://f2.example/", "F2", 500), ",",
+-                    Parent("p", "itemContainer", R"(["A","sp","t3"])"), ",",
++                    Parent("p", "itemContainer", R"(["t9"])"), ",",
++                    Tab("t9", "https://nine.example/", "Nine", 500), ",",
++                    Parent("u", "itemContainer", R"(["A","sp","t3"])"), ",",
+                     Parent("A", "list", R"(["t1"])", "A"), ",",
+                     Tab("t1", "https://one.example/", "One", 10), ",",
+                     Parent("sp", "splitView", R"(["t4","t5"])"), ",",
+@@ -289,7 +321,8 @@ TEST(ArcImportPlanTest, AReimportKeepsOn
+                     Tab("t3", "https://three.example/", "Three", 100)}),
+       Space("s1", "S", kOneSpace), R"([{"default":true},"fav"])"));
+   ASSERT_TRUE(plan);
+-  ASSERT_EQ(Shape(plan->workspaces[0].pinned), "A[t1] [t4+t5 t3]");
++  ASSERT_EQ(Shape(plan->workspaces[0].today), "A[t1] [t4+t5 t3]");
++  ASSERT_EQ(RowShape(plan->workspaces[0].pinned), "t9");
+ 
+   // First import: nothing to compare against, everything stays.
+   EXPECT_EQ(KeepCreatedAfter(*plan, base::Time()), *plan);
+@@ -300,11 +333,17 @@ TEST(ArcImportPlanTest, AReimportKeepsOn
+   EXPECT_EQ(later.favorites[0].arc_id, "f2");
+   ASSERT_EQ(later.workspaces.size(), 1u);  // kept even when it empties
+   // Folder A is gone with its only tab; the split is down to its new half.
+-  EXPECT_EQ(Shape(later.workspaces[0].pinned), "[t5]");
++  EXPECT_EQ(Shape(later.workspaces[0].today), "[t5]");
++  // Pinned rows are imported once, however new: t9 is not brought back, but it
++  // is counted, so the importer can say so.
++  EXPECT_EQ(RowShape(later.workspaces[0].pinned), "");
++  EXPECT_EQ(later.workspaces[0].pinned_left_out, 1);
++  EXPECT_TRUE(later.workspaces[0].pinned_created.empty());
+ 
+   const ArcImportPlan nothing = KeepCreatedAfter(*plan, FromArcSeconds(9999));
+   EXPECT_TRUE(nothing.favorites.empty());
+-  EXPECT_EQ(Shape(nothing.workspaces[0].pinned), "");
++  EXPECT_EQ(Shape(nothing.workspaces[0].today), "");
++  EXPECT_EQ(nothing.workspaces[0].pinned_left_out, 0);
+ }
+ 
+ // Not a test of the code above but of my reading of Arc's format: every
+@@ -328,24 +367,36 @@ TEST(ArcImportPlanTest, CountsFromARealS
+             << " skipped=" << plan->skipped << "\n";
+   int index = 0;
+   for (const ArcWorkspace& workspace : plan->workspaces) {
+-    int tabs[2] = {0, 0}, groups = 0, splits = 0, renamed = 0;
+-    const std::vector<ArcUnit>* const halves[2] = {&workspace.pinned,
+-                                                   &workspace.today};
+-    for (int half = 0; half < 2; ++half) {
+-      for (const ArcUnit& unit : *halves[half]) {
+-        groups += unit.group_title.empty() ? 0 : 1;
+-        for (const ArcItem& item : unit.items) {
+-          splits += item.tabs.size() == 2 ? 1 : 0;
+-          tabs[half] += static_cast<int>(item.tabs.size());
+-          for (const ArcTab& tab : item.tabs) {
+-            renamed += tab.custom_title.empty() ? 0 : 1;
+-          }
++    int pinned = 0, folders = 0, today = 0, groups = 0, splits = 0,
++        renamed = 0;
++    // Recursive, so a std::function-free lambda that takes itself.
++    const auto count_rows = [&](const auto& self,
++                                const std::vector<pins::PinNode>& rows) -> void {
++      for (const pins::PinNode& row : rows) {
++        if (row.type == pins::PinNode::Type::kFolder) {
++          ++folders;
++          self(self, row.children);
++        } else {
++          ++pinned;
++          renamed += row.custom_title.empty() ? 0 : 1;
++        }
++      }
++    };
++    count_rows(count_rows, workspace.pinned);
++    for (const ArcUnit& unit : workspace.today) {
++      groups += unit.group_title.empty() ? 0 : 1;
++      for (const ArcItem& item : unit.items) {
++        splits += item.tabs.size() == 2 ? 1 : 0;
++        today += static_cast<int>(item.tabs.size());
++        for (const ArcTab& tab : item.tabs) {
++          renamed += tab.custom_title.empty() ? 0 : 1;
+         }
+       }
+     }
+-    std::cout << "ARC space " << ++index << ": pinned=" << tabs[0]
+-              << " today=" << tabs[1] << " groups=" << groups
+-              << " splits=" << splits << " renamed=" << renamed
++    std::cout << "ARC space " << ++index << ": pinned=" << pinned
++              << " folders=" << folders << " today=" << today
++              << " groups=" << groups << " splits=" << splits
++              << " renamed=" << renamed
+               << " icon_bytes=" << workspace.icon.size() << "\n";
+   }
+ }
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -162,16 +162,31 @@ bool AddSavable(const std::vector<PinNod
+   return true;
+ }
+ 
+-size_t CountNodes(const std::vector<PinNode>& nodes) {
+-  size_t count = nodes.size();
+-  for (const PinNode& node : nodes) {
+-    count += CountNodes(node.children);
++PinNode* FindNode(std::vector<PinNode>& nodes, std::string_view id) {
++  for (PinNode& node : nodes) {
++    if (node.id == id) {
++      return &node;
++    }
++    if (PinNode* found = FindNode(node.children, id)) {
++      return found;
++    }
+   }
+-  return count;
++  return nullptr;
+ }
+ 
+ }  // namespace
+ 
++void CountRows(const std::vector<PinNode>& rows, int& items, int& folders) {
++  for (const PinNode& row : rows) {
++    if (row.type == PinNode::Type::kFolder) {
++      ++folders;
++      CountRows(row.children, items, folders);
++    } else {
++      ++items;
++    }
++  }
++}
++
+ base::DictValue PinTreeToValue(const PinTree& tree) {
+   base::DictValue workspaces;
+   for (const auto& [guid, roots] : tree) {
+@@ -308,11 +323,43 @@ bool PinStore::SetRoots(std::string_view
+   } else {
+     tree_.insert_or_assign(std::string(guid), std::move(roots));
+   }
++  Changed();
++  return true;
++}
++
++bool PinStore::SetFolderOpen(std::string_view id, bool open) {
++  if (!loaded_ || read_only_) {
++    return false;
++  }
++  for (auto& [guid, roots] : tree_) {
++    if (PinNode* node = FindNode(roots, id)) {
++      if (node->type != PinNode::Type::kFolder) {
++        return false;
++      }
++      if (node->open != open) {
++        node->open = open;
++        Changed();
++      }
++      return true;
++    }
++  }
++  return false;
++}
++
++bool PinStore::ToggleFolder(std::string_view id) {
++  for (auto& [guid, roots] : tree_) {
++    if (const PinNode* node = FindNode(roots, id)) {
++      return SetFolderOpen(id, !node->open);
++    }
++  }
++  return false;
++}
++
++void PinStore::Changed() {
+   writer_.ScheduleWrite(this);
+   for (Observer& observer : observers_) {
+     observer.OnPinsChanged();
+   }
+-  return true;
+ }
+ 
+ void PinStore::AddObserver(Observer* observer) {
+@@ -366,11 +413,13 @@ void PinStore::OnLoaded(LoadResult resul
+       LOG(INFO) << "[workspaces] pins: no file yet at " << writer_.path();
+       break;
+     case LoadResult::Status::kLoaded: {
+-      size_t rows = 0;
++      int items = 0;
++      int folders = 0;
+       for (const auto& [guid, roots] : tree_) {
+-        rows += CountNodes(roots);
++        CountRows(roots, items, folders);
+       }
+-      LOG(INFO) << "[workspaces] pins: loaded " << rows << " row(s) in "
++      LOG(INFO) << "[workspaces] pins: loaded " << items + folders
++                << " row(s) in "
+                 << tree_.size() << " workspace(s) from " << writer_.path();
+       break;
+     }
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -71,6 +71,9 @@ inline constexpr int kPinFileVersion = 1
+ base::DictValue PinTreeToValue(const PinTree& tree);
+ std::optional<PinTree> PinTreeFromValue(const base::DictValue& value);
+ 
++// Adds how many items and folders `rows` holds, all the way down.
++void CountRows(const std::vector<PinNode>& rows, int& items, int& folders);
++
+ // The rows to draw for workspace `guid`, own rows first. Rows kept under a
+ // workspace that no longer exists show under the default workspace, as its
+ // tabs do (ResolveTabGuid, design 2.4): nothing is lost when a workspace is
+@@ -124,6 +127,15 @@ class PinStore : public base::SupportsUs
+   // nested past what the file can hold.
+   bool SetRoots(std::string_view guid, std::vector<PinNode> roots);
+ 
++  // Opens or closes the folder with this id. The state is the profile's, so
++  // every window shows the folder the same way (Arc keeps it per window:
++  // later, design 5). False, and nothing changes, before the load, when
++  // read_only(), or when no folder has this id.
++  bool SetFolderOpen(std::string_view id, bool open);
++  // Opens the folder if it is closed, closes it if open -- its state as the
++  // store has it NOW, which another window may have changed. Same refusals.
++  bool ToggleFolder(std::string_view id);
++
+   void AddObserver(Observer* observer);
+   void RemoveObserver(Observer* observer);
+ 
+@@ -132,6 +144,9 @@ class PinStore : public base::SupportsUs
+   static LoadResult ReadFile(const base::FilePath& file);
+   void OnLoaded(LoadResult result);
+ 
++  // Schedules the write and tells the observers.
++  void Changed();
++
+   // base::ImportantFileWriter::DataSerializer:
+   std::optional<std::string> SerializeData() override;
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -86,6 +86,16 @@ TEST(WorkspacePinsTest, JsonRoundTripKee
+   EXPECT_EQ(PinTreeFromValue(PinTreeToValue(tree)), tree);
+ }
+ 
++TEST(WorkspacePinsTest, CountRowsGoesAllTheWayDown) {
++  int items = 0;
++  int folders = 0;
++  for (const auto& [guid, roots] : SampleTree()) {
++    CountRows(roots, items, folders);
++  }
++  EXPECT_EQ(items, 4);    // a, b, c, d
++  EXPECT_EQ(folders, 3);  // f1, f2, f3
++}
++
+ TEST(WorkspacePinsTest, RefusesFilesItDidNotWrite) {
+   for (std::string_view json : {
+            R"({"workspaces":{}})",
+@@ -285,6 +295,35 @@ TEST_F(PinStoreTest, ObserversHearTheLoa
+   store->RemoveObserver(&observer);
+ }
+ 
++TEST_F(PinStoreTest, AFolderOpensAndClosesAndStaysThatWay) {
++  const PinTree tree = SampleTree();
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", tree.at("default")));
++  CountingObserver observer;
++  store->AddObserver(&observer);
++
++  // f3 sits two folders down; an item is not a folder; no such id.
++  EXPECT_TRUE(store->SetFolderOpen("f3", true));
++  EXPECT_FALSE(store->SetFolderOpen("c", true));
++  EXPECT_FALSE(store->SetFolderOpen("nope", true));
++  // Already open: nothing to tell anyone.
++  EXPECT_TRUE(store->SetFolderOpen("f3", true));
++  EXPECT_EQ(observer.calls, 1);
++  // A toggle reads the state as it is now: closed, then open again.
++  EXPECT_TRUE(store->ToggleFolder("f3"));
++  EXPECT_TRUE(store->ToggleFolder("f3"));
++  EXPECT_FALSE(store->ToggleFolder("c"));
++  EXPECT_FALSE(store->ToggleFolder("nope"));
++  EXPECT_EQ(observer.calls, 3);
++  store->RemoveObserver(&observer);
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const PinTree again = LoadedStore()->tree();
++  ASSERT_EQ(RootCount(again, "default"), 2u);
++  EXPECT_TRUE(again.find("default")->second[1].children[1].children[0].open);
++}
++
+ // Everything SetRoots accepts, the next load must accept too: one refused row
+ // would otherwise send the whole file to .bad. A refusal changes nothing --
+ // no row, no observer call, no file.
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.cc
+@@ -360,8 +360,9 @@ bool TabGroupView::IsCollapsed() const {
+ }
+ 
+ views::ScrollView* TabGroupView::GetScrollViewForContainer() const {
+-  return views::ScrollView::GetScrollViewForContents(
+-      const_cast<views::View*>(parent()));
++  // Helium Workspaces (E15b): the tab list holding this group is not the
++  // scroll view's contents (UnpinnedTabContainerView::NearestScrollView).
++  return UnpinnedTabContainerView::NearestScrollView(*this);
+ }
+ 
+ void TabGroupView::UpdateTargetLayoutForDrag(
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/split_tab_util.h"
+@@ -43,6 +44,7 @@
+ #include "chrome/browser/ui/views/tabs/groups/tab_group_editor_bubble_view.h"
+ #include "chrome/browser/ui/views/tabs/horizontal/horizontal_tab_closing_helper.h"
+ #include "chrome/browser/ui/views/tabs/tab/tab_context_menu_controller.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_collection_types.h"
+@@ -599,6 +601,20 @@ TabStripCollectionController::RegisterWo
+   return service->RegisterWorkspaceChangedCallback(std::move(callback));
+ }
+ 
++std::unique_ptr<views::View>
++TabStripCollectionController::CreateUnpinnedHeader() {
++  if (!browser_view_) {
++    return nullptr;
++  }
++  BrowserWindowInterface* const browser = browser_view_->browser();
++  if (!browser->GetProfile()->IsRegularProfile() ||
++      !workspaces::WorkspaceService::From(browser)) {
++    return nullptr;
++  }
++  return std::make_unique<WorkspacePinnedSectionView>(browser,
++                                                      GetStateController());
++}
++
+ void TabStripCollectionController::TabGroupFocusChanged(
+     std::optional<tab_groups::TabGroupId> new_focused_group_id,
+     std::optional<tab_groups::TabGroupId> old_focused_group_id) {
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_TAB_STRIP_COLLECTION_CONTROLLER_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_TAB_STRIP_COLLECTION_CONTROLLER_H_
+ 
++#include <memory>
+ #include <optional>
+ 
+ #include "base/callback_list.h"
+@@ -142,6 +143,14 @@ class TabStripCollectionController : pub
+   base::CallbackListSubscription RegisterWorkspaceChangedCallback(
+       base::RepeatingClosure callback);
+ 
++  // The Workspaces pinned section (E15b, design 5), for TabStripView to put
++  // above the unpinned tabs in their scroll view; null where it cannot apply
++  // -- no browser view, not a regular profile, no WorkspaceService. Asked
++  // once, when the unpinned container arrives, so it is made whether or not
++  // Workspaces is on right now: the settings toggle can switch it on later,
++  // and the section hides itself while it is off.
++  std::unique_ptr<views::View> CreateUnpinnedHeader();
++
+   void TabGroupFocusChanged(
+       std::optional<tab_groups::TabGroupId> new_focused_group_id,
+       std::optional<tab_groups::TabGroupId> old_focused_group_id);
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
+@@ -39,6 +39,7 @@
+ #include "ui/compositor/layer.h"
+ #include "ui/views/background.h"
+ #include "ui/views/controls/scroll_view.h"
++#include "ui/views/layout/box_layout_view.h"
+ #include "ui/views/layout/layout_types.h"
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view.h"
+@@ -529,6 +530,21 @@ views::View* TabStripView::AddScrollView
+   if (auto* container =
+           views::AsViewClass<UnpinnedTabContainerView>(view.get())) {
+     unpinned_tabs_container_view_ = container;
++    // Helium Workspaces: the pinned section scrolls with today's tabs, above
++    // them in this scroll view (E15b). A plain box around the two; everything
++    // in this file that looks for the container walks up to contents().
++    std::unique_ptr<views::View> header;
++    if (orientation_ == TabStripOrientation::kVertical) {
++      header = collection_node_->GetController()->CreateUnpinnedHeader();
++    }
++    if (header) {
++      auto box = std::make_unique<views::BoxLayoutView>();
++      box->SetOrientation(views::BoxLayout::Orientation::kVertical);
++      box->AddChildView(std::move(header));
++      box->AddChildView(std::move(view));
++      unpinned_tabs_scroll_view_->SetContents(std::move(box));
++      return container;
++    }
+     return unpinned_tabs_scroll_view_->SetContents(std::move(view));
+   }
+   // `view` should only ever be UnpinnedTabContainerView or
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+@@ -281,8 +281,21 @@ void UnpinnedTabContainerView::ResetColl
+ }
+ 
+ views::ScrollView* UnpinnedTabContainerView::GetScrollViewForContainer() const {
+-  return views::ScrollView::GetScrollViewForContents(
+-      const_cast<UnpinnedTabContainerView*>(this));
++  // Helium Workspaces (E15b): see NearestScrollView().
++  return NearestScrollView(*this);
++}
++
++// static
++views::ScrollView* UnpinnedTabContainerView::NearestScrollView(
++    const views::View& view) {
++  for (views::View* ancestor = const_cast<views::View*>(view.parent());
++       ancestor; ancestor = ancestor->parent()) {
++    if (auto* const scroll_view =
++            views::AsViewClass<views::ScrollView>(ancestor)) {
++      return scroll_view;
++    }
++  }
++  return nullptr;
+ }
+ 
+ void UnpinnedTabContainerView::UpdateTargetLayoutForDrag(
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
+@@ -65,6 +65,13 @@ class UnpinnedTabContainerView
+   void SetAvailableSpace(views::SizeBound space) { available_space_ = space; }
+   views::SizeBound available_space() const { return available_space_; }
+ 
++  // Helium Workspaces (E15b): the nearest ScrollView above `view`, for this
++  // container and the groups in it. The scroll view's contents is not this
++  // container but a box holding the pinned section above it, and
++  // ScrollView::GetScrollViewForContents() answers null: every tab drag, and
++  // every drag in a group, CHECKed (LOCAL.md 49).
++  static views::ScrollView* NearestScrollView(const views::View& view);
++
+  private:
+   // DraggedTabsContainer:
+   views::ScrollView* GetScrollViewForContainer() const override;
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -16,10 +16,16 @@ source_set("vertical") {
+     "vertical_tab_strip_segmented_control.h",
+     "vertical_tab_strip_top_container.h",
+     "workspace_arc_importer.h",
++    "workspace_pinned_section_view.h",
+     "workspace_rail_view.h",
+   ]
+ 
+-  public_deps = [ "//chrome/browser/ui/views/tabs/common" ]
++  public_deps = [
++    "//chrome/browser/ui/views/tabs/common",
++
++    # workspace_pinned_section_view.h names the pins store (E15b).
++    "//chrome/browser/ui/tabs/workspaces:pins",
++  ]
+ 
+   deps = [
+     "//base",
+@@ -49,6 +55,7 @@ source_set("impl") {
+     "vertical_tab_strip_segmented_control.cc",
+     "vertical_tab_strip_top_container.cc",
+     "workspace_arc_importer.cc",
++    "workspace_pinned_section_view.cc",
+     "workspace_rail_view.cc",
+   ]
+ 
+@@ -76,12 +83,22 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs/workspaces:arc_import",
+     "//chrome/browser/ui/tabs/workspaces:prefs",
+ 
+-    # For workspace_arc_importer.cc (E14c). Kept together, out of alphabetical
+-    # order, so the fork's lines stay one hunk at a rebase.
++    # For workspace_arc_importer.cc (E14c) and workspace_pinned_section_view.cc
++    # (E15b). Kept together, out of alphabetical order, so the fork's lines
++    # stay one hunk at a rebase. The favicon HEADER target only, never
++    # //chrome/browser/favicon:impl: that one depends on //chrome/browser/ui,
++    # which depends on this target -- a cycle (LOCAL.md 43).
++    "//chrome/browser/favicon",
++    "//chrome/browser/ui/tabs/workspaces:pins",
++    "//components/favicon/core",
++    "//components/favicon_base",
++    "//components/keyed_service/core",
+     "//components/prefs",
+     "//components/saved_tab_groups/public",
+     "//components/sessions",
+     "//components/split_tabs",
++    "//components/vector_icons",
++    "//ui/gfx/codec",
+     "//url",
+ 
+     "//chrome/browser/ui/user_education",
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ui/status_bubble.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+@@ -122,10 +123,6 @@ content::WebContents* AddSleepingTab(Bro
+   if (!guid.empty()) {
+     extra_data[workspaces::kWorkspaceExtraDataKey] = guid;
+   }
+-  if (tab.anchored) {
+-    // The same spec as the entry's URL, or the tab reads as drifted.
+-    extra_data[workspaces::kAnchorUrlExtraDataKey] = url.spec();
+-  }
+   if (!tab.custom_title.empty()) {
+     extra_data[workspaces::kCustomTitleExtraDataKey] = tab.custom_title;
+   }
+@@ -136,7 +133,7 @@ content::WebContents* AddSleepingTab(Bro
+   base::Time last_active;
+   base::TimeTicks last_active_ticks;
+   const base::Time now = base::Time::Now();
+-  if (!tab.anchored && !pin && !tab.last_active.is_null() &&
++  if (!pin && !tab.last_active.is_null() &&
+       tab.last_active <= now) {
+     last_active = tab.last_active;
+     last_active_ticks = base::TimeTicks::Now() - (now - last_active);
+@@ -154,6 +151,38 @@ content::WebContents* AddSleepingTab(Bro
+       chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
+ }
+ 
++// A space's pinned container goes to the pins file as rows, not tabs (E15b):
++// nothing is created in the strip and nothing loads, however big a folder is.
++// Never over rows the workspace already has: from the first import on they
++// are the user's.
++void WritePinnedRows(workspaces::pins::PinStore& store,
++                     const std::string& guid,
++                     std::vector<workspaces::pins::PinNode> rows,
++                     WorkspaceArcImporter::Result& result) {
++  if (rows.empty()) {
++    return;
++  }
++  int items = 0;
++  int folders = 0;
++  workspaces::pins::CountRows(rows, items, folders);
++  // Rows left out here are NOT counted as skipped: the bubble says a skipped
++  // tab is "not a web page", which these are not. The log says why.
++  if (store.tree().contains(guid)) {
++    LOG(INFO) << "[workspaces] arc import: '" << guid
++              << "' already has pinned rows; " << items << " left out";
++    return;
++  }
++  if (!store.SetRoots(guid, std::move(rows))) {
++    LOG(WARNING) << "[workspaces] arc import: pinned rows of '" << guid
++                 << "' not written (the pins file is still loading, "
++                    "read-only, or refused them); "
++                 << items << " left out";
++    return;
++  }
++  result.pinned += items;
++  result.folders += folders;
++}
++
+ }  // namespace
+ 
+ WorkspaceArcImporter::WorkspaceArcImporter(BrowserWindowInterface* browser)
+@@ -208,15 +237,21 @@ void WorkspaceArcImporter::OnPlanReady(b
+ 
+   // The plan, flattened into the order the strip gets it: favorites first,
+   // while the strip is short (a pinned insert is the one insert here that is
+-  // not at the very end), then each workspace's pinned units, then its Today
+-  // units. A folder's group id is made here and travels with its items, so a
+-  // group may straddle slices: a later tab with the same id is inserted into
+-  // the group's range, which stays contiguous.
++  // not at the very end), then each workspace's Today units; its pinned rows
++  // go to the pins file here and now. A folder's group id is made here and
++  // travels with its items, so a group may straddle slices: a later tab with
++  // the same id is inserted into the group's range, which stays contiguous.
++  workspaces::pins::PinStore* const pin_store =
++      workspaces::pins::PinStore::GetOrCreate(profile, profile->GetPath());
+   for (const ArcTab& tab : todo.favorites) {
+     items_.push_back(Item{{tab}, std::string(), std::nullopt, std::string(),
+                           /*pin=*/true});
+   }
++  int pinned_left_out = 0;
+   for (const ArcWorkspace& workspace : todo.workspaces) {
++    // Counted before the skip below: a workspace whose only news is pinned
++    // tabs is exactly the one that skip would hide.
++    pinned_left_out += workspace.pinned_left_out;
+     if (workspace.pinned.empty() && workspace.today.empty()) {
+       continue;  // a re-run with nothing new: no empty workspace appears
+     }
+@@ -224,21 +259,19 @@ void WorkspaceArcImporter::OnPlanReady(b
+     const std::string guid =
+         service->EnsureWorkspaceForImport(workspace.title, workspace.icon);
+     ++result_.workspaces;
+-    for (const std::vector<ArcUnit>* units :
+-         {&workspace.pinned, &workspace.today}) {
+-      for (const ArcUnit& unit : *units) {
+-        std::optional<tab_groups::TabGroupId> group;
+-        if (!unit.group_title.empty()) {
+-          group = tab_groups::TabGroupId::GenerateNew();
+-        }
+-        const size_t first = items_.size();
+-        for (const ArcItem& item : unit.items) {
+-          items_.push_back(
+-              Item{item.tabs, guid, group, std::string(), /*pin=*/false});
+-        }
+-        if (group && items_.size() > first) {
+-          items_.back().group_title_to_apply = unit.group_title;
+-        }
++    WritePinnedRows(*pin_store, guid, workspace.pinned, result_);
++    for (const ArcUnit& unit : workspace.today) {
++      std::optional<tab_groups::TabGroupId> group;
++      if (!unit.group_title.empty()) {
++        group = tab_groups::TabGroupId::GenerateNew();
++      }
++      const size_t first = items_.size();
++      for (const ArcItem& item : unit.items) {
++        items_.push_back(
++            Item{item.tabs, guid, group, std::string(), /*pin=*/false});
++      }
++      if (group && items_.size() > first) {
++        items_.back().group_title_to_apply = unit.group_title;
+       }
+     }
+   }
+@@ -246,7 +279,14 @@ void WorkspaceArcImporter::OnPlanReady(b
+     result_.planned += static_cast<int>(item.tabs.size());
+   }
+   LOG(INFO) << "[workspaces] arc import: start: " << result_.planned
+-            << " tab(s) planned";
++            << " tab(s) planned, " << result_.pinned << " pinned row(s) in "
++            << result_.folders << " folder(s) written";
++  if (pinned_left_out) {
++    LOG(INFO) << "[workspaces] arc import: " << pinned_left_out
++              << " pinned tab(s) Arc gained since the last import left out: "
++                 "pinned rows are imported once (re-importing into folders "
++                 "is a later stage)";
++  }
+ 
+   // Imported tabs live in the session file and nowhere else. The Windows
+   // default for "On startup" is the New Tab page, which would drop them all
+@@ -376,7 +416,9 @@ void WorkspaceArcImporter::Finish() {
+   result_.elapsed = base::Time::Now() - started_;
+   if (result_.found) {
+     LOG(INFO) << "[workspaces] arc import: done: " << result_.tabs << " tab(s), "
+-              << result_.groups << " group(s), " << result_.splits
++              << result_.pinned << " pinned row(s), " << result_.folders
++              << " folder(s), " << result_.groups << " group(s), "
++              << result_.splits
+               << " split(s), " << result_.workspaces << " workspace(s), "
+               << result_.skipped << " skipped, startup "
+               << (result_.startup_changed ? "set to continue" : "unchanged")
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_arc_importer.h
+@@ -21,7 +21,9 @@ class BrowserWindowInterface;
+ class PrefService;
+ 
+ // "Import from Arc...": turns an ArcImportPlan (E14b) into sleeping tabs in the
+-// window whose rail was clicked (design 5, E14 spec). A new window was built,
++// window whose rail was clicked (design 5, E14 spec) -- favorites and Today --
++// and each space's pinned container into rows of its workspace's pinned
++// section, which are data, not tabs (E15b). A new window was built,
+ // rehearsed and withdrawn the same day: closed before the original, it left the
+ // session, and the next launch restored the original alone (LOCAL.md 40). Not
+ // a view. It lives
+@@ -31,7 +33,7 @@ class PrefService;
+ // browser_commands.h.
+ //
+ // Every tab is created through the session-restore door: no renderer, not
+-// loaded until clicked, and tagged with its workspace, anchor and custom title
++// loaded until clicked, and tagged with its workspace and custom title
+ // BEFORE it is inserted, through the extra-data hook 08 put there -- a tag
+ // written after the insert would be a change, and a relayout, per tab.
+ //
+@@ -49,6 +51,9 @@ class WorkspaceArcImporter {
+     bool aborted = false;
+     int tabs = 0;
+     int planned = 0;
++    // Pinned-section rows written: items, and folders among the rows.
++    int pinned = 0;
++    int folders = 0;
+     int groups = 0;
+     int splits = 0;
+     int workspaces = 0;
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -0,0 +1,409 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
++
++#include <algorithm>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/strings/strcat.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/cancelable_task_tracker.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/timer/elapsed_timer.h"
++#include "chrome/browser/favicon/favicon_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
++#include "components/favicon/core/favicon_service.h"
++#include "components/favicon_base/favicon_types.h"
++#include "components/keyed_service/core/service_access_type.h"
++#include "components/vector_icons/vector_icons.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/favicon_size.h"
++#include "ui/events/event.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/button/label_button.h"
++#include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/separator.h"
++#include "ui/views/focus/focus_manager.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/view_utils.h"
++#include "ui/views/widget/widget.h"
++#include "url/gurl.h"
++
++namespace {
++
++using workspaces::pins::PinNode;
++
++// Per nesting level, and on each side of a row.
++constexpr int kIndent = 16;
++constexpr int kRowInset = 8;
++
++std::u16string RowText(const PinNode& node) {
++  const std::string& text = !node.custom_title.empty() ? node.custom_title
++                            : !node.title.empty()      ? node.title
++                                                       : node.url;
++  return base::UTF8ToUTF16(text);
++}
++
++// One row: a folder (its icon shows open or closed) or an item (its page's
++// icon, a globe until one is found). Only the icon of a DRAWN row is looked
++// up, so a closed folder asks nothing.
++class PinRow : public views::LabelButton {
++  METADATA_HEADER(PinRow, views::LabelButton)
++
++ public:
++  PinRow(const PinNode& node,
++         int level,
++         Profile* profile,
++         bool frame_active,
++         views::Button::PressedCallback callback)
++      : views::LabelButton(std::move(callback), RowText(node)),
++        id_(node.id),
++        folder_(node.type == PinNode::Type::kFolder),
++        open_(node.open) {
++    SetTooltipText(folder_ ? RowText(node)
++                           : base::StrCat({RowText(node), u"\n",
++                                           base::UTF8ToUTF16(node.url)}));
++    SetBorder(views::CreateEmptyBorder(
++        gfx::Insets::TLBR(0, kRowInset + level * kIndent, 0, kRowInset)));
++    SetMinSize(
++        gfx::Size(0, GetLayoutConstant(LayoutConstant::kVerticalTabHeight)));
++    // No opaque background under the text, as on the rail's buttons.
++    label()->SetSubpixelRenderingEnabled(false);
++    // The ring drawn inside: the rows sit in a clipping scroll view (E13).
++    views::FocusRing::Get(this)->SetOutsetFocusRingDisabled(true);
++    ConfigureInkDrop(this);
++    // A tree to assistive tech (design 5): an item at its level, a folder
++    // expanded or collapsed; the arrow keys move and open (OnKeyPressed).
++    GetViewAccessibility().SetRole(ax::mojom::Role::kTreeItem);
++    GetViewAccessibility().SetHierarchicalLevel(level + 1);
++
++    if (folder_) {
++      if (open_) {
++        GetViewAccessibility().SetIsExpanded();
++      } else {
++        GetViewAccessibility().SetIsCollapsed();
++      }
++      vector_icon_ = open_ ? &vector_icons::kFolderOpenIcon
++                           : &vector_icons::kFolderFlippableIcon;
++      SetFrameActive(frame_active);
++      return;
++    }
++    vector_icon_ = &vector_icons::kGlobeIcon;
++    SetFrameActive(frame_active);
++    // With fallback_to_host: most items were never visited in this profile,
++    // but another page of the same site often was (LOCAL.md 43).
++    if (favicon::FaviconService* const favicons =
++            FaviconServiceFactory::GetForProfile(
++                profile, ServiceAccessType::EXPLICIT_ACCESS)) {
++      favicons->GetRawFaviconForPageURL(
++          GURL(node.url), {favicon_base::IconType::kFavicon},
++          gfx::kFaviconSize * 2, /*fallback_to_host=*/true,
++          // Unretained: `favicon_tasks_` is a member, so a row destroyed first
++          // cancels its own request.
++          base::BindOnce(&PinRow::OnFavicon, base::Unretained(this)),
++          &favicon_tasks_);
++    }
++  }
++  PinRow(const PinRow&) = delete;
++  PinRow& operator=(const PinRow&) = delete;
++  ~PinRow() override = default;
++
++  const std::string& id() const { return id_; }
++
++  // Tabs dim in a window that is not the active one, and so do the rows.
++  void SetFrameActive(bool active) {
++    const ui::ColorId color = active ? kColorTabForegroundInactiveFrameActive
++                                     : kColorTabForegroundInactiveFrameInactive;
++    SetEnabledTextColors(color);
++    if (vector_icon_) {
++      SetImageModel(views::Button::STATE_NORMAL,
++                    ui::ImageModel::FromVectorIcon(*vector_icon_, color,
++                                                   gfx::kFaviconSize));
++    }
++  }
++
++  // views::View:
++  //
++  // Up and Down move between rows; Right opens a closed folder and Left closes
++  // an open one. Enter and Space stay the button's.
++  bool OnKeyPressed(const ui::KeyEvent& event) override {
++    switch (event.key_code()) {
++      case ui::VKEY_UP:
++      case ui::VKEY_DOWN: {
++        const views::View::Views& rows = parent()->children();
++        const auto it = std::ranges::find(rows, this);
++        if (event.key_code() == ui::VKEY_UP ? it != rows.begin()
++                                            : std::next(it) != rows.end()) {
++          (event.key_code() == ui::VKEY_UP ? *std::prev(it) : *std::next(it))
++              ->RequestFocus();
++        }
++        return true;
++      }
++      case ui::VKEY_LEFT:
++      case ui::VKEY_RIGHT:
++        if (folder_ && open_ == (event.key_code() == ui::VKEY_LEFT)) {
++          NotifyClick(event);
++        }
++        return true;
++      default:
++        return views::LabelButton::OnKeyPressed(event);
++    }
++  }
++  // A pane (F6) registers the arrow keys as its own shortcuts, and views runs
++  // those BEFORE the focused view sees the key: without this, Right and Left on
++  // a folder moved the focus instead of opening or closing it (the owner's
++  // check of E15b). Up and Down stay the pane's, which carry on into the tabs.
++  bool SkipDefaultKeyEventProcessing(const ui::KeyEvent& event) override {
++    return (folder_ && (event.key_code() == ui::VKEY_LEFT ||
++                        event.key_code() == ui::VKEY_RIGHT)) ||
++           views::LabelButton::SkipDefaultKeyEventProcessing(event);
++  }
++
++ private:
++  // Asked for at twice the icon size, so it is crisp at 200 %.
++  void OnFavicon(const favicon_base::FaviconRawBitmapResult& result) {
++    if (!result.is_valid()) {
++      return;
++    }
++    const SkBitmap bitmap = gfx::PNGCodec::Decode(
++        base::span<const uint8_t>(*result.bitmap_data));
++    if (bitmap.isNull()) {
++      return;
++    }
++    // The page's own icon from now on: SetFrameActive leaves it alone.
++    vector_icon_ = nullptr;
++    SetImageModel(views::Button::STATE_NORMAL,
++                  ui::ImageModel::FromImageSkia(gfx::ImageSkia::CreateFromBitmap(
++                      bitmap, static_cast<float>(bitmap.width()) /
++                                  gfx::kFaviconSize)));
++  }
++
++  const std::string id_;
++  const bool folder_;
++  const bool open_;
++  // The icon drawn in the text color; null once the page's own icon arrived.
++  raw_ptr<const gfx::VectorIcon> vector_icon_ = nullptr;
++  base::CancelableTaskTracker favicon_tasks_;
++};
++
++BEGIN_METADATA(PinRow)
++END_METADATA
++
++}  // namespace
++
++WorkspacePinnedSectionView::WorkspacePinnedSectionView(
++    BrowserWindowInterface* browser,
++    tabs::VerticalTabStripStateController* state_controller)
++    : browser_(browser), state_controller_(state_controller) {
++  SetLayoutManager(std::make_unique<views::BoxLayout>(
++                       views::BoxLayout::Orientation::kVertical))
++      ->set_inside_border_insets(gfx::Insets::TLBR(0, 0, 4, 0));
++  SetVisible(false);
++}
++
++WorkspacePinnedSectionView::~WorkspacePinnedSectionView() = default;
++
++void WorkspacePinnedSectionView::AddedToWidget() {
++  views::View::AddedToWidget();
++  // Once: a view can be added to a widget again.
++  if (!store_) {
++    Profile* const profile = browser_->GetProfile();
++    store_ = workspaces::pins::PinStore::GetOrCreate(profile,
++                                                     profile->GetPath());
++    store_observation_.Observe(store_.get());
++    // Unretained: the subscriptions are members, cancelled with this view.
++    if (workspaces::WorkspaceService* const service =
++            workspaces::WorkspaceService::From(browser_)) {
++      workspace_changed_subscription_ =
++          service->RegisterWorkspaceChangedCallback(base::BindRepeating(
++              &WorkspacePinnedSectionView::ScheduleRebuild,
++              base::Unretained(this)));
++      // Also how the settings toggle arrives (OnEnabledChanged).
++      workspace_list_changed_subscription_ =
++          service->RegisterWorkspaceListChangedCallback(base::BindRepeating(
++              &WorkspacePinnedSectionView::ScheduleRebuild,
++              base::Unretained(this)));
++    }
++    if (state_controller_) {
++      collapse_changed_subscription_ =
++          state_controller_->RegisterOnCollapseChanged(base::BindRepeating(
++              &WorkspacePinnedSectionView::OnCollapseChanged,
++              base::Unretained(this)));
++    }
++  }
++  paint_as_active_subscription_ =
++      GetWidget()->RegisterPaintAsActiveChangedCallback(base::BindRepeating(
++          &WorkspacePinnedSectionView::UpdateRowColors,
++          base::Unretained(this)));
++  ScheduleRebuild();
++}
++
++void WorkspacePinnedSectionView::RemovedFromWidget() {
++  paint_as_active_subscription_ = {};
++  views::View::RemovedFromWidget();
++}
++
++void WorkspacePinnedSectionView::OnThemeChanged() {
++  views::View::OnThemeChanged();
++  // A font change is a theme change: measure again.
++  preferred_height_.reset();
++  PreferredSizeChanged();
++}
++
++gfx::Size WorkspacePinnedSectionView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  // Measured once per rebuild: every row is one line at a fixed height, so the
++  // answer cannot change until the rows do. A bounded width is never cached by
++  // the layout manager (LayoutManagerBase::GetPreferredSize), so without this
++  // every strip layout asked each of the 1,313 rows (E15b review).
++  if (!preferred_height_) {
++    preferred_height_ =
++        views::View::CalculatePreferredSize(available_size).height();
++  }
++  return gfx::Size(0, *preferred_height_);
++}
++
++void WorkspacePinnedSectionView::OnPinsChanged() {
++  ScheduleRebuild();
++}
++
++void WorkspacePinnedSectionView::ScheduleRebuild() {
++  if (rebuild_scheduled_) {
++    return;
++  }
++  rebuild_scheduled_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspacePinnedSectionView::Rebuild,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void WorkspacePinnedSectionView::Rebuild() {
++  rebuild_scheduled_ = false;
++  const base::ElapsedTimer timer;
++  // The row with keyboard focus keeps it across the rebuild, so a folder
++  // opened or closed from the keyboard stays under the cursor (E15b review).
++  std::string focused_id;
++  if (const views::FocusManager* const focus = GetFocusManager()) {
++    const views::View* const focused = focus->GetFocusedView();
++    if (focused && Contains(focused)) {
++      if (const auto* const row = views::AsViewClass<PinRow>(focused)) {
++        focused_id = row->id();
++      }
++    }
++  }
++  // Cleared BEFORE the views go: `list_` would dangle across the delete.
++  list_ = nullptr;
++  preferred_height_.reset();
++  RemoveAllChildViews();
++
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  std::vector<const PinNode*> roots;
++  if (service && service->IsEnabled() && store_ && store_->loaded() &&
++      !(state_controller_ && state_controller_->IsCollapsed())) {
++    roots = workspaces::pins::RootsForWorkspace(
++        store_->tree(), service->active_guid(), service->known_guids());
++  }
++  SetVisible(!roots.empty());
++  if (roots.empty()) {
++    return;
++  }
++
++  // Built OFF the widget, then attached as one child. Every child added to or
++  // removed from a view in the widget makes views walk the whole layer subtree
++  // of its nearest layered ancestor (View::ReorderLayers) -- here the scroll
++  // view's contents, which holds every tab of the strip as well -- so rows
++  // added one by one cost rows x everything: 1,313 rows took 5.3 s at the E15b
++  // gate. Detached, an add walks nothing; attached once, the walk runs once.
++  auto list = std::make_unique<views::View>();
++  list->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical));
++  const bool frame_active = IsFrameActive();
++  size_t rows = 0;
++  for (const PinNode* root : roots) {
++    rows += AddRow(*list, *root, /*level=*/0, frame_active);
++  }
++  list_ = AddChildView(std::move(list));
++  AddChildView(std::make_unique<views::Separator>());
++  if (!focused_id.empty()) {
++    for (views::View* const child : list_->children()) {
++      if (views::AsViewClass<PinRow>(child)->id() == focused_id) {
++        child->RequestFocus();
++        break;
++      }
++    }
++  }
++  LOG(INFO) << "[workspaces] pins: drew " << rows << " row(s) of '"
++            << service->active_guid() << "' in "
++            << timer.Elapsed().InMilliseconds() << " ms";
++}
++
++size_t WorkspacePinnedSectionView::AddRow(views::View& list,
++                                          const PinNode& row,
++                                          int level,
++                                          bool frame_active) {
++  views::Button::PressedCallback callback;
++  if (row.type == PinNode::Type::kFolder) {
++    // The id only: the folder's state is read when it is clicked, since
++    // another window may have opened or closed it since this row was made.
++    callback = base::BindRepeating(&WorkspacePinnedSectionView::OnFolderPressed,
++                                   base::Unretained(this), row.id);
++  }
++  list.AddChildView(std::make_unique<PinRow>(
++      row, level, browser_->GetProfile(), frame_active, std::move(callback)));
++  size_t count = 1;
++  if (row.type == PinNode::Type::kFolder && row.open) {
++    for (const PinNode& child : row.children) {
++      count += AddRow(list, child, level + 1, frame_active);
++    }
++  }
++  return count;
++}
++
++void WorkspacePinnedSectionView::OnFolderPressed(const std::string& id) {
++  if (store_) {
++    store_->ToggleFolder(id);
++  }
++}
++
++bool WorkspacePinnedSectionView::IsFrameActive() const {
++  return GetWidget() ? GetWidget()->ShouldPaintAsActive() : true;
++}
++
++void WorkspacePinnedSectionView::UpdateRowColors() {
++  if (!list_) {
++    return;
++  }
++  const bool frame_active = IsFrameActive();
++  for (views::View* const child : list_->children()) {
++    views::AsViewClass<PinRow>(child)->SetFrameActive(frame_active);
++  }
++}
++
++void WorkspacePinnedSectionView::OnCollapseChanged(
++    tabs::VerticalTabStripCollapseState state) {
++  ScheduleRebuild();
++}
++
++BEGIN_METADATA(WorkspacePinnedSectionView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -0,0 +1,107 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_PINNED_SECTION_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_PINNED_SECTION_VIEW_H_
++
++#include <optional>
++#include <string>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++class BrowserWindowInterface;
++
++namespace tabs {
++class VerticalTabStripStateController;
++enum class VerticalTabStripCollapseState;
++}  // namespace tabs
++
++// The pinned section of the workspace this window shows (design 5, E15 spec):
++// its folders and items, above today's tabs and scrolling with them. Read-only
++// in E15b -- a folder opens and closes, an item is a row that opens nothing
++// yet (E15c).
++//
++// The rows are the pins file's data, not tabs: a closed folder makes no rows
++// for what it holds, so a 1,159-item folder costs one row until it is opened,
++// and nothing is ever loaded to draw one. Plain LabelButtons, no layer each.
++//
++// Made by TabStripCollectionController for every vertical strip of a regular
++// profile, and mounted by the one hunk in TabStripView::AddScrollViewContents.
++// It hides itself while Workspaces is off, while the strip is collapsed, and
++// while the workspace has no pinned rows.
++class WorkspacePinnedSectionView
++    : public views::View,
++      public workspaces::pins::PinStore::Observer {
++  METADATA_HEADER(WorkspacePinnedSectionView, views::View)
++
++ public:
++  WorkspacePinnedSectionView(
++      BrowserWindowInterface* browser,
++      tabs::VerticalTabStripStateController* state_controller);
++  WorkspacePinnedSectionView(const WorkspacePinnedSectionView&) = delete;
++  WorkspacePinnedSectionView& operator=(const WorkspacePinnedSectionView&) =
++      delete;
++  ~WorkspacePinnedSectionView() override;
++
++  // views::View:
++  //
++  // Subscribes here rather than in the constructor, as the rail does: being
++  // in a widget is certainly after the window's WorkspaceService and the
++  // vertical strip's controller are up.
++  void AddedToWidget() override;
++  void RemovedFromWidget() override;
++  void OnThemeChanged() override;
++  // Never wider than it is given: a long title elides, it does not widen the
++  // strip. The height is the rows', measured once per rebuild.
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++
++  // workspaces::pins::PinStore::Observer:
++  void OnPinsChanged() override;
++
++ private:
++  // Every change goes through a posted Rebuild(), never a direct one: a folder
++  // row's own click changes the store, and rebuilding inside that click would
++  // delete the button while its click handler is still running. Posting also
++  // folds several changes in one task into one rebuild.
++  void ScheduleRebuild();
++  void Rebuild();
++  // Adds `row` to `list`, then its children if it is an open folder. Returns
++  // how many rows that made.
++  size_t AddRow(views::View& list,
++                const workspaces::pins::PinNode& row,
++                int level,
++                bool frame_active);
++  void OnFolderPressed(const std::string& id);
++  void OnCollapseChanged(tabs::VerticalTabStripCollapseState state);
++  // Whether the window paints as active: the rows dim with the tabs when not.
++  bool IsFrameActive() const;
++  void UpdateRowColors();
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  const raw_ptr<tabs::VerticalTabStripStateController> state_controller_;
++  // The profile's; outlives every window's views.
++  raw_ptr<workspaces::pins::PinStore> store_ = nullptr;
++  base::ScopedObservation<workspaces::pins::PinStore,
++                          workspaces::pins::PinStore::Observer>
++      store_observation_{this};
++  base::CallbackListSubscription workspace_changed_subscription_;
++  base::CallbackListSubscription workspace_list_changed_subscription_;
++  base::CallbackListSubscription collapse_changed_subscription_;
++  base::CallbackListSubscription paint_as_active_subscription_;
++  // The rows' container, made by each Rebuild(); every child is a row.
++  raw_ptr<views::View> list_ = nullptr;
++  // CalculatePreferredSize()'s answer until the next rebuild or theme change.
++  mutable std::optional<int> preferred_height_;
++  bool rebuild_scheduled_ = false;
++  base::WeakPtrFactory<WorkspacePinnedSectionView> weak_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_PINNED_SECTION_VIEW_H_
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -841,7 +841,8 @@ void WorkspaceRailView::OnArcImportDone(
+                                          base::FormatNumber(result.tabs)));
+     builder.AddParagraph(ui::DialogModelLabel(l10n_util::GetStringFUTF16(
+         IDS_HELIUM_WORKSPACE_IMPORT_ARC_DETAILS,
+-        base::NumberToString16(result.groups),
++        base::NumberToString16(result.pinned),
++        base::NumberToString16(result.folders),
+         base::NumberToString16(result.skipped))));
+     if (result.startup_changed) {
+       builder.AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(

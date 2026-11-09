@@ -1,0 +1,195 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -2695,7 +2695,7 @@ size_t WorkspacePinnedSectionView::AddRo
+     pin_row->SetEscapeCallbacks(
+         base::BindRepeating(&WorkspacePinnedSectionView::HasSelection,
+                             base::Unretained(this)),
+-        base::BindRepeating(&WorkspacePinnedSectionView::ClearSelectionForEscape,
++        base::BindRepeating(&WorkspacePinnedSectionView::ClearSelection,
+                             base::Unretained(this)));
+     pin_row->SetSelected(selected_.contains(row.id));
+   }
+@@ -2974,27 +2974,22 @@ void WorkspacePinnedSectionView::ApplySe
+   }
+ }
+ 
+-void WorkspacePinnedSectionView::ClearSelection() {
+-  if (selected_.empty() && select_anchor_.empty()) {
+-    return;
++bool WorkspacePinnedSectionView::ClearSelection() {
++  // The anchor goes with it, selected or not: a toggled-off click leaves one.
++  select_anchor_.clear();
++  if (selected_.empty()) {
++    return false;
+   }
+   selected_.clear();
+-  select_anchor_.clear();
+   ApplySelection();
+   LOG(INFO) << "[workspaces] pins: selection cleared";
++  return true;
+ }
+ 
+ bool WorkspacePinnedSectionView::HasSelection() const {
+   return !selected_.empty();
+ }
+ 
+-bool WorkspacePinnedSectionView::ClearSelectionForEscape() {
+-  if (selected_.empty()) {
+-    return false;
+-  }
+-  ClearSelection();
+-  return true;
+-}
+ 
+ bool WorkspacePinnedSectionView::BuildSelectionMenu(const std::string& id,
+                                                     bool peek) {
+@@ -3119,26 +3114,14 @@ void WorkspacePinnedSectionView::ShowDel
+     const std::vector<std::string>& ids) {
+   LOG(INFO) << "[workspaces] confirm asked: delete " << ids.size()
+             << " selected row(s)";
+-  std::unique_ptr<ui::DialogModel> model =
+-      ui::DialogModel::Builder()
+-          .SetTitle(l10n_util::GetPluralStringFUTF16(
+-              IDS_HELIUM_PINNED_SELECTION_CONFIRM_DELETE,
+-              static_cast<int>(ids.size())))
+-          .AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(
+-              IDS_HELIUM_PINNED_SELECTION_CONFIRM_BODY)))
+-          .AddOkButton(
++  ShowConfirm(l10n_util::GetPluralStringFUTF16(
++                  IDS_HELIUM_PINNED_SELECTION_CONFIRM_DELETE,
++                  static_cast<int>(ids.size())),
++              l10n_util::GetStringUTF16(
++                  IDS_HELIUM_PINNED_SELECTION_CONFIRM_BODY),
++              l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_ITEM_DELETE),
+               base::BindOnce(&WorkspacePinnedSectionView::DeleteSelection,
+-                             weak_factory_.GetWeakPtr(), ids),
+-              ui::DialogModel::Button::Params().SetLabel(
+-                  l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_ITEM_DELETE)))
+-          .AddCancelButton(base::BindOnce(
+-              [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
+-          .Build();
+-  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
+-      std::move(model), this, views::BubbleBorder::TOP_LEFT);
+-  views::BubbleDialogDelegate::CreateBubbleDeprecated(
+-      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
+-      ->Show();
++                             weak_factory_.GetWeakPtr(), ids));
+ }
+ 
+ void WorkspacePinnedSectionView::DeleteSelection(
+@@ -3459,23 +3442,16 @@ void WorkspacePinnedSectionView::DeleteR
+             << " archived)";
+ }
+ 
+-void WorkspacePinnedSectionView::ShowDeleteFolderConfirm(const std::string& id,
+-                                                         int items) {
+-  // Logged when asked and when cancelled, as the rail's confirm is, so a test
+-  // can tell "asked, then cancelled" from "never asked".
+-  LOG(INFO) << "[workspaces] confirm asked: delete folder '" << id << "', "
+-            << items << " item(s)";
++void WorkspacePinnedSectionView::ShowConfirm(const std::u16string& title,
++                                             const std::u16string& body,
++                                             const std::u16string& ok_label,
++                                             base::OnceClosure on_ok) {
+   std::unique_ptr<ui::DialogModel> model =
+       ui::DialogModel::Builder()
+-          .SetTitle(l10n_util::GetPluralStringFUTF16(
+-              IDS_HELIUM_PINNED_FOLDER_CONFIRM_DELETE, items))
+-          .AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(
+-              IDS_HELIUM_PINNED_FOLDER_CONFIRM_BODY)))
+-          .AddOkButton(
+-              base::BindOnce(&WorkspacePinnedSectionView::DeleteRow,
+-                             weak_factory_.GetWeakPtr(), id),
+-              ui::DialogModel::Button::Params().SetLabel(
+-                  l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_FOLDER_DELETE)))
++          .SetTitle(title)
++          .AddParagraph(ui::DialogModelLabel(body))
++          .AddOkButton(std::move(on_ok),
++                       ui::DialogModel::Button::Params().SetLabel(ok_label))
+           .AddCancelButton(base::BindOnce(
+               [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
+           .Build();
+@@ -3486,6 +3462,20 @@ void WorkspacePinnedSectionView::ShowDel
+       ->Show();
+ }
+ 
++void WorkspacePinnedSectionView::ShowDeleteFolderConfirm(const std::string& id,
++                                                         int items) {
++  // Logged when asked and when cancelled, as the rail's confirm is, so a test
++  // can tell "asked, then cancelled" from "never asked".
++  LOG(INFO) << "[workspaces] confirm asked: delete folder '" << id << "', "
++            << items << " item(s)";
++  ShowConfirm(l10n_util::GetPluralStringFUTF16(
++                  IDS_HELIUM_PINNED_FOLDER_CONFIRM_DELETE, items),
++              l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_FOLDER_CONFIRM_BODY),
++              l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_FOLDER_DELETE),
++              base::BindOnce(&WorkspacePinnedSectionView::DeleteRow,
++                             weak_factory_.GetWeakPtr(), id));
++}
++
+ void WorkspacePinnedSectionView::MoveRow(const std::string& id,
+                                          const std::string& guid) {
+   // Already there: Move would only put it last (C4, the one guard for the
+@@ -3547,26 +3537,13 @@ void WorkspacePinnedSectionView::ShowOpe
+   // cancelled" from "never asked".
+   LOG(INFO) << "[workspaces] confirm asked: open all of folder '" << id
+             << "', " << pages << " page(s)";
+-  std::unique_ptr<ui::DialogModel> model =
+-      ui::DialogModel::Builder()
+-          .SetTitle(l10n_util::GetPluralStringFUTF16(
+-              IDS_HELIUM_PINNED_FOLDER_CONFIRM_OPEN_ALL, pages))
+-          .AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(
+-              IDS_HELIUM_PINNED_FOLDER_CONFIRM_OPEN_ALL_BODY)))
+-          .AddOkButton(
++  ShowConfirm(l10n_util::GetPluralStringFUTF16(
++                  IDS_HELIUM_PINNED_FOLDER_CONFIRM_OPEN_ALL, pages),
++              l10n_util::GetStringUTF16(
++                  IDS_HELIUM_PINNED_FOLDER_CONFIRM_OPEN_ALL_BODY),
++              l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_FOLDER_OPEN_ALL),
+               base::BindOnce(&WorkspacePinnedSectionView::StartOpenAll,
+-                             weak_factory_.GetWeakPtr(), id),
+-              ui::DialogModel::Button::Params().SetLabel(
+-                  l10n_util::GetStringUTF16(
+-                      IDS_HELIUM_PINNED_FOLDER_OPEN_ALL)))
+-          .AddCancelButton(base::BindOnce(
+-              [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
+-          .Build();
+-  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
+-      std::move(model), this, views::BubbleBorder::TOP_LEFT);
+-  views::BubbleDialogDelegate::CreateBubbleDeprecated(
+-      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
+-      ->Show();
++                             weak_factory_.GetWeakPtr(), id));
+ }
+ 
+ void WorkspacePinnedSectionView::StartOpenAll(const std::string& id) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -297,11 +297,10 @@ class WorkspacePinnedSectionView
+   // Marks each drawn row selected or not from `selected_`; a rebuild marks the
+   // rows it makes itself (AddRow).
+   void ApplySelection();
+-  void ClearSelection();
+-  // Esc on a row (C29): whether there is a selection to let go of, and
+-  // letting go of it.
++  // Lets go of the selection; true when there was one to let go of.
++  bool ClearSelection();
++  // Esc on a row (C29): whether there is a selection to let go of.
+   bool HasSelection() const;
+-  bool ClearSelectionForEscape();
+   // The menu of several selected rows, when the row right-clicked is one of at
+   // least two; a right-click on a row that is not selected ends the selection
+   // and builds nothing. Fills context_menu_selection_ and context_menu_model_.
+@@ -357,6 +356,12 @@ class WorkspacePinnedSectionView
+   // Removes an item, or a folder with all it holds, closing their pages.
+   void DeleteRow(const std::string& id);
+   void ShowDeleteFolderConfirm(const std::string& id, int items);
++  // The confirmation bubble the three confirms share (Delete folder, Open all,
++  // Delete selection): `on_ok` runs on the OK button; Cancel only logs.
++  void ShowConfirm(const std::u16string& title,
++                   const std::u16string& body,
++                   const std::u16string& ok_label,
++                   base::OnceClosure on_ok);
+   // C3: row `id` -- a folder with all it holds -- goes last in workspace
+   // `guid`, and its open pages, in every window, follow it there. Never to
+   // the workspace on screen, where it is already: the menu greys it, and a

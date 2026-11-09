@@ -1,0 +1,1287 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -134,6 +134,33 @@
+ #define IDC_ADD_NEW_TAB_RECENT_GROUP  34107
+ #define IDC_UNFOCUS_TAB_GROUP         34108
+ 
++// Helium Workspaces commands.
++//
++// Reserved as one contiguous block on purpose. Eight Helium patches touch
++// this file, so every extra hunk here is another conflict to resolve at
++// every rebase; taking the whole range now means the rest of the feature
++// never has to reopen it. 34110-34999 is entirely free -- Helium's own ids
++// stop at 34091 and the upstream block above ends at 34108.
++//
++// Only NEXT and PREV are wired today. The others are named so that the
++// range is visibly spoken for, and 34126-34139 is left spare.
++#define IDC_HELIUM_WORKSPACE_NEXT     34110
++#define IDC_HELIUM_WORKSPACE_PREV     34111
++#define IDC_HELIUM_WORKSPACE_1        34112
++#define IDC_HELIUM_WORKSPACE_2        34113
++#define IDC_HELIUM_WORKSPACE_3        34114
++#define IDC_HELIUM_WORKSPACE_4        34115
++#define IDC_HELIUM_WORKSPACE_5        34116
++#define IDC_HELIUM_WORKSPACE_6        34117
++#define IDC_HELIUM_WORKSPACE_7        34118
++#define IDC_HELIUM_WORKSPACE_8        34119
++#define IDC_HELIUM_WORKSPACE_9        34120
++#define IDC_HELIUM_WORKSPACE_NEW      34121
++#define IDC_HELIUM_WORKSPACE_CLOSE    34122
++#define IDC_HELIUM_WORKSPACE_RENAME   34123
++#define IDC_HELIUM_WORKSPACE_MOVE_TAB_TO 34124
++#define IDC_HELIUM_WORKSPACE_TOGGLE_RAIL 34125
++
+ // Page-related commands
+ #define IDC_BOOKMARK_THIS_TAB           35000
+ #define IDC_BOOKMARK_ALL_TABS           35001
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -313,6 +313,9 @@ are declared in tools/grit/grit_args.gni
+       <!-- Shortcut Input specific strings -->
+       <part file="shortcut_input_strings.grdp" />
+ 
++      <!-- Helium Workspaces strings -->
++      <part file="../browser/ui/tabs/workspaces/workspaces_strings.grdp" />
++
+       <!-- Chrome-OS-specific strings -->
+       <if expr="is_chromeos">
+         <part file="chromeos_shared_strings.grdp" />
+--- a/chrome/app/generated_resources.grd.gritdeps
++++ b/chrome/app/generated_resources.grd.gritdeps
+@@ -108,4 +108,5 @@ chrome/app/skills_strings.grdp
+ chrome/app/support_tool_strings.grdp
+ chrome/app/vr_strings.grdp
+ chrome/app/whats_new_strings.grdp
++chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
+ components/helium_onboarding/helium_onboarding_strings.grdp
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -4025,6 +4025,7 @@ source_set("browser") {
+       "//chrome/browser/ui/tabs/back_to_opener",
+       "//chrome/browser/ui/tabs/tab_drag_api",
+       "//chrome/browser/ui/tabs/tab_strip_api",
++      "//chrome/browser/ui/tabs/workspaces",
+       "//chrome/browser/ui/toasts",
+       "//chrome/browser/ui/toasts:impl",
+       "//chrome/browser/ui/toolbar/cast",
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -676,7 +676,18 @@ if (!is_android) {
+ 
+   source_set("browser_command_controller_impl") {
+     sources = [ "browser_command_controller.cc" ]
+-    public_deps = [ ":browser_command_controller" ]
++
++    # Helium Workspaces: the bodies of its command hooks (review #16). They reach the
++    # workspaces model and the vertical views, so they keep the catch-all public dep
++    # this target had until 157 (see browser_public_dependencies in chrome/browser).
++    sources += [
++      "workspace_command_hooks.cc",
++      "workspace_command_hooks.h",
++    ]
++    public_deps = [
++      ":browser_command_controller",
++      "//chrome/browser:browser_public_dependencies",
++    ]
+     deps = [
+       ":accelerator_table",
+       ":browser_actions",
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -241,6 +241,16 @@ const AcceleratorMapping kAcceleratorMap
+     {ui::VKEY_T, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_FOCUS_TOOLBAR},
+     {ui::VKEY_RIGHT, ui::EF_ALT_DOWN, IDC_FORWARD},
+     {ui::VKEY_RIGHT, ui::EF_ALTGR_DOWN, IDC_FORWARD},
++    // Helium Workspaces. Shift+Alt, not the Ctrl+Alt that Arc and Zen use:
++    // Ctrl+Alt is what AltGr sends on many Windows layouts, GetAcceleratorList
++    // below DCHECKs on any Ctrl+Alt accelerator for exactly that reason, and
++    // AltGr+Left is already Back on the line above. Shift+Alt also matches
++    // kTabGroupAcceleratorMap, the closest neighbouring feature. Rebindable
++    // through the Helium shortcuts settings page like everything else.
++    {ui::VKEY_LEFT, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
++     IDC_HELIUM_WORKSPACE_PREV},
++    {ui::VKEY_RIGHT, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
++     IDC_HELIUM_WORKSPACE_NEXT},
+     {ui::VKEY_HOME, ui::EF_ALT_DOWN, IDC_HOME},
+     {ui::VKEY_E, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+     {ui::VKEY_F, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -106,6 +106,7 @@
+ #include "chrome/browser/ui/webui/side_panel/customize_chrome/customize_chrome_section.h"
+ #include "chrome/browser/ui/webui/util/webui_util_desktop.h"
+ #include "chrome/browser/ui/window_feature_controller/window_feature_controller.h"
++#include "chrome/browser/ui/workspace_command_hooks.h"
+ #include "chrome/browser/web_applications/web_app_install_params.h"
+ #include "chrome/browser/web_applications/web_app_utils.h"
+ #include "chrome/common/channel_info.h"
+@@ -697,6 +698,11 @@ void BrowserCommandController::HandleCom
+     base::TimeTicks time_stamp) {
+   DCHECK(IsCommandEnabled(id)) << "Invalid/disabled command " << id;
+ 
++  // Helium Workspaces: the fork's commands (workspace_command_hooks.cc).
++  if (workspaces::ExecuteWorkspaceCommand(browser_, id)) {
++    return;
++  }
++
+   // The order of commands in this switch statement must match the function
+   // declaration order in browser.h!
+   switch (id) {
+@@ -1893,6 +1899,9 @@ void BrowserCommandController::InitComma
+   command_updater_->UpdateCommandEnabled(IDC_ADD_NEW_TAB_RECENT_GROUP, true);
+   command_updater_->UpdateCommandEnabled(IDC_UNFOCUS_TAB_GROUP, true);
+ 
++  // Helium Workspaces: the fork's commands (workspace_command_hooks.cc).
++  workspaces::EnableWorkspaceCommands(command_updater_.get());
++
+   // Omnibox commands
+   command_updater_->UpdateCommandEnabled(IDC_SHOW_FULL_URLS, true);
+   command_updater_->UpdateCommandEnabled(IDC_SHOW_GOOGLE_LENS_SHORTCUT, true);
+--- a/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
+@@ -13,6 +13,7 @@
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/workspace_command_hooks.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/prefs/pref_service.h"
+@@ -77,6 +78,12 @@ std::optional<BrowserShortcutCommandLabe
+     return std::nullopt;
+   }
+ 
++  // Helium Workspaces: the fork's commands (workspace_command_hooks.cc).
++  if (std::optional<BrowserShortcutCommandLabel> label =
++          workspaces::WorkspaceShortcutLabel(command_id)) {
++    return label;
++  }
++
+   switch (command_id) {
+     case IDC_BACK:
+       return Label(IDS_SHORTCUT_COMMAND_BACK);
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -6,6 +6,8 @@
+ 
+ #include <string>
+ #include <string_view>
++#include <utility>
++#include <vector>
+ 
+ #include "base/logging.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -17,6 +19,15 @@
+ 
+ namespace workspaces {
+ 
++namespace {
++
++// Temporary, for E6b only: switching needs somewhere to switch to, and the
++// real workspace list does not exist until E7. Deliberately not a pref, not
++// persisted and not user-visible, so deleting it later costs nothing.
++constexpr std::string_view kTemporarySecondWorkspaceGuid = "second";
++
++}  // namespace
++
+ DEFINE_USER_DATA(WorkspaceService);
+ 
+ WorkspaceService::WorkspaceService(
+@@ -24,6 +35,8 @@ WorkspaceService::WorkspaceService(
+     ui::UnownedUserDataHost& unowned_user_data_host)
+     : tab_strip_(tab_strip_model),
+       active_guid_(kDefaultWorkspaceGuid),
++      workspaces_({std::string(kDefaultWorkspaceGuid),
++                   std::string(kTemporarySecondWorkspaceGuid)}),
+       scoped_data_holder_(unowned_user_data_host, *this) {
+   tab_strip_->AddObserver(this);
+ }
+@@ -37,6 +50,29 @@ WorkspaceService* WorkspaceService::From
+   return browser ? Get(browser->GetUnownedUserDataHost()) : nullptr;
+ }
+ 
++void WorkspaceService::SetActiveWorkspace(std::string_view guid) {
++  const std::string_view effective_guid =
++      guid.empty() ? kDefaultWorkspaceGuid : guid;
++  if (std::string_view(active_guid_) == effective_guid) {
++    return;
++  }
++  active_guid_ = std::string(effective_guid);
++
++  LOG(INFO) << "[workspaces] active workspace -> '" << active_guid_ << "'";
++
++  workspace_changed_callbacks_.Notify();
++}
++
++void WorkspaceService::ActivateRelativeWorkspace(int offset) {
++  SetActiveWorkspace(RelativeWorkspaceGuid(workspaces_, active_guid_, offset));
++}
++
++base::CallbackListSubscription
++WorkspaceService::RegisterWorkspaceChangedCallback(
++    base::RepeatingClosure callback) {
++  return workspace_changed_callbacks_.Add(std::move(callback));
++}
++
+ bool WorkspaceService::IsTabVisible(const tabs::TabInterface* tab) const {
+   if (!tab) {
+     return true;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -6,7 +6,11 @@
+ #define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SERVICE_H_
+ 
+ #include <string>
++#include <string_view>
++#include <vector>
+ 
++#include "base/callback_list.h"
++#include "base/functional/callback_forward.h"
+ #include "base/memory/raw_ref.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+@@ -54,6 +58,35 @@ class WorkspaceService : public TabStrip
+   // ever written to a pref (design 2.4).
+   const std::string& active_guid() const { return active_guid_; }
+ 
++  // Shows `guid` in this window, and tells everything registered through
++  // RegisterWorkspaceChangedCallback() that it changed. A no-op if that
++  // workspace is already active, so holding a shortcut down cannot produce
++  // a storm of relayouts.
++  //
++  // An empty `guid` means the default workspace, matching
++  // IsVisibleInWorkspace.
++  //
++  // This changes only our own bookkeeping -- it calls nothing on
++  // TabStripModel -- so the re-entrancy rule above is not in play. Keep it
++  // that way: the moment switching also has to move or activate a tab, that
++  // part belongs in a posted task, not here.
++  void SetActiveWorkspace(std::string_view guid);
++
++  // Shows the workspace `offset` positions from the active one, wrapping at
++  // both ends. +1 is next, -1 is previous.
++  void ActivateRelativeWorkspace(int offset);
++
++  // Runs `callback` after every actual change of active workspace. This is
++  // how a workspace switch reaches the tab strip: the visibility predicate
++  // is re-read on each layout, so the view layer only needs to be told to
++  // lay out again. Nothing here knows what a view is (design 3.1).
++  //
++  // The returned subscription may safely outlive this service:
++  // base::CallbackList::Add() binds a weak pointer to the list, so a
++  // cancellation that arrives after the service is gone does nothing.
++  base::CallbackListSubscription RegisterWorkspaceChangedCallback(
++      base::RepeatingClosure callback);
++
+   // Whether `tab` is drawn in this window, for the rendering predicate.
+   //
+   // Fails open: a null tab, a tab with no WebContents, or a tab that has never
+@@ -76,6 +109,14 @@ class WorkspaceService : public TabStrip
+   const raw_ref<TabStripModel> tab_strip_;
+   std::string active_guid_;
+ 
++  // Temporary scaffolding, in cycling order. The real list is per profile,
++  // user-editable and persisted, and arrives with E7; two hardcoded entries
++  // are the minimum that makes switching mean anything, and nothing else
++  // reads this, so replacing it later is a local change.
++  std::vector<std::string> workspaces_;
++
++  base::RepeatingClosureList workspace_changed_callbacks_;
++
+   // Must be last: it publishes `this` to the window, so everything else has to
+   // be initialised before it, and it must be torn down first.
+   ui::ScopedUnownedUserData<WorkspaceService> scoped_data_holder_;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ namespace workspaces {
+ 
+@@ -33,4 +34,30 @@ bool IsVisibleInWorkspace(std::string_vi
+   return effective_tab == effective_active;
+ }
+ 
++std::string RelativeWorkspaceGuid(const std::vector<std::string>& workspaces,
++                                  std::string_view active_guid,
++                                  int offset) {
++  if (workspaces.empty()) {
++    return std::string(kDefaultWorkspaceGuid);
++  }
++
++  const std::string_view effective_active =
++      active_guid.empty() ? kDefaultWorkspaceGuid : active_guid;
++
++  const int size = static_cast<int>(workspaces.size());
++  int index = 0;
++  for (int i = 0; i < size; ++i) {
++    if (workspaces[i] == effective_active) {
++      index = i;
++      break;
++    }
++  }
++
++  // In C++ the sign of a % b follows a, so (0 + -1) % 2 is -1 and would
++  // index off the front of the vector. Adding one more `size` before the
++  // second modulo makes the result non-negative for any offset.
++  const int target = ((index + offset) % size + size) % size;
++  return workspaces[target];
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -7,6 +7,7 @@
+ 
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ // The rules deciding which workspace a tab belongs to.
+ //
+@@ -57,6 +58,23 @@ std::string ResolveGuidForInsertedTab(st
+ bool IsVisibleInWorkspace(std::string_view tab_guid,
+                           std::string_view active_guid);
+ 
++// The workspace `offset` positions away from `active_guid` in
++// `workspaces`, wrapping at both ends: next-from-last is the first, and
++// previous-from-first is the last. Switching is a cycle, never a dead end,
++// so a user holding the shortcut always keeps moving.
++//
++// The corner cases are all reachable from the keyboard, so none of them may
++// be left to chance:
++//  - an empty list returns kDefaultWorkspaceGuid, since the implicit default
++//    workspace always exists (design 2.4);
++//  - an empty `active_guid` means the default workspace, exactly as it does
++//    in IsVisibleInWorkspace;
++//  - an `active_guid` that is not in the list counts as position 0, so a
++//    stale guid still moves somewhere instead of wedging.
++std::string RelativeWorkspaceGuid(const std::vector<std::string>& workspaces,
++                                  std::string_view active_guid,
++                                  int offset);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ 
+ #include <string>
++#include <vector>
+ 
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -83,5 +84,77 @@ TEST(WorkspaceStampingTest, NewlyStamped
+   }
+ }
+ 
++// Switching wraps in both directions. Without this a user who reaches the
++// last workspace and keeps pressing Next simply stops moving, with no
++// feedback to explain why.
++TEST(WorkspaceRelativeTest, NextAndPreviousWrapAround) {
++  const std::vector<std::string> list = {"a", "b", "c"};
++  EXPECT_EQ("b", RelativeWorkspaceGuid(list, "a", 1));
++  EXPECT_EQ("a", RelativeWorkspaceGuid(list, "c", 1));
++  EXPECT_EQ("a", RelativeWorkspaceGuid(list, "b", -1));
++  EXPECT_EQ("c", RelativeWorkspaceGuid(list, "a", -1));
++}
++
++// The reason the modulo is written the way it is: the sign of a % b follows
++// a in C++, so a negative offset would index off the front of the vector.
++// Large offsets in both directions are checked because nothing stops a
++// future caller passing one.
++TEST(WorkspaceRelativeTest, LargeOffsetsStayInRange) {
++  const std::vector<std::string> list = {"a", "b", "c"};
++  EXPECT_EQ("b", RelativeWorkspaceGuid(list, "a", 4));
++  EXPECT_EQ("c", RelativeWorkspaceGuid(list, "a", -4));
++  EXPECT_EQ("a", RelativeWorkspaceGuid(list, "a", 300));
++  EXPECT_EQ("a", RelativeWorkspaceGuid(list, "a", -300));
++}
++
++// One workspace means every switch is a no-op, not a crash and not an empty
++// guid. This is first run, before anyone has made a second workspace.
++TEST(WorkspaceRelativeTest, SingleWorkspaceStaysPut) {
++  const std::vector<std::string> list = {std::string(kDefaultWorkspaceGuid)};
++  EXPECT_EQ(kDefaultWorkspaceGuid, RelativeWorkspaceGuid(list, "", 1));
++  EXPECT_EQ(kDefaultWorkspaceGuid,
++            RelativeWorkspaceGuid(list, kDefaultWorkspaceGuid, -1));
++}
++
++// An empty list cannot happen today, but the implicit default workspace is
++// what the whole design leans on when nothing else is known, so it is what
++// this returns rather than an empty string every caller would have to check.
++TEST(WorkspaceRelativeTest, EmptyListReturnsDefaultWorkspace) {
++  EXPECT_EQ(kDefaultWorkspaceGuid, RelativeWorkspaceGuid({}, "work", 1));
++}
++
++// An empty active guid means the default workspace here exactly as it does
++// in IsVisibleInWorkspace. If these two disagreed, a fresh window would
++// switch away from a workspace it was not actually showing.
++TEST(WorkspaceRelativeTest, EmptyActiveGuidMeansDefaultWorkspace) {
++  const std::vector<std::string> list = {std::string(kDefaultWorkspaceGuid),
++                                         "work"};
++  EXPECT_EQ("work", RelativeWorkspaceGuid(list, "", 1));
++  EXPECT_EQ("work", RelativeWorkspaceGuid(list, "", -1));
++}
++
++// A guid that is not in the list is treated as position 0 rather than
++// wedging. Reachable at E8: a tab restored into a workspace the user has
++// since deleted leaves the window pointing at a guid nobody lists.
++TEST(WorkspaceRelativeTest, UnknownActiveGuidStillMoves) {
++  const std::vector<std::string> list = {"a", "b", "c"};
++  EXPECT_EQ("b", RelativeWorkspaceGuid(list, "deleted", 1));
++  EXPECT_EQ("c", RelativeWorkspaceGuid(list, "deleted", -1));
++}
++
++// The switching rule and the visibility rule have to agree: whatever
++// RelativeWorkspaceGuid lands on must be a workspace IsVisibleInWorkspace
++// then shows tabs for. If they ever disagreed, switching would land on a
++// workspace that renders as permanently empty.
++TEST(WorkspaceRelativeTest, LandedWorkspaceShowsItsOwnTabs) {
++  const std::vector<std::string> list = {std::string(kDefaultWorkspaceGuid),
++                                         "work"};
++  for (int offset : {1, -1}) {
++    const std::string landed = RelativeWorkspaceGuid(list, "", offset);
++    EXPECT_TRUE(IsVisibleInWorkspace(landed, landed))
++        << "landed on '" << landed << "' with offset " << offset;
++  }
++}
++
+ }  // namespace
+ }  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
+@@ -0,0 +1,617 @@
++<?xml version="1.0" encoding="utf-8"?>
++<grit-part>
++  <!-- Helium Workspaces: every string of the fork, in one file of its own,
++       included by one line in chrome/app/generated_resources.grd. New
++       strings are appended here, by the patch that uses them. -->
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_NEXT" desc="Command name shown on the Settings shortcuts page for switching to the next workspace.">
++    Next workspace
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_PREVIOUS" desc="Command name shown on the Settings shortcuts page for switching to the previous workspace.">
++    Previous workspace
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_NEW" desc="Command name shown on the Settings shortcuts page for creating a workspace.">
++    New workspace
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_MOVE_UP" desc="Command name shown on the Settings shortcuts page for moving the current workspace one place earlier in the workspace list.">
++    Move workspace up
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_MOVE_DOWN" desc="Command name shown on the Settings shortcuts page for moving the current workspace one place later in the workspace list.">
++    Move workspace down
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_N" desc="Command name shown on the Settings shortcuts page for switching to a workspace by its place in the workspace bar.">
++    Workspace <ph name="WORKSPACE_NUMBER">$1<ex>1</ex></ph>
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_BACK" desc="Command name shown on the Settings shortcuts page for switching back to the workspace shown before the current one.">
++    Back to the last workspace
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_PIN_TAB" desc="Command name shown on the Settings shortcuts page for pinning the current tab to its workspace, or unpinning it when it is already a pinned page.">
++    Pin or unpin this page
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_CLEAR" desc="Command name shown on the Settings shortcuts page for closing every tab in the current workspace's Today list, keeping its pinned pages.">
++    Clear Today
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_ARCHIVE" desc="Command name shown on the Settings shortcuts page for opening the Archive of closed tabs.">
++    Open the Archive
++  </message>
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_QUICK_SEARCH" desc="Command name shown on the Settings shortcuts page for opening the quick search box, which finds open tabs, pinned pages and archived tabs of every workspace.">
++    Find tabs and pages
++  </message>
++  <message name="IDS_HELIUM_LITTLE_WINDOW_OPEN" desc="Tooltip and accessible name of the button at the right end of the address row of the small window a link from another app opens in: moves the page into the main browser window as a tab, at the top of the tab list, and closes the small window.">
++    Open in main window
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_DEFAULT_NAME" desc="Name shown for the workspace every tab belongs to until it is put in another one.">
++    Home
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_NEW" desc="Title of the dialog for creating a workspace, and the tooltip of the button that opens it.">
++    New workspace
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_RENAME" desc="Menu item and dialog title for renaming a workspace.">
++    Rename workspace
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_MOVE_UP" desc="Menu item on a workspace in the workspace rail that moves it one place earlier in the list. 'Up' means earlier in the order, which is toward the left when the tab strip is expanded and the rail is drawn as a row, and literally upward when the strip is collapsed and the rail is a column.">
++    Move up
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_MOVE_DOWN" desc="Menu item on a workspace in the workspace rail that moves it one place later in the list. 'Down' means later in the order, which is toward the right when the tab strip is expanded and the rail is drawn as a row, and literally downward when the strip is collapsed and the rail is a column.">
++    Move down
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_DELETE" desc="Menu item for deleting a workspace, which also closes the tabs in it.">
++    Delete workspace
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CHANGE_ICON" desc="Menu item and dialog title for choosing the emoji the workspace rail shows for a workspace.">
++    Change icon
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_CUSTOM" desc="Last item of the Change icon submenu on the workspace rail: opens a text field for typing any emoji instead of picking one of the ready-made ones.">
++    Custom…
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_HOME" desc="Name shown beside the house emoji in the Change icon submenu.">
++    Home
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_WORK" desc="Name shown beside the briefcase emoji in the Change icon submenu.">
++    Work
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_STUDY" desc="Name shown beside the books emoji in the Change icon submenu.">
++    Study
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_PLAY" desc="Name shown beside the game controller emoji in the Change icon submenu.">
++    Play
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_SHOPPING" desc="Name shown beside the shopping cart emoji in the Change icon submenu.">
++    Shopping
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_MUSIC" desc="Name shown beside the musical note emoji in the Change icon submenu.">
++    Music
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_LABEL" desc="Label of the text field for a workspace's icon. The user types or pastes an emoji into it; leaving it empty removes the icon.">
++    Icon (an emoji; empty for none)
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SAVE_AS_BOOKMARKS" desc="Menu item on a workspace in the workspace rail: saves the workspace's pinned pages, with their folders, and its open tabs as bookmarks, in a new folder named after the workspace and the date and time, under Other bookmarks, Workspaces. Nothing is closed.">
++    Save as bookmarks
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_BOOKMARKS_FOLDER" desc="Name of the bookmark folder in Other bookmarks that holds the folders made by the Save as bookmarks item of the workspace rail, one per save.">
++    Workspaces
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_BOOKMARKS_TODAY" desc="Name of the sub-folder, in a bookmark folder made by Save as bookmarks, that holds the workspace's open tabs (its Today tabs, below its pinned pages).">
++    Today
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_UNLOAD" desc="Menu item on a workspace in the workspace rail that hibernates the tabs in that workspace to free memory, keeping them in the tab strip.">
++    Unload workspace
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_UNLOAD_OTHERS" desc="Menu item on a workspace in the workspace rail that hibernates the tabs of every other workspace to free memory, keeping them in the tab strip.">
++    Unload other workspaces
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CLOSE_ALL" desc="Menu item on a workspace in the workspace rail that closes every tab in that workspace; the workspace itself stays and the tabs can be reopened from Recently Closed.">
++    Close all tabs
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CLOSE_DUPLICATES" desc="Menu item on a workspace in the workspace rail: finds the workspace's Today tabs whose address is already open in another tab of it or is one of its pinned pages, then asks before closing those copies into the Archive.">
++    Close duplicate tabs…
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CONFIRM_CLOSE_DUPLICATES" desc="Title of the confirmation before Close duplicate tabs closes the copies it found.">
++    {NUM_TABS, plural,
++     =1 {Close 1 duplicate tab?}
++     other {Close # duplicate tabs?}}
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CONFIRM_DUPLICATES_MORE" desc="Last line of the list of tab titles in the Close duplicate tabs confirmation, when more tabs will close than the list shows.">
++    {NUM_TABS, plural,
++     =1 {and 1 more}
++     other {and # more}}
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CONFIRM_DUPLICATES_BODY" desc="Body of the Close duplicate tabs confirmation: the closed copies can be found and restored in the Archive.">
++    They stay in the Archive.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CONFIRM_DUPLICATES_ACCEPT" desc="Button of the Close duplicate tabs confirmation that closes the listed copies.">
++    Close tabs
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SCROLL_BACK" desc="Tooltip and accessible name of the arrow at the left end of the workspace rail, which slides the workspace buttons to show earlier workspaces.">
++    Previous workspaces
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SCROLL_FORWARD" desc="Tooltip and accessible name of the arrow at the right end of the workspace rail, which slides the workspace buttons to show later workspaces.">
++    More workspaces
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ADD_MENU" desc="Tooltip and accessible name of the plus button on the workspace rail, which opens a menu with New tab, New workspace and Tab search.">
++    New tab, workspace or tab search
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CONFIRM_CLOSE_ALL" desc="Title of the confirmation shown before Close all tabs on a workspace in the workspace rail closes more tabs than Recently Closed can reopen.">
++    {NUM_TABS, plural,
++     =1 {Close the tab in this workspace?}
++     other {Close all # tabs in this workspace?}}
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CONFIRM_DELETE" desc="Title of the confirmation shown before Delete workspace in the workspace rail closes more tabs than Recently Closed can reopen.">
++    {NUM_TABS, plural,
++     =1 {Delete this workspace and close its tab?}
++     other {Delete this workspace and close its # tabs?}}
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_CONFIRM_BODY" desc="Body of the confirmation before closing many tabs of a workspace: Recently Closed (Ctrl+Shift+T) keeps only the last 25 closed tabs, so the rest cannot be brought back.">
++    Only the last 25 closed tabs can be reopened with Ctrl+Shift+T.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC" desc="Item on the workspace rail's + menu: imports the spaces, folders and tabs of the Arc browser into workspaces.">
++    Import from Arc…
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_DONE" desc="Title of the bubble shown when an import from the Arc browser finished.">
++    Imported <ph name="COUNT">$1<ex>3865</ex></ph> tabs from Arc
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_DETAILS" desc="Body of the bubble shown when an import from the Arc browser finished. Arc's pinned tabs become rows of each workspace's pinned section, which load nothing. Tabs are skipped when they are not web pages.">
++    <ph name="PINNED">$1<ex>3183</ex></ph> pinned tabs are now in the workspaces' pinned sections, in <ph name="FOLDERS">$2<ex>28</ex></ph> folders. <ph name="SKIPPED">$3<ex>9</ex></ph> tabs were skipped because they are not web pages. The tabs are asleep until you click them.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_STARTUP" desc="Extra line in the import bubble when the import changed the On startup setting so the imported tabs are restored at the next launch.">
++    "On startup" is now set to "Continue where you left off", so these tabs come back after a restart.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_PROGRESS" desc="Status text at the bottom of the window while tabs are being imported from the Arc browser. $1 = tabs done so far, $2 = total.">
++    Importing from Arc: <ph name="DONE">$1<ex>1,200</ex></ph> of <ph name="TOTAL">$2<ex>3,873</ex></ph> tabs
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_ABORTED" desc="Title of the bubble shown when an import from the Arc browser stopped because its window was closed. $1 = tabs imported, $2 = tabs planned.">
++    The import stopped: its window was closed after <ph name="DONE">$1<ex>1,200</ex></ph> of <ph name="TOTAL">$2<ex>3,873</ex></ph> tabs
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_ARC_NOT_FOUND" desc="Title of the bubble shown when the Arc browser's data could not be found or read.">
++    Arc's data was not found on this computer
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ARCHIVE" desc="Item on the workspace rail's + menu, and the title of the screen it opens: the tabs the user closed, kept for 60 days, which can be searched and reopened.">
++    Archive
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_SEARCH" desc="Placeholder and accessible name of the search box on the Archive screen, which filters the list of closed tabs as the user types.">
++    Search archive
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_ALL_WORKSPACES" desc="Check box on the Archive screen: when checked, the list shows the closed tabs of every workspace instead of only the current workspace's.">
++    All workspaces
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_TODAY" desc="Header on the Archive screen over the tabs closed today.">
++    Today
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_YESTERDAY" desc="Header on the Archive screen over the tabs closed yesterday.">
++    Yesterday
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_EMPTY" desc="Shown on the Archive screen when no closed tab is kept for the workspaces shown.">
++    No archived tabs
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_NO_MATCHES" desc="Shown on the Archive screen when no closed tab matches what is typed in the search box.">
++    No matches
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_RESTORE" desc="Menu item on a closed tab in the Archive screen: reopens it in its workspace and removes it from the archive.">
++    Restore
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_DELETE" desc="Menu item on a closed tab in the Archive screen: removes it from the archive for good.">
++    Delete
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_CLEAR" desc="Menu button at the bottom of the Archive screen: opens a menu of time ranges (Last hour, Last 24 hours, Last 7 days, All time); choosing one asks before the closed tabs of that range are removed from the archive.">
++    Clear…
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_CLEAR_OK" desc="Button of the confirmation on the Archive screen that removes the closed tabs of the chosen time range, of every workspace, from the archive.">
++    Delete
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_CLEAR_HOUR_CONFIRM" desc="Question shown on the Archive screen after Last hour is chosen on the Clear… menu, before every closed tab of every workspace closed in the last hour is removed from the archive.">
++    {COUNT, plural,
++     =1 {Delete 1 archived tab from the last hour, from every workspace?}
++     other {Delete # archived tabs from the last hour, from every workspace?}}
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_CLEAR_DAY_CONFIRM" desc="Question shown on the Archive screen after Last 24 hours is chosen on the Clear… menu, before every closed tab of every workspace closed in the last 24 hours is removed from the archive.">
++    {COUNT, plural,
++     =1 {Delete 1 archived tab from the last 24 hours, from every workspace?}
++     other {Delete # archived tabs from the last 24 hours, from every workspace?}}
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_CLEAR_WEEK_CONFIRM" desc="Question shown on the Archive screen after Last 7 days is chosen on the Clear… menu, before every closed tab of every workspace closed in the last 7 days is removed from the archive.">
++    {COUNT, plural,
++     =1 {Delete 1 archived tab from the last 7 days, from every workspace?}
++     other {Delete # archived tabs from the last 7 days, from every workspace?}}
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_CLEAR_ALL_CONFIRM" desc="Question shown on the Archive screen after All time is chosen on the Clear… menu, before every closed tab of every workspace is removed from the archive.">
++    {COUNT, plural,
++     =1 {Delete 1 archived tab, from every workspace?}
++     other {Delete # archived tabs, from every workspace?}}
++  </message>
++  <message name="IDS_HELIUM_QUICK_SEARCH" desc="Placeholder and accessible name of the text field of the quick search box, and the box's accessible title. The box finds open tabs, pinned pages and archived tabs of every workspace as the user types.">
++    Find tabs and pages
++  </message>
++  <message name="IDS_HELIUM_QUICK_SEARCH_RECENT" desc="Heading in the quick search box over the tabs used most recently in the current workspace, shown while nothing is typed.">
++    Recent tabs
++  </message>
++  <message name="IDS_HELIUM_QUICK_SEARCH_TABS" desc="Heading in the quick search box over the open tabs that match what is typed.">
++    Open tabs
++  </message>
++  <message name="IDS_HELIUM_QUICK_SEARCH_PINNED" desc="Heading in the quick search box over the pinned pages of the workspaces' pinned sections that match what is typed.">
++    Pinned pages
++  </message>
++  <message name="IDS_HELIUM_QUICK_SEARCH_ARCHIVED" desc="Heading in the quick search box over the closed tabs kept in the Archive that match what is typed.">
++    Archived
++  </message>
++  <message name="IDS_HELIUM_QUICK_SEARCH_NONE" desc="Shown in the quick search box while nothing is typed and the current workspace has no other open tab to list.">
++    No open tabs. Type to find pinned pages and archived tabs.
++  </message>
++  <message name="IDS_HELIUM_PREVIEW_LINK" desc="Item of a link's right-click menu: opens the link in a card over the current page, instead of in the page or in a new tab.">
++    Preview link
++  </message>
++  <message name="IDS_HELIUM_LINK_PREVIEW" desc="Accessible name of the card that shows a linked page over the current page; its visible title is the linked page's site.">
++    Link preview
++  </message>
++  <message name="IDS_HELIUM_LINK_PREVIEW_OPEN_AS_TAB" desc="Button of the link preview card: the page shown in the card becomes a tab of its own, at the top of the tab list, and the card closes.">
++    Open as tab
++  </message>
++  <message name="IDS_HELIUM_PINNED_ITEM_UNPIN" desc="Menu item on a pinned page in a workspace's pinned section: it becomes an ordinary tab of the tab list and leaves the pinned section.">
++    Unpin
++  </message>
++  <message name="IDS_HELIUM_PINNED_ITEM_DELETE" desc="Menu item on a pinned page in a workspace's pinned section: remove it; its page is closed if it is open.">
++    Delete
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_DELETE" desc="Menu item on a folder in a workspace's pinned section, and the button of its confirmation: remove the folder and every pinned page in it.">
++    Delete folder
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_CONFIRM_DELETE" desc="Title of the confirmation shown before a folder of the pinned section is deleted with the pinned pages it holds.">
++    {NUM_PAGES, plural,
++     =1 {Delete this folder and the pinned page in it?}
++     other {Delete this folder and the # pinned pages in it?}}
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_CONFIRM_BODY" desc="Body of the confirmation before a folder of the pinned section is deleted.">
++    Its pages go to the Archive, where they can be restored for 60 days. Open ones are closed.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EXPORT" desc="Item of the workspaces bar's + menu: save the workspaces, pinned pages and Archive to a file.">
++    Export workspaces…
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT" desc="Item of the workspaces bar's + menu: replace the workspaces, pinned pages and Archive with those of an exported file.">
++    Import workspaces…
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EXPORT_TITLE" desc="Title of the Save dialog of Export workspaces.">
++    Export workspaces
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_TITLE" desc="Title of the Open dialog of Import workspaces.">
++    Import workspaces
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EXPORT_TYPE_JSON" desc="A choice in the Save dialog's file type list: the file that holds everything and can be imported again.">
++    Helium workspaces (everything, can be imported)
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EXPORT_TYPE_CSV" desc="A choice in the Save dialog's file type list: a list of the pinned pages for a spreadsheet, which cannot be imported.">
++    Pinned pages list (for a spreadsheet, cannot be imported)
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_TYPE_JSON" desc="The file type shown in the Open dialog of Import workspaces.">
++    Helium workspaces export
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EXPORT_DONE" desc="Title of the message shown after workspaces were exported.">
++    Workspaces exported
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EXPORT_DONE_BODY" desc="Body of the message after an export of everything. $1 is the number of pinned pages, $2 the file.">
++    <ph name="PAGES">$1<ex>3434</ex></ph> pinned pages and your workspaces and Archive were saved to <ph name="FILE">$2<ex>helium-workspaces.json</ex></ph>.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EXPORT_DONE_CSV" desc="Body of the message after an export of the pinned pages as a list. $1 is the number of pinned pages, $2 the file.">
++    A list of <ph name="PAGES">$1<ex>3434</ex></ph> pinned pages was saved to <ph name="FILE">$2<ex>helium-workspaces.csv</ex></ph>.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EXPORT_FAILED" desc="Title of the message shown when workspaces could not be exported.">
++    Could not export your workspaces
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_FAILED" desc="Title of the message shown when a workspaces file could not be imported.">
++    Could not import this file
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_CONFIRM_TITLE" desc="Title of the question before an import replaces the workspaces, pinned pages and Archive.">
++    Replace your workspaces with the ones in this file?
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_CONFIRM_BODY" desc="Body of that question. $1-$3 are what the browser has now (workspaces, pinned pages, archived tabs), $4-$6 what the file holds.">
++    Now: <ph name="NOW_WORKSPACES">$1<ex>5</ex></ph> workspaces, <ph name="NOW_PAGES">$2<ex>25</ex></ph> pinned pages, <ph name="NOW_ARCHIVED">$3<ex>12</ex></ph> archived tabs. In the file: <ph name="FILE_WORKSPACES">$4<ex>4</ex></ph> workspaces, <ph name="FILE_PAGES">$5<ex>3434</ex></ph> pinned pages, <ph name="FILE_ARCHIVED">$6<ex>1638</ex></ph> archived tabs. The tabs you have open stay open. A copy of what you have now is saved first.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_REPLACE" desc="Button that replaces the workspaces, pinned pages and Archive with those of the file.">
++    Replace
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_DONE" desc="Title of the message shown after workspaces were imported.">
++    Workspaces imported
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_IMPORT_DONE_BODY" desc="Body of the message after an import. $1 workspaces, $2 pinned pages, $3 archived tabs now.">
++    You now have <ph name="WORKSPACES">$1<ex>4</ex></ph> workspaces, <ph name="PAGES">$2<ex>3434</ex></ph> pinned pages and <ph name="ARCHIVED">$3<ex>1638</ex></ph> archived tabs. A copy of what you had is in the Workspace Backups folder of your profile.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_TRANSFER_LOADING" desc="Reason shown when export or import is tried before the pinned pages and Archive have loaded.">
++    Your pinned pages or Archive are still loading. Try again in a moment.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_TRANSFER_READONLY" desc="Reason shown when the pinned pages or Archive file could not be read at startup, so it is protected.">
++    Your pinned pages or Archive file could not be read when the browser started, so it is protected and cannot be replaced.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_TRANSFER_WRITE_FAILED" desc="Reason shown when the export file could not be written.">
++    The file could not be written. Check that the place you chose can be written to.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_TRANSFER_READ_FAILED" desc="Reason shown when the import file could not be read.">
++    The file could not be read.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_TRANSFER_PARTLY" desc="Reason shown when the pinned pages or Archive of an import were refused after the settings were already applied.">
++    The settings were imported, but the pinned pages or Archive could not be replaced.
++  </message>
++  <message name="IDS_HELIUM_PINNED_SELECTION_CONFIRM_DELETE" desc="Title of the confirmation shown before several selected rows of the pinned section (pinned pages and folders) are deleted together.">
++    {NUM_ROWS, plural,
++     =1 {Delete the selected row?}
++     other {Delete the # selected rows?}}
++  </message>
++  <message name="IDS_HELIUM_PINNED_SELECTION_CONFIRM_BODY" desc="Body of the confirmation before several selected rows of the pinned section are deleted.">
++    Their pages go to the Archive, where they can be restored for 60 days. Open ones are closed.
++  </message>
++  <message name="IDS_HELIUM_PINNED_ITEM_CLOSE" desc="Tooltip of the close button on an open pinned page in the pinned section: closes the page, the pinned page stays.">
++    Close page
++  </message>
++  <message name="IDS_HELIUM_PINNED_LIST_NAME" desc="Name a screen reader gives the list of a workspace's pinned pages and folders, in which several rows can be selected at once.">
++    Pinned pages
++  </message>
++  <message name="IDS_HELIUM_PINNED_ITEM_RESET" desc="Tooltip of the back arrow on an open pinned page that has navigated away from its pinned address: goes back to that address.">
++    Back to the pinned page
++  </message>
++  <message name="IDS_HELIUM_PINNED_ITEM_REPLACE_URL" desc="Menu item on an open pinned page that has navigated away from its pinned address: makes the address it shows now the pinned page's address.">
++    Replace pinned URL with current
++  </message>
++  <message name="IDS_HELIUM_PINNED_NEW_FOLDER" desc="Menu item on a row of a workspace's pinned section that makes a new folder just below that row, and the new folder's name until the user types one.">
++    New folder
++  </message>
++  <message name="IDS_HELIUM_PINNED_PAGE_COUNT" desc="A line of the tooltip on a workspace's header and on a folder of its pinned section: how many pinned pages the workspace or the folder holds, sub-folders included.">
++    {COUNT, plural,
++     =1 {1 pinned page}
++     other {# pinned pages}}
++  </message>
++  <message name="IDS_HELIUM_PINNED_MOVE_TO_WORKSPACE" desc="Menu item on a row of a workspace's pinned section opening a submenu of the other workspaces: the row, with its open pages, moves to the end of the chosen workspace's pinned section.">
++    Move to workspace
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_OPEN_ALL" desc="Menu item on a folder in a workspace's pinned section, and the button of its confirmation: opens every pinned page in the folder that is not open yet, sub-folders included, in the background.">
++    Open all
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_CLOSE_ALL" desc="Menu item on a folder in a workspace's pinned section: closes every open page of the pinned pages in the folder, sub-folders included; the pinned pages stay.">
++    Close all
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_SORT" desc="Menu item on a folder in a workspace's pinned section: puts the folder's own rows in order of their names.">
++    Sort by name
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_UNDO_SORT" desc="Menu item on a folder in a workspace's pinned section, shown after Sort by name while the folder is as the sort left it: puts its rows back in their order before the sort.">
++    Undo sort
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_COPY_LINKS" desc="Menu item on a folder in a workspace's pinned section: copies the address of every pinned page in the folder, sub-folders included, one per line.">
++    Copy links
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_CONFIRM_OPEN_ALL" desc="Title of the confirmation shown before Open all opens many pinned pages of a folder of the pinned section at once.">
++    {COUNT, plural,
++     =1 {Open 1 page?}
++     other {Open # pages?}}
++  </message>
++  <message name="IDS_HELIUM_PINNED_FOLDER_CONFIRM_OPEN_ALL_BODY" desc="Body of the confirmation before Open all opens many pinned pages of a folder of the pinned section.">
++    They open in the background and load when you show them. They stay open until you close them — Close all on this folder closes them all.
++  </message>
++  <message name="IDS_HELIUM_PINNED_SECTION_FOLDED" desc="A line of the tooltip on a workspace's header while its pinned section is folded, showing only the page in front: clicking the header shows every pinned page again.">
++    Pinned pages folded — click to show them
++  </message>
++  <message name="IDS_HELIUM_TODAY_TAB_COUNT" desc="A line of the tooltip on a workspace's header: how many ordinary tabs the workspace's tab list (its Today tabs, below the pinned pages) holds in this window.">
++    {COUNT, plural,
++     =1 {1 Today tab}
++     other {# Today tabs}}
++  </message>
++  <message name="IDS_HELIUM_ANCHORED_TAB_COUNT" desc="A line of the tooltip on a workspace's header, shown only when there are any: how many of the workspace's Today tabs in this window are anchored to a page.">
++    {COUNT, plural,
++     =1 {1 anchored tab}
++     other {# anchored tabs}}
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_PIN_TAB" desc="Tab context menu item: the tab becomes a pinned page at the end of its workspace's pinned section, and stays open.">
++    Pin to workspace
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_FROM_GROUP" desc="Tab context menu item on a tab of a tab group: makes a new workspace with the group's name and colour, moves the group's tabs into it, still grouped, and switches the window to it.">
++    Make this group a workspace
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_NAME_LABEL" desc="Label of the text field for a workspace's name.">
++    Name
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_MOVE_TABS_HERE" desc="Menu item on a workspace in the workspace rail that moves the tabs the user has selected into that workspace.">
++    {NUM_TABS, plural,
++     =1 {Move tab here}
++     other {Move # tabs here}}
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_MOVE_TAB_TO" desc="Tab context menu item opening a submenu of workspaces to move the tab into.">
++    Move tab to workspace
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SITE_RULE" desc="Tab context menu item: from now on, a link to this site opened in a new tab -- from a page, a bookmark or another app -- opens in this workspace. $1 is the site (a host such as github.com), $2 the name of the workspace the window is showing.">
++    Always open <ph name="SITE">$1<ex>github.com</ex></ph> in <ph name="WORKSPACE">$2<ex>Work</ex></ph>
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_STOP_SITE_RULE" desc="Tab context menu item, in place of 'Always open ... in ...' when the site already always opens in this workspace: links to it open where the user is again. $1 is the site, $2 the name of the workspace.">
++    Stop always opening <ph name="SITE">$1<ex>github.com</ex></ph> in <ph name="WORKSPACE">$2<ex>Work</ex></ph>
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EDIT_SITES" desc="Heading over the list of sites in the Edit workspace bubble: links to these sites opened in a new tab always open in this workspace.">
++    Sites
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EDIT_NO_SITES" desc="Muted line under the Sites heading of the Edit workspace bubble when the workspace has no sites: says where they are added.">
++    None yet. Right-click a tab to always open its site here.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EDIT_REMOVE_SITE" desc="Tooltip and accessible name of the small button beside a site in the Edit workspace bubble: links to the site stop always opening in this workspace. $1 is the site.">
++    Remove <ph name="SITE">$1<ex>github.com</ex></ph>
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ANCHOR_SUBMENU" desc="Tab context menu item opening the submenu that anchors a tab to a page.">
++    Anchor
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_RENAME_TAB" desc="Tab context menu item and dialog title for giving a tab a title of the user's own.">
++    Rename tab
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_TAB_TITLE_LABEL" desc="Label of the text field for a tab's custom title. Leaving it empty restores the page's own title.">
++    Title (empty restores the page's own)
++  </message>
++  <message name="IDS_HELIUM_SET_EMOJI" desc="Menu item on a tab, and on a pinned page or a folder of a workspace's pinned section, and the title of the box it opens: the emoji typed there is drawn in place of the tab's or pinned page's icon, or inside the folder's box. Leaving the box empty removes it.">
++    Set emoji…
++  </message>
++  <message name="IDS_HELIUM_PIN_AS_FAVORITE" desc="Tab context menu item, in place of Chromium's 'Pin': makes the tab a favorite -- a pinned tab, shown at the top of the sidebar in every workspace -- told apart from 'Pin to workspace', which pins it in the workspace's pinned section.">
++    Add to Favorites
++  </message>
++  <message name="IDS_HELIUM_REMOVE_FROM_FAVORITES" desc="Tab context menu item on a favorite, in place of Chromium's 'Unpin tab': makes the favorite an ordinary tab again, the opposite of Add to Favorites.">
++    Remove from Favorites
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_SUBMENU" desc="Tab context menu item opening the submenu that puts a tab away in the Archive until a time, when it comes back by itself.">
++    Snooze tab
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_IN_HOURS" desc="Item of the Snooze tab submenu: the tab comes back this many hours from now. The time it comes back follows in brackets.">
++    {COUNT, plural, =1 {In 1 hour} other {In # hours}}
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_CUSTOM" desc="Item of the Snooze tab submenu opening a box to type how long the tab is snoozed.">
++    Custom…
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_TITLE" desc="Title of the box that asks how long to snooze the tabs.">
++    {COUNT, plural, =1 {Snooze 1 tab} other {Snooze # tabs}}
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_CUSTOM_HINT" desc="Line in the snooze box saying what to type and where the tab comes back.">
++    A whole number, up to a year. The tab comes back at the top of its workspace.
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_AMOUNT" desc="Label of the number field in the snooze box.">
++    For
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_UNIT" desc="Label of the list of units in the snooze box.">
++    Unit
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_MINUTES" desc="Unit in the snooze box.">
++    Minutes
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_HOURS" desc="Unit in the snooze box.">
++    Hours
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_DAYS" desc="Unit in the snooze box.">
++    Days
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_WEEKS" desc="Unit in the snooze box.">
++    Weeks
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SNOOZE_OK" desc="Button of the snooze box that snoozes the tabs.">
++    Snooze
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_WOKEN" desc="Line in a workspace button's tooltip: a tab of that workspace came back from a snooze. The tab's title follows.">
++    Back from snooze
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_SNOOZED" desc="Header on the Archive screen over the snoozed tabs, which come back by themselves.">
++    Snoozed
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_FAVORITE_ROW" desc="Accessible name and tooltip of a closed tab on the Archive screen that was a favorite (a pinned tab) when it was closed; restoring it pins it again. $1 is the tab's title.">
++    Favorite: <ph name="TITLE">$1<ex>Example Domain</ex></ph>
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ANCHOR_TAB" desc="Anchor submenu item: anchor this tab at the page it is showing, so closing it puts it to sleep at that page instead of closing it.">
++    Anchor to this page
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_UNANCHOR_TAB" desc="Anchor submenu item: remove the anchor so the tab closes normally again.">
++    Remove anchor
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_RESET_TO_ANCHOR" desc="Anchor submenu item: navigate the tab back to its anchored page.">
++    Back to anchored page
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_REPLACE_ANCHOR" desc="Anchor submenu item: make the page the tab is showing its new anchor.">
++    Anchor to this page instead
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EDIT" desc="Menu item on a workspace in the workspace bar that opens a bubble for changing the workspace's name, colour and icon.">
++    Edit workspace…
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EDIT_TITLE" desc="Title of the bubble for changing a workspace's name, colour and icon.">
++    Edit workspace
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EDIT_COLOR" desc="Heading over the row of colours in the Edit workspace bubble; clicking one makes it the workspace's colour.">
++    Color
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_EDIT_ICON" desc="Heading over the grid of ready-made icons in the Edit workspace bubble; clicking one makes it the workspace's icon.">
++    Icon
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_CUSTOM_EMOJI" desc="Button in the Edit workspace bubble that opens a text field for typing any emoji as the workspace's icon instead of one of the ready-made icons.">
++    Custom emoji…
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_MOVE_LEFT" desc="Menu item on a workspace in the workspace bar, while the tab strip is expanded and the bar is a row: moves the workspace one place to the left, earlier in the list.">
++    Move left
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_MOVE_RIGHT" desc="Menu item on a workspace in the workspace bar, while the tab strip is expanded and the bar is a row: moves the workspace one place to the right, later in the list.">
++    Move right
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_CODE" desc="Name of the code brackets icon in the Edit workspace bubble's grid of ready-made workspace icons.">
++    Code
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_TRAVEL" desc="Name of the globe-with-magnifier icon in the Edit workspace bubble's grid of ready-made workspace icons.">
++    Travel
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_FLIGHT" desc="Name of the aeroplane icon in the Edit workspace bubble's grid of ready-made workspace icons.">
++    Flight
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_LAUNCH" desc="Name of the rocket icon in the Edit workspace bubble's grid of ready-made workspace icons.">
++    Launch
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_STAR" desc="Name of the star icon in the Edit workspace bubble's grid of ready-made workspace icons.">
++    Star
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_ICON_PETS" desc="Name of the paw print icon in the Edit workspace bubble's grid of ready-made workspace icons.">
++    Pets
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_THIS_WORKSPACE" desc="Left half of the two-part switch on the Archive screen, beside All workspaces: when chosen, the list shows only the closed tabs of the current workspace.">
++    This workspace
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_EARLIER_THIS_WEEK" desc="Heading on the Archive screen over the tabs closed this week (weeks start on Sunday) before yesterday.">
++    Earlier this week
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_LAST_WEEK" desc="Heading on the Archive screen over the tabs closed in the previous week, Sunday to Saturday.">
++    Last week
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_NOTHING_YET" desc="Shown on the Archive screen when no closed tab is kept for the workspaces shown.">
++    Nothing archived yet
++  </message>
++  <message name="IDS_HELIUM_ARCHIVE_KEEP_60_DAYS" desc="Second line on the Archive screen under Nothing archived yet: how long a closed tab is kept in the archive.">
++    Tabs you close stay here for 60 days.
++  </message>
++
++  <!-- chrome://settings > Appearance -->
++  <message name="IDS_SETTINGS_TAB_STYLE" desc="Label for the dropdown that chooses how tall the tabs of the vertical tab strip are.">
++    Tab style
++  </message>
++  <message name="IDS_SETTINGS_TAB_STYLE_DEFAULT" desc="Option in the tab style dropdown: the vertical tabs are as tall as Helium makes them.">
++    Default
++  </message>
++  <message name="IDS_SETTINGS_TAB_STYLE_ROOMY_36" desc="Option in the tab style dropdown: taller vertical tabs, 36 pixels, with more room around the icon.">
++    Comfortable, 36 px
++  </message>
++  <message name="IDS_SETTINGS_TAB_STYLE_ROOMY_40" desc="Option in the tab style dropdown: taller vertical tabs, 40 pixels, with more room around the icon.">
++    Roomy, 40 px
++  </message>
++  <message name="IDS_SETTINGS_TAB_STYLE_ROOMY_42" desc="Option in the tab style dropdown: taller vertical tabs, 42 pixels, with more room around the icon.">
++    Spacious, 42 px
++  </message>
++  <message name="IDS_SETTINGS_SMOOTH_TAB_LIST_SCROLLING" desc="Label for the toggle that makes the vertical tab list glide, instead of jump, when the mouse wheel scrolls it.">
++    Smooth scrolling in the tab list
++  </message>
++  <message name="IDS_SETTINGS_SMOOTH_TAB_LIST_SCROLLING_DESCRIPTION" desc="Description for the smooth-scrolling toggle, explaining that the vertical tab list moves smoothly when the mouse wheel turns.">
++    The tab list glides when you roll the mouse wheel
++  </message>
++  <message name="IDS_SETTINGS_WIDE_SIDEBAR" desc="Label for the toggle that lets the user drag the vertical tab strip's edge wider than its usual 400 px maximum.">
++    Allow a wider sidebar
++  </message>
++  <message name="IDS_SETTINGS_WIDE_SIDEBAR_DESCRIPTION" desc="Description for the wider-sidebar toggle, explaining that when it is on the vertical tab strip can be dragged as wide as the window allows, and when it is off its width stops at 400 pixels.">
++    Drag the sidebar's edge as wide as the window allows. When off, a drag stops at 400 px
++  </message>
++  <message name="IDS_SETTINGS_LITTLE_WINDOW" desc="Label for the toggle that makes a link opened from another app, such as an email program, open in a small separate browser window instead of as a tab of the main window.">
++    Open links from other apps in a small window
++  </message>
++  <message name="IDS_SETTINGS_LITTLE_WINDOW_DESCRIPTION" desc="Description for the small-window toggle, explaining that a link from another app opens in its own small window, which can be moved into the main window to keep the page or closed to discard it.">
++    A link from Outlook, Teams or another app opens in its own small window. Open it in the main window to keep it, or close the window to throw it away
++  </message>
++  <message name="IDS_SETTINGS_WORKSPACES" desc="Label for the toggle that enables workspaces, which split the vertical tab strip into separate named sets of tabs.">
++    Workspaces
++  </message>
++  <message name="IDS_SETTINGS_WORKSPACES_DESCRIPTION" desc="Description for the workspaces toggle, explaining that tabs are divided into named sets shown one at a time.">
++    Keep separate sets of tabs in one window and switch between them from the tab strip
++  </message>
++  <message name="IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER" desc="Label for the dropdown that chooses how long a tab may go unviewed before it is closed automatically and kept in the Archive.">
++    Archive tabs after
++  </message>
++  <message name="IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_DESCRIPTION" desc="Description for the archive-tabs-after dropdown, explaining that tabs left unviewed for the chosen time move to the Archive, where they can be found and restored.">
++    Tabs you haven't looked at for this long move to the Archive, where you can find and restore them
++  </message>
++  <message name="IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_NEVER" desc="Option in the archive-tabs-after dropdown: tabs are never archived automatically.">
++    Never
++  </message>
++  <message name="IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_1_DAY" desc="Option in the archive-tabs-after dropdown: tabs unviewed for one day are archived.">
++    1 day
++  </message>
++  <message name="IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_7_DAYS" desc="Option in the archive-tabs-after dropdown: tabs unviewed for seven days are archived.">
++    7 days
++  </message>
++  <message name="IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_30_DAYS" desc="Option in the archive-tabs-after dropdown: tabs unviewed for thirty days are archived.">
++    30 days
++  </message>
++</grit-part>
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ 
++#include <utility>
+ #include <variant>
+ 
+ #include "base/check_deref.h"
+@@ -575,6 +576,20 @@ bool TabStripCollectionController::IsTab
+   return !service || service->IsTabVisible(tab);
+ }
+ 
++base::CallbackListSubscription
++TabStripCollectionController::RegisterWorkspaceChangedCallback(
++    base::RepeatingClosure callback) {
++  if (!browser_view_) {
++    return base::CallbackListSubscription();
++  }
++  workspaces::WorkspaceService* service =
++      workspaces::WorkspaceService::From(browser_view_->browser());
++  if (!service) {
++    return base::CallbackListSubscription();
++  }
++  return service->RegisterWorkspaceChangedCallback(std::move(callback));
++}
++
+ void TabStripCollectionController::TabGroupFocusChanged(
+     std::optional<tab_groups::TabGroupId> new_focused_group_id,
+     std::optional<tab_groups::TabGroupId> old_focused_group_id) {
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
+@@ -132,6 +132,16 @@ class TabStripCollectionController : pub
+   // renders exactly as stock Helium does.
+   bool IsTabVisibleForWorkspace(const tabs::TabInterface* tab) const;
+ 
++  // Runs `callback` whenever this window's active Workspace changes, so
++  // the caller can lay out again and get the new answer from
++  // IsTabVisibleForWorkspace().
++  //
++  // Returns an empty subscription -- one that simply never fires -- when
++  // there is no browser view or no WorkspaceService, which is the same
++  // fail-open shape as IsTabVisibleForWorkspace() and GetFocusedGroup().
++  base::CallbackListSubscription RegisterWorkspaceChangedCallback(
++      base::RepeatingClosure callback);
++
+   void TabGroupFocusChanged(
+       std::optional<tab_groups::TabGroupId> new_focused_group_id,
+       std::optional<tab_groups::TabGroupId> old_focused_group_id);
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+@@ -109,6 +109,28 @@ UnpinnedTabContainerView::UnpinnedTabCon
+   node_destroyed_subscription_ = collection_node_->RegisterWillDestroyCallback(
+       base::BindOnce(&UnpinnedTabContainerView::ResetCollectionNode,
+                      base::Unretained(this)));
++
++  // Lay out again whenever this window's Workspace changes. The visibility
++  // predicate in UnpinnedTabContainerViewLayout is re-read on every layout,
++  // so an invalidation is the whole of what a switch needs -- and it has to
++  // be an invalidation rather than cached state, because switching
++  // kHeliumLayout destroys and rebuilds this view entirely.
++  //
++  // Both ends of this already exist by the time we get here, which is the
++  // part worth checking rather than assuming: TabCollectionNode::
++  // AddNewChild() gives a node its controller before it builds the node's
++  // view, and WorkspaceService is older still -- browser.cc creates
++  // BrowserWindowFeatures before the browser window exists at all, and says
++  // so in a comment. If either were not yet built, subscribing here would
++  // fail silently, and switching would look like a broken predicate rather
++  // than missing wiring.
++  if (TabStripCollectionController* controller =
++          collection_node_->GetController()) {
++    workspace_changed_subscription_ =
++        controller->RegisterWorkspaceChangedCallback(base::BindRepeating(
++            &views::View::InvalidateLayout, base::Unretained(this),
++            /*avoid_propagate_during_layout=*/false));
++  }
+ }
+ 
+ UnpinnedTabContainerView::~UnpinnedTabContainerView() = default;
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
+@@ -91,6 +91,7 @@ class UnpinnedTabContainerView
+   const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;
++  base::CallbackListSubscription workspace_changed_subscription_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_UNPINNED_TAB_CONTAINER_VIEW_H_
+--- /dev/null
++++ b/chrome/browser/ui/workspace_command_hooks.cc
+@@ -0,0 +1,74 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/workspace_command_hooks.h"
++
++#include <string>
++
++#include "base/i18n/rtl.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/command_updater.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/grit/generated_resources.h"
++
++namespace workspaces {
++
++namespace {
++
++using Label = browser_shortcuts::BrowserShortcutCommandLabel;
++
++// The fork's block of ids in chrome_command_ids.h, 34110-34139.
++constexpr int kFirstCommand = IDC_HELIUM_WORKSPACE_NEXT;
++constexpr int kLastCommand = IDC_HELIUM_WORKSPACE_NEXT + 29;
++
++}  // namespace
++
++bool ExecuteWorkspaceCommand(BrowserWindowInterface* browser, int id) {
++  switch (id) {
++    case IDC_HELIUM_WORKSPACE_NEXT:
++    case IDC_HELIUM_WORKSPACE_PREV: {
++      // Next and previous swap under RTL for the same reason Chromium's tab
++      // group commands do it: these are bound to arrow keys, and an arrow
++      // pointing at the start of the strip has to mean "previous" whichever
++      // way the strip runs.
++      const bool forward =
++          (id == IDC_HELIUM_WORKSPACE_NEXT) != base::i18n::IsRTL();
++      // Null on window types Workspaces does not apply to; doing nothing is
++      // the right answer there, not a crash.
++      if (WorkspaceService* service = WorkspaceService::From(browser)) {
++        service->ActivateRelativeWorkspace(forward ? 1 : -1);
++      }
++      break;
++    }
++    default:
++      return false;
++  }
++  return true;
++}
++
++void EnableWorkspaceCommands(CommandUpdater* updater) {
++  // One list to keep, WorkspaceShortcutLabel's: an id of the block is a
++  // command exactly when the shortcuts page names it, and the ids still
++  // reserved have no name, so they stay off.
++  for (int id = kFirstCommand; id <= kLastCommand; ++id) {
++    if (WorkspaceShortcutLabel(id)) {
++      updater->UpdateCommandEnabled(id, true);
++    }
++  }
++}
++
++std::optional<browser_shortcuts::BrowserShortcutCommandLabel>
++WorkspaceShortcutLabel(int id) {
++  switch (id) {
++    case IDC_HELIUM_WORKSPACE_NEXT:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_NEXT};
++    case IDC_HELIUM_WORKSPACE_PREV:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_PREVIOUS};
++    default:
++      return std::nullopt;
++  }
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/workspace_command_hooks.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WORKSPACE_COMMAND_HOOKS_H_
++#define CHROME_BROWSER_UI_WORKSPACE_COMMAND_HOOKS_H_
++
++#include <optional>
++
++class BrowserWindowInterface;
++class CommandUpdater;
++
++namespace browser_shortcuts {
++struct BrowserShortcutCommandLabel;
++}
++
++// Helium Workspaces: the fork's browser commands, its block of ids in
++// chrome_command_ids.h. BrowserCommandController and the shortcut metadata
++// each ask these in one call, so a rebase that rewrites Chromium's lists of
++// commands moves a line, never a block of cases (review #16). Built in
++// browser_command_controller.cc's own target, so these reach what it reaches.
++namespace workspaces {
++
++// HandleCommandWithDisposition: runs `id` and returns true when it is one of
++// the fork's commands; false leaves it to Chromium's switch.
++bool ExecuteWorkspaceCommand(BrowserWindowInterface* browser, int id);
++
++// InitCommandState: every id of the fork's block that WorkspaceShortcutLabel
++// names. Not optional: an id that is never enabled is silently dropped by
++// CommandUpdater, so the accelerator would fire and nothing would happen.
++void EnableWorkspaceCommands(CommandUpdater* updater);
++
++// GetBrowserShortcutCommandLabel: the name the Settings shortcuts page shows
++// for one of the fork's commands; nullopt for every other id.
++std::optional<browser_shortcuts::BrowserShortcutCommandLabel>
++WorkspaceShortcutLabel(int id);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_WORKSPACE_COMMAND_HOOKS_H_

@@ -1,0 +1,194 @@
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -4026,6 +4026,7 @@ source_set("browser") {
+       "//chrome/browser/ui/tabs/tab_drag_api",
+       "//chrome/browser/ui/tabs/tab_strip_api",
+       "//chrome/browser/ui/tabs/workspaces",
++      "//chrome/browser/ui/tabs/workspaces:prefs",
+       "//chrome/browser/ui/tabs/workspaces:tab_data",
+       "//chrome/browser/ui/toasts",
+       "//chrome/browser/ui/toasts:impl",
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -66,6 +66,9 @@ void RegisterProfilePrefs(PrefRegistrySi
+ 
+   // On: the owner asked for it (E18).
+   registry->RegisterBooleanPref(kHeliumWorkspacesSmoothScrolling, true);
++
++  // On: as wide as the window allows, as the owner asked (E18, D14).
++  registry->RegisterBooleanPref(kHeliumWorkspacesWideSidebar, true);
+ }
+ 
+ base::DictValue DefaultWorkspacesDict() {
+@@ -395,4 +398,12 @@ int IconTitleGap() {
+   return g_tab_row_height > kCompactTabRowHeight ? 12 : 7;
+ }
+ 
++int MaxSidebarWidth(bool wide,
++                    int window_width,
++                    int min_width,
++                    int helium_max,
++                    int page_min) {
++  return wide ? std::max(min_width, window_width - page_min) : helium_max;
++}
++
+ }  // namespace workspaces::prefs
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -87,6 +87,13 @@ inline constexpr int kMaxTabRowHeight =
+ inline constexpr char kHeliumWorkspacesSmoothScrolling[] =
+     "helium.workspaces.smooth_scrolling";
+ 
++// Whether the sidebar's edge drags as wide as the window allows (E18, design 5
++// "E18 spec" 4): the "Allow a wider sidebar" setting, on by default; off keeps
++// Helium's 400 px. Read on every drag step, so a change needs no observer. A
++// sibling of the prefs above for the reason above, and pinned by the same test.
++inline constexpr char kHeliumWorkspacesWideSidebar[] =
++    "helium.workspaces.wide_sidebar";
++
+ // Keys inside kHeliumWorkspacesList.
+ inline constexpr char kSchemaVersionKey[] = "schema_version";
+ inline constexpr char kItemsKey[] = "items";
+@@ -299,6 +306,17 @@ int TabRowHeight();
+ int IconInsetExtra();
+ int IconTitleGap();
+ 
++// The widest a drag of the sidebar's edge may make it (E18). `wide`, the
++// setting: the window's width less the page's minimum, never below the
++// sidebar's own minimum (the drag's std::clamp needs its maximum at or above
++// its minimum). Not `wide`: Helium's maximum. Pure -- the region view hands in
++// the window's numbers -- so it is tested here.
++int MaxSidebarWidth(bool wide,
++                    int window_width,
++                    int min_width,
++                    int helium_max,
++                    int page_min);
++
+ }  // namespace workspaces::prefs
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PREFS_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -129,10 +129,12 @@ TEST(WorkspacePrefsTest, NeitherPrefPath
+   const std::string archive_after(kHeliumWorkspacesArchiveAfterMinutes);
+   const std::string tab_row_height(kHeliumWorkspacesTabRowHeight);
+   const std::string smooth_scrolling(kHeliumWorkspacesSmoothScrolling);
+-  for (const std::string& later :
+-       {imported_at, archive_after, tab_row_height, smooth_scrolling}) {
+-    for (const std::string& other : {enabled, list, imported_at, archive_after,
+-                                     tab_row_height, smooth_scrolling}) {
++  const std::string wide_sidebar(kHeliumWorkspacesWideSidebar);
++  for (const std::string& later : {imported_at, archive_after, tab_row_height,
++                                   smooth_scrolling, wide_sidebar}) {
++    for (const std::string& other :
++         {enabled, list, imported_at, archive_after, tab_row_height,
++          smooth_scrolling, wide_sidebar}) {
+       if (other == later) {
+         continue;
+       }
+@@ -247,6 +249,40 @@ TEST(WorkspacePrefsTest, SmoothScrolling
+   EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesSmoothScrolling));
+ }
+ 
++// ---------------------------------------------------- wide sidebar (E18)
++
++TEST(WorkspacePrefsTest, WideSidebarPrefNameIsStable) {
++  EXPECT_STREQ("helium.workspaces.wide_sidebar", kHeliumWorkspacesWideSidebar);
++}
++
++// On is the default: as wide as the window allows (D14).
++TEST(WorkspacePrefsTest, WideSidebarDefaultsToOn) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++
++  EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesWideSidebar));
++}
++
++// The region view's numbers: minimum 160, Helium's maximum 400, the page's
++// minimum 200. On, the window less the page, never below the minimum; off,
++// 400 whatever the window.
++TEST(WorkspacePrefsTest, MaxSidebarWidthFollowsTheSetting) {
++  EXPECT_EQ(800, MaxSidebarWidth(true, 1000, 160, 400, 200));
++  EXPECT_EQ(1720, MaxSidebarWidth(true, 1920, 160, 400, 200));
++  // A window narrower than Helium's 400 plus the page: less than 400, which
++  // is also all the layout would draw.
++  EXPECT_EQ(300, MaxSidebarWidth(true, 500, 160, 400, 200));
++  // Helium's narrowest window, and narrower: the minimum still holds.
++  EXPECT_EQ(200, MaxSidebarWidth(true, 400, 160, 400, 200));
++  EXPECT_EQ(160, MaxSidebarWidth(true, 300, 160, 400, 200));
++  EXPECT_EQ(160, MaxSidebarWidth(true, 0, 160, 400, 200));
++
++  for (int window_width : {0, 500, 1000, 1920}) {
++    EXPECT_EQ(400, MaxSidebarWidth(false, window_width, 160, 400, 200))
++        << window_width;
++  }
++}
++
+ // ------------------------------------------------------- registered default
+ 
+ TEST(WorkspacePrefsTest, RegistersWorkspacesPref) {
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -81,6 +81,12 @@
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_utils.h"
++// Helium Workspaces (E18): kept apart at the end, away from Helium's includes.
++#include "base/logging.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/views/frame/layout/browser_view_layout.h"
++#include "components/prefs/pref_service.h"
+ 
+ namespace {
+ constexpr int kResizeAreaWidth = 5;
+@@ -725,10 +731,18 @@ void VerticalTabStripRegionView::OnResiz
+       floating_style_ != FloatingStyle::kDetached &&
+       proposed_width <= tabs::kVerticalTabStripCollapseSnapWidth;
+   new_state.uncollapsed_width = target_collapse_state_.uncollapsed_width;
++  // Helium Workspaces (E18): with "Allow a wider sidebar" on, as wide as the
++  // window allows, the page keeping the browser's own minimum; off, Helium's
++  // 400. Read at every step, so a change of the setting needs no observer.
++  const int max_width = workspaces::prefs::MaxSidebarWidth(
++      browser_view()->GetProfile()->GetPrefs()->GetBoolean(
++          workspaces::prefs::kHeliumWorkspacesWideSidebar),
++      browser_view()->width(), tabs::kVerticalTabStripUncollapsedMinWidth,
++      tabs::kVerticalTabStripUncollapsedMaxWidth,
++      BrowserViewLayout::kContentsContainerMinimumWidth);
+   if (!new_state.collapsed) {
+-    new_state.uncollapsed_width =
+-        std::clamp(proposed_width, tabs::kVerticalTabStripUncollapsedMinWidth,
+-                   tabs::kVerticalTabStripUncollapsedMaxWidth);
++    new_state.uncollapsed_width = std::clamp(
++        proposed_width, tabs::kVerticalTabStripUncollapsedMinWidth, max_width);
+     if (std::abs(new_state.uncollapsed_width -
+                  tabs::kVerticalTabStripDefaultUncollapsedWidth) <
+         kSnapDistance) {
+@@ -781,6 +795,27 @@ void VerticalTabStripRegionView::OnResiz
+     // If we are still in the expanding animation, invalidating the layout will
+     // happen in AnimationProgressed, instead of here.
+     InvalidateLayout();
++    // Helium Workspaces (E18): when the drag ends, keep the width the window
++    // DREW, which can be less than max_width: the browser's layout also
++    // leaves the toolbar its minimum width (CalculateHorizontalLayout in
++    // browser_view_tabbed_layout_impl.cc). Kept as asked, the sidebar would
++    // open wider than it was ever seen -- in the next window, or in this one
++    // made wider. So the window is laid out now rather than at its next
++    // frame -- unless the last frame already drew the asked width, the usual
++    // case at a mouse release -- and the drawn width replaces the one saved
++    // above.
++    if (done_resizing) {
++      if (width() != target_collapse_state_.uncollapsed_width) {
++        GetWidget()->LayoutRootViewIfNecessary();
++      }
++      if (width() < target_collapse_state_.uncollapsed_width) {
++        target_collapse_state_.uncollapsed_width = width();
++        state_controller_->SetUncollapsedWidth(width());
++      }
++      LOG(INFO) << "[workspaces] sidebar: width "
++                << target_collapse_state_.uncollapsed_width << " (max "
++                << max_width << ")";
++    }
+   }
+ }
+ 

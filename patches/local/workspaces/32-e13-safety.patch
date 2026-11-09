@@ -1,0 +1,345 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -129,6 +129,10 @@ source_set("workspaces") {
+     "//components/tab_groups",
+     "//components/tabs:public",
+     "//content/public/browser",
++
++    # For blink::mojom::SuddenTerminationDisablerType: whether a page has a
++    # "Leave site?" handler, which anchors and Unload must not discard (E13.5).
++    "//third_party/blink/public/mojom:mojom_core",
+     "//ui/base/unowned_user_data",
+ 
+     # For the empty GURL() handed to TabStripModelDelegate::AddTabAt when a
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -37,13 +37,39 @@
+ #include "content/public/browser/invalidate_type.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/referrer.h"
++#include "third_party/blink/public/mojom/frame/sudden_termination_disabler_type.mojom.h"
+ #include "ui/base/page_transition_types.h"
+ #include "url/gurl.h"
+ 
+ namespace workspaces {
+ 
++namespace {
++
++// Whether any live frame of `contents` has a beforeunload handler -- the page
++// asks "Leave site?" before it is closed. Not NeedToFireBeforeUnloadOrUnload
++// Events(): that is also true for unload / pagehide / visibilitychange
++// handlers, which nearly every page with analytics has, and would make this
++// true almost everywhere.
++bool AsksBeforeLeaving(content::WebContents* contents) {
++  if (!contents) {
++    return false;
++  }
++  bool asks = false;
++  contents->GetPrimaryMainFrame()->ForEachRenderFrameHost(
++      [&asks](content::RenderFrameHost* frame) {
++        asks |= frame->IsRenderFrameLive() &&
++                frame->GetSuddenTerminationDisablerState(
++                    blink::mojom::SuddenTerminationDisablerType::
++                        kBeforeUnloadHandler);
++      });
++  return asks;
++}
++
++}  // namespace
++
+ DEFINE_USER_DATA(WorkspaceService);
+ 
+ WorkspaceService::WorkspaceService(
+@@ -328,23 +354,8 @@ int WorkspaceService::CloseWorkspaceTabs
+   // taking more than the tab it was asked for (a split closes as a unit), which
+   // a reverse-order index walk would not.
+   //
+-  // Pinned tabs are skipped: they have no tag, and no tag resolves to the
+-  // default workspace, so "Close all tabs" on Home closed every pinned tab
+-  // until E13. A pinned tab belongs to every workspace (design 2.5), the
+-  // same rule UnloadWorkspaceTabs applies below.
+-  std::vector<tabs::TabHandle> doomed;
+   int pinned_kept = 0;
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
+-    tabs::TabInterface* tab = tab_strip_->GetTabAtIndex(i);
+-    if (!tab || !IsTabOfWorkspace(tab, guid)) {
+-      continue;
+-    }
+-    if (tab->IsPinned()) {
+-      ++pinned_kept;
+-      continue;
+-    }
+-    doomed.push_back(tab->GetHandle());
+-  }
++  const std::vector<tabs::TabHandle> doomed = TabsToClose(guid, &pinned_kept);
+ 
+   // The kept count is the evidence for the pinned rule: Chromium reopens the
+   // last session's pinned tabs at startup, so how many tabs a close takes
+@@ -373,6 +384,34 @@ int WorkspaceService::CloseWorkspaceTabs
+   return closed;
+ }
+ 
++std::vector<tabs::TabHandle> WorkspaceService::TabsToClose(
++    std::string_view guid,
++    int* pinned_kept) const {
++  // Pinned tabs are skipped: they have no tag, and no tag resolves to the
++  // default workspace, so "Close all tabs" on Home closed every pinned tab
++  // until E13. A pinned tab belongs to every workspace (design 2.5), the
++  // same rule UnloadWorkspaceTabs applies below.
++  std::vector<tabs::TabHandle> doomed;
++  for (int i = 0; i < tab_strip_->count(); ++i) {
++    tabs::TabInterface* tab = tab_strip_->GetTabAtIndex(i);
++    if (!tab || !IsTabOfWorkspace(tab, guid)) {
++      continue;
++    }
++    if (tab->IsPinned()) {
++      if (pinned_kept) {
++        ++*pinned_kept;
++      }
++      continue;
++    }
++    doomed.push_back(tab->GetHandle());
++  }
++  return doomed;
++}
++
++int WorkspaceService::CountTabsToClose(std::string_view guid) const {
++  return static_cast<int>(TabsToClose(guid, nullptr).size());
++}
++
+ int WorkspaceService::UnloadWorkspaceTabs(std::string_view guid, bool others) {
+   // Indices are stable across a discard -- the contents is replaced in place,
+   // nothing is inserted or removed -- so a forward index walk is safe here in
+@@ -386,6 +425,7 @@ int WorkspaceService::UnloadWorkspaceTab
+   // Pinned tabs carry no tag and belong to every workspace, so they are never
+   // "of" one and never "other" than one.
+   std::vector<int> candidates;
++  int kept_awake = 0;
+   for (int i = 0; i < tab_strip_->count(); ++i) {
+     tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
+     if (!tab || tab->IsPinned() || tab_strip_->IsTabInForeground(i)) {
+@@ -394,13 +434,21 @@ int WorkspaceService::UnloadWorkspaceTab
+     if (IsTabOfWorkspace(tab, guid) == others) {
+       continue;
+     }
++    // Helium's command does not protect these (the header says why); a page
++    // that asks before it is left may be holding typed text or an upload.
++    if (AsksBeforeLeaving(tab->GetContents())) {
++      ++kept_awake;
++      continue;
++    }
+     candidates.push_back(i);
+   }
+   // Logged BEFORE the discards, because a discard lands synchronously and
+   // the observer logs each one as "tab contents replaced": a line written
+   // afterwards reads as if the replacements caused the unload (LOCAL.md 31).
+   LOG(INFO) << "[workspaces] unload " << (others ? "all but" : "workspace")
+-            << " '" << guid << "': asking " << candidates.size() << " tab(s)";
++            << " '" << guid << "': asking " << candidates.size()
++            << " tab(s), kept " << kept_awake
++            << " awake (a page asks before leaving)";
+   for (int i : candidates) {
+     tab_strip_->ExecuteContextMenuCommand(i, TabStripModel::CommandDiscard);
+   }
+@@ -1390,6 +1438,20 @@ bool WorkspaceService::HibernateAnchored
+     }
+   }
+ 
++  // A page with a "Leave site?" listener is put away but kept LIVE, not
++  // discarded: the discard never runs beforeunload, so typed text, an upload
++  // or a call would be lost with no prompt (E13 risk sweep). Not a normal
++  // close either -- a listener is not a question: Chrome's PDF viewer and
++  // many apps register one and only ask when something is unsaved, so falling
++  // through to CloseTab closed their anchors outright (E13.5 review). Kept
++  // live, both rules hold: no typed text lost, no anchor lost. The same
++  // outcome as "could not be discarded" below.
++  if (AsksBeforeLeaving(contents)) {
++    LOG(INFO) << "[workspaces] anchored tab at index " << index
++              << " asks before leaving; kept live, not hibernated";
++    return true;
++  }
++
+   // Copied out before the discard: `contents` does not survive it. The
+   // replacement observer carries tag and anchor onto the new contents.
+   const GURL anchor(AnchorUrlForTab(contents));
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -186,13 +186,20 @@ class WorkspaceService : public TabStrip
+   // ONLY CALL FROM A MENU OR COMMAND HANDLER: it closes tabs.
+   int CloseWorkspaceTabs(std::string_view guid);
+ 
++  // How many tabs CloseWorkspaceTabs(guid) would close, so a menu can ask
++  // first when that is more than Recently Closed keeps (E13.5).
++  int CountTabsToClose(std::string_view guid) const;
++
+   // Hibernates the tabs of `guid` -- or, with `others`, of every workspace
+   // except `guid` -- through Helium's own Hibernate command, one tab at a
+-  // time, skipping pinned tabs and the foreground tab. Going through that
+-  // command is the point: it is eligibility-gated, so a tab holding an unsaved
+-  // form or playing audio stays awake, where the ungated discard anchors use
+-  // would not. Answers how many tabs were asked; each one that actually sleeps
+-  // is logged by the observer as "tab contents replaced".
++  // time, skipping pinned tabs, the foreground tab, and any page with a "Leave
++  // site?" handler. That last skip is ours and it is needed: Helium's command
++  // discards with reason EXTERNAL, which Chromium's eligibility policy always
++  // allows (discard_eligibility_policy.cc), so it does NOT keep a tab with an
++  // unsaved form or playing audio awake -- earlier notes here said it did, and
++  // were wrong at M153 (E13 risk sweep). Answers how many tabs were asked; each
++  // one that actually sleeps is logged by the observer as "tab contents
++  // replaced".
+   //
+   // ONLY CALL FROM A MENU OR COMMAND HANDLER: it replaces WebContents.
+   int UnloadWorkspaceTabs(std::string_view guid, bool others);
+@@ -344,8 +351,9 @@ class WorkspaceService : public TabStrip
+   // Returns false when `tab` is not an anchored tab the caller should keep --
+   // not anchored, in a split, or activation could not be moved off it -- in
+   // which case the caller closes as it always did. Returns true when the tab
+-  // was hibernated, or was already asleep: an anchor is never closed by
+-  // Ctrl+W, only by unanchoring it first (the Zen rule, design 5).
++  // was hibernated, or was already asleep, or was put away but kept live
++  // because its page has a "Leave site?" listener (E13.5): an anchor is never
++  // closed by Ctrl+W, only by unanchoring it first (the Zen rule, design 5).
+   using DiscardFn =
+       base::FunctionRef<content::WebContents*(content::WebContents*)>;
+   bool HibernateAnchoredTab(tabs::TabInterface* tab, DiscardFn discard);
+@@ -384,6 +392,13 @@ class WorkspaceService : public TabStrip
+   // would skip exactly the tabs the user can see (E11 review).
+   bool IsTabOfWorkspace(tabs::TabInterface* tab, std::string_view guid) const;
+ 
++  // The tabs CloseWorkspaceTabs(guid) closes, as handles: the workspace's own,
++  // never a pinned one. `pinned_kept`, when given, counts the pinned tabs that
++  // would otherwise have matched. One collector, so the confirm's count and the
++  // close cannot disagree.
++  std::vector<tabs::TabHandle> TabsToClose(std::string_view guid,
++                                           int* pinned_kept) const;
++
+   // THE ONLY PLACE A TAG IS EVER WRITTEN. Every rule in this class -- insert,
+   // pin, unpin, group, split, contents replacement -- ends here, so that
+   // "membership changed" and "membership was written down" cannot drift apart.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -91,6 +91,12 @@ constexpr int kMenuCommandTabSearch = 19
+ static_assert(kMenuCommandIconPresetFirst + std::size(kIconPresets) <=
+               kMenuCommandNewTab);
+ 
++// Close all / Delete ask first above this many tabs: Recently Closed keeps
++// only this many entries (TabRestoreServiceHelper::kMaxEntries), and these
++// close one tab per entry, so beyond it Ctrl+Shift+T cannot bring them back
++// (E13 risk sweep). At or below it they act at once, as before.
++constexpr int kRecentlyClosedLimit = 25;
++
+ // The arrows are narrower than the 32 px squares: at the owner's 200 px strip
+ // every pixel they do not take is a workspace button shown.
+ constexpr int kArrowWidth = 20;
+@@ -717,10 +723,21 @@ void WorkspaceRailView::ExecuteCommand(i
+       service->UnloadWorkspaceTabs(guid, /*others=*/true);
+       break;
+     case kMenuCommandCloseAll:
+-      // Same no-confirmation reasoning as Delete below: every tab goes to
+-      // Recently Closed with its tag, so Ctrl+Shift+T is the undo.
+-      service->CloseWorkspaceTabs(guid);
++    case kMenuCommandDelete: {
++      // Ctrl+Shift+T is the undo only up to kRecentlyClosedLimit tabs; above
++      // it, ask first and say how many. This replaces E9b's "no confirm until a
++      // workspace is lost", a trigger that could only fire after the loss.
++      const bool deleting = command_id == kMenuCommandDelete;
++      const int count = service->CountTabsToClose(guid);
++      if (count > kRecentlyClosedLimit) {
++        ShowCloseConfirmBubble(guid, count, deleting);
++      } else if (deleting) {
++        service->DeleteWorkspace(guid);
++      } else {
++        service->CloseWorkspaceTabs(guid);
++      }
+       break;
++    }
+     case kMenuCommandMoveTabsHere:
+       service->MoveSelectedTabsToWorkspace(guid);
+       break;
+@@ -730,14 +747,6 @@ void WorkspaceRailView::ExecuteCommand(i
+     case kMenuCommandMoveDown:
+       service->MoveWorkspace(guid, 1);
+       break;
+-    case kMenuCommandDelete:
+-      // No confirmation step, and design 5 asks for one. Deliberate for now and
+-      // recorded in LOCAL.md 18: every tab it closes goes to Recently Closed
+-      // with its workspace tag intact, so Ctrl+Shift+T brings them back, and a
+-      // modal confirm is a second dialog class for a reversible action. Add one
+-      // when a workspace is ever lost that the user wanted.
+-      service->DeleteWorkspace(guid);
+-      break;
+     default:
+       if (command_id >= kMenuCommandIconPresetFirst &&
+           command_id < kMenuCommandIconPresetFirst +
+@@ -749,6 +758,55 @@ void WorkspaceRailView::ExecuteCommand(i
+   }
+ }
+ 
++void WorkspaceRailView::ShowCloseConfirmBubble(const std::string& guid,
++                                               int count,
++                                               bool deleting) {
++  // Logged when asked and when cancelled, so a test can tell "asked, then
++  // cancelled, nothing closed" from "never asked".
++  LOG(INFO) << "[workspaces] confirm asked: "
++            << (deleting ? "delete" : "close all") << " of workspace '" << guid
++            << "', " << count << " tab(s)";
++  auto on_accept = base::BindOnce(
++      [](base::WeakPtr<WorkspaceRailView> self, const std::string& guid,
++         bool deleting) {
++        workspaces::WorkspaceService* const service =
++            self ? workspaces::WorkspaceService::From(self->browser_) : nullptr;
++        if (!service) {
++          return;
++        }
++        if (deleting) {
++          service->DeleteWorkspace(guid);
++        } else {
++          service->CloseWorkspaceTabs(guid);
++        }
++      },
++      weak_factory_.GetWeakPtr(), guid, deleting);
++
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(l10n_util::GetPluralStringFUTF16(
++              deleting ? IDS_HELIUM_WORKSPACE_CONFIRM_DELETE
++                       : IDS_HELIUM_WORKSPACE_CONFIRM_CLOSE_ALL,
++              count))
++          .AddParagraph(ui::DialogModelLabel(
++              l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_CONFIRM_BODY)))
++          .AddOkButton(std::move(on_accept),
++                       ui::DialogModel::Button::Params().SetLabel(
++                           l10n_util::GetStringUTF16(
++                               deleting ? IDS_HELIUM_WORKSPACE_DELETE
++                                        : IDS_HELIUM_WORKSPACE_CLOSE_ALL)))
++          .AddCancelButton(base::BindOnce(
++              [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
++          .Build();
++
++  // Anchored to the rail, like the name bubble below.
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), this, views::BubbleBorder::TOP_LEFT);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
+ void WorkspaceRailView::ShowNameBubble(
+     views::View* anchor,
+     int title_string_id,
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -134,6 +134,10 @@ class WorkspaceRailView : public views::
+ 
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+ 
++  // Asks before Close all tabs / Delete workspace takes `count` tabs, more
++  // than Recently Closed can give back; runs the action only on the OK button.
++  void ShowCloseConfirmBubble(const std::string& guid, int count, bool deleting);
++
+   // Opens the one-textfield bubble both create and rename use, anchored to
+   // `anchor`. `on_accept` is run with whatever was typed, and not run at all if
+   // the bubble is dismissed.

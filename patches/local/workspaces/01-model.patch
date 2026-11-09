@@ -1,0 +1,480 @@
+--- a/chrome/browser/ui/browser_window/internal/BUILD.gn
++++ b/chrome/browser/ui/browser_window/internal/BUILD.gn
+@@ -132,6 +132,7 @@ source_set("internal") {
+       "//chrome/browser/ui/tabs/tab_strip_api:impl",
+       "//chrome/browser/ui/tabs/tab_strip_api/controllers",
+       "//chrome/browser/ui/tabs/tab_strip_api/tab_strip_model_impl",
++      "//chrome/browser/ui/tabs/workspaces",
+       "//chrome/browser/ui/toasts",
+       "//chrome/browser/ui/toolbar",
+       "//chrome/browser/ui/toolbar/chrome_labs",
+--- a/chrome/browser/ui/browser_window/internal/browser_window_features.cc
++++ b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+@@ -113,6 +113,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_iph_controller.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/toasts/toast_features.h"
+ #include "chrome/browser/ui/toasts/toast_service.h"
+ #include "chrome/browser/ui/toolbar/avatar_toolbar_iph_controller.h"
+@@ -535,6 +536,12 @@ void BrowserWindowFeatures::Init(Browser
+   tab_list_bridge_ = std::make_unique<TabListBridge>(
+       *tab_strip_model_, browser->GetUnownedUserDataHost());
+ 
++  // Helium Workspaces. Created unconditionally for now; the IsEnabled gate
++  // (TYPE_NORMAL, not off-the-record, vertical layout, pref) lands with the
++  // rendering hook that first has something to hide.
++  workspace_service_ = std::make_unique<workspaces::WorkspaceService>(
++      *tab_strip_model_, browser->GetUnownedUserDataHost());
++
+   signin_view_controller_ =
+       GetUserDataFactory().CreateInstance<SigninViewController>(
+           *browser, browser, profile, tab_strip_model_);
+--- a/chrome/browser/ui/browser_window/public/browser_window_features.h
++++ b/chrome/browser/ui/browser_window/public/browser_window_features.h
+@@ -268,6 +268,10 @@ namespace web_app {
+ class AppBrowserController;
+ }  // namespace web_app
+ 
++namespace workspaces {
++class WorkspaceService;
++}  // namespace workspaces
++
+ // This class owns the core controllers for features that are scoped to a given
+ // browser window on desktop.
+ //
+@@ -362,6 +366,10 @@ class BrowserWindowFeatures {
+   //   extension_window_controller_ depends on tab_list_bridge_.
+   std::unique_ptr<TabListBridge> tab_list_bridge_;
+ 
++  // Helium Workspaces. Observes this window's tab strip; reached elsewhere via
++  // workspaces::WorkspaceService::From(browser).
++  std::unique_ptr<workspaces::WorkspaceService> workspace_service_;
++
+   std::unique_ptr<contextual_tasks::ContextualTasksBrowserController>
+       contextual_tasks_browser_controller_;
+   std::unique_ptr<CookieControlsBubbleCoordinator>
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -25,13 +25,59 @@ source_set("prefs") {
+   deps = [ "//components/prefs" ]
+ }
+ 
++# The workspace membership rules, as free functions over plain values.
++#
++# A second leaf target, for the same reason as ":prefs" but a different payoff:
++# these are the rules most worth testing, and this is what lets the test binary
++# below reach them without dragging in TabStripModel. Keep it dependency-free --
++# the moment this needs //chrome, the rules stop being testable in this fork.
++source_set("stamping") {
++  sources = [
++    "workspace_stamping.cc",
++    "workspace_stamping.h",
++  ]
++}
++
++# The window-scoped service and the per-tab tag it stamps. Unlike the two leaf
++# targets above this one is genuinely tied to the browser, so nothing in the
++# test binary may depend on it.
++#
++# Views-free and Browser-free on purpose (design 3.1): the hook sites in
++# views/tabs/common and sessions do not depend on //chrome/browser/ui, so a
++# target all of them can depend on must not either. The API is therefore in
++# tabs::TabInterface / TabStripModel terms, never views::View or Browser.
++source_set("workspaces") {
++  sources = [
++    "workspace_service.cc",
++    "workspace_service.h",
++    "workspace_tab_data.cc",
++    "workspace_tab_data.h",
++  ]
++
++  deps = [
++    ":stamping",
++    "//base",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/tabs:tab_strip",
++    "//components/tabs:public",
++    "//content/public/browser",
++    "//ui/base/unowned_user_data",
++  ]
++}
++
+ source_set("unit_tests") {
+   testonly = true
+ 
+-  sources = [ "workspace_prefs_unittest.cc" ]
++  sources = [
++    "workspace_prefs_unittest.cc",
++    "workspace_stamping_unittest.cc",
++  ]
+ 
++  # Leaf targets only. Adding ":workspaces" here would pull TabStripModel and
++  # most of //chrome into the test binary and undo the reason it exists.
+   deps = [
+     ":prefs",
++    ":stamping",
+     "//components/prefs",
+     "//components/prefs:test_support",
+     "//testing/gtest",
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -0,0 +1,75 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++
++#include <string>
++
++#include "base/logging.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++
++namespace workspaces {
++
++DEFINE_USER_DATA(WorkspaceService);
++
++WorkspaceService::WorkspaceService(
++    TabStripModel& tab_strip_model,
++    ui::UnownedUserDataHost& unowned_user_data_host)
++    : tab_strip_(tab_strip_model),
++      active_guid_(kDefaultWorkspaceGuid),
++      scoped_data_holder_(unowned_user_data_host, *this) {
++  tab_strip_->AddObserver(this);
++}
++
++WorkspaceService::~WorkspaceService() {
++  tab_strip_->RemoveObserver(this);
++}
++
++// static
++WorkspaceService* WorkspaceService::From(BrowserWindowInterface* browser) {
++  return browser ? Get(browser->GetUnownedUserDataHost()) : nullptr;
++}
++
++void WorkspaceService::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  if (change.type() != TabStripModelChange::kInserted) {
++    return;
++  }
++
++  for (const auto& inserted : change.GetInsert()->contents) {
++    tabs::TabInterface* tab = inserted.tab.get();
++    if (!tab) {
++      continue;
++    }
++    content::WebContents* contents = tab->GetContents();
++    if (!contents) {
++      continue;
++    }
++
++    WorkspaceTabData* tab_data =
++        WorkspaceTabData::GetOrCreateForWebContents(contents);
++
++    // The opener's workspace is not consulted yet -- reading it needs the
++    // opener lookup that arrives with the rest of the stamping table. Passing
++    // empty here makes ResolveGuidForInsertedTab fall through to the active
++    // workspace, which is the right answer for every tab a user opens directly.
++    tab_data->set_guid(ResolveGuidForInsertedTab(
++        tab_data->guid(), /*opener_guid=*/std::string_view(), active_guid_));
++
++    // Temporary: the visible proof that the service is wired into a real
++    // window and observing a real tab strip. Replaced when rendering starts
++    // reading these tags.
++    LOG(INFO) << "[workspaces] tab inserted at index " << inserted.index
++              << " -> workspace '" << tab_data->guid() << "'";
++  }
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SERVICE_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SERVICE_H_
++
++#include <string>
++
++#include "base/memory/raw_ref.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
++
++class BrowserWindowInterface;
++class TabStripModel;
++
++namespace workspaces {
++
++// One per browser window. Owns which workspace that window is showing, and
++// stamps membership onto tabs as they arrive.
++//
++// Lifetime is managed by BrowserWindowFeatures; this object registers itself as
++// unowned user data on the window so production code can reach it with
++// WorkspaceService::From(browser) without BrowserWindowInterface growing a
++// method for it (see ui/base/unowned_user_data/README.md).
++//
++// THE RULE THAT KEEPS THIS FROM CRASHING (design 2.2): TabStripModel is not
++// re-entrant and enforces it with a CHECK, and observers are notified from
++// inside that guarded scope. So no method here may ever call a TabStripModel
++// mutator -- not AddTab, MoveWebContentsAt, ActivateTab, SetTabPinned or
++// CloseWebContentsAt. This observer stamps bookkeeping and nothing else.
++// Anything that has to move, activate or insert belongs in a posted task or a
++// command handler.
++class WorkspaceService : public TabStripModelObserver {
++ public:
++  DECLARE_USER_DATA(WorkspaceService);
++
++  WorkspaceService(TabStripModel& tab_strip_model,
++                   ui::UnownedUserDataHost& unowned_user_data_host);
++  WorkspaceService(const WorkspaceService&) = delete;
++  WorkspaceService& operator=(const WorkspaceService&) = delete;
++  ~WorkspaceService() override;
++
++  // Null if the window has no service (for example a window type Workspaces
++  // does not apply to).
++  static WorkspaceService* From(BrowserWindowInterface* browser);
++
++  // The workspace this window is currently showing. Per window and in memory
++  // only: two windows can show different workspaces, and nothing per-window is
++  // ever written to a pref (design 2.4).
++  const std::string& active_guid() const { return active_guid_; }
++
++ private:
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++
++  const raw_ref<TabStripModel> tab_strip_;
++  std::string active_guid_;
++
++  // Must be last: it publishes `this` to the window, so everything else has to
++  // be initialised before it, and it must be torn down first.
++  ui::ScopedUnownedUserData<WorkspaceService> scoped_data_holder_;
++};
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SERVICE_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++
++#include <string>
++#include <string_view>
++
++namespace workspaces {
++
++std::string ResolveGuidForInsertedTab(std::string_view existing_guid,
++                                      std::string_view opener_guid,
++                                      std::string_view active_guid) {
++  if (!existing_guid.empty()) {
++    return std::string(existing_guid);
++  }
++  if (!opener_guid.empty()) {
++    return std::string(opener_guid);
++  }
++  if (!active_guid.empty()) {
++    return std::string(active_guid);
++  }
++  return std::string(kDefaultWorkspaceGuid);
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
++
++#include <string>
++#include <string_view>
++
++// The rules deciding which workspace a tab belongs to.
++//
++// Everything here is a free function over plain values -- no Profile, no
++// TabStripModel, no WebContents. That is deliberate and load-bearing: it is
++// what lets these rules be tested in workspaces_unittests, which does not link
++// //chrome/test:test_support and therefore builds at all in this fork
++// (LOCAL.md 8). The TabStripModelObserver stays a thin adapter that reads
++// values off the model and calls in here.
++//
++// Keep it that way. A rule that needs a live Chromium object is a rule nobody
++// can test.
++namespace workspaces {
++
++// The workspace an untagged tab belongs to. An implicit default workspace
++// always exists and cannot be deleted while it is the only one, so an untagged
++// tab is never orphaned -- that covers first run, enabling the feature on a
++// profile with 200 open tabs, and a tab restored into a deleted workspace
++// (design 2.4).
++inline constexpr std::string_view kDefaultWorkspaceGuid = "default";
++
++// Which workspace a tab joins when it is inserted into a tab strip. Applied in
++// order (design 2.5):
++//
++//  1. A tab that already carries a tag keeps it. This is the case that makes
++//     dragging a tab between windows and restoring a session work at all: the
++//     tag travels on the tab, so the receiving window must not overwrite it.
++//  2. Otherwise it joins its opener's workspace, so a link opened from a tab
++//     lands beside the tab it came from.
++//  3. Otherwise it joins whatever workspace is active in this window.
++//
++// Never returns empty; falls back to kDefaultWorkspaceGuid.
++std::string ResolveGuidForInsertedTab(std::string_view existing_guid,
++                                      std::string_view opener_guid,
++                                      std::string_view active_guid);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++
++#include <string>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace workspaces {
++namespace {
++
++// Rule 1 -- an existing tag always wins. This is the rule that makes dragging a
++// tab between windows and restoring a session work: the tag travels on the tab,
++// so the receiving window must not restamp it with its own active workspace.
++TEST(WorkspaceStampingTest, ExistingGuidIsKept) {
++  EXPECT_EQ("work", ResolveGuidForInsertedTab("work", "personal", "personal"));
++}
++
++// Rule 2 -- a link opened from a tab lands beside the tab it came from, even
++// when that tab is not in the active workspace.
++TEST(WorkspaceStampingTest, OpenerGuidUsedWhenUntagged) {
++  EXPECT_EQ("work", ResolveGuidForInsertedTab("", "work", "personal"));
++}
++
++// Rule 3 -- a plain new tab joins the workspace you are looking at.
++TEST(WorkspaceStampingTest, ActiveGuidUsedWithoutOpener) {
++  EXPECT_EQ("personal", ResolveGuidForInsertedTab("", "", "personal"));
++}
++
++// The result is never empty: an untagged tab belongs to the implicit default
++// workspace rather than to nothing (design 2.4).
++TEST(WorkspaceStampingTest, FallsBackToDefaultWorkspace) {
++  EXPECT_EQ(kDefaultWorkspaceGuid, ResolveGuidForInsertedTab("", "", ""));
++}
++
++// Precedence is existing > opener > active, checked as one chain rather than
++// relying on the three tests above to imply it.
++TEST(WorkspaceStampingTest, PrecedenceIsExistingThenOpenerThenActive) {
++  EXPECT_EQ("a", ResolveGuidForInsertedTab("a", "b", "c"));
++  EXPECT_EQ("b", ResolveGuidForInsertedTab("", "b", "c"));
++  EXPECT_EQ("c", ResolveGuidForInsertedTab("", "", "c"));
++}
++
++}  // namespace
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.cc
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
++
++#include "content/public/browser/web_contents.h"
++
++namespace workspaces {
++
++WorkspaceTabData::WorkspaceTabData(content::WebContents* web_contents)
++    : content::WebContentsUserData<WorkspaceTabData>(*web_contents) {}
++
++WorkspaceTabData::~WorkspaceTabData() = default;
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(WorkspaceTabData);
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_TAB_DATA_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_TAB_DATA_H_
++
++#include <string>
++
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace workspaces {
++
++// Which workspace a tab belongs to, stored on the tab itself.
++//
++// This is the source of truth for membership, and it is a tag rather than a
++// position (design 2.1). Rendering filters by tag, so a tab sitting at an
++// awkward index is still drawn in the right workspace, and none of the
++// index-range bookkeeping that sank the first design is needed.
++//
++// Living on the WebContents is what makes the tag survive the things that move
++// a tab around: dragging it into another window, moving it between tab strips,
++// and being restored from a session all carry this object along with the tab.
++//
++// Stage 5 adds anchor fields here; keep it a plain data holder with no
++// behaviour of its own.
++class WorkspaceTabData : public content::WebContentsUserData<WorkspaceTabData> {
++ public:
++  WorkspaceTabData(const WorkspaceTabData&) = delete;
++  WorkspaceTabData& operator=(const WorkspaceTabData&) = delete;
++  ~WorkspaceTabData() override;
++
++  // Empty until the tab has been stamped. An empty guid means "belongs to the
++  // implicit default workspace", never "belongs to nothing".
++  const std::string& guid() const { return guid_; }
++  void set_guid(std::string guid) { guid_ = std::move(guid); }
++
++ private:
++  friend class content::WebContentsUserData<WorkspaceTabData>;
++
++  explicit WorkspaceTabData(content::WebContents* web_contents);
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++
++  std::string guid_;
++};
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_TAB_DATA_H_

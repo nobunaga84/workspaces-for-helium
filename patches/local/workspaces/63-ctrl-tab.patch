@@ -1,0 +1,320 @@
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -41,6 +41,7 @@
+ #include "chrome/browser/ui/tabs/tab_menu_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/unload_controller.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+@@ -435,6 +436,32 @@ bool BrowserTabStripModelDelegate::IsTab
+          (service->IsTabVisible(tab) && !service->IsDrawnAsPinnedRow(tab));
+ }
+ 
++bool BrowserTabStripModelDelegate::IsTabCycleStop(
++    const tabs::TabInterface* tab) const {
++  // The question above without its last clause (C2): an open pinned page of
++  // the workspace on screen IS a stop for Ctrl+Tab, as in Arc -- inside a
++  // closed folder too (D4), where the peek row draws it once it is in front
++  // (C12). IsTabVisible() answers by tag, so another workspace's tabs and
++  // pinned pages stay out. Favorites and service-less windows as above.
++  if (tab && tab->IsPinned()) {
++    return true;
++  }
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  return !service || service->IsTabVisible(tab);
++}
++
++base::Time BrowserTabStripModelDelegate::GetTabLeftTime(
++    const tabs::TabInterface* tab) const {
++  // Recorded by WorkspaceService on every switch away, not gated on
++  // IsEnabled(), and carried on the WebContents across windows (C2, D2).
++  // Null for a tab never left in a window that has a service: a service-less
++  // window's MRU order is then stock, by last-active time alone.
++  const workspaces::WorkspaceTabData* const data =
++      workspaces::WorkspaceTabData::FromWebContents(tab->GetContents());
++  return data ? data->left_at() : base::Time();
++}
++
+ bool BrowserTabStripModelDelegate::IsTabAnchored(
+     const tabs::TabInterface* tab) const {
+   // IsEnabled() because anchors are dormant while Workspaces is off (E10b):
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.h
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.h
+@@ -86,6 +86,8 @@ class BrowserTabStripModelDelegate : pub
+   BrowserWindowInterface* GetBrowserWindowInterface() override;
+   bool IsTabVisibleInActiveWorkspace(
+       const tabs::TabInterface* tab) const override;
++  bool IsTabCycleStop(const tabs::TabInterface* tab) const override;
++  base::Time GetTabLeftTime(const tabs::TabInterface* tab) const override;
+   bool IsTabAnchored(const tabs::TabInterface* tab) const override;
+   bool ResetAnchoredTabInsteadOfClosing(tabs::TabInterface* tab,
+                                         const char* via) override;
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -4595,39 +4595,9 @@ void TabStripModel::SelectRelativeTabCyc
+ 
+ void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
+                                  TabStripUserGestureDetails detail) {
+-  if (mru_cycle_list_.empty()) {
+-    BrowserWindowInterface* browser =
+-        GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(
+-          GetWebContentsAt(0));
+-    if (!browser) {
+-      return;
+-    }
+-
+-    for (int i = 0; i < count(); ++i) {
+-      mru_cycle_list_.push_back(i);
+-    }
+-
+-    std::sort(mru_cycle_list_.begin(), mru_cycle_list_.end(),
+-              [this](int a, int b) {
+-                return GetWebContentsAt(a)->GetLastActiveTimeTicks() >
+-                       GetWebContentsAt(b)->GetLastActiveTimeTicks();
+-              });
+-
+-    if (BrowserView* browser_view =
+-            BrowserView::GetBrowserViewForBrowser(browser)) {
+-      browser_view->StartTabCycling();
+-    }
+-  }
+-
+-  if (direction == TabRelativeDirection::kNext) {
+-    std::rotate(mru_cycle_list_.begin(), mru_cycle_list_.begin() + 1,
+-                mru_cycle_list_.end());
+-  } else {
+-    std::rotate(mru_cycle_list_.rbegin(), mru_cycle_list_.rbegin() + 1,
+-                mru_cycle_list_.rend());
+-  }
+-
+-  ActivateTabAt(mru_cycle_list_[0], detail);
++  // Workspaces C2: the whole step, in workspace_tab_strip_hooks.cc.
++  workspaces::SelectMRUTab(this, &mru_cycle_list_,
++                           direction == TabRelativeDirection::kNext, detail);
+ }
+ 
+ void TabStripModel::StopMRUCycling() {
+@@ -4664,7 +4634,9 @@ void TabStripModel::SelectRelativeTab(Ta
+     // Asked through delegate_, never WorkspaceService directly (no GN cycle).
+     // The loop below stops at start_index, so a workspace with nothing
+     // selectable falls through to "activate nothing" rather than spinning.
+-    if (!delegate_->IsTabVisibleInActiveWorkspace(GetTabAtIndex(i))) {
++    // IsTabCycleStop, not IsTabVisibleInActiveWorkspace: an open pinned page
++    // of this workspace is a landing place for Ctrl+Tab, as in Arc (C2).
++    if (!delegate_->IsTabCycleStop(GetTabAtIndex(i))) {
+       return true;
+     }
+ 
+--- a/chrome/browser/ui/tabs/tab_strip_model_delegate.h
++++ b/chrome/browser/ui/tabs/tab_strip_model_delegate.h
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include "base/functional/callback_forward.h"
++#include "base/time/time.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/common/buildflags.h"
+ #include "components/sessions/core/session_id.h"
+@@ -232,6 +233,28 @@ class TabStripModelDelegate {
+     return true;
+   }
+ 
++  // Whether Ctrl+Tab in the default (left-to-right) order may land on `tab`
++  // (C2). Not IsTabVisibleInActiveWorkspace: that one also says no to an open
++  // pinned page, because the commands that enumerate the tab list (Ctrl+1..9,
++  // "Close other tabs") must pass it by -- but Arc's Ctrl+Tab reaches it, and
++  // so does ours. Ctrl+PgDn / PgUp and every other caller of
++  // TabStripModel::SelectNextTab() / SelectPreviousTab() share this road
++  // (D5). The default keeps stock behaviour and the test delegate's. Fork
++  // addition (C2).
++  virtual bool IsTabCycleStop(const tabs::TabInterface* tab) const {
++    return IsTabVisibleInActiveWorkspace(tab);
++  }
++
++  // When the user last LEFT `tab` -- another tab of its window became active
++  // -- or a null time when it never was (C2, D2). The MRU Ctrl+Tab order's
++  // clock: a tab opened in the background and never shown keeps its creation
++  // time as its last-active time, so by that clock alone it outranks the page
++  // the user was reading a moment ago. Null by default: stock MRU order.
++  // Fork addition (C2).
++  virtual base::Time GetTabLeftTime(const tabs::TabInterface* tab) const {
++    return base::Time();
++  }
++
+   // Whether `tab` is an anchored tab of an enabled Workspaces window. The
+   // range closes ("Close other tabs", "Close tabs below/above") skip these the
+   // way they skip pinned tabs. Same delegate route, and the same default-false
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
+@@ -4,12 +4,19 @@
+ 
+ #include "chrome/browser/ui/tabs/workspace_tab_strip_hooks.h"
+ 
++#include <algorithm>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "base/time/time.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -61,4 +68,123 @@ bool CanPinToWorkspace(const TabStripMod
+              .SchemeIsHTTPOrHTTPS();
+ }
+ 
++void SelectMRUTab(TabStripModel* model,
++                  std::vector<int>* cycle,
++                  bool next,
++                  TabStripUserGestureDetails detail) {
++  // As SelectRelativeTab: buffered key presses can arrive after the last tab
++  // went, and GetWebContentsAt(0) below would CHECK.
++  if (model->empty()) {
++    return;
++  }
++
++  // The list holds tab HANDLES, never indices (D1). Brave's raw indices went
++  // stale on the first close or move inside one Ctrl hold: Ctrl held, Tab, W,
++  // Tab activated an index past the end and CHECK-crashed. Built from EVERY
++  // tab of the window: MRU crosses workspaces, as Arc's does (design 3.6, the
++  // owner's answer), so no IsTabCycleStop here.
++  if (cycle->empty()) {
++    BrowserWindowInterface* browser =
++        GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(
++            model->GetWebContentsAt(0));
++    if (!browser) {
++      return;
++    }
++
++    // The order (D2): the active tab first, then the tabs the user LEFT, the
++    // latest leave first, then the tabs never left, by last-active time. Not
++    // last-active time alone: a tab opened in the background keeps its
++    // creation time, so it outranked the page used a moment before and the
++    // first Ctrl+Tab landed on it. Each value read ONCE, and one clock per
++    // rank, so the comparison is a strict weak ordering.
++    // Walked with the iterator, not GetTabAtIndex(i): an index lookup walks
++    // the collection, and the Arc import put 3,862 tabs in one window.
++    // Brave's comparator looked both tabs up by index on every comparison.
++    struct Entry {
++      int rank = 2;  // 0 the active tab, 1 left, 2 never left.
++      base::Time left_at;
++      base::TimeTicks last_active;
++      int32_t handle = 0;
++    };
++    std::vector<Entry> entries;
++    entries.reserve(model->count());
++    const tabs::TabInterface* const active_tab = model->GetActiveTab();
++    for (tabs::TabInterface* tab : *model) {
++      Entry entry;
++      entry.handle = tab->GetHandle().raw_value();
++      entry.left_at = model->delegate()->GetTabLeftTime(tab);
++      if (tab == active_tab) {
++        entry.rank = 0;
++      } else if (!entry.left_at.is_null()) {
++        entry.rank = 1;
++      } else {
++        entry.last_active = tab->GetContents()->GetLastActiveTimeTicks();
++      }
++      entries.push_back(entry);
++    }
++    std::sort(entries.begin(), entries.end(),
++              [](const Entry& a, const Entry& b) {
++                if (a.rank != b.rank) {
++                  return a.rank < b.rank;
++                }
++                return a.rank == 1 ? a.left_at > b.left_at
++                                   : a.last_active > b.last_active;
++              });
++    for (const Entry& entry : entries) {
++      cycle->push_back(entry.handle);
++    }
++
++    if (BrowserView* browser_view =
++            BrowserView::GetBrowserViewForBrowser(browser)) {
++      browser_view->StartTabCycling();
++    }
++    // StartTabCycling() replaces the Ctrl-release handler. When an older one
++    // is still live (the list emptied by the prune below while Ctrl stayed
++    // down), destroying it runs StopTabCycling() -> StopMRUCycling(), which
++    // clears the list just built (D1). This press then does nothing; the
++    // next one finds no handler and starts clean. Never clear the list
++    // mid-cycle for the same reason.
++    if (cycle->empty()) {
++      return;
++    }
++  }
++
++  // Every press: drop the tabs closed, or moved to another window, since the
++  // list was built -- BEFORE the rotate, so the press never lands on one.
++  // owning_model() rather than GetIndexOfTab() == kNoTab: the same answer
++  // without a walk of the collection per entry, and the very test
++  // ActivateTab() CHECKs below.
++  std::erase_if(*cycle, [model](int handle) {
++    const tabs::TabInterface* const tab = tabs::TabHandle(handle).Get();
++    return !tab ||
++           static_cast<const tabs::TabModel*>(tab)->owning_model() != model;
++  });
++  if (cycle->empty()) {
++    return;
++  }
++
++  // D17: start the step from the tab on screen. After a Ctrl+W mid-hold the
++  // model activated a tab of its own choosing, which is not the list's
++  // front; stepping from the front would skip it, or land back on it.
++  if (const tabs::TabInterface* const active = model->GetActiveTab()) {
++    if (auto it = std::ranges::find(*cycle, active->GetHandle().raw_value());
++        it != cycle->end()) {
++      std::rotate(cycle->begin(), it, cycle->end());
++    } else {
++      // A tab made during the hold (a New Tab the close spawned, Ctrl+T)
++      // joins the cycle at the front, so the step still starts from it
++      // (code review); the prune drops it like any other once it closes.
++      cycle->insert(cycle->begin(), active->GetHandle().raw_value());
++    }
++  }
++
++  if (next) {
++    std::rotate(cycle->begin(), cycle->begin() + 1, cycle->end());
++  } else {
++    std::rotate(cycle->rbegin(), cycle->rbegin() + 1, cycle->rend());
++  }
++
++  model->ActivateTab(tabs::TabHandle(cycle->front()).Get(), detail);
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
+@@ -11,6 +11,7 @@
+ 
+ class TabStripModel;
+ class TabStripModelDelegate;
++struct TabStripUserGestureDetails;
+ 
+ namespace tabs {
+ class TabInterface;
+@@ -46,6 +47,14 @@ bool NewTabAtTopOfList(const TabStripMod
+ // model, a tab that left under the open menu (review #35).
+ bool CanPinToWorkspace(const TabStripModel& model, int index);
+ 
++// SelectMRUTab (C2): one Ctrl+Tab step in most-recently-used order, `next` or
++// back. `cycle` is the model's list of tab handles for this Ctrl hold, built
++// on the first press and cleared by StopMRUCycling() on Ctrl's release.
++void SelectMRUTab(TabStripModel* model,
++                  std::vector<int>* cycle,
++                  bool next,
++                  TabStripUserGestureDetails detail);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_

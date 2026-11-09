@@ -1,0 +1,610 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -175,6 +175,10 @@ source_set("workspaces") {
+     # listed anyway because this target includes its header directly, and a
+     # public_deps edge in an upstream file is not ours to rely on.
+     ":archive",
++
++    # ":pins" for the homes of a workspace's pinned pages, which "Close
++    # duplicate tabs..." keeps (C32). //base-only, so no cycle.
++    ":pins",
+     ":prefs",
+     ":stamping",
+     ":tab_data",
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -8,6 +8,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <optional>
++#include <set>
+ #include <sstream>
+ #include <string>
+ #include <string_view>
+@@ -36,6 +37,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+@@ -224,6 +226,13 @@ base::Time LeftAt(const tabs::TabInterfa
+   return data ? data->left_at() : base::Time();
+ }
+ 
++// C32: what "the same address" means to Close duplicate tabs (D7): the URL
++// without its #part, so a #section link is the page it is on. Empty for an
++// invalid URL, which is nobody's duplicate -- and whose spec() is fatal.
++std::string DuplicateKey(const GURL& url) {
++  return url.is_valid() ? url.GetWithoutRef().spec() : std::string();
++}
++
+ }  // namespace
+ 
+ DEFINE_USER_DATA(WorkspaceService);
+@@ -590,6 +599,21 @@ void WorkspaceService::DeleteWorkspace(s
+ 
+ int WorkspaceService::CloseWorkspaceTabs(std::string_view guid,
+                                          bool today_only) {
++  int pinned_kept = 0;
++  std::vector<tabs::TabHandle> doomed =
++      TabsToClose(guid, &pinned_kept, today_only);
++
++  // The kept count is the evidence for the pinned rule: Chromium reopens the
++  // last session's pinned tabs at startup, so how many tabs a close takes
++  // depends on history, and only this number says the rule ran (LOCAL.md 34).
++  LOG(INFO) << "[workspaces] closing " << doomed.size()
++            << " tab(s) of workspace '" << guid << "' in this window, "
++            << pinned_kept << " pinned kept"
++            << (today_only ? ", pinned pages kept (Clear Today)" : "");
++  return CloseTabs(std::move(doomed));
++}
++
++int WorkspaceService::CloseTabs(std::vector<tabs::TabHandle> doomed) {
+   // Collected as handles before anything is closed, and re-resolved to an index
+   // on the way past. TabStripModel::CloseTabs() takes the whole set at once but
+   // is private, so these go one at a time through CloseWebContentsAt() -- and
+@@ -598,9 +622,6 @@ int WorkspaceService::CloseWorkspaceTabs
+   // taking more than the tab it was asked for (a split closes as a unit), which
+   // a reverse-order index walk would not.
+   //
+-  int pinned_kept = 0;
+-  std::vector<tabs::TabHandle> doomed =
+-      TabsToClose(guid, &pinned_kept, today_only);
+   // The active tab LAST (C34, A4): a close of the active tab lands on the tab
+   // left last, often another doomed one, which would then be shown, stamped
+   // left and closed in its turn, one after another. Last, the active tab
+@@ -609,14 +630,6 @@ int WorkspaceService::CloseWorkspaceTabs
+     PutLast(doomed, active->GetHandle());
+   }
+ 
+-  // The kept count is the evidence for the pinned rule: Chromium reopens the
+-  // last session's pinned tabs at startup, so how many tabs a close takes
+-  // depends on history, and only this number says the rule ran (LOCAL.md 34).
+-  LOG(INFO) << "[workspaces] closing " << doomed.size()
+-            << " tab(s) of workspace '" << guid << "' in this window, "
+-            << pinned_kept << " pinned kept"
+-            << (today_only ? ", pinned pages kept (Clear Today)" : "");
+-
+   // CLOSE_CREATE_HISTORICAL_TAB so they land in Recently Closed. Each one still
+   // carries its guid in its session data, so reopening one lands back in this
+   // workspace -- or, if the workspace was deleted meanwhile, resolves through
+@@ -637,6 +650,115 @@ int WorkspaceService::CloseWorkspaceTabs
+   return closed;
+ }
+ 
++std::vector<tabs::TabHandle> WorkspaceService::DuplicateTabs(
++    std::string_view guid) const {
++  if (!IsEnabled()) {
++    return {};
++  }
++  // The addresses whose copy stays somewhere else, so that every Today copy
++  // of one closes (D8). First the homes of the workspace's pinned pages, in
++  // any folder or split, open or asleep -- skipped until the pins file has
++  // loaded, which only means fewer closes.
++  std::set<std::string> kept;
++  Profile* const profile = browser_window_->GetProfile();
++  if (const pins::PinStore* const store =
++          pins::PinStore::GetOrCreate(profile, profile->GetPath());
++      store->loaded()) {
++    std::vector<const pins::PinNode*> rows =
++        pins::RootsForWorkspace(store->tree(), guid, known_guids_);
++    while (!rows.empty()) {
++      const pins::PinNode* const row = rows.back();
++      rows.pop_back();
++      if (row->type == pins::PinNode::Type::kItem) {
++        kept.insert(DuplicateKey(GURL(row->url)));
++      }
++      for (const pins::PinNode& child : row->children) {
++        rows.push_back(&child);
++      }
++    }
++  }
++
++  // One walk with the strip's own iterator, never GetTabAtIndex(i): an index
++  // lookup walks the collection tree, and the menu asks this as it opens, in a
++  // window that may hold 3,862 tabs (LOCAL.md 37, C2). The address is read
++  // only of the tabs that need it.
++  const tabs::TabInterface* const active = tab_strip_->GetActiveTab();
++  std::vector<DuplicateCandidate> today;
++  std::vector<tabs::TabHandle> handles;
++  for (tabs::TabInterface* const tab : *tab_strip_) {
++    // A favorite first: it has no tag, and belongs to every workspace.
++    const bool favorite = tab->IsPinned();
++    content::WebContents* const contents = tab->GetContents();
++    if (!contents || (!favorite && !IsTabOfWorkspace(tab, guid))) {
++      continue;
++    }
++    std::string key = DuplicateKey(contents->GetLastCommittedURL());
++    // An open pinned page: the page it shows now, which may have drifted.
++    if (favorite || IsDrawnAsPinnedRow(tab)) {
++      kept.insert(std::move(key));
++      continue;
++    }
++    // D13: it would not reach the Archive, and every one shares an address.
++    if (IsUntouchedNewTabPage(contents)) {
++      continue;
++    }
++    // D12: a tab the user marked is never closed -- a split closes as a unit,
++    // closing a saved group's last tab deletes the group, and the Archive
++    // keeps no anchor -- so it is the copy that stays.
++    if (tab->IsSplit() || tab->GetGroup().has_value() || IsAnchored(tab) ||
++        !CustomTitleForTab(contents).empty()) {
++      kept.insert(std::move(key));
++      continue;
++    }
++    // Never left: a null time, 0 microseconds.
++    today.push_back(
++        {.key = std::move(key),
++         .active = tab == active,
++         .left_at_us =
++             LeftAt(tab).ToDeltaSinceWindowsEpoch().InMicroseconds()});
++    handles.push_back(tab->GetHandle());
++  }
++
++  std::vector<tabs::TabHandle> doomed;
++  for (const size_t i : DuplicatesToClose(today, kept)) {
++    doomed.push_back(handles[i]);
++  }
++  return doomed;
++}
++
++int WorkspaceService::CloseDuplicateTabs(
++    std::string_view guid,
++    const std::vector<tabs::TabHandle>& listed) {
++  // D14: only what is still a duplicate. The confirm stayed open while pages
++  // loaded, closed and were used, and a listed tab may now be the copy that
++  // stays; a fresh look never names that one.
++  std::vector<tabs::TabHandle> doomed = DuplicateTabs(guid);
++  std::erase_if(doomed, [&listed](const tabs::TabHandle& handle) {
++    return std::ranges::find(listed, handle) == listed.end();
++  });
++  // A window of nothing but copies keeps the page in front: emptied, the
++  // window would close with them (review).
++  if (doomed.size() == static_cast<size_t>(tab_strip_->count())) {
++    if (const tabs::TabInterface* const active = tab_strip_->GetActiveTab()) {
++      std::erase(doomed, active->GetHandle());
++    }
++  }
++  // CloseWebContentsAt() answers nothing, and a page with a "Leave site?"
++  // handler closes only once the user says so: counted, so the log tells a
++  // tab still open from a close that never ran.
++  int asking = 0;
++  for (const tabs::TabHandle& handle : doomed) {
++    if (const tabs::TabInterface* const tab = handle.Get();
++        tab && AsksBeforeLeaving(tab->GetContents())) {
++      ++asking;
++    }
++  }
++  LOG(INFO) << "[workspaces] duplicates: closing " << doomed.size() << " of "
++            << listed.size() << " listed in workspace '" << guid << "', "
++            << asking << " ask before leaving";
++  return CloseTabs(std::move(doomed));
++}
++
+ std::vector<tabs::TabHandle> WorkspaceService::TabsToClose(
+     std::string_view guid,
+     int* pinned_kept,
+@@ -645,10 +767,12 @@ std::vector<tabs::TabHandle> WorkspaceSe
+   // default workspace, so "Close all tabs" on Home closed every pinned tab
+   // until E13. A pinned tab belongs to every workspace (design 2.5), the
+   // same rule UnloadWorkspaceTabs applies below.
++  //
++  // The strip's own iterator, not GetTabAtIndex(i): an index lookup walks the
++  // collection tree, and the window may hold 3,862 tabs (C32).
+   std::vector<tabs::TabHandle> doomed;
+-  for (int i = 0; i < tab_strip_->count(); ++i) {
+-    tabs::TabInterface* tab = tab_strip_->GetTabAtIndex(i);
+-    if (!tab || !IsTabOfWorkspace(tab, guid)) {
++  for (tabs::TabInterface* const tab : *tab_strip_) {
++    if (!IsTabOfWorkspace(tab, guid)) {
+       continue;
+     }
+     if (tab->IsPinned()) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -231,6 +231,25 @@ class WorkspaceService : public TabStrip
+   // can ask first when that is more than Recently Closed keeps (E13.5).
+   int CountTabsToClose(std::string_view guid, bool today_only = false) const;
+ 
++  // C32, "Close duplicate tabs...": the Today tabs of `guid` in this window
++  // whose address -- without its #part (D7) -- is already one of the
++  // workspace's pinned pages (at home, or the page an open one shows), a
++  // favorite's, or a tab the user marked (in a split, in a group, anchored,
++  // renamed: never closed, so the copy that stays, D12); of the other copies
++  // of one address, all but the one used last (DuplicatesToClose). Never an
++  // untouched New Tab page (D13). Empty while disabled. One walk of the strip,
++  // nothing logged, nothing changed -- though it may create the profile's pins
++  // store and start its load, as the pinned section does.
++  std::vector<tabs::TabHandle> DuplicateTabs(std::string_view guid) const;
++
++  // Closes those of `listed` -- the tabs a confirm named -- that a fresh
++  // DuplicateTabs(guid) still holds (D14), into Recently Closed and the
++  // Archive, and answers how many closes it asked. A page with a "Leave
++  // site?" handler asks first, so it may close later or not at all.
++  // ONLY CALL FROM A MENU OR COMMAND HANDLER: it closes tabs.
++  int CloseDuplicateTabs(std::string_view guid,
++                         const std::vector<tabs::TabHandle>& listed);
++
+   // Hibernates the tabs of `guid` -- or, with `others`, of every workspace
+   // except `guid` -- through Helium's own Hibernate command, one tab at a
+   // time, skipping pinned tabs, the foreground tab, and any page with a "Leave
+@@ -554,6 +573,12 @@ class WorkspaceService : public TabStrip
+                                            int* pinned_kept,
+                                            bool today_only) const;
+ 
++  // Closes `doomed` with CLOSE_CREATE_HISTORICAL_TAB, the active tab last,
++  // re-resolving each handle on the way past; answers the closes asked. The
++  // one loop CloseWorkspaceTabs() and CloseDuplicateTabs() share (C32). ONLY
++  // FROM A MENU OR COMMAND HANDLER: it closes tabs.
++  int CloseTabs(std::vector<tabs::TabHandle> doomed);
++
+   // THE ONLY PLACE A TAG IS EVER WRITTEN. Every rule in this class -- insert,
+   // pin, unpin, group, split, contents replacement -- ends here, so that
+   // "membership changed" and "membership was written down" cannot drift apart.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -5,8 +5,10 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ 
+ #include <cstddef>
++#include <map>
+ #include <numeric>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -210,4 +212,34 @@ std::vector<size_t> ReconciledUnitOrder(
+   return order;
+ }
+ 
++std::vector<size_t> DuplicatesToClose(
++    const std::vector<DuplicateCandidate>& today,
++    const std::set<std::string>& kept) {
++  // The copy that stays, per key: the first seen, until the active one or one
++  // left later comes along. Views into `today`, which outlives this.
++  std::map<std::string_view, size_t> keeper;
++  for (size_t i = 0; i < today.size(); ++i) {
++    const DuplicateCandidate& tab = today[i];
++    if (kept.contains(tab.key)) {
++      continue;
++    }
++    const auto [it, first] = keeper.try_emplace(tab.key, i);
++    const DuplicateCandidate& best = today[it->second];
++    if (!first && !best.active &&
++        (tab.active || tab.left_at_us > best.left_at_us)) {
++      it->second = i;
++    }
++  }
++
++  std::vector<size_t> doomed;
++  for (size_t i = 0; i < today.size(); ++i) {
++    const std::string& key = today[i].key;
++    if (!key.empty() &&
++        (kept.contains(key) || keeper.find(key)->second != i)) {
++      doomed.push_back(i);
++    }
++  }
++  return doomed;
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -7,7 +7,9 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstdint>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -267,6 +269,27 @@ void PutLast(std::vector<T>& items, cons
+   }
+ }
+ 
++// C32: one Today tab, as "Close duplicate tabs..." weighs it. `key` is its
++// address without the #part (empty: never a duplicate); `left_at_us` is when
++// the user last left it, 0 when not in this run (WorkspaceTabData::left_at).
++// Plain values, so the rule below is tested here.
++struct DuplicateCandidate {
++  std::string key;
++  bool active = false;
++  int64_t left_at_us = 0;
++};
++
++// C32: which of `today` -- in strip order -- close, as indices into it,
++// ascending. Every candidate whose key is in `kept` closes, the active one
++// too: that address stays elsewhere (a pinned page, a favorite, a tab the
++// user marked), so a Today copy of it always closes -- the owner's answer. Of
++// the rest, per key all but one: the active, else the one left last, else the
++// first, which after a restart is the top one until one is used. An empty key
++// never closes.
++std::vector<size_t> DuplicatesToClose(
++    const std::vector<DuplicateCandidate>& today,
++    const std::set<std::string>& kept);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <cstddef>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -626,5 +627,67 @@ TEST(WorkspaceReconcileTest, AlwaysNames
+   }
+ }
+ 
++// C32: "Close duplicate tabs...". The candidates are Today tabs in strip
++// order; the answer is the indices that close.
++TEST(WorkspaceDuplicatesTest, AKeptAddressClosesEveryCopy) {
++  // A pinned page's address: the pinned page is the copy that stays, so every
++  // Today copy closes, the active one too (the owner's "always closes").
++  const std::vector<DuplicateCandidate> today = {
++      {.key = "a", .active = true}, {.key = "b"}, {.key = "a"}};
++
++  EXPECT_EQ(std::vector<size_t>({0, 2}), DuplicatesToClose(today, {"a"}));
++}
++
++TEST(WorkspaceDuplicatesTest, TheActiveCopyStays) {
++  const std::vector<DuplicateCandidate> today = {
++      {.key = "a", .left_at_us = 9}, {.key = "a", .active = true}};
++
++  EXPECT_EQ(std::vector<size_t>({0}), DuplicatesToClose(today, {}));
++  // On top too: a lower copy left later does not take its place.
++  const std::vector<DuplicateCandidate> active_first = {
++      {.key = "a", .active = true}, {.key = "a", .left_at_us = 9}};
++  EXPECT_EQ(std::vector<size_t>({1}), DuplicatesToClose(active_first, {}));
++}
++
++TEST(WorkspaceDuplicatesTest, TheCopyLeftLastStays) {
++  const std::vector<DuplicateCandidate> today = {
++      {.key = "a", .left_at_us = 5},
++      {.key = "a", .left_at_us = 9},
++      {.key = "a"}};
++
++  EXPECT_EQ(std::vector<size_t>({0, 2}), DuplicatesToClose(today, {}));
++}
++
++TEST(WorkspaceDuplicatesTest, WithNoClockTheTopCopyStays) {
++  // After a restart left_at is not known: the top one stays.
++  const std::vector<DuplicateCandidate> today = {{.key = "a"}, {.key = "a"}};
++
++  EXPECT_EQ(std::vector<size_t>({1}), DuplicatesToClose(today, {}));
++}
++
++TEST(WorkspaceDuplicatesTest, ThreeCopiesCloseTwo) {
++  const std::vector<DuplicateCandidate> today = {
++      {.key = "a"}, {.key = "b"}, {.key = "a"}, {.key = "a"}};
++
++  EXPECT_EQ(std::vector<size_t>({2, 3}), DuplicatesToClose(today, {}));
++}
++
++TEST(WorkspaceDuplicatesTest, AnEmptyKeyNeverCloses) {
++  // An address that could not be read is nobody's duplicate, even if the
++  // caller's kept set holds an empty key too.
++  const std::vector<DuplicateCandidate> today = {
++      {.key = ""}, {.key = "", .active = true}, {.key = ""}};
++
++  EXPECT_TRUE(DuplicatesToClose(today, {""}).empty());
++  EXPECT_TRUE(DuplicatesToClose(today, {}).empty());
++}
++
++TEST(WorkspaceDuplicatesTest, UniqueAddressesCloseNothing) {
++  const std::vector<DuplicateCandidate> today = {
++      {.key = "a"}, {.key = "b"}, {.key = "c"}};
++
++  EXPECT_TRUE(DuplicatesToClose(today, {"d"}).empty());
++}
++
+ }  // namespace
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -23,6 +23,7 @@
+ #include "base/logging.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+@@ -73,6 +74,7 @@
+ #include "ui/gfx/color_utils.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/gfx/text_constants.h"
++#include "ui/gfx/text_elider.h"
+ #include "ui/gfx/vector_icon_types.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/background.h"
+@@ -113,6 +115,9 @@ constexpr int kMenuCommandMoveDown = 5;
+ constexpr int kMenuCommandUnload = 7;
+ constexpr int kMenuCommandUnloadOthers = 8;
+ constexpr int kMenuCommandCloseAll = 9;
++// C32. 22, a number no item ever had: a retired one may still be named in an
++// old log or test.
++constexpr int kMenuCommandCloseDuplicates = 22;
+ 
+ // The "+" menu (E13). Its Archive item (21) became the bar's Archive button.
+ constexpr int kMenuCommandNewTab = 17;
+@@ -340,6 +345,72 @@ void ShowCloseConfirm(views::View* ancho
+       ->Show();
+ }
+ 
++// C32: asks before "Close duplicate tabs..." closes `listed`, the copies a
++// fresh look found in workspace `guid` of `browser`, naming the first ten; OK
++// closes those that are still duplicates then (D14). Centred over the page
++// like Clear Today's confirm: zen mode's floating strip slides away, and a
++// bubble anchored to the bar would go with it.
++void ShowCloseDuplicatesConfirm(BrowserWindowInterface* browser,
++                                const std::string& guid,
++                                std::vector<tabs::TabHandle> listed) {
++  BrowserView* const browser_view =
++      BrowserView::GetBrowserViewForBrowser(browser);
++  if (!browser_view) {
++    return;
++  }
++  // One title per line, each cut short: a page names itself, and one long
++  // name would make the bubble as wide as the window.
++  constexpr size_t kTitlesShown = 10;
++  constexpr size_t kTitleLength = 60;
++  std::vector<std::u16string> lines;
++  for (size_t i = 0; i < std::min(listed.size(), kTitlesShown); ++i) {
++    const tabs::TabInterface* const tab = listed[i].Get();
++    if (tab && tab->GetContents()) {
++      lines.push_back(gfx::TruncateString(tab->GetContents()->GetTitle(),
++                                          kTitleLength, gfx::CHARACTER_BREAK));
++    }
++  }
++  if (listed.size() > kTitlesShown) {
++    lines.push_back(l10n_util::GetPluralStringFUTF16(
++        IDS_HELIUM_WORKSPACE_CONFIRM_DUPLICATES_MORE,
++        static_cast<int>(listed.size() - kTitlesShown)));
++  }
++  const int count = static_cast<int>(listed.size());
++  LOG(INFO) << "[workspaces] duplicates: asked to close " << count;
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(l10n_util::GetPluralStringFUTF16(
++              IDS_HELIUM_WORKSPACE_CONFIRM_CLOSE_DUPLICATES, count))
++          .AddParagraph(ui::DialogModelLabel(base::JoinString(lines, u"\n")))
++          .AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(
++              IDS_HELIUM_WORKSPACE_CONFIRM_DUPLICATES_BODY)))
++          .AddOkButton(
++              base::BindOnce(
++                  [](base::WeakPtr<BrowserWindowInterface> browser,
++                     const std::string& guid,
++                     const std::vector<tabs::TabHandle>& listed) {
++                    if (workspaces::WorkspaceService* const service =
++                            browser ? workspaces::WorkspaceService::From(
++                                          browser.get())
++                                    : nullptr) {
++                      service->CloseDuplicateTabs(guid, listed);
++                    }
++                  },
++                  browser->GetWeakPtr(), guid, std::move(listed)),
++              ui::DialogModel::Button::Params().SetLabel(
++                  l10n_util::GetStringUTF16(
++                      IDS_HELIUM_WORKSPACE_CONFIRM_DUPLICATES_ACCEPT)))
++          .AddCancelButton(base::BindOnce(
++              [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), browser_view->contents_container(),
++      views::BubbleBorder::FLOAT);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
+ // The alert a chip shows for `tab` (C14, D8), or nullopt: screen, tab or
+ // camera / microphone capture, or sound -- sound only while it is heard, as a
+ // muted tab that plays holds kAudioMuting AND kAudioPlaying (B3). The top one
+@@ -1191,11 +1262,12 @@ void WorkspaceRailView::ShowWorkspaceMen
+       column ? IDS_HELIUM_WORKSPACE_MOVE_DOWN : IDS_HELIUM_WORKSPACE_MOVE_RIGHT,
+       MenuIcon(column ? kArrowDownwardIcon : vector_icons::kArrowForwardIcon));
+ 
+-  // The three that act on the workspace's TABS (E11), in order of how much
++  // The four that act on the workspace's TABS (E11, C32), in order of how much
+   // they take away: unloading keeps everything and can be undone by a click,
+-  // closing keeps the workspace and can be undone by Ctrl+Shift+T. Delete is
+-  // separated again below them: it closes every tab in the workspace, and a
+-  // mis-click on it is the most expensive one in the menu.
++  // closing keeps the workspace and can be undone by Ctrl+Shift+T -- the
++  // duplicates first, then all. Delete is separated again below them: it
++  // closes every tab in the workspace, and a mis-click on it is the most
++  // expensive one in the menu.
+   context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   context_menu_model_->AddItemWithStringIdAndIcon(
+       kMenuCommandUnload, IDS_HELIUM_WORKSPACE_UNLOAD,
+@@ -1203,6 +1275,18 @@ void WorkspaceRailView::ShowWorkspaceMen
+   context_menu_model_->AddItemWithStringIdAndIcon(
+       kMenuCommandUnloadOthers, IDS_HELIUM_WORKSPACE_UNLOAD_OTHERS,
+       MenuIcon(vector_icons::kPauseIcon));
++  // C32: counted once, here, and logged with its time -- a walk of the whole
++  // strip, which may hold 3,862 tabs -- so a test can read the count the item
++  // was greyed by.
++  const base::TimeTicks count_start = base::TimeTicks::Now();
++  context_menu_duplicates_ =
++      service ? service->DuplicateTabs(context_menu_guid_).size() : 0;
++  LOG(INFO) << "[workspaces] duplicates: " << context_menu_duplicates_
++            << " of workspace '" << context_menu_guid_ << "' (menu), "
++            << (base::TimeTicks::Now() - count_start).InMilliseconds() << " ms";
++  context_menu_model_->AddItemWithStringIdAndIcon(
++      kMenuCommandCloseDuplicates, IDS_HELIUM_WORKSPACE_CLOSE_DUPLICATES,
++      MenuIcon(vector_icons::kContentCopyIcon));
+   context_menu_model_->AddItemWithStringIdAndIcon(
+       kMenuCommandCloseAll, IDS_HELIUM_WORKSPACE_CLOSE_ALL,
+       MenuIcon(kTabCloseIcon));
+@@ -1240,6 +1324,12 @@ bool WorkspaceRailView::IsCommandIdEnabl
+     return guids_.size() > 1;
+   }
+ 
++  // C32: greyed when the workspace had no duplicates as the menu opened; the
++  // press looks again.
++  if (command_id == kMenuCommandCloseDuplicates) {
++    return context_menu_duplicates_ > 0;
++  }
++
+   // Moving tabs into the workspace they are already in is a no-op; the item is
+   // left off that workspace's menu (E17a), and this still greys it should a
+   // shortcut switch to it while the menu is open, because an enabled item that
+@@ -1344,6 +1434,14 @@ void WorkspaceRailView::ExecuteCommand(i
+       }
+       break;
+     }
++    case kMenuCommandCloseDuplicates:
++      // A fresh look, not the menu's count: pages load, close and are used
++      // while the menu is open. Nothing to ask about, nothing shown.
++      if (std::vector<tabs::TabHandle> listed = service->DuplicateTabs(guid);
++          !listed.empty()) {
++        ShowCloseDuplicatesConfirm(browser_, guid, std::move(listed));
++      }
++      break;
+     case kMenuCommandMoveTabsHere:
+       service->MoveSelectedTabsToWorkspace(guid);
+       break;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -314,6 +314,11 @@ class WorkspaceRailView : public views::
+   // remembered here. Empty while the "+" menu is open.
+   std::string context_menu_guid_;
+ 
++  // C32: how many duplicate tabs the open workspace menu's workspace had as
++  // the menu opened, counted once there: IsCommandIdEnabled greys "Close
++  // duplicate tabs..." on it, and a walk of the strip per ask is not free.
++  size_t context_menu_duplicates_ = 0;
++
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
+   std::unique_ptr<views::MenuRunner> context_menu_runner_;
+ 

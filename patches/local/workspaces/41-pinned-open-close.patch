@@ -1,0 +1,1717 @@
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -413,7 +413,9 @@ bool BrowserTabStripModelDelegate::IsTab
+   // Workspaces does not apply to, and every such tab is shown.
+   const workspaces::WorkspaceService* service =
+       workspaces::WorkspaceService::From(browser_);
+-  return !service || service->IsTabVisible(tab);
++  // Nor an open pinned item's page: it is not in the list (E15c).
++  return !service ||
++         (service->IsTabVisible(tab) && !service->IsDrawnAsPinnedRow(tab));
+ }
+ 
+ bool BrowserTabStripModelDelegate::IsTabAnchored(
+@@ -436,6 +438,11 @@ bool BrowserTabStripModelDelegate::Reset
+   // is not anchored, a split, and everything while the feature is off.
+   workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
++  // An open pinned item's page is anchored too, but closes for real: the item
++  // keeps its address, so there is nothing to put to sleep (E15c).
++  if (service && service->ClosePinItemPage(tab, via)) {
++    return true;
++  }
+   if (!service ||
+       !service->HibernateAnchoredTab(tab, [](content::WebContents* contents) {
+         return g_browser_process->GetTabManager()->DiscardTabByExtension(
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -393,6 +393,12 @@ if (!is_android) {
+       "tab_strip_scrubbing_metrics.cc",
+     ]
+ 
++    # Helium Workspaces: the bodies of its workspace hooks (LOCAL.md 120).
++    sources += [
++      "workspace_tab_strip_hooks.cc",
++      "workspace_tab_strip_hooks.h",
++    ]
++
+     deps = [
+       ":tab_group",
+       ":tab_model",
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -75,6 +75,7 @@
+ #include "chrome/browser/ui/tabs/tab_utils.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_metrics.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/workspace_tab_strip_hooks.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_tab_helper.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+@@ -3602,6 +3603,10 @@ void TabStripModel::ExecuteCloseTabsComm
+     base::RepeatingCallback<std::vector<tabs::TabInterface*>()>
+         get_tabs_to_close,
+     bool delete_groups) {
++  // Helium Workspaces: a close of several tabs closes only the tabs this
++  // window draws (E15c).
++  get_tabs_to_close =
++      workspaces::DrawnTabsOnly(delegate_.get(), std::move(get_tabs_to_close));
+   std::vector<tabs::TabInterface*> tabs_to_close = get_tabs_to_close.Run();
+   std::vector<tab_groups::TabGroupId> groups_to_delete =
+       GetGroupsDestroyedFromRemovingTabs(get_tabs_to_close.Run());
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspace_tab_strip_hooks.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++
++namespace workspaces {
++
++base::RepeatingCallback<std::vector<tabs::TabInterface*>()> DrawnTabsOnly(
++    const TabStripModelDelegate* delegate,
++    base::RepeatingCallback<std::vector<tabs::TabInterface*>()> get_tabs) {
++  return base::BindRepeating(
++      [](const TabStripModelDelegate* drawn_by,
++         const base::RepeatingCallback<std::vector<tabs::TabInterface*>()>&
++             get) {
++        std::vector<tabs::TabInterface*> tabs = get.Run();
++        if (tabs.size() > 1) {
++          std::erase_if(tabs, [drawn_by](const tabs::TabInterface* tab) {
++            return !drawn_by->IsTabVisibleInActiveWorkspace(tab);
++          });
++        }
++        return tabs;
++      },
++      base::Unretained(delegate), std::move(get_tabs));
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
++
++#include <vector>
++
++#include "base/functional/callback.h"
++
++class TabStripModelDelegate;
++
++namespace tabs {
++class TabInterface;
++}
++
++// Helium Workspaces: what TabStripModel's workspace hooks do. Each hook there
++// is one call, so a rebase that rewrites the code around it moves a line,
++// never a block that still compiles in the wrong place (LOCAL.md 120). Built
++// in TabStripModel's own target, which cannot depend on :workspaces (a GN
++// cycle): these reach the workspace code through the delegate only.
++namespace workspaces {
++
++// ExecuteCloseTabsCommand: `get_tabs`, keeping only the tabs this window draws
++// when it returns more than one. A shift-click selects a RANGE of the model,
++// which can hold tabs this window does not draw -- another workspace's, an
++// open pinned item's page (E15c). A close of several tabs closes only the
++// drawn ones, as a move does (E13); one tab is closed as asked.
++base::RepeatingCallback<std::vector<tabs::TabInterface*>()> DrawnTabsOnly(
++    const TabStripModelDelegate* delegate,
++    base::RepeatingCallback<std::vector<tabs::TabInterface*>()> get_tabs);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -162,18 +162,37 @@ bool AddSavable(const std::vector<PinNod
+   return true;
+ }
+ 
+-PinNode* FindNode(std::vector<PinNode>& nodes, std::string_view id) {
+-  for (PinNode& node : nodes) {
++const PinNode* FindNode(const std::vector<PinNode>& nodes,
++                        std::string_view id) {
++  for (const PinNode& node : nodes) {
+     if (node.id == id) {
+       return &node;
+     }
+-    if (PinNode* found = FindNode(node.children, id)) {
++    if (const PinNode* found = FindNode(node.children, id)) {
+       return found;
+     }
+   }
+   return nullptr;
+ }
+ 
++PinNode* FindNode(std::vector<PinNode>& nodes, std::string_view id) {
++  return const_cast<PinNode*>(FindNode(std::as_const(nodes), id));
++}
++
++// Erases the row with `id` from `nodes` or below. True when it was there.
++bool EraseNode(std::vector<PinNode>& nodes, std::string_view id) {
++  for (auto it = nodes.begin(); it != nodes.end(); ++it) {
++    if (it->id == id) {
++      nodes.erase(it);
++      return true;
++    }
++    if (EraseNode(it->children, id)) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ }  // namespace
+ 
+ void CountRows(const std::vector<PinNode>& rows, int& items, int& folders) {
+@@ -353,6 +372,55 @@ bool PinStore::ToggleFolder(std::string_
+     }
+   }
+   return false;
++}
++
++const PinNode* PinStore::Find(std::string_view id) const {
++  for (const auto& [guid, roots] : tree_) {
++    if (const PinNode* node = FindNode(roots, id)) {
++      return node;
++    }
++  }
++  return nullptr;
++}
++
++bool PinStore::Remove(std::string_view id) {
++  if (!loaded_ || read_only_) {
++    return false;
++  }
++  for (auto it = tree_.begin(); it != tree_.end(); ++it) {
++    if (EraseNode(it->second, id)) {
++      // An empty workspace is not stored, as the load does not keep one.
++      if (it->second.empty()) {
++        tree_.erase(it);
++      }
++      Changed();
++      return true;
++    }
++  }
++  return false;
++}
++
++bool PinStore::SetLastActive(std::string_view id, base::Time time) {
++  if (!loaded_ || read_only_) {
++    return false;
++  }
++  for (auto& [guid, roots] : tree_) {
++    if (PinNode* node = FindNode(roots, id)) {
++      if (node->type != PinNode::Type::kItem) {
++        return false;
++      }
++      // A minute is fine enough, and each write is the whole file -- about a
++      // megabyte after a big import (E15c review #7).
++      if ((time - node->last_active).magnitude() < base::Minutes(1)) {
++        return true;
++      }
++      node->last_active = time;
++      // Written, not announced (the header says why).
++      writer_.ScheduleWrite(this);
++      return true;
++    }
++  }
++  return false;
+ }
+ 
+ void PinStore::Changed() {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -136,6 +136,19 @@ class PinStore : public base::SupportsUs
+   // store has it NOW, which another window may have changed. Same refusals.
+   bool ToggleFolder(std::string_view id);
+ 
++  // The row with `id` in any workspace, or null (E15c): how an open tab finds
++  // its item, and how a row's menu reads it at click time.
++  const PinNode* Find(std::string_view id) const;
++  // Removes the row with `id` -- a folder with everything in it -- and a
++  // workspace left without rows. False when there is no such row, before the
++  // load, or while read-only.
++  bool Remove(std::string_view id);
++  // When the item's page was last shown (design 5, from Arc's own file).
++  // Written to the file like every change, but observers are NOT told:
++  // nothing drawn depends on it, and every window would draw its section
++  // again each time a pinned page is activated. False for a folder.
++  bool SetLastActive(std::string_view id, base::Time time);
++
+   void AddObserver(Observer* observer);
+   void RemoveObserver(Observer* observer);
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -324,6 +324,63 @@ TEST_F(PinStoreTest, AFolderOpensAndClos
+   EXPECT_TRUE(again.find("default")->second[1].children[1].children[0].open);
+ }
+ 
++// E15c: an item is found at any depth, a folder goes with everything in it,
++// and a workspace left empty goes too; each removal is announced and saved.
++TEST_F(PinStoreTest, FindAndRemoveReachAnyDepth) {
++  const PinTree tree = SampleTree();
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", tree.at("default")));
++  ASSERT_TRUE(store->SetRoots("work", tree.at("work")));
++  CountingObserver observer;
++  store->AddObserver(&observer);
++
++  ASSERT_TRUE(store->Find("c"));
++  EXPECT_EQ(store->Find("c")->url, "https://c.example/");
++  EXPECT_TRUE(store->Find("d"));
++  EXPECT_FALSE(store->Find("nope"));
++
++  EXPECT_TRUE(store->Remove("f2"));
++  EXPECT_FALSE(store->Find("f2"));
++  EXPECT_FALSE(store->Find("f3"));
++  EXPECT_FALSE(store->Find("c"));
++  EXPECT_TRUE(store->Find("b"));
++  EXPECT_TRUE(store->Remove("d"));
++  EXPECT_EQ(RootCount(store->tree(), "work"), 0u);
++  EXPECT_FALSE(store->Remove("nope"));
++  EXPECT_EQ(observer.calls, 2);
++  store->RemoveObserver(&observer);
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  EXPECT_TRUE(again->Find("b"));
++  EXPECT_FALSE(again->Find("c"));
++  EXPECT_FALSE(again->Find("d"));
++}
++
++// E15c: an item's last-used time is saved, and nobody is told -- or every
++// window would draw its section again on each activation of a pinned page.
++TEST_F(PinStoreTest, LastActiveIsSavedWithoutTellingObservers) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", SampleTree().at("default")));
++  CountingObserver observer;
++  store->AddObserver(&observer);
++  const base::Time when = base::Time::FromSecondsSinceUnixEpoch(1'760'000'000);
++  EXPECT_TRUE(store->SetLastActive("b", when));
++  // Within a minute of the last stamp: accepted, and nothing changes.
++  EXPECT_TRUE(store->SetLastActive("b", when + base::Seconds(30)));
++  EXPECT_FALSE(store->SetLastActive("f1", when));
++  EXPECT_FALSE(store->SetLastActive("nope", when));
++  EXPECT_EQ(observer.calls, 0);
++  store->RemoveObserver(&observer);
++
++  store.reset();
++  task_environment_.RunUntilIdle();
++  const std::unique_ptr<PinStore> again = LoadedStore();
++  ASSERT_TRUE(again->Find("b"));
++  EXPECT_EQ(again->Find("b")->last_active, when);
++}
++
+ // Everything SetRoots accepts, the next load must accept too: one refused row
+ // would otherwise send the whole file to .bad. A refusal changes nothing --
+ // no row, no observer call, no file.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -502,8 +502,10 @@ std::vector<tabs::TabInterface*> Workspa
+     // workspace's tabs the user cannot see -- and moving one would re-tag it,
+     // and pull it out of its group, from a workspace it was never in (E13
+     // review).
++    // Nor an open pinned item's page (E15c): it is on screen, as its row, and
++    // an active one anchors the shift-click range at the end of the model.
+     if (!tab || !tab->GetContents() || tab->IsPinned() ||
+-        !IsTabOnScreen(tab)) {
++        !IsTabOnScreen(tab) || IsPinItemTab(tab)) {
+       continue;
+     }
+     const std::optional<split_tabs::SplitTabId> split = tab->GetSplit();
+@@ -725,7 +727,9 @@ int WorkspaceService::TargetTabIndexForA
+   // Landing on a pinned tab is a real answer rather than a near miss: it is
+   // drawn in this workspace, so the user can see where they were put.
+   for (int i = 0; i < tab_strip_->count(); ++i) {
+-    if (IsTabOnScreen(tab_strip_->GetTabAtIndex(i))) {
++    // A tab of the list, not an open pinned page (E15c review #3).
++    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
++    if (IsTabOnScreen(tab) && !IsDrawnAsPinnedRow(tab)) {
+       return i;
+     }
+   }
+@@ -1031,6 +1035,13 @@ void WorkspaceService::OnTabStripModelCh
+     // nothing.
+     if (IsEnabled() && !IsTabOnScreen(selection.new_tab)) {
+       PostEnsureActiveTabVisible();
++    } else if (selection.active_tab_changed() &&
++               IsDrawnAsPinnedRow(selection.new_tab)) {
++      // The close landed on an open pinned page: the list's own neighbour is
++      // what the user expects. Posted, for the same reason as above.
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&WorkspaceService::MoveOffPinnedPage,
++                                    weak_factory_.GetWeakPtr()));
+     }
+     return;
+   }
+@@ -1174,7 +1185,9 @@ void WorkspaceService::CarryTagAcrossRep
+   const std::string old_guid = WorkspaceGuidForTab(replace->old_contents);
+   const std::string old_anchor = AnchorUrlForTab(replace->old_contents);
+   const std::string old_title = CustomTitleForTab(replace->old_contents);
+-  if (old_guid.empty() && old_anchor.empty() && old_title.empty()) {
++  const std::string old_pin_item = PinItemForTab(replace->old_contents);
++  if (old_guid.empty() && old_anchor.empty() && old_title.empty() &&
++      old_pin_item.empty()) {
+     return;
+   }
+   // The anchor first, so the SetTag below persists both in one write. This is
+@@ -1191,6 +1204,11 @@ void WorkspaceService::CarryTagAcrossRep
+     WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
+         ->set_custom_title(old_title);
+   }
++  // And an open item's page stays its item's when it is put to sleep.
++  if (!old_pin_item.empty()) {
++    WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
++        ->set_pin_item(old_pin_item);
++  }
+ 
+   // Through SetTag rather than straight onto the new contents, because the
+   // replacement gets a brand new SessionTabHelper and therefore a brand new
+@@ -1335,6 +1353,11 @@ void WorkspaceService::PersistTag(conten
+   session_service->AddTabExtraData(
+       session_tab_helper->window_id(), session_tab_helper->session_id(),
+       kCustomTitleExtraDataKey, CustomTitleForTab(contents));
++  // And the pinned item an open item's page belongs to (E15c): a restart
++  // brings the page back hidden, drawn as its row again.
++  session_service->AddTabExtraData(
++      session_tab_helper->window_id(), session_tab_helper->session_id(),
++      kPinItemExtraDataKey, PinItemForTab(contents));
+ }
+ 
+ void WorkspaceService::ApplyCollectionGuid(
+@@ -1381,6 +1404,85 @@ bool WorkspaceService::IsAnchored(const
+   return tab && !AnchorUrlForTab(tab->GetContents()).empty();
+ }
+ 
++bool WorkspaceService::IsPinItemTab(const tabs::TabInterface* tab) const {
++  // Not a pinned tab: one pinned while Workspaces was off is a favorite now,
++  // drawn at the top, and its row leaves it alone (E15c review #6).
++  return IsEnabled() && tab && !tab->IsPinned() &&
++         !PinItemForTab(tab->GetContents()).empty();
++}
++
++bool WorkspaceService::IsDrawnAsPinnedRow(
++    const tabs::TabInterface* tab) const {
++  const tabs::VerticalTabStripStateController* const vertical = VerticalTabs();
++  return IsPinItemTab(tab) && !(vertical && vertical->IsCollapsed());
++}
++
++int WorkspaceService::ListTabNear(int index, int delta) const {
++  std::vector<bool> selectable;
++  selectable.reserve(static_cast<size_t>(tab_strip_->count()));
++  for (int i = 0; i < tab_strip_->count(); ++i) {
++    // IsTabOnScreen, not IsTabVisible: the latter judges by tag, and a
++    // pinned tab has no tag, so a workspace holding one anchor and one
++    // pinned tab would find no fallback and spawn a blank tab beside a
++    // perfectly good neighbour (E10b). Not an open pinned page: it is not in
++    // the list, and landing there leaves the user on a page the list does not
++    // show (E15c review #3).
++    tabs::TabInterface* const tab = tab_strip_->GetTabAtIndex(i);
++    selectable.push_back(i != index && !tab_strip_->IsTabCollapsed(i) &&
++                         IsTabOnScreen(tab) && !IsDrawnAsPinnedRow(tab));
++  }
++  return NextVisibleTabIndex(selectable, index, delta);
++}
++
++void WorkspaceService::MoveOffPinnedPage() {
++  if (!IsDrawnAsPinnedRow(tab_strip_->GetActiveTab())) {
++    return;
++  }
++  const int index = tab_strip_->active_index();
++  const int target = ListTabNear(index, -1);
++  if (target != index) {
++    tab_strip_->ActivateTabAt(
++        target, TabStripUserGestureDetails(
++                    TabStripUserGestureDetails::GestureType::kOther));
++  }
++}
++
++void WorkspaceService::SetPinItem(tabs::TabInterface* tab, std::string id) {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return;
++  }
++  WorkspaceTabData* const data =
++      WorkspaceTabData::GetOrCreateForWebContents(contents);
++  if (data->pin_item() == id) {
++    return;
++  }
++  data->set_pin_item(std::move(id));
++  PersistTag(contents);
++  LOG(INFO) << "[workspaces] pin item link -> '" << data->pin_item() << "'";
++  // The tab leaves or joins the list, so the strip must lay out again: the
++  // same reason, and the same callbacks, as SetTag().
++  workspace_changed_callbacks_.Notify();
++}
++
++bool WorkspaceService::ClosePinItemPage(tabs::TabInterface* tab,
++                                        const char* via) {
++  if (!IsPinItemTab(tab)) {
++    return false;
++  }
++  const int index = tab_strip_->GetIndexOfTab(tab);
++  if (index == TabStripModel::kNoTab) {
++    return false;
++  }
++  // Logged first: the close can destroy the tab.
++  LOG(INFO) << "[workspaces] closed the page of pinned item '"
++            << PinItemForTab(tab->GetContents()) << "' (" << via << ")";
++  // CLOSE_USER_GESTURE without CLOSE_CREATE_HISTORICAL_TAB: no Recently Closed
++  // entry. The unload listener still runs -- a real close is what asks.
++  tab_strip_->CloseWebContentsAt(index, TabCloseTypes::CLOSE_USER_GESTURE);
++  return true;
++}
++
+ bool WorkspaceService::ShouldDivertTypedNavigation(
+     content::WebContents* contents,
+     const GURL& url) const {
+@@ -1463,17 +1565,7 @@ bool WorkspaceService::HibernateAnchored
+   // workspace, outside collapsed groups; the walk is the tested helper
+   // SelectRelativeTab used before M153 gave it its own bounded loop.
+   if (index == tab_strip_->active_index()) {
+-    std::vector<bool> selectable;
+-    selectable.reserve(static_cast<size_t>(tab_strip_->count()));
+-    for (int i = 0; i < tab_strip_->count(); ++i) {
+-      // IsTabOnScreen, not IsTabVisible: the latter judges by tag, and a
+-      // pinned tab has no tag, so a workspace holding one anchor and one
+-      // pinned tab would find no fallback and spawn a blank tab beside a
+-      // perfectly good neighbour (E10b).
+-      selectable.push_back(i != index && !tab_strip_->IsTabCollapsed(i) &&
+-                           IsTabOnScreen(tab_strip_->GetTabAtIndex(i)));
+-    }
+-    const int fallback = NextVisibleTabIndex(selectable, index, 1);
++    const int fallback = ListTabNear(index, 1);
+     if (fallback == index) {
+       // Nothing else to show in this workspace: spawn one, the way switching
+       // into an empty workspace does. StampInsertedTab tags it as it lands.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -366,6 +366,34 @@ class WorkspaceService : public TabStrip
+       base::FunctionRef<content::WebContents*(content::WebContents*)>;
+   bool HibernateAnchoredTab(tabs::TabInterface* tab, DiscardFn discard);
+ 
++  // Arc folders (E15c, design 5). Whether `tab` is the open page of a pinned
++  // item: the tab list does not draw it, and Ctrl+Tab, Ctrl+1..9, moves and
++  // multi-tab closes pass it by -- its row in the pinned section is its face.
++  // NOT a question for IsTabVisible()/IsTabOnScreen(): the page is in its
++  // workspace, so activating it neither switches workspace nor sends
++  // EnsureActiveTabVisible() looking for another tab. Gated on IsEnabled(),
++  // like anchors (E10b): with Workspaces off the page is an ordinary tab, and
++  // the link waits, kept, for the feature to come back.
++  bool IsPinItemTab(const tabs::TabInterface* tab) const;
++
++  // IsPinItemTab(), and the section is there to draw it: while the strip is
++  // collapsed the section hides, so the page is drawn as a tab of the list
++  // again rather than nowhere (E15c review #4). What the list, the scroll
++  // guard and the commands that follow the list ask.
++  bool IsDrawnAsPinnedRow(const tabs::TabInterface* tab) const;
++
++  // Links `tab` to the pinned item `id`, or unlinks it with an empty id: the
++  // tab leaves or joins the list. Persisted through the same session write as
++  // the tag.
++  void SetPinItem(tabs::TabInterface* tab, std::string id);
++
++  // Closes an open item's page for real: the X on its row, Ctrl+W on the page,
++  // a deleted item. No Recently Closed entry -- nothing is lost, the item is
++  // the way back -- but a page with a "Leave site?" listener still asks. False
++  // when `tab` is not an open item's page. `via` names the door for the log.
++  // Never from an observer: closing a tab mutates the model (design 2.2).
++  bool ClosePinItemPage(tabs::TabInterface* tab, const char* via);
++
+  private:
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+@@ -512,6 +540,13 @@ class WorkspaceService : public TabStrip
+   // One door for posting a repair, the way SetTag() is one door for writing a
+   // tag (LOCAL.md 23 deferred this here).
+   void PostEnsureActiveTabVisible();
++  // After a close landed on an open pinned page -- they sit at the end of the
++  // model, next to the last tab of the list -- show the nearest tab of the
++  // list instead, if the page is still active and there is one (review #3).
++  void MoveOffPinnedPage();
++  // The tab of the list nearest `index` walking by `delta` (not `index`, not
++  // in a collapsed group, not a page drawn as a row), or `index` when none.
++  int ListTabNear(int index, int delta) const;
+   void PostReconcile();
+ 
+   // Reacts to this window's layout switching between vertical and classic,
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
+@@ -41,6 +41,15 @@ std::string CustomTitleForTab(content::W
+   return tab_data ? tab_data->custom_title() : std::string();
+ }
+ 
++std::string PinItemForTab(content::WebContents* contents) {
++  if (!contents) {
++    return std::string();
++  }
++  const WorkspaceTabData* tab_data =
++      WorkspaceTabData::FromWebContents(contents);
++  return tab_data ? tab_data->pin_item() : std::string();
++}
++
+ bool HasDriftedFrom(content::WebContents* contents, const GURL& url) {
+   const std::string anchor = AnchorUrlForTab(contents);
+   return !anchor.empty() && anchor != url.spec();
+@@ -70,6 +79,10 @@ void PopulateWorkspaceExtraData(
+   if (!title.empty()) {
+     (*extra_data)[kCustomTitleExtraDataKey] = std::move(title);
+   }
++  std::string pin_item = PinItemForTab(contents);
++  if (!pin_item.empty()) {
++    (*extra_data)[kPinItemExtraDataKey] = std::move(pin_item);
++  }
+ }
+ 
+ void RestoreWorkspaceFromExtraData(
+@@ -81,8 +94,9 @@ void RestoreWorkspaceFromExtraData(
+   const auto guid_it = extra_data.find(kWorkspaceExtraDataKey);
+   const auto anchor_it = extra_data.find(kAnchorUrlExtraDataKey);
+   const auto title_it = extra_data.find(kCustomTitleExtraDataKey);
++  const auto pin_it = extra_data.find(kPinItemExtraDataKey);
+   if (guid_it == extra_data.end() && anchor_it == extra_data.end() &&
+-      title_it == extra_data.end()) {
++      title_it == extra_data.end() && pin_it == extra_data.end()) {
+     return;
+   }
+   // Set even when the stored value is empty. An empty tag is a real state --
+@@ -98,6 +112,11 @@ void RestoreWorkspaceFromExtraData(
+   if (anchor_it != extra_data.end()) {
+     data->set_anchor_url(anchor_it->second);
+   }
++  // Before the insert, like the tag: the list never draws an open item's page,
++  // not even for the one layout before a link would arrive (E15c).
++  if (pin_it != extra_data.end()) {
++    data->set_pin_item(pin_it->second);
++  }
+   if (title_it != extra_data.end()) {
+     data->set_custom_title(title_it->second);
+     // The one line that proves a rename survived a restart or Ctrl+Shift+T;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
+@@ -59,6 +59,10 @@ inline constexpr char kAnchorUrlExtraDat
+ // written empty to clear, absent means "not renamed".
+ inline constexpr char kCustomTitleExtraDataKey[] = "helium.custom_title";
+ 
++// The pinned item an open item's page belongs to (E15c). Same carrier, same
++// rules: written empty to clear, absent means "an ordinary tab".
++inline constexpr char kPinItemExtraDataKey[] = "helium.pin_item";
++
+ // The workspace `contents` is tagged for, or empty for a tab that has never
+ // been stamped, a pinned tab (pinning clears the tag), or a null argument.
+ // Empty means the implicit default workspace, never "no workspace".
+@@ -70,6 +74,9 @@ std::string AnchorUrlForTab(content::Web
+ // The title the user typed for `contents`, or empty when it has none.
+ std::string CustomTitleForTab(content::WebContents* contents);
+ 
++// The pinned item `contents` is the open page of, or empty for an ordinary tab.
++std::string PinItemForTab(content::WebContents* contents);
++
+ // Whether an anchored `contents` would be away from home at `url`. False for a
+ // tab that is not anchored: a tab with no home cannot be away from it.
+ //
+--- a/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_tab_data.h
+@@ -67,6 +67,12 @@ class WorkspaceTabData : public content:
+   const std::string& custom_title() const { return custom_title_; }
+   void set_custom_title(std::string title) { custom_title_ = std::move(title); }
+ 
++  // The pinned item this tab is the open page of (E15c, design 5): its id in
++  // the pins file, or empty for an ordinary tab. The list does not draw such a
++  // tab -- its row in the pinned section is its face.
++  const std::string& pin_item() const { return pin_item_; }
++  void set_pin_item(std::string id) { pin_item_ = std::move(id); }
++
+  private:
+   friend class content::WebContentsUserData<WorkspaceTabData>;
+ 
+@@ -77,6 +83,7 @@ class WorkspaceTabData : public content:
+   std::string guid_;
+   std::string anchor_url_;
+   std::string custom_title_;
++  std::string pin_item_;
+ };
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -582,7 +582,19 @@ bool TabStripCollectionController::IsTab
+   }
+   const workspaces::WorkspaceService* service =
+       workspaces::WorkspaceService::From(browser_view_->browser());
+-  return !service || service->IsTabVisible(tab);
++  // An open pinned item's page is drawn as its row instead (E15c).
++  return !service ||
++         (service->IsTabVisible(tab) && !service->IsDrawnAsPinnedRow(tab));
++}
++
++bool TabStripCollectionController::IsTabDrawnAsPinnedRow(
++    const tabs::TabInterface* tab) const {
++  if (!browser_view_) {
++    return false;
++  }
++  const workspaces::WorkspaceService* service =
++      workspaces::WorkspaceService::From(browser_view_->browser());
++  return service && service->IsDrawnAsPinnedRow(tab);
+ }
+ 
+ base::CallbackListSubscription
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
+@@ -127,6 +127,11 @@ class TabStripCollectionController : pub
+   // renders exactly as stock Helium does.
+   bool IsTabVisibleForWorkspace(const tabs::TabInterface* tab) const;
+ 
++  // Whether `tab` is an open pinned item's page, drawn as its row in the
++  // pinned section and not in the list (E15c): TabStripView must not scroll
++  // the list to the empty slot it leaves.
++  bool IsTabDrawnAsPinnedRow(const tabs::TabInterface* tab) const;
++
+   // Runs `callback` whenever this window's active Workspace changes, so
+   // the caller can lay out again and get the new answer from
+   // IsTabVisibleForWorkspace().
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
+@@ -329,6 +329,13 @@ void TabStripView::OnTabChanged(const ta
+     return;
+   }
+ 
++  // Helium Workspaces: an open pinned item's page is drawn as its row in the
++  // pinned section, not in this list, and its hidden view is an empty slot the
++  // list would scroll to. The row scrolls itself into view (E15c).
++  if (collection_node_->GetController()->IsTabDrawnAsPinnedRow(active_tab)) {
++    return;
++  }
++
+   if (collection_node_->GetController()->GetDragHandler().IsDragging()) {
+     return;
+   }
+@@ -363,6 +370,12 @@ void TabStripView::ScrollToFitTabs(const
+     return;
+   }
+ 
++  // Helium Workspaces: a tab opened behind an open pinned item's page is
++  // fitted alone -- the page has no place in this list (E15c).
++  if (collection_node_->GetController()->IsTabDrawnAsPinnedRow(active_tab)) {
++    active_tab = new_tab;
++  }
++
+   if (collection_node_->GetController()->GetDragHandler().IsDragging()) {
+     return;
+   }
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -10,41 +10,65 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/containers/span.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/cancelable_task_tracker.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
+ #include "base/timer/elapsed_timer.h"
+ #include "chrome/browser/favicon/favicon_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
++#include "chrome/grit/generated_resources.h"
+ #include "components/favicon/core/favicon_service.h"
+ #include "components/favicon_base/favicon_types.h"
+ #include "components/keyed_service/core/service_access_type.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "components/vector_icons/vector_icons.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/web_contents.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/base_window.h"
++#include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/dialog_model.h"
+ #include "ui/base/models/image_model.h"
+-#include "ui/gfx/codec/png_codec.h"
+-#include "ui/gfx/favicon_size.h"
++#include "ui/base/mojom/menu_source_type.mojom-shared.h"
+ #include "ui/events/event.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/favicon_size.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
+ #include "ui/views/border.h"
++#include "ui/views/bubble/bubble_border.h"
++#include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/button/label_button.h"
+ #include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/controls/separator.h"
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/layout/box_layout.h"
++#include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+ #include "url/gurl.h"
+@@ -56,6 +80,15 @@ using workspaces::pins::PinNode;
+ // Per nesting level, and on each side of a row.
+ constexpr int kIndent = 16;
+ constexpr int kRowInset = 8;
++// The close and back buttons of an open item.
++constexpr int kRowButtonIconSize = 12;
++// The active item's highlight, as round as a vertical tab's.
++constexpr float kActiveRowRadius = 6;
++
++// The row menu.
++constexpr int kCommandUnpin = 1;
++constexpr int kCommandDelete = 2;
++constexpr int kCommandDeleteFolder = 3;
+ 
+ std::u16string RowText(const PinNode& node) {
+   const std::string& text = !node.custom_title.empty() ? node.custom_title
+@@ -64,6 +97,39 @@ std::u16string RowText(const PinNode& no
+   return base::UTF8ToUTF16(text);
+ }
+ 
++// The tab of `model` that is the page of item `id`, or null.
++tabs::TabInterface* LinkedTab(TabStripModel* model, std::string_view id) {
++  for (int i = 0; model && i < model->count(); ++i) {
++    tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++    if (workspaces::PinItemForTab(tab->GetContents()) == id) {
++      return tab;
++    }
++  }
++  return nullptr;
++}
++
++// Every window of `profile`, this one included, that has a tab strip.
++std::vector<BrowserWindowInterface*> WindowsOf(Profile* profile) {
++  std::vector<BrowserWindowInterface*> windows;
++  for (BrowserWindowInterface* window : GetAllBrowserWindowInterfaces()) {
++    if (window->GetProfile() == profile && window->GetTabStripModel()) {
++      windows.push_back(window);
++    }
++  }
++  return windows;
++}
++
++// `row`'s id if it is an item, or the ids of every item under it.
++void CollectItemIds(const PinNode& row, std::vector<std::string>& ids) {
++  if (row.type == PinNode::Type::kItem) {
++    ids.push_back(row.id);
++    return;
++  }
++  for (const PinNode& child : row.children) {
++    CollectItemIds(child, ids);
++  }
++}
++
+ // One row: a folder (its icon shows open or closed) or an item (its page's
+ // icon, a globe until one is found). Only the icon of a DRAWN row is looked
+ // up, so a closed folder asks nothing.
+@@ -71,15 +137,22 @@ class PinRow : public views::LabelButton
+   METADATA_HEADER(PinRow, views::LabelButton)
+ 
+  public:
++  enum class ItemState { kSleeping, kOpen, kActive };
++
+   PinRow(const PinNode& node,
+          int level,
+          Profile* profile,
+          bool frame_active,
+-         views::Button::PressedCallback callback)
++         views::Button::PressedCallback callback,
++         base::RepeatingClosure on_close,
++         base::RepeatingClosure on_reset)
+       : views::LabelButton(std::move(callback), RowText(node)),
+         id_(node.id),
+         folder_(node.type == PinNode::Type::kFolder),
+-        open_(node.open) {
++        open_(node.open),
++        frame_active_(frame_active),
++        on_close_(std::move(on_close)),
++        on_reset_(std::move(on_reset)) {
+     SetTooltipText(folder_ ? RowText(node)
+                            : base::StrCat({RowText(node), u"\n",
+                                            base::UTF8ToUTF16(node.url)}));
+@@ -105,11 +178,11 @@ class PinRow : public views::LabelButton
+       }
+       vector_icon_ = open_ ? &vector_icons::kFolderOpenIcon
+                            : &vector_icons::kFolderFlippableIcon;
+-      SetFrameActive(frame_active);
++      UpdateColors();
+       return;
+     }
+     vector_icon_ = &vector_icons::kGlobeIcon;
+-    SetFrameActive(frame_active);
++    UpdateColors();
+     // With fallback_to_host: most items were never visited in this profile,
+     // but another page of the same site often was (LOCAL.md 43).
+     if (favicon::FaviconService* const favicons =
+@@ -129,19 +202,80 @@ class PinRow : public views::LabelButton
+   ~PinRow() override = default;
+ 
+   const std::string& id() const { return id_; }
++  bool folder() const { return folder_; }
+ 
+   // Tabs dim in a window that is not the active one, and so do the rows.
+   void SetFrameActive(bool active) {
+-    const ui::ColorId color = active ? kColorTabForegroundInactiveFrameActive
+-                                     : kColorTabForegroundInactiveFrameInactive;
+-    SetEnabledTextColors(color);
+-    if (vector_icon_) {
+-      SetImageModel(views::Button::STATE_NORMAL,
+-                    ui::ImageModel::FromVectorIcon(*vector_icon_, color,
+-                                                   gfx::kFaviconSize));
++    frame_active_ = active;
++    UpdateColors();
++  }
++
++  // An item's page: none (sleeping), open, or the active tab -- and, while
++  // open, whether it has left the item's address (the back arrow). The two
++  // buttons are made the first time the item opens and kept, hidden, when it
++  // sleeps again: only rows that were ever open pay for them.
++  void SetItemState(ItemState state, bool drifted) {
++    if (folder_ || (state == state_ && drifted == drifted_)) {
++      return;
++    }
++    state_ = state;
++    drifted_ = drifted;
++    if (state_ != ItemState::kSleeping && !close_) {
++      close_ = AddChildView(views::CreateVectorImageButtonWithNativeTheme(
++          on_close_, vector_icons::kCloseSmallIcon, kRowButtonIconSize));
++      close_->SetTooltipText(
++          l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_ITEM_CLOSE));
++      reset_ = AddChildView(views::CreateVectorImageButtonWithNativeTheme(
++          on_reset_, vector_icons::kArrowBackIcon, kRowButtonIconSize));
++      reset_->SetTooltipText(
++          l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_ITEM_RESET));
++    }
++    UpdateColors();
++    // The layout decides which buttons show (CalculateProposedLayout). Only
++    // this row lays out again: its size does not change, and InvalidateLayout
++    // would climb to the section and have the list measure every row -- 1,313
++    // with the biggest folder open -- on each page switch (E15c review #5).
++    GetLayoutManager()->InvalidateLayout();
++    if (!size().IsEmpty()) {
++      DeprecatedLayoutImmediately();
+     }
+   }
+ 
++  // views::LabelButton:
++  //
++  // An open item's buttons sit at the right edge -- the close button last --
++  // and the title ends before them.
++  views::ProposedLayout CalculateProposedLayout(
++      const views::SizeBounds& size_bounds) const override {
++    views::ProposedLayout layouts =
++        views::LabelButton::CalculateProposedLayout(size_bounds);
++    if (!close_ || !size_bounds.is_fully_bounded()) {
++      return layouts;
++    }
++    const bool open = state_ != ItemState::kSleeping;
++    int right = layouts.host_size.width() - kRowInset;
++    for (views::View* const button : {static_cast<views::View*>(close_.get()),
++                                       static_cast<views::View*>(reset_.get())}) {
++      const bool shown = open && (button == close_.get() || drifted_);
++      if (!shown) {
++        layouts.child_layouts.emplace_back(button, false, gfx::Rect());
++        continue;
++      }
++      const gfx::Size size = button->GetPreferredSize();
++      right -= size.width();
++      layouts.child_layouts.emplace_back(
++          button, true,
++          gfx::Rect(right, (layouts.host_size.height() - size.height()) / 2,
++                    size.width(), size.height()));
++    }
++    for (views::ChildLayout& child : layouts.child_layouts) {
++      if (child.child_view == label() && child.bounds.right() > right) {
++        child.bounds.set_width(std::max(0, right - child.bounds.x()));
++      }
++    }
++    return layouts;
++  }
++
+   // views::View:
+   //
+   // Up and Down move between rows; Right opens a closed folder and Left closes
+@@ -190,7 +324,7 @@ class PinRow : public views::LabelButton
+     if (bitmap.isNull()) {
+       return;
+     }
+-    // The page's own icon from now on: SetFrameActive leaves it alone.
++    // The page's own icon from now on: UpdateColors leaves it alone.
+     vector_icon_ = nullptr;
+     SetImageModel(views::Button::STATE_NORMAL,
+                   ui::ImageModel::FromImageSkia(gfx::ImageSkia::CreateFromBitmap(
+@@ -198,9 +332,39 @@ class PinRow : public views::LabelButton
+                                   gfx::kFaviconSize)));
+   }
+ 
++  // The tab colours: the active item's as the active tab's, every other row's
++  // as an inactive tab's, each dimmed in an inactive window.
++  void UpdateColors() {
++    const bool active = state_ == ItemState::kActive;
++    const ui::ColorId text =
++        active ? (frame_active_ ? kColorTabForegroundActiveFrameActive
++                                : kColorTabForegroundActiveFrameInactive)
++               : (frame_active_ ? kColorTabForegroundInactiveFrameActive
++                                : kColorTabForegroundInactiveFrameInactive);
++    SetEnabledTextColors(text);
++    if (vector_icon_) {
++      SetImageModel(views::Button::STATE_NORMAL,
++                    ui::ImageModel::FromVectorIcon(*vector_icon_, text,
++                                                   gfx::kFaviconSize));
++    }
++    const ui::ColorId background = frame_active_
++                                       ? kColorTabBackgroundActiveFrameActive
++                                       : kColorTabBackgroundActiveFrameInactive;
++    SetBackground(active ? views::CreateRoundedRectBackground(background,
++                                                              kActiveRowRadius)
++                         : nullptr);
++  }
++
+   const std::string id_;
+   const bool folder_;
+   const bool open_;
++  bool frame_active_;
++  ItemState state_ = ItemState::kSleeping;
++  bool drifted_ = false;
++  const base::RepeatingClosure on_close_;
++  const base::RepeatingClosure on_reset_;
++  raw_ptr<views::ImageButton> close_ = nullptr;
++  raw_ptr<views::ImageButton> reset_ = nullptr;
+   // The icon drawn in the text color; null once the page's own icon arrived.
+   raw_ptr<const gfx::VectorIcon> vector_icon_ = nullptr;
+   base::CancelableTaskTracker favicon_tasks_;
+@@ -211,6 +375,12 @@ END_METADATA
+ 
+ }  // namespace
+ 
++WorkspacePinnedSectionView::Links::Links() = default;
++WorkspacePinnedSectionView::Links::Links(Links&&) = default;
++WorkspacePinnedSectionView::Links& WorkspacePinnedSectionView::Links::operator=(
++    Links&&) = default;
++WorkspacePinnedSectionView::Links::~Links() = default;
++
+ WorkspacePinnedSectionView::WorkspacePinnedSectionView(
+     BrowserWindowInterface* browser,
+     tabs::VerticalTabStripStateController* state_controller)
+@@ -231,12 +401,13 @@ void WorkspacePinnedSectionView::AddedTo
+     store_ = workspaces::pins::PinStore::GetOrCreate(profile,
+                                                      profile->GetPath());
+     store_observation_.Observe(store_.get());
++    browser_->GetTabStripModel()->AddObserver(this);
+     // Unretained: the subscriptions are members, cancelled with this view.
+     if (workspaces::WorkspaceService* const service =
+             workspaces::WorkspaceService::From(browser_)) {
+       workspace_changed_subscription_ =
+           service->RegisterWorkspaceChangedCallback(base::BindRepeating(
+-              &WorkspacePinnedSectionView::ScheduleRebuild,
++              &WorkspacePinnedSectionView::OnWorkspaceChanged,
+               base::Unretained(this)));
+       // Also how the settings toggle arrives (OnEnabledChanged).
+       workspace_list_changed_subscription_ =
+@@ -287,6 +458,32 @@ void WorkspacePinnedSectionView::OnPinsC
+   ScheduleRebuild();
+ }
+ 
++void WorkspacePinnedSectionView::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  ScheduleRowStates();
++}
++
++void WorkspacePinnedSectionView::OnTabChangedAt(tabs::TabInterface* tab,
++                                                TabChangeType change_type) {
++  // A navigation of an item's page: it may have left the item's address.
++  if (change_type == TabChangeType::kAll && tab &&
++      !workspaces::PinItemForTab(tab->GetContents()).empty()) {
++    ScheduleRowStates();
++  }
++}
++
++void WorkspacePinnedSectionView::OnWorkspaceChanged() {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || service->active_guid() != drawn_guid_) {
++    ScheduleRebuild();
++  } else {
++    ScheduleRowStates();
++  }
++}
++
+ void WorkspacePinnedSectionView::ScheduleRebuild() {
+   if (rebuild_scheduled_) {
+     return;
+@@ -297,8 +494,22 @@ void WorkspacePinnedSectionView::Schedul
+                                 weak_factory_.GetWeakPtr()));
+ }
+ 
++void WorkspacePinnedSectionView::ScheduleRowStates() {
++  if (row_states_scheduled_) {
++    return;
++  }
++  row_states_scheduled_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspacePinnedSectionView::UpdateRowStates,
++                                weak_factory_.GetWeakPtr()));
++}
++
+ void WorkspacePinnedSectionView::Rebuild() {
+   rebuild_scheduled_ = false;
++  // Whatever the rows turn out to be -- none included -- the tabs are judged
++  // again after them: a restart can bring pages whose item is gone, and the
++  // store's load is what arrives here (UpdateRowStates, ReadLinks).
++  ScheduleRowStates();
+   const base::ElapsedTimer timer;
+   // The row with keyboard focus keeps it across the rebuild, so a folder
+   // opened or closed from the keyboard stays under the cursor (E15b review).
+@@ -313,6 +524,7 @@ void WorkspacePinnedSectionView::Rebuild
+   }
+   // Cleared BEFORE the views go: `list_` would dangle across the delete.
+   list_ = nullptr;
++  drawn_guid_.clear();
+   preferred_height_.reset();
+   RemoveAllChildViews();
+ 
+@@ -328,6 +540,7 @@ void WorkspacePinnedSectionView::Rebuild
+   if (roots.empty()) {
+     return;
+   }
++  drawn_guid_ = service->active_guid();
+ 
+   // Built OFF the widget, then attached as one child. Every child added to or
+   // removed from a view in the widget makes views walk the whole layer subtree
+@@ -335,6 +548,7 @@ void WorkspacePinnedSectionView::Rebuild
+   // view's contents, which holds every tab of the strip as well -- so rows
+   // added one by one cost rows x everything: 1,313 rows took 5.3 s at the E15b
+   // gate. Detached, an add walks nothing; attached once, the walk runs once.
++  // The open items' buttons are made here too, for the same reason.
+   auto list = std::make_unique<views::View>();
+   list->SetLayoutManager(std::make_unique<views::BoxLayout>(
+       views::BoxLayout::Orientation::kVertical));
+@@ -343,6 +557,7 @@ void WorkspacePinnedSectionView::Rebuild
+   for (const PinNode* root : roots) {
+     rows += AddRow(*list, *root, /*level=*/0, frame_active);
+   }
++  ApplyStates(*list, ReadLinks());
+   list_ = AddChildView(std::move(list));
+   AddChildView(std::make_unique<views::Separator>());
+   if (!focused_id.empty()) {
+@@ -354,25 +569,155 @@ void WorkspacePinnedSectionView::Rebuild
+     }
+   }
+   LOG(INFO) << "[workspaces] pins: drew " << rows << " row(s) of '"
+-            << service->active_guid() << "' in "
+-            << timer.Elapsed().InMilliseconds() << " ms";
++            << drawn_guid_ << "' in " << timer.Elapsed().InMilliseconds()
++            << " ms";
++}
++
++void WorkspacePinnedSectionView::UpdateRowStates() {
++  row_states_scheduled_ = false;
++  const Links links = ReadLinks();
++  // An item's address that redirects -- a moved site, a shortened or tracking
++  // link -- lands somewhere else on its first load, and where it lands is the
++  // page's home. Otherwise the back arrow shows from the start, and pressing it
++  // loads the redirect that lands in the same place again (the owner's check
++  // of E15c: an Amazon affiliate link). Only while the page holds its ONE
++  // history entry: a link followed since makes a second. The item keeps its
++  // own address; the next open redirects and settles the same way.
++  if (workspaces::WorkspaceService* const service =
++          workspaces::WorkspaceService::From(browser_)) {
++    for (const auto& [id, tab] : links.open) {
++      content::WebContents* const contents = tab->GetContents();
++      if (contents->GetController().GetEntryCount() == 1 &&
++          workspaces::HasDrifted(contents) &&
++          workspaces::WorkspaceTabData::IsAnchorableUrl(
++              contents->GetLastCommittedURL())) {
++        service->SetAnchored(tab, true);
++      }
++    }
++  }
++  if (list_) {
++    ApplyStates(*list_, links);
++  }
++  // The evidence that a restart brought the pages back as their rows.
++  if (links.open.size() != open_count_) {
++    open_count_ = links.open.size();
++    LOG(INFO) << "[workspaces] pins: " << open_count_
++              << " item page(s) open in this window";
++  }
++
++  // Once per activation, not per tab change: the item's last-used time
++  // (design 5, from Arc) and its row scrolled into view -- the list does not
++  // scroll to a tab it does not draw (TabStripView::OnTabChanged).
++  const std::string active_id =
++      links.active ? workspaces::PinItemForTab(links.active->GetContents())
++                   : std::string();
++  if (active_id == active_id_) {
++    return;
++  }
++  active_id_ = active_id;
++  if (active_id.empty() || !links.open.contains(active_id)) {
++    return;
++  }
++  store_->SetLastActive(active_id, base::Time::Now());
++  if (list_) {
++    for (views::View* const child : list_->children()) {
++      if (views::AsViewClass<PinRow>(child)->id() == active_id) {
++        child->ScrollViewToVisible();
++        break;
++      }
++    }
++  }
++}
++
++WorkspacePinnedSectionView::Links WorkspacePinnedSectionView::ReadLinks() {
++  Links links;
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  // Links are dormant while Workspaces is off, as anchors are (E10b): kept,
++  // and not judged.
++  if (!service || !service->IsEnabled() || !store_ || !store_->loaded()) {
++    return links;
++  }
++  TabStripModel* const model = browser_->GetTabStripModel();
++  links.active = model->GetActiveTab();
++  // A link to an item that is gone -- deleted, or a pins file that was set
++  // aside as broken -- or a second page of an item already open here (a window
++  // brought back from Recently Closed) is dropped: that page becomes an
++  // ordinary tab of the list. Never a hidden page nothing leads to (design 5).
++  // Not while the file is read-only: its rows are not in the tree then, but
++  // they are not gone, and a drop is persisted (E15c review #1).
++  const bool judge = !store_->read_only();
++  std::vector<tabs::TabInterface*> unlinked;
++  for (int i = 0; i < model->count(); ++i) {
++    tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++    std::string id = workspaces::PinItemForTab(tab->GetContents());
++    // A favorite pinned while Workspaces was off keeps its link, unjudged:
++    // it is drawn at the top, not as its row (IsPinItemTab, review #6).
++    if (id.empty() || tab->IsPinned()) {
++      continue;
++    }
++    const PinNode* const item = store_->Find(id);
++    if ((!item || item->type != PinNode::Type::kItem) && !judge) {
++      continue;
++    }
++    if (!item || item->type != PinNode::Type::kItem ||
++        !links.open.emplace(std::move(id), tab).second) {
++      unlinked.push_back(tab);
++    }
++  }
++  for (tabs::TabInterface* const tab : unlinked) {
++    LOG(INFO) << "[workspaces] pins: a page's item is gone or already open; "
++                 "it is an ordinary tab now";
++    // The anchor OpenItem gave it goes too, as Unpin's does: an ordinary tab
++    // closes on Ctrl+W instead of going to sleep (E15c review #2).
++    service->SetPinItem(tab, std::string());
++    service->SetAnchored(tab, false);
++  }
++  return links;
++}
++
++void WorkspacePinnedSectionView::ApplyStates(views::View& list,
++                                             const Links& links) {
++  for (views::View* const child : list.children()) {
++    auto* const row = views::AsViewClass<PinRow>(child);
++    const auto it = links.open.find(row->id());
++    if (it == links.open.end()) {
++      row->SetItemState(PinRow::ItemState::kSleeping, false);
++      continue;
++    }
++    row->SetItemState(it->second == links.active ? PinRow::ItemState::kActive
++                                                 : PinRow::ItemState::kOpen,
++                      workspaces::HasDrifted(it->second->GetContents()));
++  }
+ }
+ 
+ size_t WorkspacePinnedSectionView::AddRow(views::View& list,
+                                           const PinNode& row,
+                                           int level,
+                                           bool frame_active) {
+-  views::Button::PressedCallback callback;
+-  if (row.type == PinNode::Type::kFolder) {
+-    // The id only: the folder's state is read when it is clicked, since
+-    // another window may have opened or closed it since this row was made.
+-    callback = base::BindRepeating(&WorkspacePinnedSectionView::OnFolderPressed,
+-                                   base::Unretained(this), row.id);
+-  }
+-  list.AddChildView(std::make_unique<PinRow>(
+-      row, level, browser_->GetProfile(), frame_active, std::move(callback)));
++  // The id only, never the row: the store is read again when it is clicked,
++  // since another window may have changed it since this row was made.
++  const bool folder = row.type == PinNode::Type::kFolder;
++  views::Button::PressedCallback callback = base::BindRepeating(
++      folder ? &WorkspacePinnedSectionView::OnFolderPressed
++             : &WorkspacePinnedSectionView::OnItemPressed,
++      base::Unretained(this), row.id);
++  base::RepeatingClosure on_close;
++  base::RepeatingClosure on_reset;
++  if (!folder) {
++    on_close = base::BindRepeating(
++        &WorkspacePinnedSectionView::OnItemClosePressed,
++        base::Unretained(this), row.id);
++    on_reset = base::BindRepeating(
++        &WorkspacePinnedSectionView::OnItemResetPressed,
++        base::Unretained(this), row.id);
++  }
++  views::View* const added = list.AddChildView(std::make_unique<PinRow>(
++      row, level, browser_->GetProfile(), frame_active, std::move(callback),
++      std::move(on_close), std::move(on_reset)));
++  added->set_context_menu_controller(this);
+   size_t count = 1;
+-  if (row.type == PinNode::Type::kFolder && row.open) {
++  if (folder && row.open) {
+     for (const PinNode& child : row.children) {
+       count += AddRow(list, child, level + 1, frame_active);
+     }
+@@ -386,6 +731,241 @@ void WorkspacePinnedSectionView::OnFolde
+   }
+ }
+ 
++void WorkspacePinnedSectionView::OnItemPressed(const std::string& id) {
++  const PinNode* const item = store_ ? store_->Find(id) : nullptr;
++  if (!item || item->type != PinNode::Type::kItem) {
++    return;
++  }
++  const TabStripUserGestureDetails gesture(
++      TabStripUserGestureDetails::GestureType::kOther);
++  TabStripModel* const model = browser_->GetTabStripModel();
++  if (tabs::TabInterface* const tab = LinkedTab(model, id)) {
++    model->ActivateTabAt(model->GetIndexOfTab(tab), gesture);
++    return;
++  }
++  // One place: an item open in another window of this profile is shown
++  // there, not opened a second time here.
++  for (BrowserWindowInterface* const window :
++       WindowsOf(browser_->GetProfile())) {
++    TabStripModel* const other = window->GetTabStripModel();
++    if (tabs::TabInterface* const tab = LinkedTab(other, id)) {
++      other->ActivateTabAt(other->GetIndexOfTab(tab), gesture);
++      window->GetWindow()->Activate();
++      LOG(INFO) << "[workspaces] pins: item '" << id
++                << "' is open in another window; showed it there";
++      return;
++    }
++  }
++  OpenItem(*item, /*linked=*/true);
++}
++
++void WorkspacePinnedSectionView::OnItemClosePressed(const std::string& id) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (tabs::TabInterface* const tab =
++          LinkedTab(browser_->GetTabStripModel(), id);
++      tab && service) {
++    service->ClosePinItemPage(tab, "the row's close button");
++  }
++}
++
++void WorkspacePinnedSectionView::OnItemResetPressed(const std::string& id) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (tabs::TabInterface* const tab =
++          LinkedTab(browser_->GetTabStripModel(), id);
++      tab && service) {
++    service->ResetToAnchor(tab);
++  }
++}
++
++void WorkspacePinnedSectionView::OpenItem(const PinNode& item, bool linked) {
++  const GURL url(item.url);
++  if (!url.is_valid()) {
++    LOG(WARNING) << "[workspaces] pins: item '" << item.id
++                 << "' has no address a tab can open";
++    return;
++  }
++  // The importer's road (LOCAL.md 43): one history entry, the item's address,
++  // and everything the tab is -- linked and anchored -- on the contents BEFORE
++  // the insert, so the list never draws it for a moment. The workspace tag is
++  // left to stamping: a new tab joins the workspace on screen, which is the
++  // one whose row was clicked.
++  sessions::SerializedNavigationEntry navigation;
++  navigation.set_index(0);
++  navigation.set_virtual_url(url);
++  navigation.set_title(base::UTF8ToUTF16(item.title));
++  std::map<std::string, std::string> extra_data;
++  if (linked) {
++    extra_data[workspaces::kPinItemExtraDataKey] = item.id;
++    // The anchor is what makes a typed address open a new tab (E10b) and
++    // what the back arrow returns to.
++    extra_data[workspaces::kAnchorUrlExtraDataKey] = item.url;
++  }
++  if (!item.custom_title.empty()) {
++    extra_data[workspaces::kCustomTitleExtraDataKey] = item.custom_title;
++  }
++  TabStripModel* const model = browser_->GetTabStripModel();
++  // Appended: the session service re-records every tab after an insert point
++  // (E14c), and where a hidden tab sits in the list does not matter.
++  chrome::AddRestoredTab(
++      browser_, base::span_from_ref(navigation), model->count(),
++      /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
++      /*group=*/std::nullopt, /*select=*/true, /*pin=*/false,
++      base::TimeTicks::Now(), base::Time::Now(),
++      /*storage_namespace=*/nullptr, sessions::SerializedUserAgentOverride(),
++      extra_data, /*from_session_restore=*/false,
++      /*is_active_browser=*/std::nullopt,
++      chrome::RestoredTabLoadPolicy::kLoadIfVisible);
++  LOG(INFO) << "[workspaces] pins: opened item '" << item.id << "'"
++            << (linked ? "" : " as a Today tab");
++}
++
++void WorkspacePinnedSectionView::UnpinItem(const std::string& id) {
++  const PinNode* const found = store_ ? store_->Find(id) : nullptr;
++  if (!found || found->type != PinNode::Type::kItem) {
++    return;
++  }
++  // The page first, the row after, so that nothing is lost in between: an open
++  // page stays where it is and joins the list, a sleeping item opens here.
++  bool had_page = false;
++  for (BrowserWindowInterface* const window :
++       WindowsOf(browser_->GetProfile())) {
++    workspaces::WorkspaceService* const service =
++        workspaces::WorkspaceService::From(window);
++    if (tabs::TabInterface* const tab =
++            LinkedTab(window->GetTabStripModel(), id);
++        tab && service) {
++      service->SetPinItem(tab, std::string());
++      service->SetAnchored(tab, false);
++      had_page = true;
++    }
++  }
++  if (!had_page) {
++    const PinNode item = *found;
++    OpenItem(item, /*linked=*/false);
++  }
++  store_->Remove(id);
++  LOG(INFO) << "[workspaces] pins: unpinned item '" << id << "'";
++}
++
++void WorkspacePinnedSectionView::DeleteRow(const std::string& id) {
++  const PinNode* const row = store_ ? store_->Find(id) : nullptr;
++  if (!row) {
++    return;
++  }
++  std::vector<std::string> ids;
++  CollectItemIds(*row, ids);
++  // Their open pages close with them. A page that asks "Leave site?" and is
++  // kept loses its link with the row, and joins the list (ReadLinks).
++  int closed = 0;
++  for (BrowserWindowInterface* const window :
++       WindowsOf(browser_->GetProfile())) {
++    workspaces::WorkspaceService* const service =
++        workspaces::WorkspaceService::From(window);
++    TabStripModel* const model = window->GetTabStripModel();
++    std::vector<tabs::TabInterface*> pages;
++    for (int i = 0; service && i < model->count(); ++i) {
++      tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++      if (std::ranges::contains(ids,
++                                workspaces::PinItemForTab(tab->GetContents()))) {
++        pages.push_back(tab);
++      }
++    }
++    for (tabs::TabInterface* const tab : pages) {
++      closed += service->ClosePinItemPage(tab, "Delete") ? 1 : 0;
++    }
++  }
++  store_->Remove(id);
++  LOG(INFO) << "[workspaces] pins: deleted '" << id << "' (" << ids.size()
++            << " item(s), " << closed << " open page(s) closed)";
++}
++
++void WorkspacePinnedSectionView::ShowDeleteFolderConfirm(const std::string& id,
++                                                         int items) {
++  // Logged when asked and when cancelled, as the rail's confirm is, so a test
++  // can tell "asked, then cancelled" from "never asked".
++  LOG(INFO) << "[workspaces] confirm asked: delete folder '" << id << "', "
++            << items << " item(s)";
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(l10n_util::GetPluralStringFUTF16(
++              IDS_HELIUM_PINNED_FOLDER_CONFIRM_DELETE, items))
++          .AddParagraph(ui::DialogModelLabel(l10n_util::GetStringUTF16(
++              IDS_HELIUM_PINNED_FOLDER_CONFIRM_BODY)))
++          .AddOkButton(
++              base::BindOnce(&WorkspacePinnedSectionView::DeleteRow,
++                             weak_factory_.GetWeakPtr(), id),
++              ui::DialogModel::Button::Params().SetLabel(
++                  l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_FOLDER_DELETE)))
++          .AddCancelButton(base::BindOnce(
++              [] { LOG(INFO) << "[workspaces] confirm cancelled"; }))
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), this, views::BubbleBorder::TOP_LEFT);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
++void WorkspacePinnedSectionView::ShowContextMenuForViewImpl(
++    views::View* source,
++    const gfx::Point& point,
++    ui::mojom::MenuSourceType source_type) {
++  const auto* const row = views::AsViewClass<PinRow>(source);
++  if (!row) {
++    return;
++  }
++  context_menu_id_ = row->id();
++  context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  if (row->folder()) {
++    context_menu_model_->AddItemWithStringId(kCommandDeleteFolder,
++                                             IDS_HELIUM_PINNED_FOLDER_DELETE);
++  } else {
++    context_menu_model_->AddItemWithStringId(kCommandUnpin,
++                                             IDS_HELIUM_PINNED_ITEM_UNPIN);
++    context_menu_model_->AddItemWithStringId(kCommandDelete,
++                                             IDS_HELIUM_PINNED_ITEM_DELETE);
++  }
++  context_menu_runner_ = std::make_unique<views::MenuRunner>(
++      context_menu_model_.get(),
++      views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU);
++  context_menu_runner_->RunMenuAt(
++      source->GetWidget(), nullptr, gfx::Rect(point, gfx::Size()),
++      views::MenuAnchorPosition::kTopLeft, source_type);
++}
++
++void WorkspacePinnedSectionView::ExecuteCommand(int command_id,
++                                                int event_flags) {
++  const std::string id = context_menu_id_;
++  switch (command_id) {
++    case kCommandUnpin:
++      UnpinItem(id);
++      break;
++    case kCommandDelete:
++      DeleteRow(id);
++      break;
++    case kCommandDeleteFolder: {
++      // Asks only when there is something to lose: an empty folder just goes.
++      const PinNode* const folder = store_ ? store_->Find(id) : nullptr;
++      if (!folder) {
++        break;
++      }
++      int items = 0;
++      int folders = 0;
++      workspaces::pins::CountRows(folder->children, items, folders);
++      if (items > 0) {
++        ShowDeleteFolderConfirm(id, items);
++      } else {
++        DeleteRow(id);
++      }
++      break;
++    }
++    default:
++      break;
++  }
++}
++
+ bool WorkspacePinnedSectionView::IsFrameActive() const {
+   return GetWidget() ? GetWidget()->ShouldPaintAsActive() : true;
+ }
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_PINNED_SECTION_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_PINNED_SECTION_VIEW_H_
+ 
++#include <map>
++#include <memory>
+ #include <optional>
+ #include <string>
+ 
+@@ -12,33 +14,49 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/menus/simple_menu_model.h"
++#include "ui/views/context_menu_controller.h"
+ #include "ui/views/view.h"
+ 
+ class BrowserWindowInterface;
+ 
+ namespace tabs {
++class TabInterface;
+ class VerticalTabStripStateController;
+ enum class VerticalTabStripCollapseState;
+ }  // namespace tabs
+ 
++namespace views {
++class MenuRunner;
++}
++
+ // The pinned section of the workspace this window shows (design 5, E15 spec):
+-// its folders and items, above today's tabs and scrolling with them. Read-only
+-// in E15b -- a folder opens and closes, an item is a row that opens nothing
+-// yet (E15c).
++// its folders and items, above today's tabs and scrolling with them.
+ //
+ // The rows are the pins file's data, not tabs: a closed folder makes no rows
+ // for what it holds, so a 1,159-item folder costs one row until it is opened,
+ // and nothing is ever loaded to draw one. Plain LabelButtons, no layer each.
+ //
++// An item opens as ONE real tab of this window (E15c), linked to its item by
++// the tab's `helium.pin_item`: the tab list does not draw it, its row is its
++// face -- sleeping, open (an X to close the page) or active (highlighted), with
++// an arrow back to the item's address while the page is somewhere else.
++// Closing the page keeps the item. Right-click: Unpin or Delete an item,
++// Delete a folder.
++//
+ // Made by TabStripCollectionController for every vertical strip of a regular
+ // profile, and mounted by the one hunk in TabStripView::AddScrollViewContents.
+ // It hides itself while Workspaces is off, while the strip is collapsed, and
+ // while the workspace has no pinned rows.
+ class WorkspacePinnedSectionView
+     : public views::View,
+-      public workspaces::pins::PinStore::Observer {
++      public workspaces::pins::PinStore::Observer,
++      public TabStripModelObserver,
++      public views::ContextMenuController,
++      public ui::SimpleMenuModel::Delegate {
+   METADATA_HEADER(WorkspacePinnedSectionView, views::View)
+ 
+  public:
+@@ -66,13 +84,58 @@ class WorkspacePinnedSectionView
+   // workspaces::pins::PinStore::Observer:
+   void OnPinsChanged() override;
+ 
++  // TabStripModelObserver: which items have a page here, and which is active.
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabChangedAt(tabs::TabInterface* tab,
++                      TabChangeType change_type) override;
++
++  // views::ContextMenuController:
++  void ShowContextMenuForViewImpl(
++      views::View* source,
++      const gfx::Point& point,
++      ui::mojom::MenuSourceType source_type) override;
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override;
++
+  private:
+-  // Every change goes through a posted Rebuild(), never a direct one: a folder
+-  // row's own click changes the store, and rebuilding inside that click would
+-  // delete the button while its click handler is still running. Posting also
+-  // folds several changes in one task into one rebuild.
++  // The pages of this window that belong to items, by item id, and the tab
++  // that is active. Reading them also drops every link that no longer holds
++  // (ReadLinks).
++  struct Links {
++    Links();
++    Links(Links&&);
++    Links& operator=(Links&&);
++    ~Links();
++    std::map<std::string, raw_ptr<tabs::TabInterface>, std::less<>> open;
++    raw_ptr<tabs::TabInterface> active = nullptr;
++  };
++
++  // Every change goes through a posted task, never a direct one: a row's own
++  // click changes the store or the tabs, and redrawing inside that click
++  // would delete the button while its click handler is still running.
++  // Posting also folds several changes in one task into one pass.
++  //
++  // A REBUILD makes the rows again -- the workspace, the store or the strip
++  // changed. A STATE pass only restyles the rows there are -- a tab opened,
++  // closed, was activated or navigated. The two are kept apart because a
++  // rebuild of the biggest open folder costs half a second, and tabs change
++  // far more often than the rows do.
+   void ScheduleRebuild();
+   void Rebuild();
++  void ScheduleRowStates();
++  void UpdateRowStates();
++  // The service's "workspace changed" also fires for every tag written to a
++  // tab: only a different workspace needs new rows.
++  void OnWorkspaceChanged();
++
++  Links ReadLinks();
++  // Sets each item row of `list` sleeping, open or active.
++  void ApplyStates(views::View& list, const Links& links);
++
+   // Adds `row` to `list`, then its children if it is an open folder. Returns
+   // how many rows that made.
+   size_t AddRow(views::View& list,
+@@ -80,6 +143,20 @@ class WorkspacePinnedSectionView
+                 int level,
+                 bool frame_active);
+   void OnFolderPressed(const std::string& id);
++  // Shows the item's page: activates it here, or in the window of this
++  // profile that has it open (one place), or opens it.
++  void OnItemPressed(const std::string& id);
++  void OnItemClosePressed(const std::string& id);
++  void OnItemResetPressed(const std::string& id);
++  // Opens `item` as a tab of this window, active; linked to the item and
++  // anchored at its address when `linked`, a plain Today tab otherwise.
++  void OpenItem(const workspaces::pins::PinNode& item, bool linked);
++  // The item becomes a Today tab: its page if it has one, opened otherwise.
++  void UnpinItem(const std::string& id);
++  // Removes an item, or a folder with all it holds, closing their pages.
++  void DeleteRow(const std::string& id);
++  void ShowDeleteFolderConfirm(const std::string& id, int items);
++
+   void OnCollapseChanged(tabs::VerticalTabStripCollapseState state);
+   // Whether the window paints as active: the rows dim with the tabs when not.
+   bool IsFrameActive() const;
+@@ -98,9 +175,23 @@ class WorkspacePinnedSectionView
+   base::CallbackListSubscription paint_as_active_subscription_;
+   // The rows' container, made by each Rebuild(); every child is a row.
+   raw_ptr<views::View> list_ = nullptr;
++  // The workspace the rows are of; empty while the section is hidden.
++  std::string drawn_guid_;
++  // The item whose page was last seen active: its row is scrolled into view
++  // and its last-used time stamped once per activation, not per tab change.
++  std::string active_id_;
++  // How many item pages this window had at the last state pass, for the log.
++  size_t open_count_ = 0;
+   // CalculatePreferredSize()'s answer until the next rebuild or theme change.
+   mutable std::optional<int> preferred_height_;
+   bool rebuild_scheduled_ = false;
++  bool row_states_scheduled_ = false;
++
++  // The row menu, and the row it was opened on.
++  std::string context_menu_id_;
++  std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
++  std::unique_ptr<views::MenuRunner> context_menu_runner_;
++
+   base::WeakPtrFactory<WorkspacePinnedSectionView> weak_factory_{this};
+ };
+ 

@@ -1,0 +1,13 @@
+<!doctype html>
+<!-- check-c20.ps1 (C20, patch 89): the pinned page "C20 pinned", served from 127.0.0.1. "C20 same link" stays on
+     127.0.0.1 (the same site: it navigates the pinned page, P1); "C20 other link" goes to localhost on the same port --
+     another host with no registrable domain, so another site to SameDomainOrHost, the throttle's test (P2). -->
+<title>E18 c20pin</title>
+<body style="margin:0;background:#fff;font:24px sans-serif">
+<p style="margin:24px"><a id="same" href="c20same.html">C20 same link</a></p>
+<p style="margin:24px"><a id="other" href="c20target.html">C20 other link</a></p>
+<script>
+  document.getElementById("other").href = location.protocol + "//" +
+      (location.hostname === "localhost" ? "127.0.0.1" : "localhost") + ":" + location.port + "/c20target.html";
+</script>
+</body>

@@ -1,0 +1,526 @@
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -4026,6 +4026,7 @@ source_set("browser") {
+       "//chrome/browser/ui/tabs/tab_drag_api",
+       "//chrome/browser/ui/tabs/tab_strip_api",
+       "//chrome/browser/ui/tabs/workspaces",
++      "//chrome/browser/ui/tabs/workspaces:tab_data",
+       "//chrome/browser/ui/toasts",
+       "//chrome/browser/ui/toasts:impl",
+       "//chrome/browser/ui/toolbar/cast",
+--- a/chrome/browser/sessions/BUILD.gn
++++ b/chrome/browser/sessions/BUILD.gn
+@@ -158,6 +158,7 @@ source_set("impl") {
+       "//chrome/browser/ui/startup",
+       "//chrome/browser/ui/tabs:tab_strip",
+       "//chrome/browser/ui/tabs/saved_tab_groups",
++      "//chrome/browser/ui/tabs/workspaces:tab_data",
+       "//chrome/browser/ui/waap:window_metrics_manager",
+       "//chrome/browser/ui/web_applications",
+       "//chrome/browser/ui/webui/tab_strip_internals",
+--- a/chrome/browser/sessions/session_service.cc
++++ b/chrome/browser/sessions/session_service.cc
+@@ -49,6 +49,7 @@
+ #include "chrome/browser/ui/startup/startup_tab.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/window_metadata/window_metadata_controller.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+@@ -659,6 +660,17 @@ void SessionService::BuildCommandsForTab
+       sessions::SessionTabHelper::FromWebContents(tab);
+   SessionID session_id(session_tab_helper->session_id());
+ 
++  // Helium Workspaces: the tab's workspace keys. The rebuild replaces the
++  // whole file at every startup and every ~250 commands, so a key not written
++  // here is lost at the next restart, silently (design 2.6). Right after the
++  // id, outside every block below, so a rebase cannot move it into one.
++  std::map<std::string, std::string> workspace_data;
++  workspaces::PopulateWorkspaceExtraData(tab, &workspace_data);
++  for (const auto& [key, value] : workspace_data) {
++    command_storage_manager()->AppendRebuildCommand(
++        sessions::CreateAddTabExtraDataCommand(session_id, key, value));
++  }
++
+   const blink::UserAgentOverride& ua_override = tab->GetUserAgentOverride();
+ 
+   if (!ua_override.ua_string_override.empty()) {
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -35,6 +35,7 @@
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_selection_state.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/window_metadata/window_metadata_controller.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+@@ -207,6 +208,12 @@ std::map<std::string, std::string> Brows
+   glic::PopulateGlicExtraData(tab_strip_model_->GetTabAtIndex(index),
+                               &extra_data);
+ 
++  // Helium Workspaces: the tag is captured here, at the close, so that
++  // Ctrl+Shift+T puts the tab back in the workspace it was closed from rather
++  // than in whichever one happens to be on screen (design 2.6).
++  workspaces::PopulateWorkspaceExtraData(
++      tab_strip_model_->GetWebContentsAt(index), &extra_data);
++
+   return extra_data;
+ }
+ 
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -24,6 +24,7 @@
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser.h"
+ #include "chrome/common/buildflags.h"
+ #include "components/favicon/content/content_favicon_driver.h"
+@@ -87,6 +88,12 @@ std::unique_ptr<WebContents> CreateResto
+   send_tab_to_self::SendTabToSelfActivationTracker::RestoreFromExtraData(
+       web_contents.get(), extra_data);
+ 
++  // Helium Workspaces: put the tag back on the contents before the caller
++  // inserts the tab, so the workspace it belonged to survives both a restart
++  // and Ctrl+Shift+T. Both restore paths meet here, and both arrive with the
++  // same extra_data map (design 2.6).
++  workspaces::RestoreWorkspaceFromExtraData(web_contents.get(), extra_data);
++
+   std::vector<std::unique_ptr<NavigationEntry>> entries =
+       ContentSerializedNavigationBuilder::ToNavigationEntries(
+           navigations, browser->GetProfile());
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -51,9 +51,37 @@ source_set("stamping") {
+   ]
+ }
+ 
+-# The window-scoped service and the per-tab tag it stamps. Unlike the two leaf
+-# targets above this one is genuinely tied to the browser, so nothing in the
+-# test binary may depend on it.
++# The per-tab tag, and the session glue that carries it across a restart.
++#
++# A third leaf target, and the reason is the same GN constraint as ":prefs" read
++# from the other end. The three session hook sites live in
++# //chrome/browser/ui:ui and //chrome/browser/sessions:impl, and they need the
++# tag and nothing else. Pointing them at ":workspaces" instead would make
++# //chrome/browser/sessions:impl depend on TabStripModel and
++# //chrome/browser/ui/tabs -- an edge nobody wants to own, pointing the wrong
++# way through the graph, and the shape a cycle eventually grows out of.
++#
++# //content/public/browser is unavoidable here (WebContentsUserData is the
++# carrier). Everything else stays out: no //chrome, no //components/sessions.
++# The hook sites already link all of it; this target simply does not need to
++# know.
++source_set("tab_data") {
++  sources = [
++    "workspace_session_data.cc",
++    "workspace_session_data.h",
++    "workspace_tab_data.cc",
++    "workspace_tab_data.h",
++  ]
++
++  deps = [
++    "//base",
++    "//content/public/browser",
++  ]
++}
++
++# The window-scoped service. Unlike the three leaf targets above this one is
++# genuinely tied to the browser, so nothing in the test binary may depend on
++# it.
+ #
+ # Views-free and Browser-free on purpose (design 3.1): the hook sites in
+ # views/tabs/common and sessions do not depend on //chrome/browser/ui, so a
+@@ -63,8 +91,6 @@ source_set("workspaces") {
+   sources = [
+     "workspace_service.cc",
+     "workspace_service.h",
+-    "workspace_tab_data.cc",
+-    "workspace_tab_data.h",
+   ]
+ 
+   deps = [
+@@ -75,11 +101,20 @@ source_set("workspaces") {
+     # public_deps edge in an upstream file is not ours to rely on.
+     ":prefs",
+     ":stamping",
++    ":tab_data",
+     "//base",
++
++    # "//chrome/browser/sessions" for SessionService and its factory, and
++    # "//components/sessions" for SessionTabHelper, which is where the window
++    # and tab SessionIDs come from. Both are already reachable through
++    # //chrome/browser/ui/tabs:tab_strip, so neither adds an edge to the graph
++    # -- they are listed because this target includes their headers directly.
++    "//chrome/browser/sessions",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs:tabs",
+     "//components/prefs",
++    "//components/sessions",
+     "//components/tab_groups",
+     "//components/tabs:public",
+     "//content/public/browser",
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -15,14 +15,18 @@
+ #include "base/location.h"
+ #include "base/logging.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "components/prefs/pref_service.h"
++#include "components/sessions/content/session_tab_helper.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/gurl.h"
+@@ -324,8 +328,7 @@ void WorkspaceService::OnTabPinnedStateC
+   // depend on the index being the post-move one. Pinning reorders the strip,
+   // and TabStripModel fires this notification after the move with the final
+   // index -- true today, but not something this needs to rely on.
+-  WorkspaceTabData::GetOrCreateForWebContents(tab->GetContents())
+-      ->set_guid(tab->IsPinned() ? std::string() : active_guid_);
++  SetTag(tab->GetContents(), tab->IsPinned() ? std::string() : active_guid_);
+ }
+ 
+ void WorkspaceService::TabGroupedStateChanged(
+@@ -405,29 +408,75 @@ void WorkspaceService::CarryTagAcrossRep
+   if (!replace || !replace->old_contents || !replace->new_contents) {
+     return;
+   }
+-  const WorkspaceTabData* old_data =
+-      WorkspaceTabData::FromWebContents(replace->old_contents);
+-  if (!old_data || old_data->guid().empty()) {
++  const std::string old_guid = WorkspaceGuidForTab(replace->old_contents);
++  if (old_guid.empty()) {
+     return;
+   }
+ 
+-  WorkspaceTabData::GetOrCreateForWebContents(replace->new_contents)
+-      ->set_guid(old_data->guid());
++  // Through SetTag rather than straight onto the new contents, because the
++  // replacement gets a brand new SessionTabHelper and therefore a brand new
++  // session tab id. The tag the old contents had was written against the old
++  // id, and nothing carries it over -- so without the session write here the
++  // tab would keep its workspace on screen and lose it on the next restart,
++  // which is the same "forgets sometimes" symptom this replacement path
++  // already cost a day of.
++  SetTag(replace->new_contents, old_guid);
+ 
+   // Logged because this is otherwise completely invisible: nothing about a
+   // discard is user-initiated, so a silent failure here would surface days
+   // later as "workspaces forgets tabs sometimes".
+   LOG(INFO) << "[workspaces] tab contents replaced at index " << replace->index
+-            << " -> carried workspace '" << old_data->guid() << "'";
++            << " -> carried workspace '" << old_guid << "'";
+ }
+ 
+ std::string WorkspaceService::GuidOf(tabs::TabInterface* tab) const {
+-  if (!tab || !tab->GetContents()) {
+-    return std::string();
++  return tab ? WorkspaceGuidForTab(tab->GetContents()) : std::string();
++}
++
++void WorkspaceService::SetTag(content::WebContents* contents,
++                              std::string guid) {
++  if (!contents) {
++    return;
+   }
+-  const WorkspaceTabData* tab_data =
+-      WorkspaceTabData::FromWebContents(tab->GetContents());
+-  return tab_data ? tab_data->guid() : std::string();
++  WorkspaceTabData::GetOrCreateForWebContents(contents)->set_guid(
++      std::move(guid));
++  PersistTag(contents);
++}
++
++void WorkspaceService::PersistTag(content::WebContents* contents) {
++  if (!contents || !browser_window_) {
++    return;
++  }
++
++  // Looked up per write rather than held. The service is a KeyedService on the
++  // profile, so a stored pointer would need an OnDestroying observer to avoid
++  // dangling at shutdown -- which is exactly what Helium's
++  // VerticalTabStripStateController has to do, because it writes from a
++  // destructor path. Nothing here does: every write is driven by a tab strip
++  // event, the lookup is a map probe, and tag changes happen at human speed.
++  // "IfExisting" rather than "GetForProfile" so that stamping a tab can never
++  // be the thing that brings a SessionService into being.
++  SessionService* session_service =
++      SessionServiceFactory::GetForProfileIfExisting(
++          browser_window_->GetProfile());
++  if (!session_service) {
++    return;
++  }
++
++  // The ids the session file is keyed by. SessionServiceBrowserHelper sets the
++  // window id from its own kInserted handler, and it is constructed before
++  // this service is (browser_window_features.cc), so by the time any stamping
++  // rule runs the tab already has a valid one. A tab that somehow does not is
++  // dropped by AddTabExtraData rather than mis-filed.
++  sessions::SessionTabHelper* session_tab_helper =
++      sessions::SessionTabHelper::FromWebContents(contents);
++  if (!session_tab_helper) {
++    return;
++  }
++
++  session_service->AddTabExtraData(
++      session_tab_helper->window_id(), session_tab_helper->session_id(),
++      kWorkspaceExtraDataKey, WorkspaceGuidForTab(contents));
+ }
+ 
+ void WorkspaceService::ApplyCollectionGuid(
+@@ -436,33 +485,36 @@ void WorkspaceService::ApplyCollectionGu
+   if (!tab || !tab->GetContents()) {
+     return;
+   }
+-  WorkspaceTabData* tab_data =
+-      WorkspaceTabData::GetOrCreateForWebContents(tab->GetContents());
+-  tab_data->set_guid(
+-      ResolveGuidForCollectionJoin(member_guids, tab_data->guid()));
++  SetTag(tab->GetContents(),
++         ResolveGuidForCollectionJoin(member_guids, GuidOf(tab)));
+ }
+ 
+ void WorkspaceService::StampInsertedTab(tabs::TabInterface* tab) {
+   if (!tab || !tab->GetContents()) {
+     return;
+   }
+-  WorkspaceTabData* tab_data =
+-      WorkspaceTabData::GetOrCreateForWebContents(tab->GetContents());
+ 
+   // The opener is deliberately not consulted. It is whichever tab was active
+   // at insertion rather than the tab that spawned this one, so honouring it
+   // stamps a tab opened in an empty workspace for the workspace being left --
+   // see the comment on ResolveGuidForInsertedTab, and do not reinstate it.
+-  tab_data->set_guid(
+-      ResolveGuidForInsertedTab(tab_data->guid(), active_guid_));
++  //
++  // A restored tab arrives here already carrying its tag: chrome::
++  // CreateRestoredTab puts it back on the contents before the tab is inserted
++  // (workspace_session_data.h), and rule 1 of ResolveGuidForInsertedTab is
++  // what leaves it alone. This is also where that tag is re-persisted against
++  // the restored tab's new session id.
++  const std::string guid =
++      ResolveGuidForInsertedTab(GuidOf(tab), active_guid_);
++  SetTag(tab->GetContents(), guid);
+ 
+   // active_guid_ is in the line because without it this log cannot answer the
+   // question it exists for. "-> workspace 'default'" is the same text whether
+   // the tab joined the workspace on screen or was stamped for a different one,
+   // and telling those apart by eye is what a browser session was spent on.
+   LOG(INFO) << "[workspaces] tab inserted at index "
+-            << tab_strip_->GetIndexOfTab(tab) << " -> workspace '"
+-            << tab_data->guid() << "' (active '" << active_guid_ << "')";
++            << tab_strip_->GetIndexOfTab(tab) << " -> workspace '" << guid
++            << "' (active '" << active_guid_ << "')";
+ }
+ 
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -27,6 +27,10 @@ class BrowserWindowInterface;
+ class PrefService;
+ class TabStripModel;
+ 
++namespace content {
++class WebContents;
++}
++
+ namespace workspaces {
+ 
+ // One per browser window. Owns which workspace that window is showing, and
+@@ -171,6 +175,30 @@ class WorkspaceService : public TabStrip
+   // workspace" -- see IsVisibleInWorkspace.
+   std::string GuidOf(tabs::TabInterface* tab) const;
+ 
++  // THE ONLY PLACE A TAG IS EVER WRITTEN. Every rule in this class -- insert,
++  // pin, unpin, group, split, contents replacement -- ends here, so that
++  // "membership changed" and "membership was written down" cannot drift apart.
++  // Before E8 there were four `set_guid` call sites and adding persistence
++  // would have meant remembering all four, plus every one a later stage adds.
++  void SetTag(content::WebContents* contents, std::string guid);
++
++  // Writes the tag into the session file, so it survives a restart (design
++  // 2.6). Called only by SetTag().
++  //
++  // The write is a session command like any other: it is appended, it goes to
++  // disk on the usual save timer, and it is REPLAYED IN ORDER at restore, so
++  // the last value written for a tab is the one that comes back. That is why
++  // an empty guid is written rather than skipped -- skipping would leave an
++  // older non-empty command as the last word, and a tab pinned just before
++  // quitting would come back tagged.
++  //
++  // Does nothing when the profile has no SessionService (off-the-record, or
++  // during shutdown) and nothing when the tab's window is not being tracked.
++  // Neither loses anything: SessionService::BuildCommandsForTab re-emits every
++  // live tab's tag from scratch whenever the file is rebuilt, which is what
++  // covers a tag set before this window was being tracked at all.
++  void PersistTag(content::WebContents* contents);
++
+   // Applies the collection rule to `tab` given the tags of the other members
+   // it is joining. Shared by the group and split paths, which differ only in
+   // how the membership is looked up.
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.cc
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++
++#include <map>
++#include <string>
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
++#include "content/public/browser/web_contents.h"
++
++namespace workspaces {
++
++std::string WorkspaceGuidForTab(content::WebContents* contents) {
++  if (!contents) {
++    return std::string();
++  }
++  const WorkspaceTabData* tab_data =
++      WorkspaceTabData::FromWebContents(contents);
++  return tab_data ? tab_data->guid() : std::string();
++}
++
++void PopulateWorkspaceExtraData(
++    content::WebContents* contents,
++    std::map<std::string, std::string>* extra_data) {
++  if (!extra_data) {
++    return;
++  }
++  std::string guid = WorkspaceGuidForTab(contents);
++  if (guid.empty()) {
++    return;
++  }
++  (*extra_data)[kWorkspaceExtraDataKey] = std::move(guid);
++}
++
++void RestoreWorkspaceFromExtraData(
++    content::WebContents* contents,
++    const std::map<std::string, std::string>& extra_data) {
++  if (!contents) {
++    return;
++  }
++  const auto it = extra_data.find(kWorkspaceExtraDataKey);
++  if (it == extra_data.end()) {
++    return;
++  }
++
++  // Set even when the stored value is empty. An empty tag is a real state --
++  // it is what pinning a tab leaves behind -- and the session file records it
++  // by writing the key with an empty value over the older one, so honouring it
++  // here is what makes unpin-then-restart agree with unpin-then-reopen.
++  WorkspaceTabData::GetOrCreateForWebContents(contents)->set_guid(it->second);
++}
++
++}  // namespace workspaces
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_session_data.h
+@@ -0,0 +1,89 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SESSION_DATA_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SESSION_DATA_H_
++
++#include <map>
++#include <string>
++
++namespace content {
++class WebContents;
++}
++
++// How a workspace tag survives a restart, and how it gets back onto the tab
++// afterwards (design 2.6).
++//
++// Chromium already carries an arbitrary per-tab string map through both of its
++// restore paths, and this rides on it rather than inventing a file:
++//
++//   restart          SessionService::AddTabExtraData(...)  [command 33]
++//                      -> SessionTab::extra_data
++//                      -> chrome::AddRestoredTab(..., extra_data, ...)
++//   Ctrl+Shift+T     LiveTabContext::GetExtraDataForTab()  [captured at close]
++//                      -> tab_restore::Entry::extra_data   [Tabs-file cmd 14]
++//                      -> ReplaceRestoredTab(..., extra_data, ...)
++//
++// Both ends of both paths meet in chrome::CreateRestoredTab, which is where
++// RestoreWorkspaceFromExtraData() below is called from. The in-tree consumer
++// this copies is glic_tab_restore_helper.{h,cc}; send_tab_to_self uses the
++// same shape one line further down the same function.
++//
++// WHY THIS IS NOT IN workspace_service.h. The three hook sites live in
++// //chrome/browser/ui and //chrome/browser/sessions, and the sessions one must
++// not be made to depend on the window service (which drags in TabStripModel
++// and //chrome/browser/ui/tabs, and is how a GN cycle gets built by accident --
++// design 3.1). Everything here is free functions over a WebContents and a
++// string map, in the leaf ":tab_data" target, so a hook site pays for the tag
++// and nothing else.
++namespace workspaces {
++
++// The key the guid is stored under, in Helium's helium.<area> convention and
++// matching the WorkspaceTabData it mirrors.
++//
++// CHOSEN ONCE. Unlike a pref name, this string is written into session files
++// that outlive the build that wrote them, so renaming it does not migrate
++// anything -- it silently orphans every tag in every profile's Current
++// Session, Last Session and Tabs files, and the feature looks like it forgot
++// everything exactly once, on the build that renamed it.
++inline constexpr char kWorkspaceExtraDataKey[] = "helium.workspace";
++
++// The workspace `contents` is tagged for, or empty for a tab that has never
++// been stamped, a pinned tab (pinning clears the tag), or a null argument.
++// Empty means the implicit default workspace, never "no workspace".
++std::string WorkspaceGuidForTab(content::WebContents* contents);
++
++// Adds the tag to the map the tab-restore service captures when a tab is
++// closed, so reopening it with Ctrl+Shift+T puts it back in its workspace.
++//
++// An empty guid writes nothing. That is safe here and NOT safe on the session
++// path, which is the one asymmetry in this file worth remembering: this map is
++// built from scratch at the moment of the close, so an absent key and an empty
++// value already mean the same thing. The session file instead accumulates
++// commands across the whole run, so there an empty guid has to be written to
++// overwrite an older non-empty one (see WorkspaceService::PersistTag).
++void PopulateWorkspaceExtraData(
++    content::WebContents* contents,
++    std::map<std::string, std::string>* extra_data);
++
++// Puts a restored tab back in its workspace, by re-attaching the tag to the
++// contents before anything else sees the tab.
++//
++// THIS RUNS BEFORE THE TAB IS IN A TAB STRIP, which is what makes it work
++// rather than a problem to solve. chrome::CreateRestoredTab builds the
++// WebContents, and only the caller afterwards inserts it -- so by the time
++// WorkspaceService's observer sees the insert, the tag is already on the tab,
++// and ResolveGuidForInsertedTab's first rule ("a tab that already carries a
++// tag keeps it") leaves it alone. Nothing has to be queued and consumed later.
++//
++// A missing key leaves the tab untagged rather than stamping it with anything:
++// that is every tab saved before this build existed, and untagged already
++// means the default workspace.
++void RestoreWorkspaceFromExtraData(
++    content::WebContents* contents,
++    const std::map<std::string, std::string>& extra_data);
++
++}  // namespace workspaces
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_SESSION_DATA_H_

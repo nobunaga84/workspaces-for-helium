@@ -1,0 +1,90 @@
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <stddef.h>
+ 
++#include <iterator>
+ #include <memory>
+ #include <string>
+ #include <string_view>
+@@ -50,6 +51,26 @@ constexpr int kMenuCommandChangeIcon = 6
+ constexpr int kMenuCommandUnload = 7;
+ constexpr int kMenuCommandUnloadOthers = 8;
+ constexpr int kMenuCommandCloseAll = 9;
++constexpr int kMenuCommandIconSubmenu = 10;
++// Six ready-made icons, one command id each, then the custom field. UTF-8
++// escapes rather than literal emoji so the file stays ASCII.
++constexpr int kMenuCommandIconPresetFirst = 11;
++constexpr const char* const kIconPresets[] = {
++    "\xF0\x9F\x8F\xA0",  // house
++    "\xF0\x9F\x92\xBC",  // briefcase
++    "\xF0\x9F\x93\x9A",  // books
++    "\xF0\x9F\x8E\xAE",  // game controller
++    "\xF0\x9F\x9B\x92",  // shopping cart
++    "\xF0\x9F\x8E\xB5",  // musical note
++};
++// A word beside each, because six emoji at menu size are not tellable apart
++// by everyone (the owner picked "the second one", LOCAL.md 31).
++constexpr int kIconPresetNames[] = {
++    IDS_HELIUM_WORKSPACE_ICON_HOME,     IDS_HELIUM_WORKSPACE_ICON_WORK,
++    IDS_HELIUM_WORKSPACE_ICON_STUDY,    IDS_HELIUM_WORKSPACE_ICON_PLAY,
++    IDS_HELIUM_WORKSPACE_ICON_SHOPPING, IDS_HELIUM_WORKSPACE_ICON_MUSIC,
++};
++static_assert(std::size(kIconPresetNames) == std::size(kIconPresets));
+ 
+ // What a workspace's button says.
+ //
+@@ -352,8 +373,22 @@ void WorkspaceRailView::ShowContextMenuF
+ 
+   context_menu_model_->AddItemWithStringId(kMenuCommandRename,
+                                            IDS_HELIUM_WORKSPACE_RENAME);
+-  context_menu_model_->AddItemWithStringId(kMenuCommandChangeIcon,
+-                                           IDS_HELIUM_WORKSPACE_CHANGE_ICON);
++  // Presets first, the free-text field last. A native submenu rather than a
++  // picker of our own: the six labels ARE the emoji, drawn by the same font
++  // fallback the rail button uses.
++  icon_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  for (size_t i = 0; i < std::size(kIconPresets); ++i) {
++    icon_menu_model_->AddItem(
++        kMenuCommandIconPresetFirst + static_cast<int>(i),
++        base::UTF8ToUTF16(kIconPresets[i]) + u"  " +
++            l10n_util::GetStringUTF16(kIconPresetNames[i]));
++  }
++  icon_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  icon_menu_model_->AddItemWithStringId(kMenuCommandChangeIcon,
++                                        IDS_HELIUM_WORKSPACE_ICON_CUSTOM);
++  context_menu_model_->AddSubMenuWithStringId(kMenuCommandIconSubmenu,
++                                              IDS_HELIUM_WORKSPACE_CHANGE_ICON,
++                                              icon_menu_model_.get());
+ 
+   // "Up" and "down" mean earlier and later in the list, which is left and
+   // right while the strip is expanded and the rail is drawn as a row, and
+@@ -526,6 +561,14 @@ void WorkspaceRailView::ExecuteCommand(i
+       // when a workspace is ever lost that the user wanted.
+       service->DeleteWorkspace(guid);
+       break;
++    default:
++      if (command_id >= kMenuCommandIconPresetFirst &&
++          command_id < kMenuCommandIconPresetFirst +
++                           static_cast<int>(std::size(kIconPresets))) {
++        service->SetWorkspaceIcon(
++            guid, kIconPresets[command_id - kMenuCommandIconPresetFirst]);
++      }
++      break;
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -130,6 +130,10 @@ class WorkspaceRailView : public views::
+   std::string context_menu_guid_;
+ 
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
++  // The "Change icon" submenu. Created AFTER context_menu_model_ is replaced
++  // and never before it: the parent holds a raw pointer to this, so the old
++  // parent has to be gone before the old submenu is.
++  std::unique_ptr<ui::SimpleMenuModel> icon_menu_model_;
+   std::unique_ptr<views::MenuRunner> context_menu_runner_;
+ 
+   base::CallbackListSubscription workspace_changed_subscription_;

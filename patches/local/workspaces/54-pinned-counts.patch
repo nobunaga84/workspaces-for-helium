@@ -1,0 +1,547 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -274,6 +274,13 @@ void CountRows(const std::vector<PinNode
+   }
+ }
+ 
++int CountPages(const std::vector<PinNode>& rows) {
++  int items = 0;
++  int folders = 0;
++  CountRows(rows, items, folders);
++  return items;
++}
++
+ base::DictValue PinTreeToValue(const PinTree& tree) {
+   base::DictValue workspaces;
+   for (const auto& [guid, roots] : tree) {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -84,6 +84,10 @@ std::optional<PinTree> PinTreeFromValue(
+ // Adds how many items and folders `rows` holds, all the way down.
+ void CountRows(const std::vector<PinNode>& rows, int& items, int& folders);
+ 
++// How many items `rows` holds, all the way down: CountRows for a caller that
++// wants the pages alone (E18).
++int CountPages(const std::vector<PinNode>& rows);
++
+ // The rows to draw for workspace `guid`, own rows first. Rows kept under a
+ // workspace that no longer exists show under the default workspace, as its
+ // tabs do (ResolveTabGuid, design 2.4): nothing is lost when a workspace is
+--- a/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -135,6 +135,14 @@ TEST(WorkspacePinsTest, CountRowsGoesAll
+   EXPECT_EQ(folders, 3);  // f1, f2, f3
+ }
+ 
++TEST(WorkspacePinsTest, CountPagesCountsTheItemsAllTheWayDown) {
++  int pages = 0;
++  for (const auto& [guid, roots] : SampleTree()) {
++    pages += CountPages(roots);
++  }
++  EXPECT_EQ(pages, 4);  // a, b, c, d -- the folders are not pages
++}
++
+ TEST(WorkspacePinsTest, RefusesFilesItDidNotWrite) {
+   for (std::string_view json : {
+            R"({"workspaces":{}})",
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -2062,11 +2062,19 @@ void WorkspaceService::SetAnchored(tabs:
+   }
+   WorkspaceTabData* const data =
+       WorkspaceTabData::GetOrCreateForWebContents(contents);
++  const bool was_anchored = !data->anchor_url().empty();
+   data->set_anchor_url(anchored ? contents->GetLastCommittedURL().spec()
+                                 : std::string());
+   PersistTag(contents);
+   LOG(INFO) << "[workspaces] anchor at index " << tab_strip_->GetIndexOfTab(tab)
+             << " -> '" << data->anchor_url() << "'";
++  // The pinned section's header counts the anchored tabs (E18), so it is
++  // told -- but only when the tab becomes anchored or stops being anchored.
++  // Every subscriber lays the strip out again, and a new address ("Move
++  // anchor here", a first load's redirect) changes no count.
++  if (was_anchored != !data->anchor_url().empty()) {
++    workspace_changed_callbacks_.Notify();
++  }
+ }
+ 
+ void WorkspaceService::SetCustomTitle(tabs::TabInterface* tab,
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -14,6 +14,7 @@
+ #include "base/containers/span.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
++#include "base/i18n/number_formatting.h"
+ #include "base/logging.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+@@ -79,11 +80,14 @@
+ #include "ui/compositor/layer.h"
+ #include "ui/events/event.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/canvas.h"
+ #include "ui/gfx/codec/png_codec.h"
+ #include "ui/gfx/color_utils.h"
+ #include "ui/gfx/favicon_size.h"
+ #include "ui/gfx/font.h"
++#include "ui/gfx/font_list.h"
+ #include "ui/gfx/image/image_skia.h"
++#include "ui/gfx/text_utils.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/background.h"
+ #include "ui/views/border.h"
+@@ -172,6 +176,14 @@ constexpr int kHeaderMarkSize = 28;
+ constexpr int kHeaderIconSize = 16;
+ constexpr int kHeaderSpacing = 4;
+ 
++// The numbers (E18, design 5 "E18 spec" 1): this far after the title they
++// follow, a folder's or the header's name; and below this header width the
++// header draws the pinned count alone, so the name keeps some room (D6).
++constexpr int kCountGap = 8;
++constexpr int kHeaderAllCountsMinWidth = 240;
++// Between the header's numbers: a middle dot, spaced.
++constexpr char16_t kCountSeparator[] = u" \u00B7 ";
++
+ // The row menu.
+ constexpr int kCommandUnpin = 1;
+ constexpr int kCommandDelete = 2;
+@@ -280,6 +292,15 @@ void CollectItems(const PinNode& row, st
+ // -- then its name, 12 px semibold. Made once, by the section; each rebuild
+ // only says what it shows. Its right-click is the section's to route: the
+ // bar's menu for the workspace. Collapsed, the mark alone, centred.
++//
++// At the right end, its numbers (E18): the workspace's pinned pages, this
++// window's Today tabs and, when there are any, the anchored ones among them
++// -- plain numbers between middle dots, in the dimmer tone of the rows'
++// text, and spelled out in the tooltip, which a screen reader reads as the
++// heading's description. PAINTED, not a label: a label's new text lays out
++// every view above it, and the section's list would measure all its rows --
++// 1,313 with the biggest folder open -- on every tab opened or closed. A new
++// number only repaints.
+ class WorkspaceHeaderView : public views::View {
+   METADATA_HEADER(WorkspaceHeaderView, views::View)
+ 
+@@ -295,15 +316,23 @@ class WorkspaceHeaderView : public views
+     GetViewAccessibility().SetRole(ax::mojom::Role::kHeading);
+     icon_ = AddChildView(std::make_unique<views::ImageView>());
+     icon_->SetPreferredSize(gfx::Size(kHeaderMarkSize, kHeaderMarkSize));
++    // The header's tooltip, its numbers (E18), shows over the mark too: an
++    // image would otherwise answer the hover with its own empty one.
++    icon_->SetCanProcessEventsWithinSubtree(false);
+     glyph_ = AddChildView(std::make_unique<views::Label>());
+     glyph_->SetPreferredSize(gfx::Size(kHeaderMarkSize, kHeaderMarkSize));
+     glyph_->SetHorizontalAlignment(gfx::ALIGN_CENTER);
+     name_ = AddChildView(std::make_unique<views::Label>());
++    // The numbers (E18) are drawn in the name's font, at the normal weight.
++    counts_font_ = name_->font_list();
+     name_->SetFontList(
+         name_->font_list().DeriveWithWeight(gfx::Font::Weight::SEMIBOLD));
+     name_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+     // A long name elides instead of widening the strip.
+     layout_->SetFlexForView(name_.get(), 1);
++    // Hovering the name shows the header's tooltip, its numbers (E18) --
++    // an elided name would otherwise show its own full text instead.
++    name_->SetHandlesTooltips(false);
+     for (views::Label* const label : {glyph_.get(), name_.get()}) {
+       // No opaque background under the text, as on the rows; and the colours
+       // set are the ones drawn.
+@@ -337,14 +366,38 @@ class WorkspaceHeaderView : public views
+     // A letter is drawn in the colour, an emoji in its own (the bar's rule).
+     tint_glyph_ = entry.icon.empty();
+     color_ = color;
++    collapsed_ = collapsed;
+     layout_->set_main_axis_alignment(
+         collapsed ? views::LayoutAlignment::kCenter
+                   : views::LayoutAlignment::kStart);
+     layout_->set_inside_border_insets(
+         gfx::Insets::VH(0, collapsed ? 0 : kHeaderInset));
++    UpdateTooltip();
+     UpdateColors();
+   }
+ 
++  // The numbers (E18): the workspace's pinned pages, sub-folders' included;
++  // this window's Today tabs; how many of those are anchored. Returns false,
++  // and does nothing, when they are the ones already shown.
++  bool SetCounts(int pinned, int today, int anchored) {
++    if (pinned == pinned_ && today == today_ && anchored == anchored_) {
++      return false;
++    }
++    pinned_ = pinned;
++    today_ = today;
++    anchored_ = anchored;
++    UpdateTooltip();
++    // Only when the text outgrows the room the name left it, and only this
++    // view lays out again: its size does not change, and InvalidateLayout
++    // would climb to the section and have the list measure every row (as
++    // PinRow::SetItemState).
++    if (!size().IsEmpty() && CountsWidth() > counts_width_) {
++      DeprecatedLayoutImmediately();
++    }
++    SchedulePaint();
++    return true;
++  }
++
+   // Never in the constructor -- no provider before the widget. Run again by
+   // the section when the window's active state changes, which is not a theme
+   // change.
+@@ -372,6 +425,8 @@ class WorkspaceHeaderView : public views
+     icon_->SetBackground(WorkspaceRailView::CurrentFill(*provider, color));
+     glyph_->SetBackground(WorkspaceRailView::CurrentFill(*provider, color));
+     name_->SetEnabledColor(text);
++    // The numbers are painted, in the window's state at the time (OnPaint).
++    SchedulePaint();
+   }
+ 
+   // views::View:
+@@ -380,7 +435,88 @@ class WorkspaceHeaderView : public views
+     UpdateColors();
+   }
+ 
++  // The box places the mark and the name; the name then ends a gap before
++  // the numbers, so a long one elides there. Run again when the width
++  // changes, which can change what is drawn (CountsText).
++  void Layout(PassKey) override {
++    LayoutSuperclass<views::View>(this);
++    counts_width_ = CountsWidth();
++    if (counts_width_ > 0) {
++      const int end = width() - kHeaderInset - counts_width_ - kCountGap;
++      name_->SetSize(gfx::Size(std::clamp(end - name_->x(), 0, name_->width()),
++                               name_->height()));
++    }
++  }
++
++ protected:
++  // views::View:
++  //
++  // The numbers at the right end, in the tone the rows' text and "+ New Tab"
++  // have in this window's state. No opaque background under them, as under
++  // the labels.
++  void OnPaint(gfx::Canvas* canvas) override {
++    views::View::OnPaint(canvas);
++    const std::u16string text = CountsText();
++    const ui::ColorProvider* const provider = GetColorProvider();
++    if (text.empty() || !provider) {
++      return;
++    }
++    const bool frame_active = GetWidget() && GetWidget()->ShouldPaintAsActive();
++    const SkColor color = provider->GetColor(
++        frame_active ? kColorTabForegroundInactiveFrameActive
++                     : kColorTabForegroundInactiveFrameInactive);
++    const int text_width = gfx::GetStringWidth(text, counts_font_);
++    canvas->DrawStringRectWithFlags(
++        text, counts_font_, color,
++        GetMirroredRect(gfx::Rect(width() - kHeaderInset - text_width, 0,
++                                  text_width, height())),
++        gfx::Canvas::NO_ELLIPSIS | gfx::Canvas::NO_SUBPIXEL_RENDERING);
++  }
++
+  private:
++  // What is drawn at the current width: nothing collapsed (D7), the pinned
++  // count alone on a narrow header (D6), the anchored count only when there
++  // are any (D3); nothing before the pins file has loaded.
++  std::u16string CountsText() const {
++    if (collapsed_ || pinned_ < 0) {
++      return std::u16string();
++    }
++    std::u16string text = base::FormatNumber(pinned_);
++    if (width() < kHeaderAllCountsMinWidth) {
++      return text;
++    }
++    base::StrAppend(&text, {kCountSeparator, base::FormatNumber(today_)});
++    if (anchored_ > 0) {
++      base::StrAppend(&text, {kCountSeparator, base::FormatNumber(anchored_)});
++    }
++    return text;
++  }
++  int CountsWidth() const {
++    const std::u16string text = CountsText();
++    return text.empty() ? 0 : gfx::GetStringWidth(text, counts_font_);
++  }
++
++  // The numbers spelled out, one per line; none collapsed, where the header
++  // is its symbol only (D7). Different from the name, so it is also the
++  // heading's accessible description (ViewAccessibility).
++  void UpdateTooltip() {
++    if (collapsed_ || pinned_ < 0) {
++      SetTooltipText(std::u16string());
++      return;
++    }
++    std::u16string text = base::StrCat(
++        {l10n_util::GetPluralStringFUTF16(IDS_HELIUM_PINNED_PAGE_COUNT,
++                                          pinned_),
++         u"\n",
++         l10n_util::GetPluralStringFUTF16(IDS_HELIUM_TODAY_TAB_COUNT, today_)});
++    if (anchored_ > 0) {
++      base::StrAppend(&text, {u"\n", l10n_util::GetPluralStringFUTF16(
++                                         IDS_HELIUM_ANCHORED_TAB_COUNT,
++                                         anchored_)});
++    }
++    SetTooltipText(text);
++  }
++
+   raw_ptr<views::BoxLayout> layout_ = nullptr;
+   raw_ptr<views::ImageView> icon_ = nullptr;
+   raw_ptr<views::Label> glyph_ = nullptr;
+@@ -388,6 +524,14 @@ class WorkspaceHeaderView : public views
+   raw_ptr<const gfx::VectorIcon> symbol_ = nullptr;
+   bool tint_glyph_ = true;
+   int color_ = workspaces::prefs::kGreyColor;
++  bool collapsed_ = false;
++  // The numbers (E18), their font, and the room the last layout left them.
++  // -1: the pins file has not loaded yet, and nothing is shown.
++  int pinned_ = -1;
++  int today_ = 0;
++  int anchored_ = 0;
++  gfx::FontList counts_font_;
++  int counts_width_ = 0;
+ };
+ 
+ BEGIN_METADATA(WorkspaceHeaderView)
+@@ -427,9 +571,15 @@ class PinRow : public views::LabelButton
+         on_close_(std::move(on_close)),
+         on_reset_(std::move(on_reset)),
+         on_drag_(std::move(on_drag)) {
+-    SetTooltipText(folder_ ? RowText(node)
+-                           : base::StrCat({RowText(node), u"\n",
+-                                           base::UTF8ToUTF16(node.url)}));
++    // A folder in the open strip gets its tooltip once, below, with its count
++    // (E18): a button whose name equals its OLD tooltip takes the new one as
++    // its name (Button::OnTooltipTextChanged), and the tests find a folder by
++    // its name.
++    if (!folder_ || icon_only_) {
++      SetTooltipText(folder_ ? RowText(node)
++                             : base::StrCat({RowText(node), u"\n",
++                                             base::UTF8ToUTF16(node.url)}));
++    }
+     SetBorder(views::CreateEmptyBorder(
+         icon_only_ ? gfx::Insets()
+                    : gfx::Insets::TLBR(0,
+@@ -465,6 +615,24 @@ class PinRow : public views::LabelButton
+         chevron_ = AddChildView(std::make_unique<views::ImageView>());
+         chevron_->SetCanProcessEventsWithinSubtree(false);
+         chevron_->GetViewAccessibility().SetIsIgnored(true);
++        // How many pages it holds, sub-folders' included -- what Delete
++        // folder would close (E18). Set once: a change of the pins makes the
++        // rows again. At the right end in the title's font and colour; not
++        // part of the name, which the hands-free tests press a folder by (a
++        // label takes no clicks either: the press and the drag stay the
++        // row's). A screen reader hears it in the tooltip, the row's
++        // description. Not in the collapsed column (D7).
++        const int pages = workspaces::pins::CountPages(node.children);
++        count_ = AddChildView(
++            std::make_unique<views::Label>(base::FormatNumber(pages)));
++        count_->SetFontList(label()->font_list());
++        count_->SetSubpixelRenderingEnabled(false);
++        count_->SetAutoColorReadabilityEnabled(false);
++        count_->GetViewAccessibility().SetIsIgnored(true);
++        SetTooltipText(base::StrCat(
++            {RowText(node), u"\n",
++             l10n_util::GetPluralStringFUTF16(IDS_HELIUM_PINNED_PAGE_COUNT,
++                                              pages)}));
+       }
+       UpdateColors();
+       return;
+@@ -533,9 +701,10 @@ class PinRow : public views::LabelButton
+ 
+   // views::LabelButton:
+   //
+-  // A folder's chevron sits in the room its border keeps before the icon. An
+-  // open item's buttons sit at the right edge -- the close button last --
+-  // and the title ends before them. Collapsed, the icon alone, centred.
++  // A folder's chevron sits in the room its border keeps before the icon, and
++  // its number at the right edge (E18). An open item's buttons sit there --
++  // the close button last. The title ends before either. Collapsed, the icon
++  // alone, centred.
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override {
+     views::ProposedLayout layouts =
+@@ -560,6 +729,15 @@ class PinRow : public views::LabelButton
+                     (layouts.host_size.height() - kChevronSize) / 2,
+                     kChevronSize, kChevronSize));
+     }
++    if (count_) {
++      const int count_width = count_->GetPreferredSize().width();
++      const int count_x = layouts.host_size.width() - kRowInset - count_width;
++      layouts.child_layouts.emplace_back(
++          count_.get(), true,
++          gfx::Rect(count_x, 0, count_width, layouts.host_size.height()));
++      EndTitleAt(layouts, count_x - kCountGap);
++      return layouts;
++    }
+     if (!close_) {
+       return layouts;
+     }
+@@ -579,11 +757,7 @@ class PinRow : public views::LabelButton
+           gfx::Rect(right, (layouts.host_size.height() - size.height()) / 2,
+                     size.width(), size.height()));
+     }
+-    for (views::ChildLayout& child : layouts.child_layouts) {
+-      if (child.child_view == label() && child.bounds.right() > right) {
+-        child.bounds.set_width(std::max(0, right - child.bounds.x()));
+-      }
+-    }
++    EndTitleAt(layouts, right);
+     return layouts;
+   }
+ 
+@@ -669,6 +843,16 @@ class PinRow : public views::LabelButton
+   }
+ 
+  private:
++  // The title ends at `right` at the latest: before what sits at the row's
++  // right end, an item's buttons or a folder's number.
++  void EndTitleAt(views::ProposedLayout& layouts, int right) const {
++    for (views::ChildLayout& child : layouts.child_layouts) {
++      if (child.child_view == label() && child.bounds.right() > right) {
++        child.bounds.set_width(std::max(0, right - child.bounds.x()));
++      }
++    }
++  }
++
+   gfx::Point ScreenPoint(const ui::MouseEvent& event) const {
+     gfx::Point point = event.location();
+     views::View::ConvertPointToScreen(this, &point);
+@@ -721,6 +905,9 @@ class PinRow : public views::LabelButton
+                 : kKeyboardArrowRightIcon,
+           text, kChevronSize));
+     }
++    if (count_) {
++      count_->SetEnabledColor(text);
++    }
+     const ui::ColorId background = frame_active_
+                                        ? kColorTabBackgroundActiveFrameActive
+                                        : kColorTabBackgroundActiveFrameInactive;
+@@ -745,8 +932,9 @@ class PinRow : public views::LabelButton
+   bool dragging_ = false;
+   raw_ptr<views::ImageButton> close_ = nullptr;
+   raw_ptr<views::ImageButton> reset_ = nullptr;
+-  // A folder's, except collapsed.
++  // A folder's, except collapsed; and its number of pages (E18).
+   raw_ptr<views::ImageView> chevron_ = nullptr;
++  raw_ptr<views::Label> count_ = nullptr;
+   // The icon drawn in the text color (a folder's in its own); null once the
+   // page's own icon arrived.
+   raw_ptr<const gfx::VectorIcon> vector_icon_ = nullptr;
+@@ -890,6 +1078,14 @@ void WorkspacePinnedSectionView::OnTabCh
+   }
+ }
+ 
++void WorkspacePinnedSectionView::OnTabPinnedStateChanged(
++    tabs::TabInterface* tab,
++    int index) {
++  // A tab made a favorite, or no longer one, joins or leaves the header's
++  // Today count (E18); one that stays at its index sends no move.
++  ScheduleRowStates();
++}
++
+ void WorkspacePinnedSectionView::OnWorkspaceChanged() {
+   const workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
+@@ -963,6 +1159,18 @@ void WorkspacePinnedSectionView::Rebuild
+     roots = workspaces::pins::RootsForWorkspace(
+         store_->tree(), service->active_guid(), service->known_guids());
+   }
++  // The header's pinned count (E18): every page of the workspace, those in
++  // closed folders and sub-folders too -- AddRow visits only what it draws.
++  // The state pass scheduled above hands it to the header. Unknown (-1) until
++  // the pins file has loaded, so the header shows no "0" for a moment.
++  drawn_pages_ = store_ && store_->loaded() ? 0 : -1;
++  for (const PinNode* const root : roots) {
++    if (root->type == PinNode::Type::kItem) {
++      ++drawn_pages_;
++    } else {
++      drawn_pages_ += workspaces::pins::CountPages(root->children);
++    }
++  }
+   SetVisible(shown);
+   if (!shown) {
+     return;
+@@ -1067,6 +1275,14 @@ void WorkspacePinnedSectionView::UpdateR
+     LOG(INFO) << "[workspaces] pins: " << open_count_
+               << " item page(s) open in this window";
+   }
++  // The header's numbers (E18), logged when one changes: pinned pages /
++  // Today tabs / anchored tabs. None before the pins file has loaded.
++  if (views::AsViewClass<WorkspaceHeaderView>(header_.get())
++          ->SetCounts(drawn_pages_, links.today, links.anchored) &&
++      drawn_pages_ >= 0) {
++    LOG(INFO) << "[workspaces] pins: header counts " << drawn_pages_ << "/"
++              << links.today << "/" << links.anchored;
++  }
+ 
+   // Once per activation, not per tab change: the item's last-used time
+   // (design 5, from Arc) and its row scrolled into view -- the list does not
+@@ -1115,6 +1331,19 @@ WorkspacePinnedSectionView::Links Worksp
+   std::vector<tabs::TabInterface*> unlinked;
+   for (int i = 0; i < model->count(); ++i) {
+     tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++    // The header's Today and anchored counts (E18) ride this walk. A Today
++    // tab is one the list draws -- its own rule,
++    // TabStripCollectionController::IsTabVisibleForWorkspace -- and not a
++    // favorite: the list never reaches those, but their empty tag reads as
++    // the default workspace's. A split counts two, a tab in a closed group
++    // one (D4); the anchored ones are among them, never a pinned page (D5).
++    if (!tab->IsPinned() && service->IsTabVisible(tab) &&
++        !service->IsDrawnAsPinnedRow(tab)) {
++      ++links.today;
++      if (service->IsAnchored(tab)) {
++        ++links.anchored;
++      }
++    }
+     std::string id = workspaces::PinItemForTab(tab->GetContents());
+     // A favorite pinned while Workspaces was off keeps its link, unjudged:
+     // it is drawn at the top, not as its row (IsPinItemTab, review #6).
+@@ -2135,9 +2364,7 @@ void WorkspacePinnedSectionView::Execute
+       if (!folder) {
+         break;
+       }
+-      int items = 0;
+-      int folders = 0;
+-      workspaces::pins::CountRows(folder->children, items, folders);
++      const int items = workspaces::pins::CountPages(folder->children);
+       if (items > 0) {
+         ShowDeleteFolderConfirm(id, items);
+       } else {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -70,7 +70,9 @@ class ScrollView;
+ // its symbol in its colour and its name; right-click: the bar's menu for it
+ // -- and the rows sit on a soft rounded card, which only rows make. A folder
+ // is solid, in its own colour or the workspace's, after a chevron that shows
+-// it open or closed.
++// it open or closed. Since E18 the header ends with the workspace's pinned
++// pages, this window's Today tabs and its anchored ones, as numbers; and a
++// folder with the pages it holds.
+ //
+ // Below the card, "+ New Tab", at the top of the list as in Arc (E15c.1).
+ // Right-click on it: Helium's New Tab menu.
+@@ -125,6 +127,7 @@ class WorkspacePinnedSectionView
+       const TabStripSelectionChange& selection) override;
+   void OnTabChangedAt(tabs::TabInterface* tab,
+                       TabChangeType change_type) override;
++  void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
+ 
+   // views::ContextMenuController:
+   void ShowContextMenuForViewImpl(
+@@ -180,6 +183,10 @@ class WorkspacePinnedSectionView
+     ~Links();
+     std::map<std::string, raw_ptr<tabs::TabInterface>, std::less<>> open;
+     raw_ptr<tabs::TabInterface> active = nullptr;
++    // The header's numbers (E18): this window's Today tabs -- the tabs the
++    // list draws -- and how many of them are anchored.
++    int today = 0;
++    int anchored = 0;
+   };
+ 
+   // Every change goes through a posted task, never a direct one: a row's own
+@@ -318,6 +325,9 @@ class WorkspacePinnedSectionView
+   // Its effective colour (prefs::EffectiveColors): a folder's without one of
+   // its own (E17b).
+   int drawn_color_ = 0;
++  // How many pinned pages it holds, all the way down: the header's first
++  // number (E18), counted by each Rebuild().
++  int drawn_pages_ = 0;
+   // The rows are the collapsed strip's column of icons (E17b).
+   bool collapsed_ = false;
+   // The item whose page was last seen active: its row is scrolled into view

@@ -1,0 +1,1145 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
+@@ -401,6 +401,31 @@ int DaysAgo(base::Time archived_at, base
+   return static_cast<int>(std::lround((today - day) / base::Days(1)));
+ }
+ 
++ArchiveBucket BucketFor(base::Time archived_at, base::Time now) {
++  const int days = DaysAgo(archived_at, now);
++  if (days == 0) {
++    return {ArchiveBucketKind::kToday};
++  }
++  if (days == 1) {
++    return {ArchiveBucketKind::kYesterday};
++  }
++  base::Time::Exploded today;
++  now.LocalExplode(&today);
++  // Days since this week's Sunday (weeks start on Sunday, the owner
++  // 2026-10-02): day_of_week is 0 on a Sunday, so a Sunday has no "earlier
++  // this week".
++  const int into_week = today.day_of_week;
++  if (days <= into_week) {
++    return {ArchiveBucketKind::kEarlierThisWeek};
++  }
++  if (days <= into_week + 7) {
++    return {ArchiveBucketKind::kLastWeek};
++  }
++  base::Time::Exploded day;
++  archived_at.LocalExplode(&day);
++  return {ArchiveBucketKind::kMonth, day.year, day.month};
++}
++
+ std::u16string SearchTextFor(const ArchiveEntry& entry) {
+   // Newlines, so a query word never matches across two fields: a word holds
+   // no whitespace.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.h
+@@ -183,6 +183,27 @@ class ArchiveStore : public base::Suppor
+ // time after `now` (the clock went back) is 0.
+ int DaysAgo(base::Time archived_at, base::Time now);
+ 
++// The Archive screen's headings (E17c): Today, Yesterday, Earlier this week,
++// Last week, then one per local calendar month.
++enum class ArchiveBucketKind {
++  kToday,
++  kYesterday,
++  kEarlierThisWeek,
++  kLastWeek,
++  kMonth
++};
++struct ArchiveBucket {
++  ArchiveBucketKind kind;
++  int year = 0;   // kMonth only (local time)
++  int month = 0;  // kMonth only, 1-12
++  bool operator==(const ArchiveBucket&) const = default;
++};
++
++// Weeks start on Sunday (local time). Today / Yesterday by DaysAgo; then the
++// rest of this week; then the previous Sunday-to-Saturday week; then the local
++// calendar month of `archived_at`. A time after `now` is kToday, as DaysAgo.
++ArchiveBucket BucketFor(base::Time archived_at, base::Time now);
++
+ // What the search box looks in for `entry`: its custom name, its title and its
+ // address, case-folded (base::i18n::FoldCase) and joined by newlines. The
+ // screen makes it once per row, not once per keystroke.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
+@@ -505,6 +505,51 @@ TEST(WorkspaceArchiveTest, DaysAgoCounts
+   EXPECT_EQ(DaysAgo(now + base::Days(2), now), 0);
+ }
+ 
++// A local wall-clock time, so the buckets hold in any time zone (E17c).
++base::Time LocalTime(int year,
++                     int month,
++                     int day_of_week,
++                     int day_of_month,
++                     int hour) {
++  base::Time time;
++  EXPECT_TRUE(base::Time::FromLocalExploded(
++      {year, month, day_of_week, day_of_month, hour, 0, 0, 0}, &time));
++  return time;
++}
++
++TEST(WorkspaceArchiveTest, BucketsStartTheWeekOnSunday) {
++  // Wednesday 2026-09-30, 15:00: this week began on Sunday the 27th (the
++  // owner, 2026-10-02).
++  const base::Time now = LocalTime(2026, 9, 3, 30, 15);
++  EXPECT_EQ(BucketFor(LocalTime(2026, 9, 3, 30, 9), now),
++            ArchiveBucket{ArchiveBucketKind::kToday});
++  EXPECT_EQ(BucketFor(LocalTime(2026, 9, 2, 29, 23), now),
++            ArchiveBucket{ArchiveBucketKind::kYesterday});
++  EXPECT_EQ(BucketFor(LocalTime(2026, 9, 1, 28, 8), now),
++            ArchiveBucket{ArchiveBucketKind::kEarlierThisWeek});
++  // This week's first day.
++  EXPECT_EQ(BucketFor(LocalTime(2026, 9, 0, 27, 12), now),
++            ArchiveBucket{ArchiveBucketKind::kEarlierThisWeek});
++  EXPECT_EQ(BucketFor(LocalTime(2026, 9, 6, 26, 12), now),
++            ArchiveBucket{ArchiveBucketKind::kLastWeek});
++  // Last week's first day.
++  EXPECT_EQ(BucketFor(LocalTime(2026, 9, 0, 20, 12), now),
++            ArchiveBucket{ArchiveBucketKind::kLastWeek});
++  EXPECT_EQ(BucketFor(LocalTime(2026, 9, 6, 19, 12), now),
++            (ArchiveBucket{ArchiveBucketKind::kMonth, 2026, 9}));
++  EXPECT_EQ(BucketFor(LocalTime(2026, 8, 2, 25, 12), now),
++            (ArchiveBucket{ArchiveBucketKind::kMonth, 2026, 8}));
++}
++
++TEST(WorkspaceArchiveTest, ASundayHasNoEarlierThisWeek) {
++  // Sunday 2026-09-27, 10:00.
++  const base::Time now = LocalTime(2026, 9, 0, 27, 10);
++  EXPECT_EQ(BucketFor(LocalTime(2026, 9, 6, 26, 12), now),
++            ArchiveBucket{ArchiveBucketKind::kYesterday});
++  EXPECT_EQ(BucketFor(LocalTime(2026, 9, 5, 25, 12), now),
++            ArchiveBucket{ArchiveBucketKind::kLastWeek});
++}
++
+ TEST(WorkspaceArchiveTest, SearchFindsEveryWordInAnyFieldAndCase) {
+   ArchiveEntry entry = Entry("a", "https://example.com/chromium");
+   entry.title = "GitHub Pull Requests";
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
+@@ -14,23 +14,30 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/containers/flat_map.h"
+ #include "base/containers/span.h"
+ #include "base/functional/bind.h"
++#include "base/i18n/icubridge/date_time_formatter.h"
++#include "base/i18n/icubridge/icu_bridge.h"
+ #include "base/i18n/time_formatting.h"
+ #include "base/logging.h"
+ #include "base/memory/ptr_util.h"
++#include "base/no_destructor.h"
++#include "base/notreached.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/cancelable_task_tracker.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/timer/elapsed_timer.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/favicon/favicon_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sessions/tab_restore_service_factory.h"
+ #include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+@@ -58,32 +65,42 @@
+ #include "ui/base/models/image_model.h"
+ #include "ui/base/ui_base_types.h"
+ #include "ui/color/color_id.h"
++#include "ui/gfx/canvas.h"
+ #include "ui/gfx/codec/png_codec.h"
+ #include "ui/gfx/favicon_size.h"
+ #include "ui/gfx/geometry/point_f.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/strings/grit/ui_strings.h"
+ #include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
+ #include "ui/views/border.h"
+ #include "ui/views/bubble/bubble_border.h"
+ #include "ui/views/bubble/bubble_dialog_model_host.h"
+-#include "ui/views/controls/button/checkbox.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/button/label_button.h"
+ #include "ui/views/controls/button/md_text_button.h"
+ #include "ui/views/controls/button/menu_button_controller.h"
+ #include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/image_view.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/controls/textfield/textfield.h"
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/layout/box_layout.h"
++#include "ui/views/layout/layout_provider.h"
++#include "ui/views/layout/layout_types.h"
++#include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/style/typography.h"
+ #include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_delegate.h"
+ #include "url/gurl.h"
+ 
+ namespace {
+ 
++using workspaces::archive::ArchiveBucket;
++using workspaces::archive::ArchiveBucketKind;
+ using workspaces::archive::ArchiveEntry;
+ using workspaces::archive::ArchiveStore;
+ 
+@@ -93,16 +110,33 @@ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kA
+ // the list grows before it scrolls.
+ constexpr int kWidth = 360;
+ constexpr int kListMaxHeight = 480;
+-// Each side of a row and a day header, as in the pinned section (E15b).
++// Each side of a row and a heading, as in the pinned section (E15b).
+ constexpr int kRowInset = 8;
+-// Between the screen's parts, and above a day header.
++// Between the screen's parts, and above a heading.
+ constexpr int kSpacing = 8;
++// Design 5 "E17 spec" 4: the bubble's corners, a row's height, the search
++// box's height and its icon's size.
++constexpr int kBubbleRadius = 12;
++constexpr int kRowHeight = 30;
++constexpr int kSearchHeight = 34;
++constexpr int kIconSize = 16;
++// The switch: each half's height, the outline's radius, and the gap between
++// the outline and the halves.
++constexpr int kSwitchHeight = 28;
++constexpr int kSwitchRadius = 8;
++constexpr int kSwitchInset = 2;
++// The "All workspaces" dot before a row's time, and the gap each side of it.
++constexpr int kDotSize = 7;
++constexpr int kDotGap = 6;
++// How soon after this window's screen closed by losing the focus a press on
++// the Archive button counts as the press that closed it (E17a review #6).
++constexpr base::TimeDelta kToggleWindow = base::Milliseconds(250);
+ 
+ // The row menu.
+ constexpr int kCommandRestore = 1;
+ constexpr int kCommandDelete = 2;
+ 
+-// The Clear… menu's ranges, in its order, each item's command id
++// The Clear... menu's ranges, in its order, each item's command id
+ // kCommandClearFirst + its index (E14d.3). Chromium's own words for Clear
+ // browsing data's ranges; a zero span is All time.
+ struct ClearRange {
+@@ -133,13 +167,31 @@ std::u16string EntryText(const ArchiveEn
+                                                        : entry.url);
+ }
+ 
+-// "Today", "Yesterday", then the date, over the entries `days` days old.
+-std::unique_ptr<views::Label> MakeDayHeader(int days, base::Time time) {
++// What the heading over `bucket`'s entries says, `time` one of them (design 5
++// "E17 spec" 4): "Today", "Yesterday", "Earlier this week", "Last week", then
++// the month ("September 2026").
++std::u16string HeadingText(const ArchiveBucket& bucket, base::Time time) {
++  switch (bucket.kind) {
++    case ArchiveBucketKind::kToday:
++      return l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_TODAY);
++    case ArchiveBucketKind::kYesterday:
++      return l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_YESTERDAY);
++    case ArchiveBucketKind::kEarlierThisWeek:
++      return l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_EARLIER_THIS_WEEK);
++    case ArchiveBucketKind::kLastWeek:
++      return l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_LAST_WEEK);
++    case ArchiveBucketKind::kMonth:
++      return base::TimeFormatMonthAndYear(time);
++  }
++  NOTREACHED();
++}
++
++// A heading, said as one (the hands-free test counts them).
++std::unique_ptr<views::Label> MakeHeading(const ArchiveBucket& bucket,
++                                          base::Time time) {
+   auto header = std::make_unique<views::Label>(
+-      days == 0   ? l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_TODAY)
+-      : days == 1 ? l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_YESTERDAY)
+-                  : base::TimeFormatFriendlyDate(time),
+-      views::style::CONTEXT_LABEL, views::style::STYLE_SECONDARY);
++      HeadingText(bucket, time), views::style::CONTEXT_LABEL,
++      views::style::STYLE_SECONDARY);
+   header->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+   header->SetBorder(views::CreateEmptyBorder(
+       gfx::Insets::TLBR(kSpacing, kRowInset, kSpacing / 2, kRowInset)));
+@@ -147,6 +199,54 @@ std::unique_ptr<views::Label> MakeDayHea
+   return header;
+ }
+ 
++// The answers RowTime() made in this rebuild: the format (0 time of day, 1
++// weekday, 2 month and day) and the minute or the local day it shows.
++using RowTimeCache = std::map<std::pair<int, base::Time>, std::u16string>;
++
++// When an entry of `kind` was closed, as its row's right end says it (design
++// 5 "E17 spec" 4): the time of day today and yesterday ("2:14 PM"), the
++// weekday earlier this week, else the month and day ("Sep 25"). Each answer
++// is made once per rebuild: one ICU format builds its own pattern generator,
++// and the 1,750 rows of E14d.2's open gate share a few hundred answers at
++// most. Through IcuBridge for the two base has no helper for at 154 (the
++// spec's LocalizedTimeFormatWithPattern is gone); base's own helpers call it.
++std::u16string RowTime(base::Time time,
++                       ArchiveBucketKind kind,
++                       RowTimeCache& cache) {
++  const bool time_of_day = kind == ArchiveBucketKind::kToday ||
++                           kind == ArchiveBucketKind::kYesterday;
++  const int format = time_of_day                                  ? 0
++                     : kind == ArchiveBucketKind::kEarlierThisWeek ? 1
++                                                                   : 2;
++  const base::Time key =
++      time_of_day ? base::Time::FromDeltaSinceWindowsEpoch(base::Minutes(
++                        time.ToDeltaSinceWindowsEpoch().InMinutes()))
++                  : time.LocalMidnight();
++  const auto [it, added] = cache.try_emplace({format, key});
++  if (added) {
++    const base::i18n::IcuBridge::DateTimeFormatter& formatter =
++        base::i18n::IcuBridge::GetInstance().date_time_formatter();
++    it->second =
++        format == 0 ? base::TimeFormatTimeOfDay(time)
++        : format == 1
++            ? formatter.Format(time, base::i18n::datetime_options::E::Long())
++            : formatter.Format(time,
++                               base::i18n::datetime_options::MD::Medium());
++  }
++  return it->second;
++}
++
++// When each window's screen last closed by losing the focus, for Show's
++// 250 ms rule. A key is never dereferenced, and Show takes its window's out.
++// ponytail: a window closed after its screen leaves one entry behind; prune
++// on window close if that ever adds up.
++base::flat_map<const BrowserWindowInterface*, base::TimeTicks>& ClosedAt() {
++  static base::NoDestructor<
++      base::flat_map<const BrowserWindowInterface*, base::TimeTicks>>
++      closed_at;
++  return *closed_at;
++}
++
+ // Where `range` starts, from a now taken at each call: RemoveSince() of it
+ // takes the range. base::Time() for All time.
+ base::Time ClearSince(const ClearRange& range) {
+@@ -246,24 +346,30 @@ void RemoveRecentlyClosedTab(Profile* pr
+   LOG(INFO) << "[workspaces] archive: its Recently Closed entry left too";
+ }
+ 
+-// One entry: its page's icon -- a globe until one is found -- and its name.
+-// PinRow (workspace_pinned_section_view.cc) without folders, drag or buttons.
++// One entry: its page's icon -- a globe until one is found --, its name, and
++// at the right end when it was closed (E17c), after a dot of its workspace's
++// colour while "All workspaces" is on. PinRow
++// (workspace_pinned_section_view.cc) without folders, drag or buttons.
+ class ArchiveRow : public views::LabelButton {
+   METADATA_HEADER(ArchiveRow, views::LabelButton)
+ 
+  public:
++  // `color` is the entry's workspace's (0-8, prefs::EffectiveColors), or -1
++  // for no dot.
+   ArchiveRow(const std::u16string& text,
+              const std::u16string& tooltip,
++             const std::u16string& time,
++             int color,
+              const GURL& url,
+              Profile* profile,
+              views::Button::PressedCallback callback)
+       : views::LabelButton(std::move(callback), text),
++        color_(color),
+         url_(url),
+         profile_(profile) {
+     SetTooltipText(tooltip);
+     SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(0, kRowInset)));
+-    SetMinSize(
+-        gfx::Size(0, GetLayoutConstant(LayoutConstant::kVerticalTabHeight)));
++    SetMinSize(gfx::Size(0, kRowHeight));
+     // The ink drop draws the row on a layer that is not opaque, and subpixel
+     // text on one DCHECKs (the rail's E9a trap; PinRow does the same).
+     SetTextSubpixelRenderingEnabled(false);
+@@ -274,11 +380,56 @@ class ArchiveRow : public views::LabelBu
+                   ui::ImageModel::FromVectorIcon(vector_icons::kGlobeIcon,
+                                                  ui::kColorIcon,
+                                                  gfx::kFaviconSize));
++    // The time, in secondary text over the same ink drop (subpixel off too).
++    // Not part of the row's name -- the hands-free test reads a row by a name
++    // that ENDS with its title -- and never the target of a click or a
++    // tooltip, which stay the row's.
++    time_ = AddChildView(std::make_unique<views::Label>(
++        time, views::style::CONTEXT_LABEL, views::style::STYLE_SECONDARY));
++    time_->SetSubpixelRenderingEnabled(false);
++    time_->SetCanProcessEventsWithinSubtree(false);
++    time_->GetViewAccessibility().SetIsIgnored(true);
+   }
+   ArchiveRow(const ArchiveRow&) = delete;
+   ArchiveRow& operator=(const ArchiveRow&) = delete;
+   ~ArchiveRow() override = default;
+ 
++  // Shows or hides the dot ("All workspaces").
++  void SetDotShown(bool shown) {
++    if (std::exchange(dot_shown_, shown) != shown) {
++      SchedulePaint();
++    }
++  }
++
++  // views::LabelButton:
++  //
++  // The button places the icon and the title; the time goes at the right
++  // end, and the title stops before the dot's place -- kept with the dot
++  // hidden too, so the switch never lays the rows out again.
++  views::ProposedLayout CalculateProposedLayout(
++      const views::SizeBounds& size_bounds) const override {
++    views::ProposedLayout layouts =
++        views::LabelButton::CalculateProposedLayout(size_bounds);
++    if (!size_bounds.is_fully_bounded()) {
++      return layouts;
++    }
++    const gfx::Rect contents = GetContentsBounds();
++    const int time_width =
++        std::min(time_->GetPreferredSize().width(), contents.width() / 2);
++    const gfx::Rect time_bounds(contents.right() - time_width, contents.y(),
++                                time_width, contents.height());
++    const int title_end = time_bounds.x() - kDotGap - kDotSize - kDotGap;
++    for (views::ChildLayout& child : layouts.child_layouts) {
++      if (child.child_view.get() == label()) {
++        child.bounds.set_width(std::clamp(title_end - child.bounds.x(), 0,
++                                          child.bounds.width()));
++      }
++    }
++    layouts.child_layouts.emplace_back(time_.get(), /*visible=*/true,
++                                       time_bounds, views::SizeBounds());
++    return layouts;
++  }
++
+  protected:
+   // views::Button:
+   //
+@@ -287,6 +438,19 @@ class ArchiveRow : public views::LabelBu
+   // scrolled to are drawn -- the pinned section's "only a drawn row asks".
+   void PaintButtonContents(gfx::Canvas* canvas) override {
+     views::LabelButton::PaintButtonContents(canvas);
++    // The dot, in the colour the bar draws the workspace in, resolved here
++    // (rows are built off the widget, with no ColorProvider). Always as for
++    // an active frame: the screen closes when it loses the focus.
++    if (dot_shown_ && color_ >= 0) {
++      const int x = GetMirroredXWithWidthInView(
++          time_->x() - kDotGap - kDotSize, kDotSize);
++      cc::PaintFlags flags;
++      flags.setAntiAlias(true);
++      flags.setColor(WorkspaceRailView::WorkspaceColor(
++          *GetColorProvider(), color_, /*active_frame=*/true));
++      canvas->DrawCircle(gfx::PointF(x + kDotSize / 2.f, height() / 2.f),
++                         kDotSize / 2.f, flags);
++    }
+     if (std::exchange(favicon_asked_, true)) {
+       return;
+     }
+@@ -322,6 +486,9 @@ class ArchiveRow : public views::LabelBu
+             bitmap, static_cast<float>(bitmap.width()) / gfx::kFaviconSize)));
+   }
+ 
++  const int color_;
++  bool dot_shown_ = false;
++  raw_ptr<views::Label> time_ = nullptr;
+   const GURL url_;
+   const raw_ptr<Profile> profile_;
+   bool favicon_asked_ = false;
+@@ -333,9 +500,62 @@ END_METADATA
+ 
+ }  // namespace
+ 
++// One half of the switch (E17c): said as a radio button, checked while its
++// half is the one shown, then filled with the selected row's colour (design 5
++// "E17 spec": the tab background). Outside the anonymous namespace only so
++// the header can name it.
++class WorkspaceArchiveScopeButton : public views::LabelButton {
++  METADATA_HEADER(WorkspaceArchiveScopeButton, views::LabelButton)
++
++ public:
++  WorkspaceArchiveScopeButton(PressedCallback callback,
++                              const std::u16string& text)
++      : views::LabelButton(std::move(callback), text) {
++    GetViewAccessibility().SetRole(ax::mojom::Role::kRadioButton);
++    SetHorizontalAlignment(gfx::ALIGN_CENTER);
++    // A zero width basis, so the layout's equal flex makes the two halves
++    // equally wide whatever their words.
++    SetPreferredSize(gfx::Size(0, kSwitchHeight));
++    // Its text sits on a fill the label does not know of.
++    SetTextSubpixelRenderingEnabled(false);
++    UpdateAccessibleCheckedState();
++  }
++  WorkspaceArchiveScopeButton(const WorkspaceArchiveScopeButton&) = delete;
++  WorkspaceArchiveScopeButton& operator=(const WorkspaceArchiveScopeButton&) =
++      delete;
++  ~WorkspaceArchiveScopeButton() override = default;
++
++  void SetSelected(bool selected) {
++    selected_ = selected;
++    // A colour id, resolved at paint time.
++    SetBackground(selected ? views::CreateRoundedRectBackground(
++                                 kColorTabBackgroundActiveFrameActive,
++                                 kSwitchRadius - kSwitchInset)
++                           : nullptr);
++    UpdateAccessibleCheckedState();
++  }
++
++ protected:
++  // views::Button:
++  //
++  // The checked state is the selection's. Button's own would set it from the
++  // pressed state, and clear it on every hover (WorkspaceEditChoice, E17a).
++  void UpdateAccessibleCheckedState() override {
++    GetViewAccessibility().SetCheckedState(
++        selected_ ? ax::mojom::CheckedState::kTrue
++                  : ax::mojom::CheckedState::kFalse);
++  }
++
++ private:
++  bool selected_ = false;
++};
++
++BEGIN_METADATA(WorkspaceArchiveScopeButton)
++END_METADATA
++
+ struct WorkspaceArchiveView::Row {
+-  raw_ptr<views::LabelButton> view;
+-  // The day header it is drawn under; the rows of one header are adjacent.
++  raw_ptr<ArchiveRow> view;
++  // The heading it is drawn under; the rows of one heading are adjacent.
+   raw_ptr<views::View> header;
+   std::string id;
+   // The workspace it shows in: ResolveTabGuid, so a deleted workspace's
+@@ -343,10 +563,18 @@ struct WorkspaceArchiveView::Row {
+   std::string guid;
+   // SearchTextFor(), made once here rather than once per keystroke.
+   std::u16string search_text;
+-  // Its text, and what "All workspaces" puts before it: the workspace's rail
+-  // mark and two spaces.
++  // Its text, and what "All workspaces" puts before it in its accessible
++  // name (no longer on screen, E17c: the dot is): the workspace's rail mark
++  // and two spaces.
+   std::u16string text;
+   std::u16string prefix;
++
++  // Its look for the switch: the dot on screen, the mark in the name only --
++  // the hands-free test reads the mark from the name, as before (E17c).
++  void ApplyScope(bool all) const {
++    view->GetViewAccessibility().SetName(all ? prefix + text : text);
++    view->SetDotShown(all);
++  }
+ };
+ 
+ // static
+@@ -358,13 +586,26 @@ void WorkspaceArchiveView::Show(BrowserW
+   if (!service || !service->IsEnabled()) {
+     return;
+   }
++  // A press on the Archive button while the screen is open takes the focus,
++  // so the screen has closed by the time the click lands here (E17a review
++  // #6): that click only closes it.
++  if (const auto closed = ClosedAt().find(browser);
++      closed != ClosedAt().end()) {
++    const bool just_closed =
++        base::TimeTicks::Now() - closed->second < kToggleWindow;
++    ClosedAt().erase(closed);
++    if (just_closed) {
++      LOG(INFO) << "[workspaces] archive screen: toggled closed";
++      return;
++    }
++  }
+   Profile* const profile = browser->GetProfile();
+   auto view = base::WrapUnique(new WorkspaceArchiveView(
+       browser, workspaces::archive::ArchiveStore::GetOrCreate(
+                    profile, profile->GetPath())));
+   WorkspaceArchiveView* const screen = view.get();
+ 
+-  // No buttons: the rows, Clear… and the close button are the screen's.
++  // No buttons: the rows, Clear... and the close button are the screen's.
+   // The search box takes the focus, so typing filters at once.
+   std::unique_ptr<ui::DialogModel> model =
+       ui::DialogModel::Builder()
+@@ -378,14 +619,28 @@ void WorkspaceArchiveView::Show(BrowserW
+           .SetInitiallyFocusedField(kArchiveSearchFieldId)
+           .Build();
+ 
+-  // Anchored to the rail, like its other bubbles.
++  // Rising above the bar's Archive button, as the bar's other bubbles do
++  // (E17a's editor), with the spec's corners (E17c).
+   auto bubble = std::make_unique<views::BubbleDialogModelHost>(
+-      std::move(model), anchor, views::BubbleBorder::TOP_LEFT);
++      std::move(model), anchor, views::BubbleBorder::BOTTOM_LEFT);
+   bubble->set_fixed_width(kWidth);
++  bubble->set_corner_radius(kBubbleRadius);
+   views::Widget* const widget =
+       views::BubbleDialogDelegate::CreateBubbleDeprecated(
+           std::move(bubble),
+           views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET);
++  // Show's 250 ms rule counts only a close by losing the focus, the one a
++  // press on the Archive button makes: after Escape, the x or a restore, a
++  // quick press opens the screen (the hands-free scripts reopen at once). Run
++  // as the widget is destroyed, while it can still say why it closed.
++  widget->widget_delegate()->RegisterWindowClosingCallback(base::BindOnce(
++      [](const BrowserWindowInterface* browser, const views::Widget* widget) {
++        if (widget->closed_reason() ==
++            views::Widget::ClosedReason::kLostFocus) {
++          ClosedAt()[browser] = base::TimeTicks::Now();
++        }
++      },
++      base::Unretained(browser), base::Unretained(widget)));
+   widget->Show();
+   // Laid out inside the timing, so the number is what the user waited for.
+   widget->LayoutRootViewIfNecessary();
+@@ -418,29 +673,67 @@ WorkspaceArchiveView::WorkspaceArchiveVi
+       l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_SEARCH));
+   search_->set_controller(this);
+   top_layout->SetFlexForView(search_, 1);
+-  // Off at every open (the owner, E14d.2). Only each row's text changes on a
+-  // toggle, never the rows.
+-  all_workspaces_ = top->AddChildView(std::make_unique<views::Checkbox>(
+-      l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_ALL_WORKSPACES),
+-      base::BindRepeating(
+-          [](WorkspaceArchiveView* self) {
+-            const base::ElapsedTimer timer;
+-            const bool all = self->all_workspaces_->GetChecked();
+-            for (const Row& row : self->rows_) {
+-              row.view->SetText(all ? row.prefix + row.text : row.text);
+-            }
+-            const int shown = self->ApplyFilter();
+-            // Laid out inside the timing, as a keystroke is: on, every entry
+-            // of every workspace can show at once (E14d.2 review).
+-            if (views::Widget* const widget = self->GetWidget()) {
+-              widget->LayoutRootViewIfNecessary();
+-            }
+-            LOG(INFO) << "[workspaces] archive screen: all workspaces "
+-                      << (all ? "on" : "off") << " -> " << shown
+-                      << " shown in " << timer.Elapsed().InMilliseconds()
+-                      << " ms";
+-          },
+-          base::Unretained(this))));
++  // The search icon inside the field's own border (E17c), so the field keeps
++  // Chromium's outline, hover and focus ring: the text starts after the icon,
++  // and the field is kSearchHeight tall, which fixes the icon's place. A zero
++  // width basis: the flex above gives it the row.
++  // ponytail: placed for left-to-right text; mirror it if Helium ships RTL.
++  search_->SetExtraInsets(gfx::Insets::TLBR(0, kIconSize + kSpacing, 0, 0));
++  search_->SetPreferredSize(gfx::Size(0, kSearchHeight));
++  auto* const search_icon =
++      search_->AddChildView(std::make_unique<views::ImageView>(
++          ui::ImageModel::FromVectorIcon(vector_icons::kSearchIcon,
++                                         ui::kColorIcon, kIconSize)));
++  search_icon->SetBounds(
++      views::LayoutProvider::Get()->GetDistanceMetric(
++          views::DISTANCE_TEXTFIELD_HORIZONTAL_TEXT_PADDING),
++      (kSearchHeight - kIconSize) / 2, kIconSize, kIconSize);
++  search_icon->SetCanProcessEventsWithinSubtree(false);
++  search_icon->GetViewAccessibility().SetIsIgnored(true);
++
++  // "Clear...": a "more" icon beside the search box (E17c: the bubble's frame
++  // has no slot for a header button), named and tooltipped "Clear..." so the
++  // scripts' `^Clear` still finds it. Its menu through a MenuButtonController,
++  // as the rail's "+" (E13 review): held pressed while the menu is up, the
++  // click that closes the menu not reopening it, and a menu button to MSAA.
++  auto clear = views::CreateVectorImageButtonWithNativeTheme(
++      views::Button::PressedCallback(), kMoreVertIcon, kIconSize);
++  clear->SetTooltipText(l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_CLEAR));
++  clear->GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_CLEAR));
++  auto clear_menu_controller = std::make_unique<views::MenuButtonController>(
++      clear.get(),
++      base::BindRepeating(&WorkspaceArchiveView::OnClearPressed,
++                          base::Unretained(this)),
++      std::make_unique<views::Button::DefaultButtonControllerDelegate>(
++          clear.get()));
++  clear_menu_controller_ = clear_menu_controller.get();
++  clear->SetButtonController(std::move(clear_menu_controller));
++  clear_ = top->AddChildView(std::move(clear));
++
++  // The switch, "This workspace | All workspaces" (E17c; a check box before):
++  // two halves in one rounded outline. Off at every open (the owner, E14d.2).
++  // A press changes each row's name and dot, never the rows.
++  auto* const scope = AddChildView(std::make_unique<views::View>());
++  scope->SetBorder(
++      views::CreateRoundedRectBorder(1, kSwitchRadius, ui::kColorSeparator));
++  auto* const scope_layout =
++      scope->SetLayoutManager(std::make_unique<views::BoxLayout>(
++          views::BoxLayout::Orientation::kHorizontal,
++          gfx::Insets(kSwitchInset)));
++  this_workspace_button_ =
++      scope->AddChildView(std::make_unique<WorkspaceArchiveScopeButton>(
++          base::BindRepeating(&WorkspaceArchiveView::SetAllWorkspaces,
++                              base::Unretained(this), false),
++          l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_THIS_WORKSPACE)));
++  all_workspaces_button_ =
++      scope->AddChildView(std::make_unique<WorkspaceArchiveScopeButton>(
++          base::BindRepeating(&WorkspaceArchiveView::SetAllWorkspaces,
++                              base::Unretained(this), true),
++          l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_ALL_WORKSPACES)));
++  scope_layout->SetFlexForView(this_workspace_button_, 1);
++  scope_layout->SetFlexForView(all_workspaces_button_, 1);
++  this_workspace_button_->SetSelected(true);
+ 
+   // Without layers: a label over a layer that is not opaque DCHECKs on
+   // subpixel text (the rail's E9a trap), and scrolling repaints at most
+@@ -453,27 +746,9 @@ WorkspaceArchiveView::WorkspaceArchiveVi
+       views::ScrollView::ScrollBarMode::kDisabled);
+   scroll_view_->ClipHeightTo(0, kListMaxHeight);
+ 
+-  // The footer: "Clear…", or in its place the question. Both built now and
+-  // swapped by visibility. A second dialog would take the focus and close
+-  // this bubble, so the confirm is inside it.
+-  auto* const clear_row = AddChildView(std::make_unique<views::View>());
+-  clear_row->SetLayoutManager(std::make_unique<views::BoxLayout>());
+-  // Its menu through a MenuButtonController, as the rail's "+" (E13 review):
+-  // held pressed while the menu is up, the click that closes the menu not
+-  // reopening it, and a menu button to MSAA.
+-  auto clear = std::make_unique<views::MdTextButton>(
+-      views::Button::PressedCallback(),
+-      l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_CLEAR));
+-  auto clear_menu_controller = std::make_unique<views::MenuButtonController>(
+-      clear.get(),
+-      base::BindRepeating(&WorkspaceArchiveView::OnClearPressed,
+-                          base::Unretained(this)),
+-      std::make_unique<views::Button::DefaultButtonControllerDelegate>(
+-          clear.get()));
+-  clear_menu_controller_ = clear_menu_controller.get();
+-  clear->SetButtonController(std::move(clear_menu_controller));
+-  clear_ = clear_row->AddChildView(std::move(clear));
+-
++  // The question a range asks, under the list (E17c: it took the footer's
++  // place before), built now and shown by visibility. A second dialog would
++  // take the focus and close this bubble, so the confirm is inside it.
+   confirm_ = AddChildView(std::make_unique<views::View>());
+   confirm_->SetLayoutManager(std::make_unique<views::BoxLayout>(
+       views::BoxLayout::Orientation::kVertical, gfx::Insets(), kSpacing));
+@@ -549,7 +824,7 @@ void WorkspaceArchiveView::ShowContextMe
+ 
+ bool WorkspaceArchiveView::IsCommandIdEnabled(int command_id) const {
+   // A range with nothing in it is disabled, or it would ask "Delete 0
+-  // archived tabs": E14d.2's disabled Clear… on an empty store, per range
++  // archived tabs": E14d.2's disabled Clear... on an empty store, per range
+   // (E14d.3 review). Counted as the menu builds its items (a range emptied
+   // while it is open asks nothing, OnClearRangeChosen). The row menu's
+   // commands are always on.
+@@ -605,14 +880,21 @@ void WorkspaceArchiveView::Rebuild() {
+   }
+   const int offset_y = scroll_view_->GetVisibleRect().y();
+ 
+-  // Each workspace's rail mark and name, by guid.
+-  std::map<std::string, std::pair<std::u16string, std::u16string>> marks;
++  // Each workspace's rail mark, name and colour (the bar's, E17a), by guid.
++  struct Mark {
++    std::u16string text;
++    std::u16string name;
++    int color;
++  };
++  std::map<std::string, Mark> marks;
+   const std::vector<workspaces::prefs::WorkspaceEntry> workspace_list =
+       service->GetWorkspaces();
++  const std::vector<int> colors =
++      workspaces::prefs::EffectiveColors(workspace_list);
+   for (size_t i = 0; i < workspace_list.size(); ++i) {
+     marks[workspace_list[i].guid] = {
+         WorkspaceRailView::ButtonText(workspace_list[i], i),
+-        WorkspaceRailView::DisplayName(workspace_list[i])};
++        WorkspaceRailView::DisplayName(workspace_list[i]), colors[i]};
+   }
+ 
+   // Newest first. The store keeps them in the order they were kept, which a
+@@ -634,23 +916,30 @@ void WorkspaceArchiveView::Rebuild() {
+   auto contents = std::make_unique<views::View>();
+   contents->SetLayoutManager(std::make_unique<views::BoxLayout>(
+       views::BoxLayout::Orientation::kVertical));
+-  // The empty-list line is the list's first child, so showing it never changes
+-  // the list's height (ApplyFilter's grow-only rule).
++  // The empty-list lines are the list's first children, so showing them never
++  // changes the list's height (ApplyFilter's grow-only rule). The second,
++  // under "Nothing archived yet" only, says how long a tab stays (kKeepFor).
+   empty_ = contents->AddChildView(std::make_unique<views::Label>(
+-      std::u16string(), views::style::CONTEXT_LABEL,
+-      views::style::STYLE_SECONDARY));
++      std::u16string(), views::style::CONTEXT_LABEL));
+   empty_->SetBorder(
+       views::CreateEmptyBorder(gfx::Insets::VH(kSpacing, kRowInset)));
++  empty_hint_ = contents->AddChildView(std::make_unique<views::Label>(
++      l10n_util::GetStringUTF16(IDS_HELIUM_ARCHIVE_KEEP_60_DAYS),
++      views::style::CONTEXT_LABEL, views::style::STYLE_SECONDARY));
++  empty_hint_->SetMultiLine(true);
++  empty_hint_->SetBorder(views::CreateEmptyBorder(
++      gfx::Insets::TLBR(0, kRowInset, kSpacing, kRowInset)));
+   const base::Time now = base::Time::Now();
+-  const bool all = all_workspaces_->GetChecked();
+   Profile* const profile = browser_->GetProfile();
+   views::View* header = nullptr;
+-  int header_days = 0;
++  ArchiveBucket header_bucket{};
++  RowTimeCache times;
+   for (const ArchiveEntry* const entry : sorted) {
+-    const int days = workspaces::archive::DaysAgo(entry->archived_at, now);
+-    if (!header || days != header_days) {
+-      header = contents->AddChildView(MakeDayHeader(days, entry->archived_at));
+-      header_days = days;
++    const ArchiveBucket bucket =
++        workspaces::archive::BucketFor(entry->archived_at, now);
++    if (!header || bucket != header_bucket) {
++      header = contents->AddChildView(MakeHeading(bucket, entry->archived_at));
++      header_bucket = bucket;
+     }
+     Row& row = rows_.emplace_back();
+     row.header = header;
+@@ -661,19 +950,23 @@ void WorkspaceArchiveView::Rebuild() {
+     row.text = EntryText(*entry);
+     const auto mark = marks.find(row.guid);
+     std::u16string workspace_name = base::UTF8ToUTF16(row.guid);
++    int color = -1;
+     if (mark != marks.end()) {
+-      row.prefix = mark->second.first + u"  ";
+-      workspace_name = mark->second.second;
++      row.prefix = mark->second.text + u"  ";
++      workspace_name = mark->second.name;
++      color = mark->second.color;
+     }
+     auto view = std::make_unique<ArchiveRow>(
+-        all ? row.prefix + row.text : row.text,
++        row.text,
+         base::StrCat({row.text, u"\n", base::UTF8ToUTF16(entry->url), u"\n",
+                       workspace_name}),
++        RowTime(entry->archived_at, bucket.kind, times), color,
+         GURL(entry->url), profile,
+         base::BindRepeating(&WorkspaceArchiveView::RestoreEntry,
+                             base::Unretained(this), entry->id));
+     view->set_context_menu_controller(this);
+     row.view = contents->AddChildView(std::move(view));
++    row.ApplyScope(all_workspaces_);
+   }
+   scroll_view_->SetContents(std::move(contents));
+   ApplyFilter();
+@@ -732,7 +1025,7 @@ int WorkspaceArchiveView::ApplyFilter()
+   const std::string_view active = service
+                                       ? std::string_view(service->active_guid())
+                                       : workspaces::kDefaultWorkspaceGuid;
+-  const bool all = all_workspaces_->GetChecked();
++  const bool all = all_workspaces_;
+   const std::u16string_view query = search_->GetText();
+   int shown = 0;
+   int in_scope = 0;
+@@ -762,11 +1055,35 @@ int WorkspaceArchiveView::ApplyFilter()
+     header->SetVisible(header_shown);
+   }
+   empty_->SetText(l10n_util::GetStringUTF16(
+-      in_scope ? IDS_HELIUM_ARCHIVE_NO_MATCHES : IDS_HELIUM_ARCHIVE_EMPTY));
++      in_scope ? IDS_HELIUM_ARCHIVE_NO_MATCHES
++               : IDS_HELIUM_ARCHIVE_NOTHING_YET));
+   empty_->SetVisible(shown == 0);
++  empty_hint_->SetVisible(shown == 0 && in_scope == 0);
+   return shown;
+ }
+ 
++void WorkspaceArchiveView::SetAllWorkspaces(bool all) {
++  if (all == all_workspaces_) {
++    return;
++  }
++  const base::ElapsedTimer timer;
++  all_workspaces_ = all;
++  this_workspace_button_->SetSelected(!all);
++  all_workspaces_button_->SetSelected(all);
++  for (const Row& row : rows_) {
++    row.ApplyScope(all);
++  }
++  const int shown = ApplyFilter();
++  // Laid out inside the timing, as a keystroke is: on, every entry of every
++  // workspace can show at once (E14d.2 review).
++  if (views::Widget* const widget = GetWidget()) {
++    widget->LayoutRootViewIfNecessary();
++  }
++  LOG(INFO) << "[workspaces] archive screen: all workspaces "
++            << (all ? "on" : "off") << " -> " << shown << " shown in "
++            << timer.Elapsed().InMilliseconds() << " ms";
++}
++
+ void WorkspaceArchiveView::OnArchiveChanged() {
+   // Posted, never run here: Add() calls this from inside TabStripModel's
+   // close (design 2.2). One rebuild however many changes come first.
+@@ -859,6 +1176,8 @@ void WorkspaceArchiveView::OnClearPresse
+   // The row menu's model, runner and delegate; ExecuteCommand tells the two
+   // menus apart by command id.
+   context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  // Under a title (E17c): the icon alone does not say what the ranges do.
++  context_menu_model_->AddTitleWithStringId(IDS_HELIUM_ARCHIVE_CLEAR);
+   for (size_t i = 0; i < std::size(kClearRanges); ++i) {
+     context_menu_model_->AddItemWithStringId(
+         kCommandClearFirst + static_cast<int>(i), kClearRanges[i].label);
+@@ -866,10 +1185,11 @@ void WorkspaceArchiveView::OnClearPresse
+   context_menu_runner_ = std::make_unique<views::MenuRunner>(
+       context_menu_model_.get(), views::MenuRunner::HAS_MNEMONICS);
+   // The event's source type, so a keyboard press opens the menu with its
+-  // first item highlighted (the rail's "+").
++  // first range highlighted (the rail's "+"). Right-aligned under the button,
++  // which sits at the screen's right edge.
+   context_menu_runner_->RunMenuAt(
+       GetWidget(), clear_menu_controller_, clear_->GetBoundsInScreen(),
+-      views::MenuAnchorPosition::kTopLeft,
++      views::MenuAnchorPosition::kTopRight,
+       ui::GetMenuSourceTypeForEvent(event));
+ }
+ 
+@@ -885,7 +1205,7 @@ void WorkspaceArchiveView::OnClearRangeC
+   clear_range_ = range;
+   confirm_label_->SetText(l10n_util::GetPluralStringFUTF16(
+       kClearRanges[range].question, static_cast<int>(count)));
+-  clear_->parent()->SetVisible(false);
++  // Under the list; "Clear..." stays, and another range asks in its place.
+   confirm_->SetVisible(true);
+   // Cancel, not Delete, under the keyboard: Enter must not clear.
+   cancel_->RequestFocus();
+@@ -904,14 +1224,12 @@ void WorkspaceArchiveView::OnClearConfir
+       store_->RemoveSince(ClearSince(kClearRanges[clear_range_]));
+   LOG(INFO) << "[workspaces] archive: cleared " << cleared << " entr(ies)";
+   confirm_->SetVisible(false);
+-  clear_->parent()->SetVisible(true);
+   search_->RequestFocus();
+ }
+ 
+ void WorkspaceArchiveView::OnClearCancelled() {
+   LOG(INFO) << "[workspaces] archive screen: clear cancelled";
+   confirm_->SetVisible(false);
+-  clear_->parent()->SetVisible(true);
+   clear_->RequestFocus();
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
+@@ -19,9 +19,10 @@
+ #include "ui/views/view.h"
+ 
+ class BrowserWindowInterface;
++class WorkspaceArchiveScopeButton;
+ 
+ namespace views {
+-class Checkbox;
++class Button;
+ class Label;
+ class MdTextButton;
+ class MenuButtonController;
+@@ -38,31 +39,38 @@ namespace ui {
+ class Event;
+ }  // namespace ui
+ 
+-// The Archive screen (E14d.2, design 5 "E14d spec"): the tabs this profile
+-// closed, newest first, under a header per day (Today, Yesterday, then dates),
+-// each row the page's icon and its name. Opened from "Archive" on the rail's
+-// "+" menu, as a bubble on the rail (the owner's choice, 2026-09-28), like
+-// the rail's other three.
+-//
+-//   [ Search archive              ]  [ ] All workspaces
++// The Archive screen (E14d.2, design 5 "E14d spec"; restyled in E17c, design 5
++// "E17 spec" 4): the tabs this profile closed, newest first, under a heading
++// per period, each row the page's icon, its name and, at the right, when it
++// was closed. Opened from the bottom bar's Archive button (E17a), as a bubble
++// rising above it.
++//
++//   Archive                                           x   (the bubble's own)
++//   [ (search) Search archive              ]  (more)
++//   [   This workspace   |   All workspaces   ]
+ //   Today
+-//     (icon) A page
+-//   Yesterday
+-//     (icon) Another page
+-//   ...
+-//   [ Clear… ]  -> Last hour / Last 24 hours / Last 7 days / All time
+-//
++//     (icon) A page                             2:14 PM
++//   Earlier this week
++//     (icon) Another page                        Monday
++//   September 2026
++//     (icon) An older page                       Sep 12
++//
++// - Headings (workspaces::archive::BucketFor, weeks from Sunday): Today,
++//   Yesterday, Earlier this week, Last week, then one per month. The time on
++//   a row is the time of day today and yesterday, the weekday earlier this
++//   week, else the month and day.
+ // - Shows the entries of this window's workspace (ResolveTabGuid: a deleted
+-//   workspace's entries are Home's, design 2.4); "All workspaces", off at every
+-//   open, shows every entry, each row then led by its workspace's rail mark
+-//   (WorkspaceRailView::ButtonText) and its tooltip naming the workspace.
++//   workspace's entries are Home's, design 2.4); the switch's "All
++//   workspaces", off at every open, shows every entry, each row then with a
++//   dot of its workspace's colour before its time, and its tooltip naming the
++//   workspace.
+ // - The search box filters as it is typed: MatchesQuery() over SearchTextFor()
+-//   (workspace_archive.h). Rows and headers are hidden, never rebuilt, so a
++//   (workspace_archive.h). Rows and headings are hidden, never rebuilt, so a
+ //   keystroke costs one layout.
+ // - The list never gets shorter while the screen is open (ApplyFilter): the
+-//   bubble sits above the rail with its bottom edge fixed, so a shrinking list
+-//   would move the search box under the typing. Its empty-list line is inside
+-//   the list for the same reason.
++//   bubble sits above the bar with its bottom edge fixed, so a shrinking list
++//   would move the search box under the typing. Its empty-list lines are
++//   inside the list for the same reason.
+ // - A click, Enter or Space on a row, or Restore on its menu, restores the
+ //   page and closes the screen: the window switches to the entry's workspace
+ //   (Home for a deleted one, WorkspaceService::EnterWorkspaceForInsert), the
+@@ -74,17 +82,22 @@ class Event;
+ //   split's tab inside a window or group), so Ctrl+Shift+T does not open the
+ //   page twice, not even after a restart.
+ // - Delete on a row's menu removes that entry; the screen stays open.
+-// - "Clear…" is a menu button (the rail's "+" pattern) of four ranges, Chrome's
+-//   Clear browsing data ones (E14d.3: the owner put them here, not on the
+-//   settings page). A range asks first, inside the screen (a second dialog
+-//   would take the focus and close this bubble): "Delete N archived tabs from
+-//   the last hour, from every workspace?" (24 hours, 7 days; All time keeps
+-//   E14d.2's "Delete N archived tabs, from every workspace?") with Delete /
+-//   Cancel, said aloud as it appears, its N kept current while it waits. It
+-//   clears EVERY workspace's entries archived at or after now minus the range
++// - The "more" button beside the search box (named "Clear...", E17c; a
++//   footer button before) is a menu button (the rail's "+" pattern): under a
++//   "Clear..." title, four ranges, Chrome's Clear browsing data ones (E14d.3:
++//   the owner put them here, not on the settings page). A range asks first,
++//   inside the screen, under the list (a second dialog would take the focus
++//   and close this bubble): "Delete N archived tabs from the last hour, from
++//   every workspace?" (24 hours, 7 days; All time keeps E14d.2's "Delete N
++//   archived tabs, from every workspace?") with Delete / Cancel, said aloud
++//   as it appears, its N kept current while it waits. It clears EVERY
++//   workspace's entries archived at or after now minus the range
+ //   (ArchiveStore::RemoveSince, base::Time() for All time, now taken again at
+ //   Delete), whatever the switch shows. A range with nothing in it is
+ //   disabled on the menu.
++// - A press on the Archive button within 250 ms of this window's screen
++//   closing does not open it again: the press itself closed it, by taking
++//   the focus, so a second click closes the screen (E17a review #6).
+ //
+ // Every row of the store is built once, off the widget, and attached with one
+ // SetContents (E15b: adding children under a layered ancestor walks the whole
+@@ -96,6 +109,7 @@ class Event;
+ // Logs, never an address, a title or the search text (47's rule: a log is
+ // pasted when asking for help):
+ //   "[workspaces] archive screen: opened, N entr(ies), M shown, in T ms"
++//   "[workspaces] archive screen: toggled closed" (the 250 ms rule above)
+ //   "[workspaces] archive screen: filter of L char(s) -> M shown in T ms"
+ //   "[workspaces] archive screen: all workspaces on|off -> M shown in T ms"
+ //   "[workspaces] archive screen: rebuilt after a change, N entr(ies) in T ms"
+@@ -112,18 +126,26 @@ class Event;
+ //   "[workspaces] archive: cleared N entr(ies)"
+ //
+ // Accessible names the hands-free test presses by (MSAA): the bubble's title
+-// "Archive", the text field "Search archive", the check box "All workspaces",
+-// each row its shown text, the headers "Today" / "Yesterday" / a date, the
+-// menu button "Clear…" (U+2026) and its items "Last hour", "Last 24 hours",
+-// "Last 7 days", "All time", the buttons "Delete" and "Cancel", and the row
+-// menu's "Restore" and "Delete". Empty lists say "No archived tabs" or "No
+-// matches".
++// "Archive", the text field "Search archive", the switch's two radio buttons
++// "This workspace" and "All workspaces", each row its title -- with "All
++// workspaces" on, its workspace's rail mark (WorkspaceRailView::ButtonText),
++// two spaces and the title, though the row SHOWS only the title and the dot
++// (E17c: the scripts read the mark from the name) -- the headings "Today",
++// "Yesterday", "Earlier this week", "Last week" or a month, the menu button
++// "Clear..." (its dots one U+2026) and its items, after a title row of the
++// same name, "Last hour", "Last 24 hours", "Last 7 days", "All time", the
++// buttons "Delete" and "Cancel", and the row menu's
++// "Restore" and "Delete". A row's time is not part of its name. Empty lists
++// say "Nothing archived yet" (and "Tabs you close stay here for 60 days.")
++// or "No matches".
+ //
+ // A plain view inside the rail's kind of bubble (a ui::DialogModel in a
+ // views::BubbleDialogModelHost, its one custom field), not a
+ // BubbleDialogDelegateView: at M153 that class's constructors are private to
+ // a friend list upstream marks "DO NOT ADD", so a subclass of ours does not
+-// compile without a new upstream file (E14d.2).
++// compile without a new upstream file (E14d.2). So the frame keeps its own
++// title and close button, and the menu button sits beside the search box
++// (E17c).
+ class WorkspaceArchiveView : public views::View,
+                              public views::TextfieldController,
+                              public views::ContextMenuController,
+@@ -132,7 +154,9 @@ class WorkspaceArchiveView : public view
+ 
+  public:
+   // Opens the screen for `browser`'s profile and window, anchored to `anchor`
+-  // (the rail). Does nothing while Workspaces is off in `browser`.
++  // (the bar's Archive button). Does nothing while Workspaces is off in
++  // `browser`, or within 250 ms of this window's screen closing (the class
++  // comment).
+   static void Show(BrowserWindowInterface* browser, views::View* anchor);
+ 
+   WorkspaceArchiveView(const WorkspaceArchiveView&) = delete;
+@@ -160,15 +184,19 @@ class WorkspaceArchiveView : public view
+   WorkspaceArchiveView(BrowserWindowInterface* browser,
+                        workspaces::archive::ArchiveStore* store);
+ 
+-  // Builds a row per entry of the store, newest first, with its day headers,
++  // Builds a row per entry of the store, newest first, with its headings,
+   // off the widget, and swaps it in with one SetContents; then ApplyFilter().
+   void Rebuild();
+ 
+-  // Shows the rows the switch and the search box let through, and the headers
+-  // with a row shown under them, or the empty-list line; the list's height
+-  // only grows. Answers how many rows are shown.
++  // Shows the rows the switch and the search box let through, and the
++  // headings with a row shown under them, or the empty-list lines; the list's
++  // height only grows. Answers how many rows are shown.
+   int ApplyFilter();
+ 
++  // The switch: `all` shows every workspace's entries. Pressing the half
++  // already shown does nothing.
++  void SetAllWorkspaces(bool all);
++
+   // The store's changed callback: posts one Rebuild(), coalesced.
+   void OnArchiveChanged();
+ 
+@@ -178,8 +206,8 @@ class WorkspaceArchiveView : public view
+   // Removes the entry `id`; the store's callback redraws.
+   void DeleteEntry(const std::string& id);
+ 
+-  // The footer's two states: "Clear…" with its menu of ranges, and the
+-  // confirm of the range chosen (an index into the .cc's kClearRanges).
++  // "Clear..." and its menu of ranges, and the confirm of the range chosen
++  // (an index into the .cc's kClearRanges).
+   void OnClearPressed(const ui::Event& event);
+   void OnClearRangeChosen(size_t range);
+   void OnClearConfirmed();
+@@ -189,22 +217,28 @@ class WorkspaceArchiveView : public view
+   const raw_ptr<workspaces::archive::ArchiveStore> store_;
+ 
+   raw_ptr<views::Textfield> search_ = nullptr;
+-  raw_ptr<views::Checkbox> all_workspaces_ = nullptr;
++  // Whether the switch shows every workspace's entries: off at every open
++  // (the owner, E14d.2), never stored.
++  bool all_workspaces_ = false;
++  raw_ptr<WorkspaceArchiveScopeButton> this_workspace_button_ = nullptr;
++  raw_ptr<WorkspaceArchiveScopeButton> all_workspaces_button_ = nullptr;
+   raw_ptr<views::ScrollView> scroll_view_ = nullptr;
+-  // "No archived tabs" / "No matches": the first child of the list's
++  // "Nothing archived yet" / "No matches", and under the first "Tabs you
++  // close stay here for 60 days.": the first two children of the list's
+   // contents, remade and re-pointed by every Rebuild() before the old
+   // contents go.
+   raw_ptr<views::Label> empty_ = nullptr;
++  raw_ptr<views::Label> empty_hint_ = nullptr;
+   // The tallest the list has been laid out while the screen is open: its
+   // floor, so it only grows (ApplyFilter).
+   int list_height_ = 0;
+-  // The footer's two children, one shown at a time: "Clear…", and its
+-  // confirm (the question, Delete, Cancel).
+-  raw_ptr<views::MdTextButton> clear_ = nullptr;
++  // The "more" button named "Clear..." (E17c: beside the search box).
++  raw_ptr<views::Button> clear_ = nullptr;
+   // Owned by `clear_`: holds it pressed while its menu is up (the rail's "+").
+   raw_ptr<views::MenuButtonController> clear_menu_controller_ = nullptr;
+   // The range the confirm asks about, while it shows.
+   size_t clear_range_ = 0;
++  // The confirm (the question, Delete, Cancel), under the list while it asks.
+   raw_ptr<views::View> confirm_ = nullptr;
+   raw_ptr<views::Label> confirm_label_ = nullptr;
+   raw_ptr<views::MdTextButton> cancel_ = nullptr;
+@@ -215,7 +249,7 @@ class WorkspaceArchiveView : public view
+ 
+   // The entry id the open row menu belongs to (the rail's pattern: the menu
+   // runs, ExecuteCommand arrives later with a command id only). The model and
+-  // runner below serve the Clear… menu too; its command ids are its own.
++  // runner below serve the Clear... menu too; its command ids are its own.
+   std::string context_menu_id_;
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
+   std::unique_ptr<views::MenuRunner> context_menu_runner_;

@@ -1,0 +1,1265 @@
+--- a/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.cc
+@@ -36,15 +36,15 @@ namespace {
+ constexpr int kFirstCommandId =
+     ExistingBaseSubMenuModel::kMinExistingWorkspaceCommandId;
+ 
+-// The name to show for a workspace: its title, or a localised "Home" for the
+-// default workspace, or the guid for anything else still unnamed.
++}  // namespace
++
++// static
+ //
+-// DUPLICATED, deliberately, from workspace_rail_view.cc. Sharing it would mean
+-// either a new dependency edge from the lean :workspaces target onto //ui/base
+-// and the grit headers, or a target of its own for eight lines. Two call sites
+-// is the wrong number to pay either price for -- if a third appears, move it
+-// onto WorkspaceService and delete both copies.
+-std::u16string DisplayNameForWorkspace(
++// DUPLICATED, deliberately, in workspace_rail_view.cc. Sharing it across the
++// two would mean a new dependency edge from the lean :workspaces target onto
++// //ui/base and the grit headers, or a target of its own for eight lines.
++// Inside this target it is shared: the tab menu (C5) calls this one.
++std::u16string ExistingWorkspaceSubMenuModel::DisplayName(
+     const workspaces::prefs::WorkspaceEntry& entry) {
+   if (!entry.title.empty()) {
+     return base::UTF8ToUTF16(entry.title);
+@@ -55,8 +55,6 @@ std::u16string DisplayNameForWorkspace(
+   return base::UTF8ToUTF16(entry.guid);
+ }
+ 
+-}  // namespace
+-
+ ExistingWorkspaceSubMenuModel::ExistingWorkspaceSubMenuModel(
+     BrowserWindowInterface* browser,
+     TabStripModel* tab_strip,
+@@ -74,7 +72,7 @@ ExistingWorkspaceSubMenuModel::ExistingW
+   for (const workspaces::prefs::WorkspaceEntry& entry :
+        service->GetWorkspaces()) {
+     AddItem(kFirstCommandId + static_cast<int>(guids_.size()),
+-            DisplayNameForWorkspace(entry));
++            DisplayName(entry));
+     guids_.push_back(entry.guid);
+   }
+ }
+--- a/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h
++++ b/chrome/browser/ui/tabs/existing_workspace_sub_menu_model.h
+@@ -14,6 +14,10 @@
+ class BrowserWindowInterface;
+ class TabStripModel;
+ 
++namespace workspaces::prefs {
++struct WorkspaceEntry;
++}  // namespace workspaces::prefs
++
+ // "Move tab to workspace" on the tab context menu: one item per workspace
+ // (design 5, and the owner request recorded there on 2026-09-10).
+ //
+@@ -49,6 +53,12 @@ class ExistingWorkspaceSubMenuModel : pu
+   // workspace the submenu would hold a single, always-disabled item.
+   static bool ShouldShowSubmenu(BrowserWindowInterface* browser);
+ 
++  // The name to show for a workspace: its title, or a localised "Home" for the
++  // default workspace, or the guid for anything else still unnamed. Also the
++  // tab menu's site-rule item (C5), in this same target.
++  static std::u16string DisplayName(
++      const workspaces::prefs::WorkspaceEntry& entry);
++
+   // ui::SimpleMenuModel::Delegate:
+   void ExecuteCommand(int command_id, int event_flags) override;
+   bool IsCommandIdEnabled(int command_id) const override;
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -4,8 +4,10 @@
+ 
+ #include "chrome/browser/ui/tabs/tab_menu_model.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <optional>
++#include <string>
+ 
+ #include "base/command_line.h"
+ #include "base/containers/flat_set.h"
+@@ -13,6 +15,7 @@
+ #include "base/functional/bind.h"
+ #include "base/i18n/rtl.h"
+ #include "base/metrics/user_metrics.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
+@@ -460,6 +463,35 @@ void TabMenuModel::Build(int index) {
+                            snooze_submenu_.get());
+   }
+ 
++  // C5: "Always open <site> in <workspace>", or "Stop always opening ..."
++  // when the site already opens there -- beside the move, as both say where
++  // a page belongs. A plain item whose words flip: the tab menu keeps no
++  // checked state for our commands. Under Rename tab's gate, for the
++  // right-clicked tab's web page; the workspace is the one on screen, which
++  // every tab this menu opens on is drawn in.
++  if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
++          tab_strip_->delegate()->GetBrowserWindowInterface())) {
++    const workspaces::WorkspaceService* const service =
++        workspaces::WorkspaceService::From(
++            tab_strip_->delegate()->GetBrowserWindowInterface());
++    const std::string site =
++        service->RuleSiteOf(tab_strip_->GetTabAtIndex(index));
++    const std::vector<workspaces::prefs::WorkspaceEntry> entries =
++        service->GetWorkspaces();
++    const auto entry =
++        std::ranges::find(entries, service->active_guid(),
++                          &workspaces::prefs::WorkspaceEntry::guid);
++    if (!site.empty() && entry != entries.end()) {
++      AddItem(TabStripModel::CommandSiteRule,
++              l10n_util::GetStringFUTF16(
++                  service->WorkspaceOfSite(site) == entry->guid
++                      ? IDS_HELIUM_WORKSPACE_STOP_SITE_RULE
++                      : IDS_HELIUM_WORKSPACE_SITE_RULE,
++                  base::UTF8ToUTF16(site),
++                  ExistingWorkspaceSubMenuModel::DisplayName(*entry)));
++    }
++  }
++
+   // Helium Workspaces (E11): rename, as a plain item where the owner looks
+   // for it. Shown under the same gate as the submenus below.
+   if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2756,6 +2756,7 @@ bool TabStripModel::IsContextMenuCommand
+     case CommandSnoozeTab:
+     case CommandSetTabEmoji:
+     case CommandMakeGroupWorkspace:
++    case CommandSiteRule:
+       // Helium Workspaces. The submenu decides per item whether a destination
+       // makes sense; the parent is enabled whenever it exists at all, and
+       // ExistingWorkspaceSubMenuModel::ShouldShowSubmenu() is what decides
+@@ -2922,6 +2923,7 @@ void TabStripModel::ExecuteContextMenuCo
+     case CommandSnoozeTab:
+     case CommandSetTabEmoji:
+     case CommandMakeGroupWorkspace:
++    case CommandSiteRule:
+       break;
+ 
+     case CommandNewTabToRight: {
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -174,6 +174,17 @@ std::vector<WorkspaceEntry> ParseWorkspa
+     if (symbol && IsWorkspaceSymbol(*symbol)) {
+       entries.back().symbol = *symbol;
+     }
++    // C5: anything but a non-empty string is skipped, and a repeat, as a bad
++    // colour is: never a reason to drop the entry.
++    if (const base::ListValue* const sites = entry->FindList(kSitesKey)) {
++      for (const base::Value& value : *sites) {
++        const std::string* const site = value.GetIfString();
++        if (site && !site->empty() &&
++            !std::ranges::contains(entries.back().sites, *site)) {
++          entries.back().sites.push_back(*site);
++        }
++      }
++    }
+   }
+ 
+   if (entries.empty()) {
+@@ -270,6 +281,41 @@ std::vector<WorkspaceEntry> SetWorkspace
+   return entries;
+ }
+ 
++std::vector<WorkspaceEntry> SetSiteWorkspace(
++    std::vector<WorkspaceEntry> entries,
++    std::string_view site,
++    std::string_view guid) {
++  if (site.empty() || !ContainsGuid(entries, guid)) {
++    return entries;
++  }
++  for (WorkspaceEntry& entry : entries) {
++    if (entry.guid != guid) {
++      std::erase(entry.sites, site);
++    } else if (!std::ranges::contains(entry.sites, site)) {
++      entry.sites.emplace_back(site);
++    }
++  }
++  return entries;
++}
++
++std::vector<WorkspaceEntry> RemoveSite(std::vector<WorkspaceEntry> entries,
++                                       std::string_view site) {
++  for (WorkspaceEntry& entry : entries) {
++    std::erase(entry.sites, site);
++  }
++  return entries;
++}
++
++std::vector<SiteRule> SiteRules(const std::vector<WorkspaceEntry>& entries) {
++  std::vector<SiteRule> rules;
++  for (const WorkspaceEntry& entry : entries) {
++    for (const std::string& site : entry.sites) {
++      rules.push_back({site, entry.guid});
++    }
++  }
++  return rules;
++}
++
+ std::vector<int> EffectiveColors(const std::vector<WorkspaceEntry>& entries) {
+   // taken[c]: some entry holds c as its own colour, or an earlier entry was
+   // given it by default. Own colours are marked first so a default never
+@@ -390,6 +436,14 @@ base::DictValue SerializeWorkspaces(
+     if (!entry.symbol.empty()) {
+       item.Set(kSymbolKey, entry.symbol);
+     }
++    // None is an absent key, as above (C5).
++    if (!entry.sites.empty()) {
++      base::ListValue sites;
++      for (const std::string& site : entry.sites) {
++        sites.Append(site);
++      }
++      item.Set(kSitesKey, std::move(sites));
++    }
+     list.Append(std::move(item));
+   }
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -13,6 +13,8 @@
+ 
+ #include "base/time/time.h"
+ #include "base/values.h"
++// SiteRule (C5); ":stamping" is already this target's dependency.
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ 
+ class PrefRegistrySimple;
+ class PrefService;
+@@ -141,6 +143,10 @@ inline constexpr char kIconKey[] = "icon
+ // means "unset" -- EffectiveColors / EffectiveSymbol decide what is drawn.
+ inline constexpr char kColorKey[] = "color";
+ inline constexpr char kSymbolKey[] = "symbol";
++// The sites that always open in the workspace (C5): a list of hosts as
++// SiteFromHost() leaves them. Optional, as above; an older build ignores the
++// key, and its next write of the list drops it (D8).
++inline constexpr char kSitesKey[] = "sites";
+ 
+ // A colour is a tab_groups::TabGroupColorId, 0-8 (grey, blue, red, yellow,
+ // green, pink, purple, cyan, orange), stored as a plain int: :prefs must not
+@@ -178,6 +184,9 @@ struct WorkspaceEntry {
+   // One of kWorkspaceSymbols, empty = unset. Drawn only when `icon` is empty;
+   // the setters keep at most one of the two set.
+   std::string symbol;
++  // C5: the sites that always open here, in the order they were added.
++  // Appended last for the brace-inits, as `color` was.
++  std::vector<std::string> sites;
+ };
+ 
+ void RegisterProfilePrefs(PrefRegistrySimple* registry);
+@@ -258,6 +267,22 @@ std::vector<WorkspaceEntry> SetWorkspace
+     std::string_view guid,
+     std::string symbol);
+ 
++// C5's edits, the same shape. SetSiteWorkspace adds `site` to `guid`'s sites
++// and takes it out of every other workspace's (D2: one site, one workspace);
++// an empty site or an unknown guid is refused. RemoveSite takes it out of
++// every workspace. Both take the site as stored: the caller applies
++// SiteFromHost().
++std::vector<WorkspaceEntry> SetSiteWorkspace(
++    std::vector<WorkspaceEntry> entries,
++    std::string_view site,
++    std::string_view guid);
++std::vector<WorkspaceEntry> RemoveSite(std::vector<WorkspaceEntry> entries,
++                                       std::string_view site);
++
++// C5: every workspace's sites as the rules WorkspaceForHost() takes, in list
++// order.
++std::vector<SiteRule> SiteRules(const std::vector<WorkspaceEntry>& entries);
++
+ // The colour each entry is drawn in, index for index (E17a): its own colour;
+ // else grey for the default workspace; else the first of 1-8 that no entry
+ // holds as its own colour and no earlier entry was given by default; else
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -941,6 +941,86 @@ TEST(WorkspaceWriteTest, BadColorOrSymbo
+   EXPECT_EQ("*", SetWorkspaceSymbol(std::move(with_icon), "work", "rocket")[1].icon);
+ }
+ 
++// C5: the sites that always open in a workspace.
++
++TEST(WorkspaceWriteTest, SitesRoundTripInTheirOrder) {
++  std::vector<WorkspaceEntry> e = TwoWorkspaces();
++  e[1].sites = {"github.com", "docs.google.com"};
++  const std::vector<WorkspaceEntry> after =
++      ParseWorkspaces(SerializeWorkspaces(e));
++  ASSERT_EQ(2u, after.size());
++  EXPECT_EQ((std::vector<std::string>{"github.com", "docs.google.com"}),
++            after[1].sites);
++  EXPECT_TRUE(after[0].sites.empty());
++}
++
++TEST(WorkspaceWriteTest, SitesAreWrittenOnlyWhenThereAreSome) {
++  const base::DictValue plain = SerializeWorkspaces(TwoWorkspaces());
++  for (const base::Value& item : *plain.FindList(kItemsKey)) {
++    EXPECT_FALSE(item.GetDict().contains(kSitesKey));
++  }
++}
++
++TEST(WorkspacePrefsTest, BadSitesAreIgnoredNeverRefused) {
++  base::DictValue dict = SerializeWorkspaces(TwoWorkspaces());
++  base::ListValue sites;
++  sites.Append("a.com");
++  sites.Append("");
++  sites.Append(5);
++  sites.Append("a.com");
++  sites.Append(base::DictValue());
++  sites.Append("b.com");
++  (*dict.FindList(kItemsKey))[1].GetDict().Set(kSitesKey, std::move(sites));
++  // Not a list at all.
++  (*dict.FindList(kItemsKey))[0].GetDict().Set(kSitesKey, "c.com");
++  const std::vector<WorkspaceEntry> after = ParseWorkspaces(dict);
++  ASSERT_EQ(2u, after.size());  // both entries are kept
++  EXPECT_EQ((std::vector<std::string>{"a.com", "b.com"}), after[1].sites);
++  EXPECT_TRUE(after[0].sites.empty());
++}
++
++TEST(WorkspacePrefsTest, AnEntryWithoutSitesHasNone) {
++  base::ListValue list = ListOpeningWithDefault();
++  list.Append(Entry("work", "Work"));
++  const std::vector<WorkspaceEntry> after =
++      ParseWorkspaces(Stored(std::move(list)));
++  ASSERT_EQ(2u, after.size());
++  EXPECT_TRUE(after[1].sites.empty());
++}
++
++TEST(WorkspaceWriteTest, ASiteBelongsToOneWorkspace) {
++  std::vector<WorkspaceEntry> e =
++      SetSiteWorkspace(TwoWorkspaces(), "github.com", "work");
++  e = SetSiteWorkspace(std::move(e), "github.com", "work");  // once only
++  EXPECT_EQ((std::vector<std::string>{"github.com"}), e[1].sites);
++  // D2: setting it elsewhere moves it.
++  e = SetSiteWorkspace(std::move(e), "github.com", kDefaultWorkspaceGuid);
++  EXPECT_EQ((std::vector<std::string>{"github.com"}), e[0].sites);
++  EXPECT_TRUE(e[1].sites.empty());
++  e = RemoveSite(std::move(e), "github.com");
++  EXPECT_TRUE(e[0].sites.empty());
++}
++
++TEST(WorkspaceWriteTest, AnEmptySiteOrAnUnknownWorkspaceIsRefused) {
++  EXPECT_TRUE(SetSiteWorkspace(TwoWorkspaces(), "", "work")[1].sites.empty());
++  for (const WorkspaceEntry& entry :
++       SetSiteWorkspace(TwoWorkspaces(), "github.com", "gone")) {
++    EXPECT_TRUE(entry.sites.empty());
++  }
++}
++
++TEST(WorkspacePrefsTest, SiteRulesListEveryWorkspacesSitesInListOrder) {
++  std::vector<WorkspaceEntry> e = TwoWorkspaces();
++  e[0].sites = {"a.com"};
++  e[1].sites = {"b.com", "c.com"};
++  const std::vector<SiteRule> rules = SiteRules(e);
++  ASSERT_EQ(3u, rules.size());
++  EXPECT_EQ("a.com", rules[0].site);
++  EXPECT_EQ(DefaultGuid(), rules[0].guid);
++  EXPECT_EQ("c.com", rules[2].site);
++  EXPECT_EQ("work", rules[2].guid);
++}
++
+ TEST(WorkspacePrefsTest, EffectiveColorsGiveHomeGreyAndOthersTheFirstFreeColour) {
+   std::vector<WorkspaceEntry> e = TwoWorkspaces();
+   e.push_back(WorkspaceEntry{"a", "A"});
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -282,6 +282,7 @@ WorkspaceService::WorkspaceService(
+       prefs_(prefs),
+       active_guid_(InitialWorkspace(browser_window)),
+       known_guids_(prefs::GetWorkspaceGuids(prefs)),
++      site_rules_(prefs::SiteRules(prefs::GetWorkspaces(prefs))),
+       folders_(unowned_user_data_host),
+       scoped_data_holder_(unowned_user_data_host, *this) {
+   folders_.persist = base::BindRepeating(&WorkspaceService::PersistFolders,
+@@ -625,6 +626,71 @@ void WorkspaceService::SetWorkspaceSymbo
+       prefs_, prefs::SetWorkspaceSymbol(GetWorkspaces(), guid, symbol));
+ }
+ 
++// static
++std::string WorkspaceService::SiteOf(tabs::TabInterface* tab) {
++  content::WebContents* const contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return std::string();
++  }
++  const GURL& committed = contents->GetLastCommittedURL();
++  const GURL& url =
++      committed.is_valid() ? committed : contents->GetVisibleURL();
++  return url.SchemeIsHTTPOrHTTPS() && !url.host().empty()
++             ? SiteFromHost(url.host())
++             : std::string();
++}
++
++void WorkspaceService::SetSiteWorkspace(std::string_view site,
++                                        std::string_view guid) {
++  // Checked here, not only by the pref edit, so the log never reports a
++  // write that changed nothing.
++  if (site.empty() || !std::ranges::contains(known_guids_, guid)) {
++    return;
++  }
++  prefs::WriteWorkspaces(
++      prefs_, prefs::SetSiteWorkspace(GetWorkspaces(), site, guid));
++  LOG(INFO) << "[workspaces] site '" << site << "' -> workspace '" << guid
++            << "'";
++}
++
++void WorkspaceService::RemoveSite(std::string_view site) {
++  // As SetSiteWorkspace: the log never reports a write that changed nothing.
++  if (WorkspaceOfSite(site).empty()) {
++    return;
++  }
++  prefs::WriteWorkspaces(prefs_, prefs::RemoveSite(GetWorkspaces(), site));
++  LOG(INFO) << "[workspaces] site '" << site << "' removed";
++}
++
++std::string WorkspaceService::WorkspaceOfSite(std::string_view site) const {
++  const auto rule = std::ranges::find(site_rules_, site, &SiteRule::site);
++  return rule != site_rules_.end() ? rule->guid : std::string();
++}
++
++std::string WorkspaceService::RuleSiteOf(tabs::TabInterface* tab) const {
++  const std::string site = SiteOf(tab);
++  const SiteRule* const rule = RuleForHost(site, site_rules_);
++  return rule ? rule->site : site;
++}
++
++std::string WorkspaceService::RuleWorkspaceForHost(
++    std::string_view host) const {
++  std::string guid = WorkspaceForHost(host, site_rules_);
++  return std::ranges::contains(known_guids_, guid) ? guid : std::string();
++}
++
++void WorkspaceService::ToggleSiteRule(tabs::TabInterface* tab) {
++  const std::string site = RuleSiteOf(tab);
++  if (site.empty()) {
++    return;
++  }
++  if (WorkspaceOfSite(site) == active_guid_) {
++    RemoveSite(site);
++  } else {
++    SetSiteWorkspace(site, active_guid_);
++  }
++}
++
+ void WorkspaceService::MoveWorkspace(std::string_view guid, int offset) {
+   // Guarded here for the same reason CreateWorkspace() is: one of the two
+   // callers is a keyboard command, which can fire while the feature is off and
+@@ -1169,10 +1235,7 @@ int WorkspaceService::MoveTabsToWorkspac
+   // -- a split or group headed by an open pinned page, which the list hides
+   // with it -- it goes back to that collection's start; one still inside
+   // after that straddles the pinned boundary, and nothing is placed.
+-  int at = FirstTodayIndexOf(guid);
+-  while (at > tab_strip_->IndexOfFirstNonPinnedTab() && InsideACollection(at)) {
+-    --at;
+-  }
++  const int at = TopOfTodayAnchor(guid);
+   int from_above = 0;
+   int from_below = 0;
+   if (InsideACollection(at)) {
+@@ -1248,6 +1311,14 @@ int WorkspaceService::MoveTabsToWorkspac
+   return static_cast<int>(moving.size());
+ }
+ 
++int WorkspaceService::TopOfTodayAnchor(std::string_view guid) const {
++  int at = FirstTodayIndexOf(guid);
++  while (at > tab_strip_->IndexOfFirstNonPinnedTab() && InsideACollection(at)) {
++    --at;
++  }
++  return at;
++}
++
+ int WorkspaceService::RetagPinItemPages(
+     const std::vector<tabs::TabInterface*>& tabs,
+     std::string_view guid) {
+@@ -1364,7 +1435,13 @@ WorkspaceService::RegisterTabRowHeightCh
+ }
+ 
+ void WorkspaceService::OnWorkspaceListChanged() {
+-  known_guids_ = prefs::GetWorkspaceGuids(prefs_);
++  // One read of the list for both.
++  const std::vector<prefs::WorkspaceEntry> entries = GetWorkspaces();
++  known_guids_.clear();
++  for (const prefs::WorkspaceEntry& entry : entries) {
++    known_guids_.push_back(entry.guid);
++  }
++  site_rules_ = prefs::SiteRules(entries);
+ 
+   // The window this service belongs to may have been showing the workspace
+   // that just disappeared -- and the window that deleted it is not necessarily
+@@ -2244,13 +2321,30 @@ void WorkspaceService::StampInsertedTab(
+   // (workspace_session_data.h), and rule 1 of ResolveGuidForInsertedTab is
+   // what leaves it alone. This is also where that tag is re-persisted against
+   // the restored tab's new session id.
+-  const std::string guid = ResolveGuidForInsertedTab(
+-      GuidOf(tab),
+-      stamp_inserted_for_.empty() ? active_guid_ : stamp_inserted_for_);
++  //
++  // C5: a fresh open of a site with a rule joins the rule's workspace
++  // instead. A foreground one takes the window there by the auto-switch at
++  // the end of OnTabStripModelChanged; the move to the top of that
++  // workspace's Today is posted, as the observer may not move a tab.
++  const std::string ruled = SiteRuleGuidFor(tab);
++  const std::string guid =
++      !ruled.empty()
++          ? ruled
++          : ResolveGuidForInsertedTab(GuidOf(tab), stamp_inserted_for_.empty()
++                                                       ? active_guid_
++                                                       : stamp_inserted_for_);
+   SetTag(tab->GetContents(), guid);
+   if (!stamp_inserted_for_.empty()) {
+     last_rebuilt_tab_ = tab->GetHandle();
+   }
++  if (!ruled.empty()) {
++    // last_guid_ as it is before the auto-switch below may move it, for the
++    // split's undo.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&WorkspaceService::MoveRuledTab,
++                                  weak_factory_.GetWeakPtr(), tab->GetHandle(),
++                                  ruled, last_guid_));
++  }
+ 
+   // active_guid_ is in the line because without it this log cannot answer the
+   // question it exists for. "-> workspace 'default'" is the same text whether
+@@ -2263,6 +2357,105 @@ void WorkspaceService::StampInsertedTab(
+             << "' (active '" << active_guid_ << "')";
+ }
+ 
++std::string WorkspaceService::SiteRuleGuidFor(tabs::TabInterface* tab) {
++  // Cheapest first: with no rule at all, nothing else is asked of an insert.
++  if (site_rules_.empty()) {
++    return std::string();
++  }
++  // Navigate() starts the load before it inserts the tab (browser_navigator.cc
++  // "Perform the actual navigation", then AddTab), so a fresh open's address
++  // is its pending entry. A restored entry is a session's, a reopen's or a
++  // pinned page's, never a fresh open.
++  const content::NavigationEntry* const entry =
++      tab->GetContents()->GetController().GetPendingEntry();
++  FreshOpenFacts facts;
++  facts.untagged = GuidOf(tab).empty();
++  facts.rebuilding = !stamp_inserted_for_.empty();
++  facts.enabled = IsEnabled();
++  facts.pinned =
++      tab->IsPinned() || !PinItemForTab(tab->GetContents()).empty();
++  facts.pending = entry != nullptr;
++  if (entry) {
++    facts.restored = entry->IsRestored();
++    facts.http_or_https = entry->GetURL().SchemeIsHTTPOrHTTPS();
++    // A link (also a link opened in a new tab, and an extension's new tab), a
++    // bookmark, or a link from another app: AUTO_TOPLEVEL is what
++    // StartupBrowserCreatorImpl::OpenTabsInBrowser opens a command-line URL
++    // with.
++    const ui::PageTransition transition = entry->GetTransitionType();
++    facts.link_bookmark_or_app =
++        ui::PageTransitionCoreTypeIs(transition, ui::PAGE_TRANSITION_LINK) ||
++        ui::PageTransitionCoreTypeIs(transition,
++                                     ui::PAGE_TRANSITION_AUTO_BOOKMARK) ||
++        ui::PageTransitionCoreTypeIs(transition,
++                                     ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++  }
++  if (!IsFreshOpen(facts)) {
++    return std::string();
++  }
++  const std::string_view host = entry->GetURL().host();
++  std::string guid = RuleWorkspaceForHost(host);
++  if (guid.empty() || guid == active_guid_) {
++    return std::string();
++  }
++  LOG(INFO) << "[workspaces] site rule: '" << host << "' -> workspace '"
++            << guid << "' (active '" << active_guid_ << "')";
++  return guid;
++}
++
++void WorkspaceService::MoveRuledTab(tabs::TabHandle handle,
++                                    const std::string& guid,
++                                    const std::string& last_before) {
++  tabs::TabInterface* const tab = handle.Get();
++  // Closed, gone to another window, pinned or the workspace deleted since.
++  if (tab_strip_->GetIndexOfTab(tab) == TabStripModel::kNoTab ||
++      tab->IsPinned() || !IsEnabled() ||
++      ResolveTabGuid(guid, known_guids_) != guid) {
++    return;
++  }
++  // "Open link in split view" paired it with the tab it came from, each
++  // keeping its tag (OnSplitTabChanged), and activated it, so the window
++  // followed it here. The split is what the user asked for: the tab takes
++  // its partner's workspace, and the window goes back with it.
++  if (const std::optional<split_tabs::SplitTabId> split = tab->GetSplit()) {
++    for (tabs::TabInterface* const half :
++         tab_strip_->GetSplitData(*split)->ListTabs()) {
++      if (half != tab) {
++        SetTag(tab->GetContents(), GuidOf(half));
++      }
++    }
++    if (active_guid_ == guid) {
++      SetActiveWorkspace(GuidOf(tab));
++      // The rule's switch and this one cancel out: "back" (C13) stays where
++      // it was before the link.
++      last_guid_ = last_before;
++    }
++    LOG(INFO) << "[workspaces] site rule: undone, the tab opened in a split "
++                 "view";
++    return;
++  }
++  // Legal here, posted out of the observer (design 2.2). A leave keeps the
++  // tag the group's rule gave it, so it is stamped again after.
++  const bool grouped = tab->GetGroup().has_value();
++  if (grouped) {
++    tab_strip_->RemoveFromGroup({tab_strip_->GetIndexOfTab(tab)});
++  }
++  SetTag(tab->GetContents(), guid);
++  // C4's place. The tab is one of `guid`'s Today tabs now, so the anchor is
++  // never below it: it is the anchor when it is already the top one.
++  const int at = TopOfTodayAnchor(guid);
++  const int from = tab_strip_->GetIndexOfTab(tab);
++  const bool placed = !InsideACollection(at);
++  if (placed && at >= 0 && at < from) {
++    // A move changes no active tab: the observer neither switches nor
++    // stamps a left tab.
++    tab_strip_->MoveWebContentsAt(from, at, /*select_after_move=*/false);
++  }
++  LOG(INFO) << "[workspaces] site rule: to the top of '" << guid << "'"
++            << (grouped ? ", out of its group" : "")
++            << (placed ? "" : ", not placed");
++}
++
+ bool WorkspaceService::IsAnchored(const tabs::TabInterface* tab) const {
+   return tab && !AnchorUrlForTab(tab->GetContents()).empty();
+ }
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.h
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/tab_groups/tab_group_id.h"
+ // For tabs::TabHandle, which is TabInterface::Handle and so needs the full
+@@ -212,6 +213,40 @@ class WorkspaceService : public TabStrip
+   void SetWorkspaceColor(std::string_view guid, int color);
+   void SetWorkspaceSymbol(std::string_view guid, const std::string& symbol);
+ 
++  // C5, links by rule. The site of `tab`'s page: SiteFromHost() of its last
++  // committed address, else its visible one; empty unless that is http or
++  // https with a host. The one place a site is made from a page, so the
++  // setter below takes it as it comes (a second SiteFromHost() would strip a
++  // second "www.").
++  static std::string SiteOf(tabs::TabInterface* tab);
++
++  // C5: makes `site` always open in workspace `guid`, taking it out of every
++  // other workspace (D2); takes `site` out of every workspace; and which
++  // workspace holds `site` -- exactly, not by subdomain -- empty for none.
++  // The two writes go through the list pref, as RenameWorkspace() does, so
++  // every window's rules and rail follow. Pref-only: safe from anywhere. Log
++  //   "[workspaces] site '<site>' -> workspace '<guid>'"
++  //   "[workspaces] site '<site>' removed"
++  void SetSiteWorkspace(std::string_view site, std::string_view guid);
++  void RemoveSite(std::string_view site);
++  std::string WorkspaceOfSite(std::string_view site) const;
++
++  // C5: the site the tab menu offers for `tab`: the rule that already routes
++  // its page when there is one -- a parent domain's too (RuleForHost) -- so
++  // the menu stops or moves THAT rule instead of adding a narrower one beside
++  // it; else SiteOf(tab).
++  std::string RuleSiteOf(tabs::TabInterface* tab) const;
++
++  // C5: the workspace the rules send `host` to, empty for none or for a rule
++  // naming a workspace that no longer exists. The one answer the stamp and
++  // the little window (D7) both ask.
++  std::string RuleWorkspaceForHost(std::string_view host) const;
++
++  // C5, the tab menu's item: RuleSiteOf(tab) always opens in the workspace on
++  // screen -- the tab's own, as the menu opens only on a tab drawn there (a
++  // favorite in every one) -- or, when it already does, no longer by rule.
++  void ToggleSiteRule(tabs::TabInterface* tab);
++
+   // Moves a workspace `offset` places along the list -- negative is earlier,
+   // positive is later -- changing the order the rail draws and the order
+   // Shift+Alt+arrow cycles through. Does nothing at the ends of the list
+@@ -733,6 +768,36 @@ class WorkspaceService : public TabStrip
+   // Stamps a newly inserted tab with the workspace it belongs to.
+   void StampInsertedTab(tabs::TabInterface* tab, int index);
+ 
++  // C5: the workspace a site rule sends `tab` to, or empty. A FRESH open
++  // only: untagged (a restored, reopened or dragged tab keeps its tag),
++  // outside a StampInsertedTabsFor() scope, Workspaces on, not a favorite or
++  // a pinned page, loading a pending, never-restored http(s) entry whose
++  // transition is a link, a bookmark or a link from another app
++  // (AUTO_TOPLEVEL) -- never a typed address (D4). A known workspace that is
++  // not the one on screen. Logs, when it answers,
++  //   "[workspaces] site rule: '<host>' -> workspace '<guid>' (active '<a>')"
++  std::string SiteRuleGuidFor(tabs::TabInterface* tab);
++
++  // C5: the tab a site rule stamped `guid` goes to the top of that
++  // workspace's Today, as a moved tab does (C4). Out of a tab group first:
++  // Chromium puts a link from a grouped tab in the group, whose rule then
++  // retagged it, so it is stamped again. In a split view -- "Open link in
++  // split view" -- the rule yields: the tab takes its partner's workspace
++  // and the window follows it back, `last_before` (last_guid_ at the stamp)
++  // restored so "back" is not the rule's workspace. Posted from
++  // StampInsertedTab (design 2.2). Logs
++  //   "[workspaces] site rule: to the top of '<guid>'" (+ ", out of its
++  //   group" / ", not placed")
++  //   "[workspaces] site rule: undone, the tab opened in a split view"
++  void MoveRuledTab(tabs::TabHandle handle,
++                    const std::string& guid,
++                    const std::string& last_before);
++
++  // Where C4 places tabs moved to `guid`: its first Today tab's index,
++  // walked back out of a collection the list hides with an open pinned page;
++  // -1 when it has none. The caller still asks InsideACollection() of it.
++  int TopOfTodayAnchor(std::string_view guid) const;
++
+   // Moves the workspace tag onto a tab's replacement WebContents.
+   //
+   // Membership lives on a WebContentsUserData, and Chromium swaps the
+@@ -922,6 +987,10 @@ class WorkspaceService : public TabStrip
+   // same source of truth as the hot one.
+   std::vector<std::string> known_guids_;
+ 
++  // C5: every workspace's sites as rules, refreshed with known_guids_ by the
++  // pref, so an insert does not parse the list.
++  std::vector<SiteRule> site_rules_;
++
+   PrefChangeRegistrar pref_registrar_;
+ 
+   // The tab row height this window last applied (E18), so each window's log
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.cc
+@@ -251,4 +251,52 @@ bool ShouldPreviewPinnedLink(const Pinne
+          !facts.same_site;
+ }
+ 
++std::string SiteFromHost(std::string_view host) {
++  constexpr std::string_view kWww = "www.";
++  if (host.starts_with(kWww) &&
++      host.substr(kWww.size()).find('.') != std::string_view::npos) {
++    host.remove_prefix(kWww.size());
++  }
++  return std::string(host);
++}
++
++bool HostMatchesSite(std::string_view host, std::string_view site) {
++  // D1: the site itself, or a host ending in "." + site -- the dot is what
++  // keeps notgithub.com out of github.com's. An empty site covers nothing: it
++  // would take every link.
++  if (site.empty()) {
++    return false;
++  }
++  if (host.ends_with('.')) {
++    host.remove_suffix(1);
++  }
++  return host == site ||
++         (host.size() > site.size() && host.ends_with(site) &&
++          host[host.size() - site.size() - 1] == '.');
++}
++
++const SiteRule* RuleForHost(std::string_view host,
++                            const std::vector<SiteRule>& rules) {
++  const SiteRule* best = nullptr;
++  for (const SiteRule& rule : rules) {
++    if (HostMatchesSite(host, rule.site) &&
++        (!best || rule.site.size() > best->site.size())) {
++      best = &rule;
++    }
++  }
++  return best;
++}
++
++std::string WorkspaceForHost(std::string_view host,
++                             const std::vector<SiteRule>& rules) {
++  const SiteRule* const rule = RuleForHost(host, rules);
++  return rule ? rule->guid : std::string();
++}
++
++bool IsFreshOpen(const FreshOpenFacts& facts) {
++  return facts.untagged && !facts.rebuilding && facts.enabled &&
++         !facts.pinned && facts.pending && !facts.restored &&
++         facts.http_or_https && facts.link_bookmark_or_app;
++}
++
+ }  // namespace workspaces
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping.h
+@@ -306,6 +306,57 @@ struct PinnedLinkFacts {
+ // the pinned page away from its address.
+ bool ShouldPreviewPinnedLink(const PinnedLinkFacts& facts);
+ 
++// C5, links by rule: one site the owner chose for a workspace -- "this site
++// always opens in workspace X". `site` is a host as SiteFromHost() leaves it.
++// Plain values, so the rules below are tested here.
++struct SiteRule {
++  std::string site;
++  std::string guid;
++};
++
++// C5: the site a host is stored as -- the host without a leading "www.", so a
++// rule added on www.github.com covers github.com too. Kept when what is left
++// has no dot ("www.com" stays): a site of "com" would take every .com page.
++// The host is already lower case (GURL).
++std::string SiteFromHost(std::string_view host);
++
++// C5 (D1): whether `host` is covered by `site` -- the site itself or any
++// subdomain of it: gist.github.com is github.com's, notgithub.com is not. A
++// fully qualified host ("github.com.") is its site too.
++bool HostMatchesSite(std::string_view host, std::string_view site);
++
++// C5: the rule that decides `host`, null for none. The longest matching site
++// wins (D2), so a rule for gist.github.com beats one for github.com; of two
++// as long, the first. The tab menu asks it too, so it offers to stop or move
++// the rule that really routes a page, a parent domain's included.
++const SiteRule* RuleForHost(std::string_view host,
++                            const std::vector<SiteRule>& rules);
++
++// C5: the workspace a new tab opened at `host` joins by the rules, empty for
++// none: RuleForHost()'s.
++std::string WorkspaceForHost(std::string_view host,
++                             const std::vector<SiteRule>& rules);
++
++// C5: what StampInsertedTab knows about an inserted tab. Plain values, so the
++// rule below is tested here.
++struct FreshOpenFacts {
++  bool untagged = false;     // it arrived with no workspace tag
++  bool rebuilding = false;   // inside a StampInsertedTabsFor() scope
++  bool enabled = false;      // Workspaces is on in this window
++  bool pinned = false;       // a favorite, or a pinned page's tab
++  bool pending = false;      // it loads a pending entry...
++  bool restored = false;     // ...that a session, a reopen or a pin restored
++  bool http_or_https = false;  // that entry's address
++  // That entry's core transition is LINK, AUTO_BOOKMARK or AUTO_TOPLEVEL (a
++  // link from another app) -- never TYPED (D4).
++  bool link_bookmark_or_app = false;
++};
++
++// C5: whether a site rule may send this tab to another workspace -- a fresh
++// open only: never a restored, reopened, dragged or typed one (D3, D4), never
++// with Workspaces off (D5).
++bool IsFreshOpen(const FreshOpenFacts& facts);
++
+ }  // namespace workspaces
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_STAMPING_H_
+--- a/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_stamping_unittest.cc
+@@ -716,5 +716,107 @@ TEST(WorkspacePinnedLinkTest, EachCondit
+   }
+ }
+ 
++// C5: links by rule.
++TEST(WorkspaceSiteRuleTest, SiteFromHostDropsALeadingWww) {
++  EXPECT_EQ("github.com", SiteFromHost("www.github.com"));
++  EXPECT_EQ("github.com", SiteFromHost("github.com"));
++  EXPECT_EQ("gist.github.com", SiteFromHost("gist.github.com"));
++}
++
++TEST(WorkspaceSiteRuleTest, SiteFromHostKeepsAWwwWithNoDotAfterIt) {
++  // A site of "com" would take every .com page.
++  EXPECT_EQ("www.com", SiteFromHost("www.com"));
++}
++
++// HostMatchesSite() is the owner's to write (D9): these pin what it must do,
++// and fail until it is written.
++TEST(WorkspaceSiteRuleTest, AHostMatchesItsSiteAndItsSubdomains) {
++  EXPECT_TRUE(HostMatchesSite("github.com", "github.com"));
++  EXPECT_TRUE(HostMatchesSite("gist.github.com", "github.com"));
++  EXPECT_TRUE(HostMatchesSite("a.b.github.com", "github.com"));
++  EXPECT_TRUE(HostMatchesSite("github.com.", "github.com"));
++  EXPECT_TRUE(HostMatchesSite("gist.github.com.", "github.com"));
++}
++
++TEST(WorkspaceSiteRuleTest, RuleForHostNamesTheParentDomainsRule) {
++  const std::vector<SiteRule> rules = {{"github.com", "work"},
++                                       {"example.org", "play"}};
++  const SiteRule* const rule = RuleForHost("gist.github.com", rules);
++  ASSERT_TRUE(rule);
++  EXPECT_EQ(rule->site, "github.com");
++  EXPECT_FALSE(RuleForHost("example.com", rules));
++}
++
++// C5: a fresh open routes; anything else -- one fact off at a time -- never.
++TEST(WorkspaceSiteRuleTest, OnlyAFreshOpenIsRouted) {
++  const FreshOpenFacts fresh{.untagged = true,
++                             .enabled = true,
++                             .pending = true,
++                             .http_or_https = true,
++                             .link_bookmark_or_app = true};
++  EXPECT_TRUE(IsFreshOpen(fresh));
++  FreshOpenFacts f = fresh;
++  f.untagged = false;  // restored, reopened or dragged in
++  EXPECT_FALSE(IsFreshOpen(f));
++  f = fresh;
++  f.rebuilding = true;  // a saved group being rebuilt
++  EXPECT_FALSE(IsFreshOpen(f));
++  f = fresh;
++  f.enabled = false;  // D5
++  EXPECT_FALSE(IsFreshOpen(f));
++  f = fresh;
++  f.pinned = true;
++  EXPECT_FALSE(IsFreshOpen(f));
++  f = fresh;
++  f.pending = false;  // a moved page, already loaded
++  EXPECT_FALSE(IsFreshOpen(f));
++  f = fresh;
++  f.restored = true;
++  EXPECT_FALSE(IsFreshOpen(f));
++  f = fresh;
++  f.http_or_https = false;
++  EXPECT_FALSE(IsFreshOpen(f));
++  f = fresh;
++  f.link_bookmark_or_app = false;  // a typed address (D4)
++  EXPECT_FALSE(IsFreshOpen(f));
++}
++
++TEST(WorkspaceSiteRuleTest, ASameEndingIsNotASubdomain) {
++  EXPECT_FALSE(HostMatchesSite("notgithub.com", "github.com"));
++}
++
++TEST(WorkspaceSiteRuleTest, AnEmptySiteNeverMatches) {
++  EXPECT_FALSE(HostMatchesSite("github.com", ""));
++  EXPECT_FALSE(HostMatchesSite("", ""));
++}
++
++TEST(WorkspaceSiteRuleTest, TheSiteMustBeTheShorterOne) {
++  EXPECT_FALSE(HostMatchesSite("github.com", "gist.github.com"));
++}
++
++// These two need HostMatchesSite() too.
++TEST(WorkspaceSiteRuleTest, TheLongestMatchingSiteWins) {
++  // In either order: neither the first nor the last rule simply wins.
++  EXPECT_EQ("play", WorkspaceForHost("gist.github.com",
++                                     {{"github.com", "work"},
++                                      {"gist.github.com", "play"}}));
++  EXPECT_EQ("play", WorkspaceForHost("gist.github.com",
++                                     {{"gist.github.com", "play"},
++                                      {"github.com", "work"}}));
++  EXPECT_EQ("work", WorkspaceForHost("api.github.com",
++                                     {{"github.com", "work"},
++                                      {"gist.github.com", "play"}}));
++}
++
++TEST(WorkspaceSiteRuleTest, OfTwoAsLongTheFirstWins) {
++  EXPECT_EQ("work", WorkspaceForHost("github.com", {{"github.com", "work"},
++                                                    {"github.com", "play"}}));
++}
++
++TEST(WorkspaceSiteRuleTest, NoMatchingRuleIsNoWorkspace) {
++  EXPECT_EQ("", WorkspaceForHost("example.com", {{"github.com", "work"}}));
++  EXPECT_EQ("", WorkspaceForHost("github.com", {}));
++}
++
+ }  // namespace
+ }  // namespace workspaces
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -563,6 +563,15 @@ void TabStripCollectionController::Execu
+     }
+     return;
+   }
++  // C5: the clicked tab's site, by the window the tab is in now.
++  if (command_id == TabStripModel::CommandSiteRule) {
++    if (workspaces::WorkspaceService* const service =
++            workspaces::WorkspaceService::From(
++                tab->GetBrowserWindowInterface())) {
++      service->ToggleSiteRule(tab);
++    }
++    return;
++  }
+   // E15d: the clicked tab, or the selection it is part of, as the menu's
+   // other commands take it; PinTabs skips what cannot be pinned.
+   if (command_id == TabStripModel::CommandPinToWorkspace) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_edit_bubble_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_edit_bubble_view.cc
+@@ -23,12 +23,14 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "cc/paint/paint_flags.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tab_groups/tab_group_color.h"
++#include "components/vector_icons/vector_icons.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/accessibility/ax_enums.mojom.h"
+ #include "ui/base/interaction/element_identifier.h"
+@@ -51,11 +53,13 @@
+ #include "ui/views/bubble/bubble_border.h"
+ #include "ui/views/bubble/bubble_dialog_model_host.h"
+ #include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/button/md_text_button.h"
+ #include "ui/views/controls/highlight_path_generator.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/controls/textfield/textfield.h"
+ #include "ui/views/layout/box_layout.h"
++#include "ui/views/style/typography.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/widget/widget.h"
+ 
+@@ -344,6 +348,84 @@ WorkspaceEditBubbleView::WorkspaceEditBu
+       base::BindRepeating(&WorkspaceEditBubbleView::OnCustomEmojiPressed,
+                           base::Unretained(this)),
+       l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_ICON_CUSTOM_EMOJI)));
++
++  // C5: the workspace's sites (ShowSites), then the line for none. Redrawn
++  // whenever the list changes -- a rule added, moved or removed from the tab
++  // menu or another window -- posted, as the change can come from a row's
++  // own button (OnRemoveSitePressed), which must outlive its handler.
++  AddHeading(this, IDS_HELIUM_WORKSPACE_EDIT_SITES, kSectionSpacing);
++  sites_ = AddChildView(std::make_unique<views::View>());
++  sites_->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical, gfx::Insets(), kSpacing));
++  no_sites_ = AddChildView(std::make_unique<views::Label>(
++      l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_EDIT_NO_SITES),
++      views::style::CONTEXT_LABEL, views::style::STYLE_SECONDARY));
++  no_sites_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  no_sites_->SetMultiLine(true);
++  ShowSites(entry.sites);
++  sites_registrar_.Init(browser_->GetProfile()->GetPrefs());
++  sites_registrar_.Add(
++      workspaces::prefs::kHeliumWorkspacesList,
++      base::BindRepeating(
++          [](base::WeakPtr<WorkspaceEditBubbleView> view) {
++            base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE,
++                base::BindOnce(&WorkspaceEditBubbleView::ShowCurrentSites,
++                               view));
++          },
++          weak_factory_.GetWeakPtr()));
++}
++
++void WorkspaceEditBubbleView::ShowSites(const std::vector<std::string>& sites) {
++  sites_->RemoveAllChildViews();
++  // Each site, its text taking the row up to its remove button -- a long host
++  // elided at its front, where it says least.
++  for (const std::string& site : sites) {
++    auto* const row = sites_->AddChildView(std::make_unique<views::View>());
++    auto* const layout =
++        row->SetLayoutManager(std::make_unique<views::BoxLayout>(
++            views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
++            kSpacing));
++    layout->set_cross_axis_alignment(
++        views::BoxLayout::CrossAxisAlignment::kCenter);
++    const std::u16string text = base::UTF8ToUTF16(site);
++    auto* const label =
++        row->AddChildView(std::make_unique<views::Label>(text));
++    label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    label->SetElideBehavior(gfx::ELIDE_HEAD);
++    layout->SetFlexForView(label, 1);
++    const std::u16string remove =
++        l10n_util::GetStringFUTF16(IDS_HELIUM_WORKSPACE_EDIT_REMOVE_SITE, text);
++    auto* const button =
++        row->AddChildView(views::CreateVectorImageButtonWithNativeTheme(
++            base::BindRepeating(&WorkspaceEditBubbleView::OnRemoveSitePressed,
++                                base::Unretained(this), site),
++            vector_icons::kCloseSmallIcon, kIconSize));
++    button->SetTooltipText(remove);
++    button->GetViewAccessibility().SetName(remove);
++  }
++  sites_->SetVisible(!sites.empty());
++  no_sites_->SetVisible(sites.empty());
++}
++
++void WorkspaceEditBubbleView::ShowCurrentSites() {
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return;
++  }
++  const std::vector<workspaces::prefs::WorkspaceEntry> entries =
++      service->GetWorkspaces();
++  const auto entry = std::ranges::find(
++      entries, guid_, &workspaces::prefs::WorkspaceEntry::guid);
++  ShowSites(entry != entries.end() ? entry->sites
++                                   : std::vector<std::string>());
++  // The bubble takes the height it now needs; the line may wrap taller.
++  if (views::BubbleDialogDelegate* const bubble =
++          GetWidget() ? GetWidget()->widget_delegate()->AsBubbleDialogDelegate()
++                      : nullptr) {
++    bubble->SizeToContents();
++  }
+ }
+ 
+ WorkspaceEditBubbleView::~WorkspaceEditBubbleView() = default;
+@@ -411,6 +493,17 @@ void WorkspaceEditBubbleView::OnCustomEm
+                                                            std::move(prompt));
+ }
+ 
++// The list's change redraws the rows (ShowCurrentSites, posted). Only while
++// the site is still this workspace's: one moved to another workspace since
++// stays there.
++void WorkspaceEditBubbleView::OnRemoveSitePressed(const std::string& site) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (service && service->WorkspaceOfSite(site) == guid_) {
++    service->RemoveSite(site);
++  }
++}
++
+ void WorkspaceEditBubbleView::UpdateChoices() {
+   const ui::ColorProvider* const provider = GetColorProvider();
+   if (!provider) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_edit_bubble_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_edit_bubble_view.h
+@@ -12,6 +12,8 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/views/controls/textfield/textfield_controller.h"
+ #include "ui/views/view.h"
+@@ -25,6 +27,7 @@ class KeyEvent;
+ }  // namespace ui
+ 
+ namespace views {
++class Label;
+ class Textfield;
+ }  // namespace views
+ 
+@@ -41,10 +44,17 @@ struct WorkspaceEntry;
+ //   Icon    [h] [w] [s] [p] [s] [m]
+ //           [c] [t] [f] [l] [s] [p]
+ //   [ Custom emoji... ]
++//   Sites
++//   github.com                          [x]
+ //
+ // - Colour and Icon apply as they are clicked (WorkspaceService's
+ //   SetWorkspaceColor / SetWorkspaceSymbol), and the bubble moves its own
+ //   ring and fill: the write rebuilds the rail, never this bubble.
++// - Sites (C5): the sites that always open in this workspace, each with a
++//   remove button that applies as it is clicked, as a colour does
++//   (WorkspaceService::RemoveSite); the rows follow the list as it changes
++//   anywhere (the tab menu, another window); with none, a muted
++//   line saying where sites are added (the tab menu).
+ // - The name applies when the bubble closes -- Enter, Escape, a click away --
+ //   if it was changed and is not empty: per keystroke would rebuild the rail
+ //   on every letter, and an empty name keeps the old one.
+@@ -64,7 +74,8 @@ struct WorkspaceEntry;
+ //
+ // Accessible names: the text field "Name", each swatch its tab-group colour
+ // name (Chromium's), each preset its word ("Home", "Work", ...), both said as
+-// radio buttons, checked when current; the button "Custom emoji..." (U+2026).
++// radio buttons, checked when current; the button "Custom emoji..." (U+2026);
++// each site's button "Remove <site>".
+ //
+ // A plain view inside the rail's kind of bubble (a ui::DialogModel in a
+ // views::BubbleDialogModelHost, its one custom field), as the Archive screen
+@@ -107,6 +118,12 @@ class WorkspaceEditBubbleView : public v
+   void OnColorPressed(int color);
+   void OnSymbolPressed(size_t index);
+   void OnCustomEmojiPressed();
++  // C5: removes `site` from the workspace, if it is still this workspace's.
++  void OnRemoveSitePressed(const std::string& site);
++  // C5: draws `sites` as rows, or the line for none; ShowCurrentSites() with
++  // the list as it is now, sized to fit.
++  void ShowSites(const std::vector<std::string>& sites);
++  void ShowCurrentSites();
+ 
+   // Paints the swatches and the presets in this theme's colours and marks
+   // the current colour and preset. Does nothing before there is a provider.
+@@ -134,6 +151,12 @@ class WorkspaceEditBubbleView : public v
+   // Index for index: the colour ids 0-8, and prefs::kWorkspaceSymbols.
+   std::vector<raw_ptr<WorkspaceEditChoice>> swatches_;
+   std::vector<raw_ptr<WorkspaceEditChoice>> symbols_;
++  // C5: the sites' rows, the line shown when there is none, and the list pref
++  // that redraws them.
++  raw_ptr<views::View> sites_ = nullptr;
++  raw_ptr<views::Label> no_sites_ = nullptr;
++  PrefChangeRegistrar sites_registrar_;
++  base::WeakPtrFactory<WorkspaceEditBubbleView> weak_factory_{this};
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_EDIT_BUBBLE_VIEW_H_
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_link_preview.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_link_preview.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/favicon/content/content_favicon_driver.h"
+@@ -673,9 +674,14 @@ int InsertMovedPage(BrowserWindowInterfa
+                     std::unique_ptr<content::WebContents> contents) {
+   content::WebContents* const raw = contents.get();
+   TabStripModel* const model = browser->GetTabStripModel();
+-  // Where the archive's restore puts a tab; the insert stamps it with the
+-  // workspace on screen (StampInsertedTab).
++  // Where the archive's restore puts a tab, in the workspace on screen: tagged
++  // before the insert, so a site rule (C5) never takes a page the user moved
++  // here, whether or not it has finished loading.
+   const WorkspaceService* const service = WorkspaceService::From(browser);
++  if (service) {
++    WorkspaceTabData::GetOrCreateForWebContents(raw)->set_guid(
++        service->active_guid());
++  }
+   int index = service ? service->TopOfListIndex(nullptr) : -1;
+   if (index < 0) {
+     index = model->count();
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_little_window.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_little_window.cc
+@@ -20,6 +20,7 @@
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ // InsertMovedPage, C20's "Open as tab" shared: C6's move needs C20's patch.
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_link_preview.h"
+@@ -49,6 +50,19 @@ bool MaybeOpenLittleWindow(Profile* prof
+           BrowserWindowInterface::CreationStatus::kOk) {
+     return false;
+   }
++  // C5 (D7): a site with a rule opens in the main window, where the insert
++  // stamps it for the rule's workspace (WorkspaceService::SiteRuleGuidFor).
++  // Asked of the window that would take the tab, not of the pref: rules do
++  // nothing with Workspaces off OR in a classic layout (D5, IsEnabled), and
++  // then the small window stays (the review's #8).
++  const WorkspaceService* const service = WorkspaceService::From(
++      ProfileBrowserCollection::GetForProfile(profile)->FindTabbedBrowser());
++  if (service && service->IsEnabled() &&
++      !service->RuleWorkspaceForHost(url.host()).empty()) {
++    LOG(INFO) << "[workspaces] little window: skipped, site rule for '"
++              << url.host() << "'";
++    return false;
++  }
+ 
+   const gfx::Rect work =
+       display::Screen::Get()->GetDisplayForNewWindows().work_area();
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -2478,6 +2478,12 @@ void WorkspacePinnedSectionView::Rebuild
+                                      ui::kColorSeparator),
+       gfx::Insets::VH(kCardPadding - kCardEdge, 0)));
+   list->SetBackground(CardBackground());
++  // C29: the rows are tree items that can be selected together; the list is
++  // their tree, so a screen reader hears that several can be selected.
++  list->GetViewAccessibility().SetRole(ax::mojom::Role::kTree);
++  list->GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_HELIUM_PINNED_LIST_NAME));
++  list->GetViewAccessibility().SetIsMultiselectable(true);
+   const bool frame_active = IsFrameActive();
+   // After drawn_guid_ is set (above): ReadLinks may unlink a tab, which tells
+   // the workspace callbacks at once (design review).
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -63,6 +63,11 @@ enum TabContextMenuCommand {
+   // CommandRenameTab is.
+   CommandSetTabEmoji,
+   CommandMakeGroupWorkspace,
++  // C5 "Always open <site> in <workspace>" / "Stop always opening ...": a
++  // plain item run by TabStripCollectionController, as C11a's is (it needs
++  // Workspaces). Last, so no id before it moves; the submenus' ids start at
++  // 1001 (ExistingBaseSubMenuModel).
++  CommandSiteRule,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 

@@ -1,0 +1,961 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -17,6 +17,24 @@ source_set("arc_import") {
+   deps = [ "//base" ]
+ }
+ 
++# Each workspace's pinned section -- folders and items that are data, not tabs
++# -- and the per-profile file that keeps them (E15a, design 5 "E15 spec").
++# //base only, the file included: the store attaches to a Profile as
++# base::SupportsUserData, so no KeyedService factory and no upstream file
++# (LOCAL.md 43). ":stamping" is itself dependency-free and supplies
++# ResolveTabGuid, the orphan rule rows share with tabs.
++source_set("pins") {
++  sources = [
++    "workspace_pins.cc",
++    "workspace_pins.h",
++  ]
++
++  deps = [
++    ":stamping",
++    "//base",
++  ]
++}
++
+ # Pref declarations for Workspaces, deliberately split into their own leaf
+ # target rather than living in the main workspaces target that arrives in E5.
+ #
+@@ -161,6 +179,7 @@ source_set("unit_tests") {
+ 
+   sources = [
+     "arc_import_plan_unittest.cc",
++    "workspace_pins_unittest.cc",
+     "workspace_prefs_unittest.cc",
+     "workspace_stamping_unittest.cc",
+   ]
+@@ -169,9 +188,13 @@ source_set("unit_tests") {
+   # most of //chrome into the test binary and undo the reason it exists.
+   deps = [
+     ":arc_import",
++    ":pins",
+     ":prefs",
+     ":stamping",
+     "//base",
++
++    # TaskEnvironment with mock time, for the pins store's delayed write.
++    "//base/test:test_support",
+     "//components/prefs",
+     "//components/prefs:test_support",
+     "//testing/gtest",
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.cc
+@@ -0,0 +1,398 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
++
++#include <set>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/json/values_util.h"
++#include "base/logging.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++
++namespace workspaces::pins {
++namespace {
++
++constexpr char kVersionKey[] = "version";
++constexpr char kWorkspacesKey[] = "workspaces";
++constexpr char kTypeKey[] = "type";
++constexpr char kIdKey[] = "id";
++constexpr char kTitleKey[] = "title";
++constexpr char kOpenKey[] = "open";
++constexpr char kChildrenKey[] = "children";
++constexpr char kUrlKey[] = "url";
++constexpr char kCustomTitleKey[] = "custom_title";
++constexpr char kLastActiveKey[] = "last_active";
++constexpr char kFolderType[] = "folder";
++constexpr char kItemType[] = "item";
++
++// Its address is the store's key among its profile's user data.
++constexpr char kUserDataKey[] = "helium_workspace_pins";
++
++base::DictValue NodeToValue(const PinNode& node) {
++  base::DictValue dict;
++  dict.Set(kIdKey, node.id);
++  dict.Set(kTitleKey, node.title);
++  if (node.type == PinNode::Type::kFolder) {
++    dict.Set(kTypeKey, kFolderType);
++    dict.Set(kOpenKey, node.open);
++    base::ListValue children;
++    for (const PinNode& child : node.children) {
++      children.Append(NodeToValue(child));
++    }
++    dict.Set(kChildrenKey, std::move(children));
++    return dict;
++  }
++  dict.Set(kTypeKey, kItemType);
++  dict.Set(kUrlKey, node.url);
++  if (!node.custom_title.empty()) {
++    dict.Set(kCustomTitleKey, node.custom_title);
++  }
++  if (!node.last_active.is_null()) {
++    dict.Set(kLastActiveKey, base::TimeToValue(node.last_active));
++  }
++  return dict;
++}
++
++std::optional<std::vector<PinNode>> NodesFromValue(const base::ListValue& list);
++
++// Strict about shape, lenient about optional fields: this file is only ever
++// written by NodeToValue, so a node without its type, id or url means the file
++// is not ours to trust, and the whole file is refused rather than written back
++// without the node.
++std::optional<PinNode> NodeFromValue(const base::Value& value) {
++  const base::DictValue* dict = value.GetIfDict();
++  if (!dict) {
++    return std::nullopt;
++  }
++  const std::string* type = dict->FindString(kTypeKey);
++  const std::string* id = dict->FindString(kIdKey);
++  if (!type || !id || id->empty()) {
++    return std::nullopt;
++  }
++  PinNode node;
++  node.id = *id;
++  if (const std::string* title = dict->FindString(kTitleKey)) {
++    node.title = *title;
++  }
++
++  if (*type == kFolderType) {
++    node.type = PinNode::Type::kFolder;
++    node.open = dict->FindBool(kOpenKey).value_or(false);
++    const base::ListValue* children = dict->FindList(kChildrenKey);
++    if (!children) {
++      return std::nullopt;
++    }
++    // Recursion is bounded by JSONReader's own depth limit on the way in.
++    std::optional<std::vector<PinNode>> parsed = NodesFromValue(*children);
++    if (!parsed) {
++      return std::nullopt;
++    }
++    node.children = std::move(*parsed);
++    return node;
++  }
++
++  if (*type != kItemType) {
++    return std::nullopt;
++  }
++  const std::string* url = dict->FindString(kUrlKey);
++  if (!url || url->empty()) {
++    return std::nullopt;
++  }
++  node.url = *url;
++  if (const std::string* custom_title = dict->FindString(kCustomTitleKey)) {
++    node.custom_title = *custom_title;
++  }
++  if (const base::Value* last_active = dict->Find(kLastActiveKey)) {
++    std::optional<base::Time> time = base::ValueToTime(*last_active);
++    if (!time) {
++      return std::nullopt;
++    }
++    node.last_active = *time;
++  }
++  return node;
++}
++
++std::optional<std::vector<PinNode>> NodesFromValue(const base::ListValue& list) {
++  std::vector<PinNode> nodes;
++  nodes.reserve(list.size());
++  for (const base::Value& value : list) {
++    std::optional<PinNode> node = NodeFromValue(value);
++    if (!node) {
++      return std::nullopt;
++    }
++    nodes.push_back(std::move(*node));
++  }
++  return nodes;
++}
++
++// JSONReader and JSONWriter stop at 200 levels, and a folder costs two (its
++// dict and its children list): deeper than this could be kept but never saved.
++constexpr int kMaxFolderDepth = 64;
++
++// What NodeFromValue accepts, not too deep to write, and every id new to
++// `ids`: an open tab finds its item by id (E15c), so no two rows of the whole
++// tree may share one. SetRoots and the load both refuse anything else, so
++// nothing the store saves can make the next load refuse the whole file (code
++// review, LOCAL.md 44).
++bool AddSavable(const std::vector<PinNode>& nodes,
++                std::set<std::string, std::less<>>& ids,
++                int depth = 0) {
++  if (depth > kMaxFolderDepth) {
++    return false;
++  }
++  for (const PinNode& node : nodes) {
++    if (node.id.empty() || !ids.insert(node.id).second) {
++      return false;
++    }
++    const bool ok = node.type == PinNode::Type::kFolder
++                        ? AddSavable(node.children, ids, depth + 1)
++                        : !node.url.empty();
++    if (!ok) {
++      return false;
++    }
++  }
++  return true;
++}
++
++size_t CountNodes(const std::vector<PinNode>& nodes) {
++  size_t count = nodes.size();
++  for (const PinNode& node : nodes) {
++    count += CountNodes(node.children);
++  }
++  return count;
++}
++
++}  // namespace
++
++base::DictValue PinTreeToValue(const PinTree& tree) {
++  base::DictValue workspaces;
++  for (const auto& [guid, roots] : tree) {
++    base::ListValue list;
++    for (const PinNode& node : roots) {
++      list.Append(NodeToValue(node));
++    }
++    workspaces.Set(guid, std::move(list));
++  }
++  base::DictValue file;
++  file.Set(kVersionKey, kPinFileVersion);
++  file.Set(kWorkspacesKey, std::move(workspaces));
++  return file;
++}
++
++std::optional<PinTree> PinTreeFromValue(const base::DictValue& value) {
++  if (value.FindInt(kVersionKey) != kPinFileVersion) {
++    return std::nullopt;
++  }
++  const base::DictValue* workspaces = value.FindDict(kWorkspacesKey);
++  if (!workspaces) {
++    return std::nullopt;
++  }
++  PinTree tree;
++  for (const auto [guid, roots] : *workspaces) {
++    const base::ListValue* list = roots.GetIfList();
++    if (guid.empty() || !list) {
++      return std::nullopt;
++    }
++    std::optional<std::vector<PinNode>> nodes = NodesFromValue(*list);
++    if (!nodes) {
++      return std::nullopt;
++    }
++    // An empty workspace is not stored, so it does not round-trip either.
++    if (!nodes->empty()) {
++      tree.emplace(guid, std::move(*nodes));
++    }
++  }
++  std::set<std::string, std::less<>> ids;
++  for (const auto& [guid, roots] : tree) {
++    if (!AddSavable(roots, ids)) {
++      return std::nullopt;
++    }
++  }
++  return tree;
++}
++
++std::vector<const PinNode*> RootsForWorkspace(
++    const PinTree& tree,
++    std::string_view guid,
++    const std::vector<std::string>& known_guids) {
++  std::vector<const PinNode*> rows;
++  auto add = [&rows](const std::vector<PinNode>& roots) {
++    for (const PinNode& node : roots) {
++      rows.push_back(&node);
++    }
++  };
++  if (auto own = tree.find(guid); own != tree.end()) {
++    add(own->second);
++  }
++  for (const auto& [owner, roots] : tree) {
++    if (owner != guid && ResolveTabGuid(owner, known_guids) == guid) {
++      add(roots);
++    }
++  }
++  return rows;
++}
++
++struct PinStore::LoadResult {
++  enum class Status {
++    kMissing,
++    kLoaded,
++    // Not a pins file this version wrote: renamed to "<file>.bad".
++    kMovedAside,
++    // Unreadable, from a newer version, or could not be moved aside.
++    kReadOnly,
++  };
++  Status status = Status::kMissing;
++  PinTree tree;
++};
++
++// static
++PinStore* PinStore::GetOrCreate(base::SupportsUserData* host,
++                                const base::FilePath& profile_dir) {
++  if (auto* store = static_cast<PinStore*>(host->GetUserData(kUserDataKey))) {
++    return store;
++  }
++  auto owned = std::make_unique<PinStore>(
++      profile_dir.Append(kFileName),
++      base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++           base::TaskShutdownBehavior::BLOCK_SHUTDOWN}));
++  PinStore* store = owned.get();
++  host->SetUserData(kUserDataKey, std::move(owned));
++  return store;
++}
++
++PinStore::PinStore(const base::FilePath& file,
++                   scoped_refptr<base::SequencedTaskRunner> file_task_runner)
++    : writer_(file, file_task_runner, kSaveDelay) {
++  // The same sequence as the writer's, so the read always runs before any
++  // write -- and no write is scheduled before the read's reply anyway.
++  file_task_runner->PostTaskAndReplyWithResult(
++      FROM_HERE, base::BindOnce(&PinStore::ReadFile, file),
++      base::BindOnce(&PinStore::OnLoaded, weak_factory_.GetWeakPtr()));
++}
++
++PinStore::~PinStore() {
++  // ImportantFileWriter DCHECKs a pending write in its destructor. This is
++  // what saves the last 2.5 s of changes at shutdown: the profile is destroyed
++  // before the thread pool stops, and the write's sequence is BLOCK_SHUTDOWN.
++  if (writer_.HasPendingWrite()) {
++    writer_.DoScheduledWrite();
++  }
++}
++
++bool PinStore::SetRoots(std::string_view guid, std::vector<PinNode> roots) {
++  if (!loaded_ || read_only_ || guid.empty()) {
++    return false;
++  }
++  // The tree as it would be: `roots` plus every other workspace's rows.
++  std::set<std::string, std::less<>> ids;
++  bool savable = AddSavable(roots, ids);
++  for (const auto& [owner, rows] : tree_) {
++    savable = savable && (owner == guid || AddSavable(rows, ids));
++  }
++  if (!savable) {
++    return false;
++  }
++  if (roots.empty()) {
++    if (auto it = tree_.find(guid); it != tree_.end()) {
++      tree_.erase(it);
++    }
++  } else {
++    tree_.insert_or_assign(std::string(guid), std::move(roots));
++  }
++  writer_.ScheduleWrite(this);
++  for (Observer& observer : observers_) {
++    observer.OnPinsChanged();
++  }
++  return true;
++}
++
++void PinStore::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void PinStore::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++// static
++PinStore::LoadResult PinStore::ReadFile(const base::FilePath& file) {
++  LoadResult result;
++  if (!base::PathExists(file)) {
++    return result;
++  }
++  std::string contents;
++  if (!base::ReadFileToString(file, &contents)) {
++    result.status = LoadResult::Status::kReadOnly;
++    return result;
++  }
++  if (std::optional<base::DictValue> dict =
++          base::JSONReader::ReadDict(contents, base::JSON_PARSE_RFC)) {
++    std::optional<int> version = dict->FindInt(kVersionKey);
++    if (version && *version > kPinFileVersion) {
++      result.status = LoadResult::Status::kReadOnly;
++      return result;
++    }
++    if (std::optional<PinTree> tree = PinTreeFromValue(*dict)) {
++      result.status = LoadResult::Status::kLoaded;
++      result.tree = std::move(*tree);
++      return result;
++    }
++  }
++  // Kept, never written over: the next write starts a new file. A second bad
++  // file gets "<file> (1).bad", never the first one's name. An empty unique
++  // path (100 taken) fails the move, and the store stays read-only.
++  result.status =
++      base::Move(file, base::GetUniquePath(
++                           file.AddExtension(FILE_PATH_LITERAL(".bad"))))
++          ? LoadResult::Status::kMovedAside
++          : LoadResult::Status::kReadOnly;
++  return result;
++}
++
++void PinStore::OnLoaded(LoadResult result) {
++  loaded_ = true;
++  tree_ = std::move(result.tree);
++  switch (result.status) {
++    case LoadResult::Status::kMissing:
++      LOG(INFO) << "[workspaces] pins: no file yet at " << writer_.path();
++      break;
++    case LoadResult::Status::kLoaded: {
++      size_t rows = 0;
++      for (const auto& [guid, roots] : tree_) {
++        rows += CountNodes(roots);
++      }
++      LOG(INFO) << "[workspaces] pins: loaded " << rows << " row(s) in "
++                << tree_.size() << " workspace(s) from " << writer_.path();
++      break;
++    }
++    case LoadResult::Status::kMovedAside:
++      LOG(WARNING) << "[workspaces] pins: " << writer_.path()
++                   << " is not a pins file; kept as .bad, starting empty";
++      break;
++    case LoadResult::Status::kReadOnly:
++      read_only_ = true;
++      LOG(WARNING) << "[workspaces] pins: " << writer_.path()
++                   << " could not be read, is from a newer version, or could "
++                      "not be moved aside; it will not be written";
++      break;
++  }
++  for (Observer& observer : observers_) {
++    observer.OnPinsChanged();
++  }
++}
++
++std::optional<std::string> PinStore::SerializeData() {
++  return base::WriteJsonWithOptions(PinTreeToValue(tree_),
++                                    base::JSONWriter::OPTIONS_PRETTY_PRINT);
++}
++
++}  // namespace workspaces::pins
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins.h
+@@ -0,0 +1,148 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PINS_H_
++#define CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PINS_H_
++
++#include <functional>
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/files/important_file_writer.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/supports_user_data.h"
++#include "base/time/time.h"
++#include "base/values.h"
++
++namespace base {
++class SequencedTaskRunner;
++}
++
++// Each workspace's pinned section: folders and items that are data, not tabs
++// (design 5, E15 spec). Nothing here is a tab; an item becomes one only when it
++// is opened (E15c), and closing that tab leaves the item where it was.
++//
++// //base only, the file included, so all of it is tested in
++// workspaces_unittests (design 3.10). The store attaches to its profile as
++// base::SupportsUserData, which a Profile is: no KeyedService, so no factory in
++// an upstream list (LOCAL.md 43).
++namespace workspaces::pins {
++
++// One row of a pinned section.
++struct PinNode {
++  enum class Type { kFolder, kItem };
++
++  Type type = Type::kItem;
++  // Stable across restarts: an open item's tab points back at it by this id
++  // (the tab's extra data, E15c).
++  std::string id;
++  // A folder's name, or the page title an item last showed.
++  std::string title;
++
++  // Folder only.
++  bool open = false;
++  std::vector<PinNode> children;
++
++  // Item only. The item's saved address -- its anchor.
++  std::string url;
++  // The name the user gave it; empty shows `title`.
++  std::string custom_title;
++  // When the item's page was last shown. Null for never.
++  base::Time last_active;
++
++  bool operator==(const PinNode&) const = default;
++};
++
++// Workspace guid -> that workspace's top-level rows, in order.
++using PinTree = std::map<std::string, std::vector<PinNode>, std::less<>>;
++
++// The file's JSON, and back. std::nullopt when `value` is not a pin file this
++// version can read; the store then keeps the file aside rather than write over
++// it.
++inline constexpr int kPinFileVersion = 1;
++base::DictValue PinTreeToValue(const PinTree& tree);
++std::optional<PinTree> PinTreeFromValue(const base::DictValue& value);
++
++// The rows to draw for workspace `guid`, own rows first. Rows kept under a
++// workspace that no longer exists show under the default workspace, as its
++// tabs do (ResolveTabGuid, design 2.4): nothing is lost when a workspace is
++// deleted, and it all comes back if that guid ever exists again.
++std::vector<const PinNode*> RootsForWorkspace(
++    const PinTree& tree,
++    std::string_view guid,
++    const std::vector<std::string>& known_guids);
++
++// The pins file of one profile, loaded off the UI thread and written through
++// base::ImportantFileWriter, so a crash never leaves half a file. Used on one
++// sequence (the UI thread).
++class PinStore : public base::SupportsUserData::Data,
++                 public base::ImportantFileWriter::DataSerializer {
++ public:
++  class Observer : public base::CheckedObserver {
++   public:
++    // After the load and after every change.
++    virtual void OnPinsChanged() = 0;
++  };
++
++  static constexpr base::FilePath::CharType kFileName[] =
++      FILE_PATH_LITERAL("Workspace Pins");
++  // Bookmarks' delay: a restart loses nothing, a crash at most this much.
++  static constexpr base::TimeDelta kSaveDelay = base::Milliseconds(2500);
++
++  // The one store of `host` (a Profile), created -- and its load started -- on
++  // the first call.
++  static PinStore* GetOrCreate(base::SupportsUserData* host,
++                               const base::FilePath& profile_dir);
++
++  // Starts loading `file` on `file_task_runner`, which must be BLOCK_SHUTDOWN
++  // so the destructor's last write finishes.
++  PinStore(const base::FilePath& file,
++           scoped_refptr<base::SequencedTaskRunner> file_task_runner);
++  PinStore(const PinStore&) = delete;
++  PinStore& operator=(const PinStore&) = delete;
++  // Writes any change still waiting for kSaveDelay.
++  ~PinStore() override;
++
++  bool loaded() const { return loaded_; }
++  // The file exists but could not be read, or is from a newer version: it is
++  // never written, so nothing in it is lost.
++  bool read_only() const { return read_only_; }
++  const PinTree& tree() const { return tree_; }
++
++  // Replaces workspace `guid`'s rows. False, and nothing changes -- no write,
++  // no observer call -- before the load has finished, when read_only(), or
++  // when `roots` holds a row the next load would refuse (an empty id, an id
++  // another row of the tree already has, an item without a url) or folders
++  // nested past what the file can hold.
++  bool SetRoots(std::string_view guid, std::vector<PinNode> roots);
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++ private:
++  struct LoadResult;
++  static LoadResult ReadFile(const base::FilePath& file);
++  void OnLoaded(LoadResult result);
++
++  // base::ImportantFileWriter::DataSerializer:
++  std::optional<std::string> SerializeData() override;
++
++  PinTree tree_;
++  bool loaded_ = false;
++  bool read_only_ = false;
++  base::ImportantFileWriter writer_;
++  base::ObserverList<Observer> observers_;
++  base::WeakPtrFactory<PinStore> weak_factory_{this};
++};
++
++}  // namespace workspaces::pins
++
++#endif  // CHROME_BROWSER_UI_TABS_WORKSPACES_WORKSPACE_PINS_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/workspace_pins_unittest.cc
+@@ -0,0 +1,357 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/supports_user_data.h"
++#include "base/task/thread_pool.h"
++#include "base/test/task_environment.h"
++#include "base/time/time.h"
++#include "build/build_config.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace workspaces::pins {
++namespace {
++
++PinNode Item(std::string id, std::string url) {
++  PinNode node;
++  node.id = std::move(id);
++  node.url = std::move(url);
++  return node;
++}
++
++PinNode Folder(std::string id,
++               std::string title,
++               std::vector<PinNode> children,
++               bool open = false) {
++  PinNode node;
++  node.type = PinNode::Type::kFolder;
++  node.id = std::move(id);
++  node.title = std::move(title);
++  node.children = std::move(children);
++  node.open = open;
++  return node;
++}
++
++// Three folder levels, every field set somewhere, two workspaces.
++PinTree SampleTree() {
++  PinNode deep = Item("c", "https://c.example/");
++  deep.title = "C page";
++  deep.custom_title = "Renamed C";
++  deep.last_active = base::Time::FromSecondsSinceUnixEpoch(1'758'000'000);
++
++  PinTree tree;
++  tree["default"] = {
++      Item("a", "https://a.example/"),
++      Folder("f1", "Outer",
++             {Item("b", "https://b.example/"),
++              Folder("f2", "Middle", {Folder("f3", "Inner", {deep})},
++                     /*open=*/true)}),
++  };
++  tree["work"] = {Item("d", "https://d.example/")};
++  return tree;
++}
++
++// 0 for a workspace the tree does not hold. map::at would abort the whole
++// binary instead (no exceptions here), and a missing write must be a failed
++// check, not a crash that skips the tests after it.
++size_t RootCount(const PinTree& tree, std::string_view guid) {
++  auto it = tree.find(guid);
++  return it == tree.end() ? 0 : it->second.size();
++}
++
++std::vector<std::string> Ids(const std::vector<const PinNode*>& rows) {
++  std::vector<std::string> ids;
++  for (const PinNode* row : rows) {
++    ids.push_back(row->id);
++  }
++  return ids;
++}
++
++TEST(WorkspacePinsTest, JsonRoundTripKeepsNestingAndEveryField) {
++  const PinTree tree = SampleTree();
++  EXPECT_EQ(PinTreeFromValue(PinTreeToValue(tree)), tree);
++}
++
++TEST(WorkspacePinsTest, RefusesFilesItDidNotWrite) {
++  for (std::string_view json : {
++           R"({"workspaces":{}})",
++           R"({"version":2,"workspaces":{}})",
++           R"({"version":1})",
++           R"({"version":1,"workspaces":{"default":{}}})",
++           R"({"version":1,"workspaces":{"default":[{"type":"item","id":"a"}]}})",
++           R"({"version":1,"workspaces":{"default":[{"type":"item","url":"https://a/"}]}})",
++           R"({"version":1,"workspaces":{"default":[{"type":"folder","id":"f"}]}})",
++           R"({"version":1,"workspaces":{"default":[{"type":"tab","id":"x","url":"https://a/"}]}})",
++           R"({"version":1,"workspaces":{"default":[{"type":"item","id":"a","url":"https://a/","last_active":"soon"}]}})",
++           R"({"version":1,"workspaces":{"default":[{"type":"folder","id":"f","children":[{"type":"item","id":"b"}]}]}})",
++           R"({"version":1,"workspaces":{"default":[{"type":"item","id":"a","url":"https://a/"}],"work":[{"type":"item","id":"a","url":"https://b/"}]}})",
++       }) {
++    SCOPED_TRACE(json);
++    std::optional<base::DictValue> dict =
++        base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++    ASSERT_TRUE(dict);
++    EXPECT_FALSE(PinTreeFromValue(*dict).has_value());
++  }
++}
++
++TEST(WorkspacePinsTest, RowsOfADeletedWorkspaceShowUnderDefaultUntilItReturns) {
++  PinTree tree;
++  tree["default"] = {Item("d", "https://d.example/")};
++  tree["gone"] = {Item("g", "https://g.example/")};
++  tree["work"] = {Item("w", "https://w.example/")};
++
++  std::vector<std::string> known = {"default", "work"};
++  EXPECT_EQ(Ids(RootsForWorkspace(tree, "default", known)),
++            (std::vector<std::string>{"d", "g"}));
++  EXPECT_EQ(Ids(RootsForWorkspace(tree, "work", known)),
++            (std::vector<std::string>{"w"}));
++
++  known.push_back("gone");
++  EXPECT_EQ(Ids(RootsForWorkspace(tree, "default", known)),
++            (std::vector<std::string>{"d"}));
++  EXPECT_EQ(Ids(RootsForWorkspace(tree, "gone", known)),
++            (std::vector<std::string>{"g"}));
++}
++
++// Stands in for a Profile: SupportsUserData's destructor is protected.
++class FakeProfile : public base::SupportsUserData {};
++
++class PinStoreTest : public testing::Test {
++ protected:
++  void SetUp() override { ASSERT_TRUE(dir_.CreateUniqueTempDir()); }
++
++  base::FilePath file() const { return dir_.GetPath().Append(PinStore::kFileName); }
++  base::FilePath bad_file() const {
++    return file().AddExtension(FILE_PATH_LITERAL(".bad"));
++  }
++
++  // A store whose load is still on its way.
++  std::unique_ptr<PinStore> NewStore() {
++    return std::make_unique<PinStore>(
++        file(), base::ThreadPool::CreateSequencedTaskRunner(
++                    {base::MayBlock(),
++                     base::TaskShutdownBehavior::BLOCK_SHUTDOWN}));
++  }
++
++  std::unique_ptr<PinStore> LoadedStore() {
++    std::unique_ptr<PinStore> store = NewStore();
++    task_environment_.RunUntilIdle();
++    return store;
++  }
++
++  std::string Contents(const base::FilePath& path) {
++    std::string contents;
++    EXPECT_TRUE(base::ReadFileToString(path, &contents)) << path;
++    return contents;
++  }
++
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  base::ScopedTempDir dir_;
++};
++
++TEST_F(PinStoreTest, NoFileLoadsEmptyAndWritable) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  EXPECT_TRUE(store->loaded());
++  EXPECT_FALSE(store->read_only());
++  EXPECT_TRUE(store->tree().empty());
++  EXPECT_FALSE(base::PathExists(file()));
++}
++
++TEST_F(PinStoreTest, AChangeIsWrittenAfterTheDelayAndReadBack) {
++  const PinTree tree = SampleTree();
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", tree.at("default")));
++  ASSERT_TRUE(store->SetRoots("work", tree.at("work")));
++
++  task_environment_.FastForwardBy(PinStore::kSaveDelay / 2);
++  EXPECT_FALSE(base::PathExists(file()));
++  task_environment_.FastForwardBy(PinStore::kSaveDelay);
++  task_environment_.RunUntilIdle();
++  EXPECT_TRUE(base::PathExists(file()));
++
++  store.reset();
++  EXPECT_EQ(LoadedStore()->tree(), tree);
++}
++
++TEST_F(PinStoreTest, DestroyingTheStoreWritesTheChangeStillWaiting) {
++  const PinTree tree = SampleTree();
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("default", tree.at("default")));
++
++  // Well inside kSaveDelay: only the destructor can have written it.
++  store.reset();
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(base::PathExists(file()));
++  PinTree expected;
++  expected["default"] = tree.at("default");
++  EXPECT_EQ(LoadedStore()->tree(), expected);
++}
++
++TEST_F(PinStoreTest, EmptyingAWorkspaceRemovesIt) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("work", {Item("d", "https://d.example/")}));
++  ASSERT_TRUE(store->SetRoots("work", {}));
++  EXPECT_TRUE(store->tree().empty());
++}
++
++TEST_F(PinStoreTest, ABrokenFileIsKeptAsideAndNeverWrittenOver) {
++  ASSERT_TRUE(base::WriteFile(file(), "{not json"));
++  std::unique_ptr<PinStore> store = LoadedStore();
++  EXPECT_TRUE(store->loaded());
++  EXPECT_FALSE(store->read_only());
++  EXPECT_TRUE(store->tree().empty());
++  EXPECT_FALSE(base::PathExists(file()));
++  EXPECT_EQ(Contents(bad_file()), "{not json");
++
++  ASSERT_TRUE(store->SetRoots("default", {Item("a", "https://a.example/")}));
++  store.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(RootCount(LoadedStore()->tree(), "default"), 1u);
++  EXPECT_EQ(Contents(bad_file()), "{not json");
++}
++
++TEST_F(PinStoreTest, AFileFromANewerVersionIsReadOnly) {
++  const std::string newer = R"({"version":2,"workspaces":{}})";
++  ASSERT_TRUE(base::WriteFile(file(), newer));
++  std::unique_ptr<PinStore> store = LoadedStore();
++  EXPECT_TRUE(store->loaded());
++  EXPECT_TRUE(store->read_only());
++  EXPECT_FALSE(store->SetRoots("default", {Item("a", "https://a.example/")}));
++
++  store.reset();
++  task_environment_.FastForwardBy(PinStore::kSaveDelay * 2);
++  EXPECT_EQ(Contents(file()), newer);
++  EXPECT_FALSE(base::PathExists(bad_file()));
++}
++
++#if BUILDFLAG(IS_WIN)
++// Another program holding the file -- a sync tool, a virus scan: the store
++// must not start empty and then write over what it could not read. Were the
++// lock not taken, "kept" (not JSON) would be moved to .bad and this would fail.
++TEST_F(PinStoreTest, AFileItCannotReadIsNeverWritten) {
++  ASSERT_TRUE(base::WriteFile(file(), "kept"));
++  {
++    base::File lock(file(), base::File::FLAG_OPEN | base::File::FLAG_READ |
++                                base::File::FLAG_WIN_EXCLUSIVE_READ |
++                                base::File::FLAG_WIN_EXCLUSIVE_WRITE);
++    ASSERT_TRUE(lock.IsValid());
++    std::unique_ptr<PinStore> store = LoadedStore();
++    EXPECT_TRUE(store->read_only());
++    EXPECT_FALSE(store->SetRoots("default", {Item("a", "https://a.example/")}));
++  }
++  EXPECT_EQ(Contents(file()), "kept");
++  EXPECT_FALSE(base::PathExists(bad_file()));
++}
++#endif
++
++TEST_F(PinStoreTest, ChangesBeforeTheLoadAreRefused) {
++  std::unique_ptr<PinStore> store = NewStore();
++  EXPECT_FALSE(store->loaded());
++  EXPECT_FALSE(store->SetRoots("default", {Item("a", "https://a.example/")}));
++  task_environment_.RunUntilIdle();
++  EXPECT_TRUE(store->loaded());
++  EXPECT_TRUE(store->SetRoots("default", {Item("a", "https://a.example/")}));
++}
++
++class CountingObserver : public PinStore::Observer {
++ public:
++  void OnPinsChanged() override { ++calls; }
++  int calls = 0;
++};
++
++TEST_F(PinStoreTest, ObserversHearTheLoadAndEveryChange) {
++  std::unique_ptr<PinStore> store = NewStore();
++  CountingObserver observer;
++  store->AddObserver(&observer);
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(observer.calls, 1);
++  ASSERT_TRUE(store->SetRoots("default", {Item("a", "https://a.example/")}));
++  EXPECT_EQ(observer.calls, 2);
++  store->RemoveObserver(&observer);
++}
++
++// Everything SetRoots accepts, the next load must accept too: one refused row
++// would otherwise send the whole file to .bad. A refusal changes nothing --
++// no row, no observer call, no file.
++TEST_F(PinStoreTest, RefusesRowsTheNextLoadWouldRefuse) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  CountingObserver observer;
++  store->AddObserver(&observer);
++
++  PinNode no_url = Item("a", "");
++  PinNode no_id = Item("", "https://a.example/");
++  PinNode deepest = Item("leaf", "https://a.example/");
++  for (int level = 0; level <= 65; ++level) {
++    deepest = Folder("f" + base::NumberToString(level), "F", {deepest});
++  }
++  EXPECT_FALSE(store->SetRoots("default", {no_url}));
++  EXPECT_FALSE(store->SetRoots("default", {Folder("f", "F", {no_id})}));
++  EXPECT_FALSE(store->SetRoots("default", {deepest}));
++
++  EXPECT_TRUE(store->tree().empty());
++  EXPECT_EQ(observer.calls, 0);
++  store->RemoveObserver(&observer);
++  store.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(base::PathExists(file()));
++}
++
++// An open tab finds its item by id (E15c), so two rows may never share one --
++// in one workspace or across two. A workspace's own rows may be replaced by
++// rows reusing their ids.
++TEST_F(PinStoreTest, RefusesAnIdTheTreeAlreadyHolds) {
++  std::unique_ptr<PinStore> store = LoadedStore();
++  ASSERT_TRUE(store->SetRoots("work", {Item("w", "https://w.example/")}));
++
++  EXPECT_FALSE(store->SetRoots("default", {Item("w", "https://x.example/")}));
++  EXPECT_FALSE(store->SetRoots(
++      "default", {Item("x", "https://x.example/"),
++                  Folder("f", "F", {Item("x", "https://y.example/")})}));
++  EXPECT_FALSE(store->tree().contains("default"));
++
++  EXPECT_TRUE(store->SetRoots("work", {Item("w", "https://w2.example/")}));
++}
++
++TEST_F(PinStoreTest, ASecondBrokenFileDoesNotReplaceTheFirst) {
++  ASSERT_TRUE(base::WriteFile(file(), "first"));
++  LoadedStore();
++  ASSERT_TRUE(base::WriteFile(file(), "second"));
++  LoadedStore();
++
++  EXPECT_EQ(Contents(bad_file()), "first");
++  EXPECT_EQ(Contents(dir_.GetPath().Append(
++                FILE_PATH_LITERAL("Workspace Pins (1).bad"))),
++            "second");
++}
++
++TEST_F(PinStoreTest, OneStorePerProfileAndItsDeathSavesTheFile) {
++  auto profile = std::make_unique<FakeProfile>();
++  PinStore* store = PinStore::GetOrCreate(profile.get(), dir_.GetPath());
++  EXPECT_EQ(PinStore::GetOrCreate(profile.get(), dir_.GetPath()), store);
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(store->loaded());
++  ASSERT_TRUE(store->SetRoots("default", {Item("a", "https://a.example/")}));
++
++  // What a browser exit does: the profile, and its user data, are destroyed.
++  profile.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(RootCount(LoadedStore()->tree(), "default"), 1u);
++}
++
++}  // namespace
++}  // namespace workspaces::pins

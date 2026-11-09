@@ -1,0 +1,433 @@
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
+@@ -92,9 +92,12 @@ base::DictValue ExportableValues(const P
+ ImportedValues ApplyImportedValues(PrefService* prefs,
+                                    const base::DictValue& values) {
+   constexpr std::string_view kPrefix = "helium.workspaces.";
+-  // State, not content: an import leaves the profile's own.
++  // State, not content, and this PC's settings, not the workspaces' (#54: the
++  // confirm names only workspaces, pinned pages and the Archive): an import
++  // leaves the profile's own.
+   const auto kept = [](std::string_view key) {
+-    return key == "enabled" || key == "arc_imported_at";
++    return key == "enabled" || key == "arc_imported_at" ||
++           key == "toolbar_order" || key == "little_window";
+   };
+   const base::DictValue current = ExportableValues(*prefs);
+   ImportedValues result;
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.h
+@@ -70,13 +70,13 @@ inline constexpr char kHeliumWorkspacesA
+     "helium.workspaces.archive_after_minutes";
+ 
+ // How tall a tab of the vertical list is, in DIP: the Tab style setting (E18,
+-// design 5 "E18 spec" 2). The setting offers kCompactTabRowHeight, today's
+-// look and the default, and taller ones at 36, 40 or 42 (the dropdown's
+-// values, in appearance_page.html.ts -- change them there); any value from 30
+-// to kMaxTabRowHeight is honoured too, so a test can seed 36 or 40. One
+-// value for the whole browser, last writer wins (D11): a tab's layout knows
+-// no profile, and the fork runs one. A sibling of the prefs above for the
+-// reason above, and pinned by the same test.
++// design 5 "E18 spec" 2). The setting offers kCompactTabRowHeight, today's look
++// and the default, and taller ones at 36, 40 or 42 (the dropdown's values are
++// kTabStyleHeights in workspace_settings_bubble_view.cc -- change them there);
++// any value from 30 to kMaxTabRowHeight is honoured too, so a test can seed 36
++// or 40. One value for the whole browser, last writer wins (D11): a tab's
++// layout knows no profile, and the fork runs one. A sibling of the prefs above
++// for the reason above, and pinned by the same test.
+ inline constexpr char kHeliumWorkspacesTabRowHeight[] =
+     "helium.workspaces.tab_row_height";
+ inline constexpr int kCompactTabRowHeight = 30;
+@@ -414,9 +414,10 @@ struct ImportedValues {
+ 
+ // An Import's settings: the profile ends with the file's user-set values and
+ // the defaults for the rest -- except "enabled" and "arc_imported_at", state
+-// and not content, which it leaves as they are. Each change goes through
+-// PrefService, so every window follows (the list's observer moves a window off
+-// a workspace that is gone).
++// and not content, and "toolbar_order" and "little_window", this PC's and not
++// the workspaces' (the 2026-10-25 review, #54), which it leaves as they are.
++// Each change goes through PrefService, so every window follows (the list's
++// observer moves a window off a workspace that is gone).
+ ImportedValues ApplyImportedValues(PrefService* prefs,
+                                    const base::DictValue& values);
+ 
+--- a/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs_unittest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <string>
+ #include <string_view>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/strings/string_number_conversions.h"
+@@ -1100,5 +1101,31 @@ TEST(WorkspacePrefsTest, AnImportSetsCle
+   EXPECT_TRUE(pref_service.GetBoolean(kHeliumWorkspacesWideSidebar));
+ }
+ 
++// #54: the toolbar's order and the little window are this PC's. An import
++// neither clears them (a file without them) nor sets them (a file with them).
++TEST(WorkspacePrefsTest, AnImportKeepsThisPCsToolbarOrderAndLittleWindow) {
++  TestingPrefServiceSimple pref_service;
++  RegisterProfilePrefs(pref_service.registry());
++  base::ListValue order;
++  order.Append("back");
++  pref_service.SetList(kHeliumWorkspacesToolbarOrder, order.Clone());
++  pref_service.SetBoolean(kHeliumWorkspacesLittleWindow, false);
++
++  ImportedValues result = ApplyImportedValues(&pref_service, base::DictValue());
++  EXPECT_EQ(result.cleared, 0);
++  EXPECT_EQ(pref_service.GetList(kHeliumWorkspacesToolbarOrder), order);
++  EXPECT_FALSE(pref_service.GetBoolean(kHeliumWorkspacesLittleWindow));
++
++  base::ListValue other;
++  other.Append("forward");
++  base::DictValue file;
++  file.Set("toolbar_order", std::move(other));
++  file.Set("little_window", true);
++  result = ApplyImportedValues(&pref_service, file);
++  EXPECT_EQ(result.set, 0);
++  EXPECT_EQ(pref_service.GetList(kHeliumWorkspacesToolbarOrder), order);
++  EXPECT_FALSE(pref_service.GetBoolean(kHeliumWorkspacesLittleWindow));
++}
++
+ }  // namespace
+ }  // namespace workspaces::prefs
+--- a/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
++++ b/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
+@@ -593,8 +593,8 @@
+   <message name="IDS_SETTINGS_WORKSPACES" desc="Label for the toggle that enables workspaces, which split the vertical tab strip into separate named sets of tabs.">
+     Workspaces
+   </message>
+-  <message name="IDS_SETTINGS_WORKSPACES_DESCRIPTION" desc="Description for the workspaces toggle, explaining that tabs are divided into named sets shown one at a time.">
+-    Keep separate sets of tabs in one window and switch between them from the tab strip
++  <message name="IDS_SETTINGS_WORKSPACES_DESCRIPTION" desc="Description for the workspaces toggle, explaining that tabs are divided into named sets shown one at a time, and that the other workspaces settings are in the + menu at the bottom of the vertical tab strip.">
++    Keep separate sets of tabs in one window and switch between them from the tab strip. More settings are in the tab strip's + menu
+   </message>
+   <message name="IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER" desc="Label for the dropdown that chooses how long a tab may go unviewed before it is closed automatically and kept in the Archive.">
+     Archive tabs after
+@@ -614,4 +614,12 @@
+   <message name="IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_30_DAYS" desc="Option in the archive-tabs-after dropdown: tabs unviewed for thirty days are archived.">
+     30 days
+   </message>
++
++  <!-- Patch 93: the workspaces settings bubble -->
++  <message name="IDS_HELIUM_WORKSPACE_SETTINGS" desc="Item of the workspaces bar's + menu: opens a small window with the workspace settings (archive tabs after, tab style, smooth scrolling, a wider sidebar).">
++    Workspace settings…
++  </message>
++  <message name="IDS_HELIUM_WORKSPACE_SETTINGS_TITLE" desc="Title of the small window that the workspaces bar's + menu item Workspace settings… opens.">
++    Workspace settings
++  </message>
+ </grit-part>
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -22,6 +22,7 @@ source_set("vertical") {
+     "workspace_quick_search_view.h",
+     "workspace_rail_view.h",
+     "workspace_edit_bubble_view.h",
++    "workspace_settings_bubble_view.h",
+     "workspace_transfer_ui.h",
+   ]
+ 
+@@ -69,6 +70,7 @@ source_set("impl") {
+     "workspace_quick_search_view.cc",
+     "workspace_rail_view.cc",
+     "workspace_edit_bubble_view.cc",
++    "workspace_settings_bubble_view.cc",
+     "workspace_transfer_ui.cc",
+   ]
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -69,6 +69,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_edit_bubble_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_settings_bubble_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/bookmarks/browser/bookmark_model.h"
+ #include "components/bookmarks/browser/bookmark_node.h"
+@@ -163,6 +164,8 @@ constexpr int kMenuCommandImportArc = 20
+ // The "+" menu's Export / Import workspaces (C19.1).
+ constexpr int kMenuCommandExportWorkspaces = 30;
+ constexpr int kMenuCommandImportWorkspaces = 31;
++// The "+" menu's Workspace settings... (the slim chunk, patch 93).
++constexpr int kMenuCommandWorkspacesSettings = 32;
+ 
+ // Every menu item carries a Chromium icon (design 5 "E17 spec" 5).
+ constexpr int kMenuIconSize = 16;
+@@ -1638,6 +1641,11 @@ void WorkspaceRailView::OnAddPressed(con
+                                            IDS_HELIUM_WORKSPACE_EXPORT);
+   context_menu_model_->AddItemWithStringId(kMenuCommandImportWorkspaces,
+                                            IDS_HELIUM_WORKSPACE_IMPORT);
++  // Patch 93: the four settings that left chrome://settings.
++  context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  context_menu_model_->AddItemWithStringIdAndIcon(
++      kMenuCommandWorkspacesSettings, IDS_HELIUM_WORKSPACE_SETTINGS,
++      MenuIcon(vector_icons::kSettingsIcon));
+   context_menu_runner_ = std::make_unique<views::MenuRunner>(
+       context_menu_model_.get(), views::MenuRunner::HAS_MNEMONICS);
+   // The event's source type, so a keyboard press opens the menu with its first
+@@ -2274,6 +2282,11 @@ void WorkspaceRailView::ExecuteCommand(i
+       LOG(INFO) << "[workspaces] rail + menu: import workspaces";
+       transfer_ui_.Import(add_button_);
+       return;
++    case kMenuCommandWorkspacesSettings:
++      LOG(INFO) << "[workspaces] rail + menu: workspaces settings";
++      // Anchored to the rail, as the edit bubble is.
++      ShowWorkspaceSettingsBubble(browser_, this);
++      return;
+   }
+ 
+   workspaces::WorkspaceService* service =
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_settings_bubble_view.cc
+@@ -0,0 +1,198 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/workspace_settings_bubble_view.h"
++
++#include <algorithm>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/prefs/pref_service.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/base/models/simple_combobox_model.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/text_constants.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/bubble/bubble_border.h"
++#include "ui/views/bubble/bubble_dialog_delegate_view.h"
++#include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/controls/button/toggle_button.h"
++#include "ui/views/controls/combobox/combobox.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/layout/layout_provider.h"
++#include "ui/views/style/typography.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSettingsFieldId);
++
++// Wider than the edit bubble's 300, so a note wraps to two lines at most.
++constexpr int kWidth = 360;
++
++// The Settings rows' options (appearance_page.html.ts before the slim chunk),
++// item for item: the string, and the value written.
++constexpr int kArchiveAfterIds[] = {
++    IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_NEVER,
++    IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_1_DAY,
++    IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_7_DAYS,
++    IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_30_DAYS};
++constexpr int kArchiveAfterMinutes[] = {0, 1440, 10080, 43200};
++constexpr int kTabStyleIds[] = {
++    IDS_SETTINGS_TAB_STYLE_DEFAULT, IDS_SETTINGS_TAB_STYLE_ROOMY_36,
++    IDS_SETTINGS_TAB_STYLE_ROOMY_40, IDS_SETTINGS_TAB_STYLE_ROOMY_42};
++constexpr int kTabStyleHeights[] = {workspaces::prefs::kCompactTabRowHeight, 36,
++                                    40, 42};
++
++// "Title   [control]" with its note under it, the whole width: a
++// chrome://settings row. `note_id` 0 for none. Returns the control, named for
++// a screen reader by the title.
++template <typename T>
++T* AddRow(views::View* parent,
++          int title_id,
++          int note_id,
++          std::unique_ptr<T> control) {
++  auto* const group = parent->AddChildView(std::make_unique<views::View>());
++  group->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical));
++  auto* const row = group->AddChildView(std::make_unique<views::View>());
++  auto* const row_layout =
++      row->SetLayoutManager(std::make_unique<views::BoxLayout>(
++          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
++          views::LayoutProvider::Get()->GetDistanceMetric(
++              views::DISTANCE_RELATED_LABEL_HORIZONTAL)));
++  row_layout->set_cross_axis_alignment(
++      views::BoxLayout::CrossAxisAlignment::kCenter);
++
++  const std::u16string title = l10n_util::GetStringUTF16(title_id);
++  auto* const label = row->AddChildView(std::make_unique<views::Label>(title));
++  label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  row_layout->SetFlexForView(label, 1);
++  T* const added = row->AddChildView(std::move(control));
++  added->GetViewAccessibility().SetName(title);
++
++  if (note_id) {
++    auto* const note = group->AddChildView(std::make_unique<views::Label>(
++        l10n_util::GetStringUTF16(note_id), views::style::CONTEXT_LABEL,
++        views::style::STYLE_SECONDARY));
++    note->SetMultiLine(true);
++    note->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  }
++  return added;
++}
++
++// A dropdown over `values`, writing the picked one to the integer `pref`.
++views::Combobox* AddDropdown(views::View* parent,
++                             PrefService* prefs,
++                             const char* pref,
++                             int title_id,
++                             int note_id,
++                             base::span<const int> ids,
++                             base::span<const int> values) {
++  std::vector<ui::SimpleComboboxModel::Item> items;
++  for (const int id : ids) {
++    items.emplace_back(l10n_util::GetStringUTF16(id));
++  }
++  views::Combobox* const box = AddRow(
++      parent, title_id, note_id,
++      std::make_unique<views::Combobox>(
++          std::make_unique<ui::SimpleComboboxModel>(std::move(items))));
++  const auto it = std::ranges::find(values, prefs->GetInteger(pref));
++  box->SetSelectedIndex(
++      it == values.end()
++          ? std::nullopt
++          : std::optional<size_t>(static_cast<size_t>(it - values.begin())));
++  box->SetCallback(base::BindRepeating(
++      [](PrefService* prefs, const char* pref, base::span<const int> values,
++         views::Combobox* box) {
++        const std::optional<size_t> index = box->GetSelectedIndex();
++        if (!index) {
++          return;
++        }
++        prefs->SetInteger(pref, values[*index]);
++        LOG(INFO) << "[workspaces] settings: " << pref << " -> "
++                  << values[*index];
++      },
++      base::Unretained(prefs), pref, values, base::Unretained(box)));
++  return box;
++}
++
++// A switch writing the boolean `pref`.
++void AddSwitch(views::View* parent,
++               PrefService* prefs,
++               const char* pref,
++               int title_id,
++               int note_id) {
++  views::ToggleButton* const toggle =
++      AddRow(parent, title_id, note_id, std::make_unique<views::ToggleButton>());
++  toggle->SetIsOn(prefs->GetBoolean(pref));
++  toggle->SetCallback(base::BindRepeating(
++      [](PrefService* prefs, const char* pref, views::ToggleButton* toggle) {
++        prefs->SetBoolean(pref, toggle->GetIsOn());
++        LOG(INFO) << "[workspaces] settings: " << pref << " -> "
++                  << toggle->GetIsOn();
++      },
++      base::Unretained(prefs), pref, base::Unretained(toggle)));
++}
++
++}  // namespace
++
++void ShowWorkspaceSettingsBubble(BrowserWindowInterface* browser,
++                                 views::View* anchor) {
++  PrefService* const prefs =
++      browser->GetProfile()->GetOriginalProfile()->GetPrefs();
++  auto contents = std::make_unique<views::View>();
++  contents->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical, gfx::Insets(),
++      views::LayoutProvider::Get()->GetDistanceMetric(
++          views::DISTANCE_UNRELATED_CONTROL_VERTICAL)));
++  namespace p = workspaces::prefs;
++  views::Combobox* const first = AddDropdown(
++      contents.get(), prefs, p::kHeliumWorkspacesArchiveAfterMinutes,
++      IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER,
++      IDS_SETTINGS_WORKSPACES_ARCHIVE_AFTER_DESCRIPTION, kArchiveAfterIds,
++      kArchiveAfterMinutes);
++  AddDropdown(contents.get(), prefs, p::kHeliumWorkspacesTabRowHeight,
++              IDS_SETTINGS_TAB_STYLE, 0, kTabStyleIds, kTabStyleHeights);
++  AddSwitch(contents.get(), prefs, p::kHeliumWorkspacesSmoothScrolling,
++            IDS_SETTINGS_SMOOTH_TAB_LIST_SCROLLING,
++            IDS_SETTINGS_SMOOTH_TAB_LIST_SCROLLING_DESCRIPTION);
++  AddSwitch(contents.get(), prefs, p::kHeliumWorkspacesWideSidebar,
++            IDS_SETTINGS_WIDE_SIDEBAR, IDS_SETTINGS_WIDE_SIDEBAR_DESCRIPTION);
++
++  // No buttons: every control applies as it changes. The first dropdown takes
++  // the focus, so the keyboard starts in the bubble.
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(
++              l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_SETTINGS_TITLE))
++          .AddCustomField(
++              std::make_unique<views::BubbleDialogModelHost::CustomView>(
++                  std::move(contents),
++                  views::BubbleDialogModelHost::FieldType::kControl, first),
++              kSettingsFieldId)
++          .SetInitiallyFocusedField(kSettingsFieldId)
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), anchor, views::BubbleBorder::BOTTOM_LEFT);
++  bubble->set_fixed_width(kWidth);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++  LOG(INFO) << "[workspaces] settings: opened";
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_settings_bubble_view.h
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_SETTINGS_BUBBLE_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_SETTINGS_BUBBLE_VIEW_H_
++
++class BrowserWindowInterface;
++
++namespace views {
++class View;
++}  // namespace views
++
++// "Workspace settings..." on the rail's "+" menu (the slim chunk, patch 93):
++// the four settings that left chrome://settings, so the Settings page keeps
++// only Workspaces on/off and the little window (upstream-slim.md, the owner's
++// rule of 2026-10-25).
++//
++//   Workspace settings
++//   Archive tabs after                         [ Never      v ]
++//   Tabs you haven't looked at for this long move to the Archive, ...
++//   Tab style                                  [ Default    v ]
++//   Smooth scrolling in the tab list                     (o  )
++//   The tab list glides when you roll the mouse wheel
++//   Allow a wider sidebar                                (o  )
++//   Drag the sidebar's edge as wide as the window allows. ...
++//
++// - The same prefs the Settings rows wrote, so today's values carry over; each
++//   control writes as it changes, as the Settings page did, so there are no
++//   buttons. They are the profile's (the original one from an incognito
++//   window, as chrome://settings is).
++// - A dropdown shows blank for a value it does not offer (a test's 2 minutes,
++//   a hand-edited 38 px), and leaves it as it is until an item is picked.
++// - Nothing is watched while open. Import workspaces... also writes these
++//   prefs, but it is on the "+" menu, and opening that closes the bubble.
++// - Reachable only while Workspaces is on, as the rail is; Tab style and the
++//   wider sidebar act even when it is off (upstream-slim.md D-S2).
++//
++// Logs: "[workspaces] settings: opened",
++//       "[workspaces] settings: <pref> -> <value>".
++//
++// Anchored to the rail, never to the "+" button, as the edit bubble is.
++void ShowWorkspaceSettingsBubble(BrowserWindowInterface* browser,
++                                 views::View* anchor);
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_SETTINGS_BUBBLE_VIEW_H_

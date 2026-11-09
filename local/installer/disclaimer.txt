@@ -1,0 +1,39 @@
+HELIUM WORKSPACES -- PLEASE READ
+
+This is an unofficial personal add-on for Helium (https://github.com/imputnet/helium).
+It is an AI-assisted ("vibe-coded") patch set that I made for my own use. It is not
+affiliated with or endorsed by the Helium team, and I have no intention of submitting
+it to official Helium. Do not report its bugs to them.
+
+If you miss Arc's Spaces, you are welcome to use it as it is.
+
+WHAT THIS INSTALLS
+
+- Helium with Arc-style workspaces, in a folder of its own:
+  %LOCALAPPDATA%\Programs\Helium Workspaces
+- a profile of its own, made the first time you open it:
+  %LOCALAPPDATA%\Helium Workspaces\User Data
+- a Start-menu shortcut, an entry in Apps & features, and an entry in
+  Settings > Apps > Default apps (nothing changes until you pick it there).
+
+It does not touch an installed official Helium or its profile.
+
+IT NEVER UPDATES ITSELF
+
+There is no updater. Security fixes arrive only when a new version of this installer
+is built on a newer Helium, and that can lag behind official Helium. Workspaces can
+break after an update.
+
+TWO THINGS TO KNOW
+
+- To make it your default browser, use Windows Settings > Apps > Default apps >
+  Workspaces for Helium. Its own settings page cannot do it.
+- Pin it to the taskbar from the Start menu (right-click > Pin to taskbar).
+  A pin made before it was called Workspaces for Helium keeps working; unpin and pin it
+  again to show the new name.
+
+Uninstalling keeps your data unless you tick "Also delete my Workspaces for Helium data".
+
+LICENCE
+
+GPL-3.0, as Helium and ungoogled-chromium. Chromium's own licences apply to Chromium.

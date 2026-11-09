@@ -1,0 +1,556 @@
+--- a/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_list.ts
++++ b/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_list.ts
+@@ -13,7 +13,7 @@ import {assert} from 'chrome://resources
+ import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
+ import type {Action} from '../customize_toolbar.mojom-webui.js';
+-import {ActionId, CategoryId} from '../customize_toolbar.mojom-webui.js';
++import {ActionId} from '../customize_toolbar.mojom-webui.js';
+ 
+ import {CustomizeToolbarApiProxy} from './customize_toolbar_api_proxy.js';
+ import {getCss as getToolbarCss} from './toolbar.css.js';
+@@ -150,23 +150,9 @@ export class WorkspaceToolbarListElement
+   protected onRowDrop_(e: DragEvent) {
+     e.preventDefault();
+     if (this.dragIndex_ >= 0 && this.dropTarget_) {
+-      const from = this.dragIndex_;
+-      let to = this.dropTarget_.index + (this.dropTarget_.after ? 1 : 0);
+-      const [first, last] = this.blockOf_(from);
+-      if (first < last && to >= first && to <= last + 1) {
+-        // Within Chrome's own group: reorder inside it.
+-        this.moveRows_(from, from, to);
+-      } else {
+-        // Anywhere else the group moves whole, and nothing lands inside it.
+-        const [groupFirst, groupLast] =
+-            this.isGrouped_(to) && this.isGrouped_(to - 1) ? this.blockOf_(to) :
+-                                                             [to, to];
+-        if (to > groupFirst && to <= groupLast) {
+-          to = to - groupFirst <= groupLast + 1 - to ? groupFirst :
+-                                                       groupLast + 1;
+-        }
+-        this.moveRows_(first, last, to);
+-      }
++      this.moveRow_(
++          this.dragIndex_,
++          this.dropTarget_.index + (this.dropTarget_.after ? 1 : 0));
+     }
+     this.onRowDragend_();
+   }
+@@ -185,45 +171,14 @@ export class WorkspaceToolbarListElement
+     e.preventDefault();
+     const up = e.key === 'ArrowUp';
+     const from = Number(row.dataset['index']);
+-    // One step: past the neighbouring row, or past Chrome's whole group; a
+-    // row of the group steps inside it, or takes the group along at its edge.
+-    const inside =
+-        this.isGrouped_(from) && this.isGrouped_(up ? from - 1 : from + 1);
+-    const [first, last] = inside ? [from, from] : this.blockOf_(from);
+-    const neighbour = up ? first - 1 : last + 1;
+-    if (neighbour < 0 || neighbour >= this.actions_.length) {
++    if (up ? from === 0 : from === this.actions_.length - 1) {
+       return;
+     }
+-    const [nextFirst, nextLast] =
+-        inside ? [neighbour, neighbour] : this.blockOf_(neighbour);
+     this.focusedId_ = this.actions_[from]!.id;
+-    this.moveRows_(first, last, up ? nextFirst : nextLast + 1);
++    this.moveRow_(from, up ? from - 1 : from + 2);
+     this.refocus_();
+   }
+ 
+-  // Chrome's pinned buttons are ONE group in the toolbar (wish 6a): their rows
+-  // move as one block.
+-  private isGrouped_(index: number): boolean {
+-    const action = this.actions_[index];
+-    return !!action && action.category === CategoryId.kTools && action.pinned;
+-  }
+-
+-  // [first, last] of the block the row at `index` moves in: the group, or the
+-  // row alone.
+-  private blockOf_(index: number): [number, number] {
+-    let first = index;
+-    let last = index;
+-    if (this.isGrouped_(index)) {
+-      while (this.isGrouped_(first - 1)) {
+-        first--;
+-      }
+-      while (this.isGrouped_(last + 1)) {
+-        last++;
+-      }
+-    }
+-    return [first, last];
+-  }
+-
+   private refocus_(fromServer = false) {
+     const id = this.focusedId_;
+     const moves = this.moves_;
+@@ -243,15 +198,15 @@ export class WorkspaceToolbarListElement
+     return (e.target as HTMLElement).closest<HTMLElement>('[data-index]');
+   }
+ 
+-  // Moves rows `first`..`last` in front of the row now at `to` (`to` may be
+-  // the list's length: the end) and saves the new order.
+-  private moveRows_(first: number, last: number, to: number) {
+-    if (to >= first && to <= last + 1) {
++  // Moves the row at `from` in front of the row now at `to` (`to` may be the
++  // list's length: the end) and saves the new order.
++  private moveRow_(from: number, to: number) {
++    if (to === from || to === from + 1) {
+       return;
+     }
+     const actions = [...this.actions_];
+-    const moved = actions.splice(first, last - first + 1);
+-    actions.splice(to > last ? to - moved.length : to, 0, ...moved);
++    const [moved] = actions.splice(from, 1);
++    actions.splice(to > from ? to - 1 : to, 0, moved!);
+     this.actions_ = actions;
+     this.moves_++;
+     this.apiProxy_.handler.setToolbarOrder(actions.map(action => action.id));
+--- a/chrome/browser/ui/tabs/workspaces/toolbar_order.cc
++++ b/chrome/browser/ui/tabs/workspaces/toolbar_order.cc
+@@ -5,7 +5,6 @@
+ #include "chrome/browser/ui/tabs/workspaces/toolbar_order.h"
+ 
+ #include <algorithm>
+-#include <functional>
+ #include <iterator>
+ #include <set>
+ 
+@@ -64,19 +63,7 @@ std::vector<std::string> Resolve(const s
+ std::vector<std::string> Arrange(const std::vector<std::string>& saved,
+                                  const std::vector<std::string>& pinned,
+                                  const std::vector<std::string>& others) {
+-  std::vector<std::string> order = Resolve(saved, DefaultOrder(pinned, others));
+-  if (pinned.empty()) {
+-    return order;
+-  }
+-  const auto is_pinned = [&pinned](const std::string& name) {
+-    return std::ranges::contains(pinned, name);
+-  };
+-  // The run goes where pinned.front() is, counted among the names that stay.
+-  const auto anchor = std::ranges::find(order, pinned.front());
+-  const auto at = std::count_if(order.begin(), anchor, std::not_fn(is_pinned));
+-  std::erase_if(order, is_pinned);
+-  order.insert(order.begin() + at, pinned.begin(), pinned.end());
+-  return order;
++  return Resolve(saved, DefaultOrder(pinned, others));
+ }
+ 
+ std::vector<std::string> FromList(const base::ListValue& list) {
+--- a/chrome/browser/ui/tabs/workspaces/toolbar_order.h
++++ b/chrome/browser/ui/tabs/workspaces/toolbar_order.h
+@@ -56,12 +56,9 @@ std::vector<std::string> Resolve(const s
+                                  const std::vector<std::string>& known);
+ 
+ // The order the side panel lists and the toolbar draws: `saved` resolved
+-// against DefaultOrder(pinned, others), with Chrome's pinned buttons as ONE
+-// run, in `pinned` order, where pinned.front() is saved. The pinned box is one
+-// rectangle that keeps its own order -- a drag inside it changes it -- so the
+-// list shows what the toolbar can draw (wish 6a; 6b places them one by one).
+-// A newly pinned button is appended to `pinned`, so it joins the run rather
+-// than moving it to the place it had while it was off.
++// against DefaultOrder(pinned, others). Every name keeps its own saved place,
++// Chrome's pinned buttons included (wish 6b: the box lends them to the
++// toolbar one by one); a button switched on appears where its row sat.
+ std::vector<std::string> Arrange(const std::vector<std::string>& saved,
+                                  const std::vector<std::string>& pinned,
+                                  const std::vector<std::string>& others);
+--- a/chrome/browser/ui/tabs/workspaces/toolbar_order_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/toolbar_order_unittest.cc
+@@ -55,31 +55,27 @@ TEST(ToolbarOrderTest, UnknownAndRepeate
+             (Names{kAddressBar, kBack}));
+ }
+ 
+-TEST(ToolbarOrderTest, PinnedButtonsAreOneRunWhereTheBoxsFirstIs) {
++TEST(ToolbarOrderTest, PinnedButtonsKeepTheirOwnPlaces) {
+   // Saved (the whole list, as the side panel writes it): Downloads first, Dev
+-  // tools after Print. The box's own order is Dev tools, Downloads (a drag
+-  // inside the box): both go where Dev tools is saved, in the box's order.
++  // tools after Print, whatever the box's own order (wish 6b).
+   const Names saved = {"kActionShowDownloads", kCollapse, kBack, kForward,
+                        kReload, kHome, kSplit, kAddressBar, kNewTab,
+                        kExtensions, "kActionPrint", "kActionDevTools", kMedia,
+                        kAvatar, kMenu};
+   EXPECT_EQ(Arrange(saved, {"kActionDevTools", "kActionShowDownloads"},
+                     {"kActionPrint"}),
+-            (Names{kCollapse, kBack, kForward, kReload, kHome, kSplit,
+-                   kAddressBar, kNewTab, kExtensions, "kActionPrint",
+-                   "kActionDevTools", "kActionShowDownloads", kMedia, kAvatar,
+-                   kMenu}));
++            saved);
+ }
+ 
+-TEST(ToolbarOrderTest, NewlyPinnedButtonJoinsTheRun) {
+-  // The group was moved left of the address bar; Print, saved while it was
+-  // off at the right, is now pinned (the box appends it): it joins the group.
++TEST(ToolbarOrderTest, SwitchedOnButtonAppearsWhereItsRowSat) {
++  // Downloads was moved left of the address bar; Print, saved at the right
++  // while it was off, is switched on: it appears there, at the right.
+   const Names saved = {"kActionShowDownloads", kAddressBar, "kActionPrint",
+                        kMenu};
+   EXPECT_EQ(Arrange(saved, {"kActionShowDownloads", "kActionPrint"}, {}),
+             (Names{kCollapse, kBack, kForward, kReload, kHome, kSplit,
+-                   "kActionShowDownloads", "kActionPrint", kAddressBar,
+-                   kNewTab, kExtensions, kMedia, kAvatar, kMenu}));
++                   "kActionShowDownloads", kAddressBar, kNewTab, kExtensions,
++                   "kActionPrint", kMedia, kAvatar, kMenu}));
+ }
+ 
+ TEST(ToolbarOrderTest, NothingPinnedLeavesTheResolvedOrder) {
+--- a/chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.cc
++++ b/chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.cc
+@@ -106,6 +106,27 @@ class PinnedToolbarActionsContainer::Bro
+   base::ScopedObservation<views::View, views::ViewObserver> observation_{this};
+ };
+ 
++// Wish 6b: when the host starts deleting its children, this box forgets the
++// pinned buttons it hosted there, so none is freed while still listed here.
++class PinnedToolbarActionsContainer::HostObserver : public views::ViewObserver {
++ public:
++  HostObserver(PinnedToolbarActionsContainer& owner, views::View* host)
++      : owner_(owner) {
++    observation_.Observe(host);
++  }
++
++  void OnViewHierarchyWillBeDeleted(views::View*) override {
++    observation_.Reset();
++    owner_->pinned_buttons_.clear();
++    owner_->button_host_ = nullptr;
++    owner_->on_hosted_change_.Reset();
++  }
++
++ private:
++  raw_ref<PinnedToolbarActionsContainer> owner_;
++  base::ScopedObservation<views::View, views::ViewObserver> observation_{this};
++};
++
+ ///////////////////////////////////////////////////////////////////////////////
+ // PinnedToolbarActionsContainer:
+ 
+@@ -549,14 +570,19 @@ void PinnedToolbarActionsContainer::AddP
+                                         [](PinnedActionToolbarButton* button) {
+                                           return button->GetActionId();
+                                         });
+-    (*iter)->SetPinned(true);
+-    pinned_buttons_.push_back(*iter);
++    PinnedActionToolbarButton* const button = *iter;
++    button->SetPinned(true);
++    pinned_buttons_.push_back(button);
+     popped_out_buttons_.erase(iter);
++    if (button_host_) {
++      MoveButtonTo(button, button_host_);
++    }
+   } else {
+     auto pinned_button = CreateOrGetButtonForAction(id);
+     auto* button = pinned_button.get();
+     pinned_button->SetPinned(true);
+-    pinned_buttons_.push_back(AddChildView(std::move(pinned_button)));
++    pinned_buttons_.push_back(AddButtonTo(
++        std::move(pinned_button), button_host_ ? button_host_.get() : this));
+     // If the added button was previously a cached permanent button then the
+     // icon may not be correct for the current state (i.e. touch ui).
+     if (button->IsPermanent()) {
+@@ -573,6 +599,24 @@ void PinnedToolbarActionsContainer::Remo
+   if (iter == pinned_buttons_.end()) {
+     return;
+   }
++  if (button_host_) {
++    // Wish 6b: a hosted button is not this box's to fade. It comes back here
++    // to stay popped out, or leaves on a fresh task as upstream's fade-then-
++    // remove does: its own right-click menu, which it owns, may be what
++    // unpinned it.
++    PinnedActionToolbarButton* const button = *iter;
++    pinned_buttons_.erase(iter);
++    if (ShouldRemainPoppedOutInToolbar(button)) {
++      button->SetPinned(false);
++      MoveButtonTo(button, this);
++      popped_out_buttons_.push_back(button);
++    } else {
++      GetAnimatingLayoutManager()->PostOrQueueAction(
++          base::BindOnce(&PinnedToolbarActionsContainer::RemoveHostedButton,
++                         weak_ptr_factory_.GetWeakPtr(), button));
++    }
++    return;
++  }
+   if (!ShouldRemainPoppedOutInToolbar(*iter)) {
+     GetAnimatingLayoutManager()->FadeOut(*iter);
+     GetAnimatingLayoutManager()->PostOrQueueAction(
+@@ -642,6 +686,13 @@ void PinnedToolbarActionsContainer::Remo
+ 
+ bool PinnedToolbarActionsContainer::IsOverflowed(actions::ActionId id) {
+   const auto* const button = GetButtonFor(id);
++  if (button && button_host_ && button->parent() == button_host_) {
++    // Wish 6b: the host lays a hosted button out; hidden by it = overflowed.
++    return static_cast<views::LayoutManagerBase*>(
++               button_host_->GetLayoutManager())
++               ->CanBeVisible(button) &&
++           !button->GetVisible();
++  }
+   // TODO(crbug.com/40949386): If this container is not visible treat the
+   // elements inside as overflowed.
+ 
+@@ -704,7 +755,8 @@ void PinnedToolbarActionsContainer::Reor
+   // or from the user dragging to reorder.
+   const auto ordered_pinned_ids = model_->PinnedActionIds();
+   for (auto id : ordered_pinned_ids) {
+-    if (auto* button = GetPinnedButtonFor(id)) {
++    // Wish 6b: hosted buttons are the host's to place.
++    if (auto* button = GetPinnedButtonFor(id); button && button->parent() == this) {
+       ReorderChildView(button, index);
+       index++;
+     }
+@@ -726,7 +778,7 @@ void PinnedToolbarActionsContainer::Reor
+             });
+ 
+   // Add the dragged button in its location if a drag is active.
+-  if (drop_info_.get()) {
++  if (drop_info_.get() && !button_host_) {
+     ReorderChildView(GetPinnedButtonFor(drop_info_->action_id),
+                      drop_info_->index);
+   }
+@@ -783,6 +835,66 @@ void PinnedToolbarActionsContainer::Upda
+ 
+   // 4. Ensure the views match the ordering in the model.
+   ReorderViews();
++
++  // Wish 6b: the host places the buttons it holds.
++  if (button_host_ && on_hosted_change_) {
++    on_hosted_change_.Run();
++  }
++}
++
++void PinnedToolbarActionsContainer::SetButtonHost(
++    views::View* host,
++    base::RepeatingClosure on_change) {
++  CHECK(host);
++  CHECK(!button_host_);
++  button_host_ = host;
++  on_hosted_change_ = std::move(on_change);
++  host_observer_ = std::make_unique<HostObserver>(*this, host);
++  for (PinnedActionToolbarButton* const button : pinned_buttons_) {
++    MoveButtonTo(button, host);
++  }
++}
++
++PinnedActionToolbarButton* PinnedToolbarActionsContainer::AddButtonTo(
++    std::unique_ptr<PinnedActionToolbarButton> button,
++    views::View* parent) {
++  if (parent == this) {
++    button->ClearProperty(views::kFlexBehaviorKey);
++    button->set_drag_controller(this);
++  } else {
++    // No drag controller in the host: dragging a hosted button is off (6c),
++    // and this box may be freed before it when the toolbar is torn down. Full
++    // opacity: this box's fade-out may have left it at 0; the host never fades.
++    button->set_drag_controller(nullptr);
++    if (button->layer()) {
++      button->layer()->SetOpacity(1.0f);
++    }
++    // In the host's flex layout, a button that does not fit is dropped, as in
++    // this box: the order of ToolbarView's kToolbarActionsFlexOrder.
++    button->SetProperty(
++        views::kFlexBehaviorKey,
++        views::FlexSpecification(views::MinimumFlexSizeRule::kPreferredSnapToZero,
++                                 views::MaximumFlexSizeRule::kPreferred)
++            .WithOrder(1002));
++  }
++  return parent->AddChildView(std::move(button));
++}
++
++void PinnedToolbarActionsContainer::MoveButtonTo(
++    PinnedActionToolbarButton* button,
++    views::View* parent) {
++  if (button->parent() != parent) {
++    AddButtonTo(button->parent()->RemoveChildViewT(button), parent);
++  }
++}
++
++// Wish 6b: a hosted button's removal, posted by RemovePinnedActionButtonFor.
++// Home first, so upstream's RemoveButton -- which removes it from this box --
++// is right for it.
++void PinnedToolbarActionsContainer::RemoveHostedButton(
++    PinnedActionToolbarButton* button) {
++  MoveButtonTo(button, this);
++  RemoveButton(button);
+ }
+ 
+ void PinnedToolbarActionsContainer::SetActionButtonIconVisibility(
+--- a/chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.h
++++ b/chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.h
+@@ -122,6 +122,13 @@ class PinnedToolbarActionsContainer
+ 
+   const std::vector<actions::ActionId>& PinnedActionIds() const override;
+ 
++  // Helium Workspaces (wish 6b): with a host -- the toolbar -- the pinned
++  // buttons are the host's own children, so the host places each one on its
++  // own, either side of the address bar; popped-out buttons stay here.
++  // `on_change` runs after a pinned button joins or leaves the host. Moves the
++  // pinned buttons there at once. Set once, by the toolbar.
++  void SetButtonHost(views::View* host, base::RepeatingClosure on_change);
++
+   base::WeakPtr<PinnedToolbarActionsContainer> GetWeakPtrForTesting() {
+     return weak_ptr_factory_.GetWeakPtr();
+   }
+@@ -133,6 +140,7 @@ class PinnedToolbarActionsContainer
+   // A struct representing the position and action being dragged.
+   struct DropInfo;
+   class BrowserObserver;
++  class HostObserver;
+ 
+   PinnedActionToolbarButton* AddPoppedOutButtonFor(actions::ActionId id);
+   void AddPinnedActionButtonFor(actions::ActionId id);
+@@ -173,6 +181,17 @@ class PinnedToolbarActionsContainer
+   // Utility function for going from width to icon counts.
+   size_t WidthToIconCount(int x_offset);
+ 
++  // Wish 6b: adds `button` to `parent` -- the host, or this box -- with the
++  // flex rule that parent's layout needs.
++  PinnedActionToolbarButton* AddButtonTo(
++      std::unique_ptr<PinnedActionToolbarButton> button,
++      views::View* parent);
++  // Wish 6b: moves a button that already has a parent.
++  void MoveButtonTo(PinnedActionToolbarButton* button, views::View* parent);
++  // Wish 6b: the posted removal of a hosted button that is not to stay
++  // popped out (RemovePinnedActionButtonFor).
++  void RemoveHostedButton(PinnedActionToolbarButton* button);
++
+   const std::unique_ptr<BrowserObserver> browser_observer_;
+   raw_ptr<BrowserView> browser_view_;
+   raw_ptr<ToolbarButtonProvider> button_provider_;
+@@ -194,6 +213,11 @@ class PinnedToolbarActionsContainer
+   // there is none.
+   std::unique_ptr<DropInfo> drop_info_;
+ 
++  // Wish 6b: the view the pinned buttons live in instead of this box, if any.
++  raw_ptr<views::View> button_host_ = nullptr;
++  base::RepeatingClosure on_hosted_change_;
++  std::unique_ptr<HostObserver> host_observer_;
++
+   base::WeakPtrFactory<PinnedToolbarActionsContainer> weak_ptr_factory_{this};
+ 
+   base::WeakPtrFactory<PinnedToolbarActionsContainer> drop_weak_ptr_factory_{
+--- a/chrome/browser/ui/views/toolbar/toolbar_controller.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_controller.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/toolbar/overflow_button.h"
+ #include "chrome/browser/ui/views/toolbar/overflow_menu.h"
++#include "chrome/browser/ui/views/toolbar/pinned_action_toolbar_button.h"
+ #include "chrome/browser/ui/views/toolbar/pinned_toolbar_button_status_indicator.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_button.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+@@ -384,6 +385,18 @@ bool ToolbarController::ShouldShowOverfl
+     }
+   }
+ 
++  // Helium Workspaces (wish 6b): pinned buttons the box hosts here are this
++  // view's own children, so the proposed layout above says if one is dropped.
++  for (const views::ChildLayout& child_layout : proposed_layout.child_layouts) {
++    if (!child_layout.visible &&
++        views::IsViewClass<PinnedActionToolbarButton>(child_layout.child_view) &&
++        static_cast<views::LayoutManagerBase*>(
++            toolbar_container_view_->GetLayoutManager())
++            ->CanBeVisible(child_layout.child_view)) {
++      return true;
++    }
++  }
++
+   for (const auto& element : overflow_menu_.responsive_elements()) {
+     // Skip if it's an ActionId because it's already checked.
+     if (std::holds_alternative<actions::ActionId>(element.overflow_id)) {
+--- a/chrome/browser/ui/views/toolbar/workspace_toolbar_order.cc
++++ b/chrome/browser/ui/views/toolbar/workspace_toolbar_order.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/toolbar/workspace_toolbar_order.h"
+ 
+ #include <algorithm>
++#include <iterator>
+ #include <map>
+ #include <memory>
+ #include <optional>
+@@ -20,6 +21,8 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model.h"
+ #include "chrome/browser/ui/toolbar/toolbar_pref_names.h"
++#include "chrome/browser/ui/views/toolbar/pinned_action_toolbar_button.h"
++#include "chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
+@@ -27,6 +30,7 @@
+ #include "ui/base/class_property.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/view_utils.h"
+ 
+ namespace workspaces {
+ 
+@@ -110,6 +114,18 @@ void ApplyToolbarOrder(ToolbarView* tool
+     toolbar->SetProperty(
+         kToolbarOrderWatcherKey,
+         std::make_unique<ToolbarOrderWatcher>(toolbar, pref_service));
++    // Wish 6b: the pinned box lends its buttons to the toolbar, which places
++    // each one on its own; a pin or unpin lays the toolbar out again.
++    const auto box_view = FindById(toolbar->children(),
++                                   kPinnedToolbarActionsContainerElementId);
++    if (auto* box = box_view == toolbar->children().end()
++                        ? nullptr
++                        : views::AsViewClass<PinnedToolbarActionsContainer>(
++                              box_view->get())) {
++      box->SetButtonHost(
++          toolbar, base::BindRepeating(&ToolbarView::UpdateToolbarLayout,
++                                       base::Unretained(toolbar)));
++    }
+   }
+ 
+   const std::vector<std::string> saved = toolbar_order::FromList(
+@@ -137,11 +153,6 @@ void ApplyToolbarOrder(ToolbarView* tool
+     std::erase(order, toolbar_order::kCollapse);
+   }
+ 
+-  // The pinned box stands for its first button: the order keeps the box's
+-  // buttons one run that starts there. With nothing pinned it is named nothing
+-  // and rides like any unnamed child.
+-  const std::optional<std::string> pinned_box_name =
+-      pinned.empty() ? std::nullopt : std::optional(pinned.front());
+ 
+   // Each named child, with the unnamed ones that follow it today (battery
+   // saver, glic, the compact tab strip after the address bar, ...): they keep
+@@ -158,9 +169,13 @@ void ApplyToolbarOrder(ToolbarView* tool
+       overflow = child;
+       continue;
+     }
++    // A pinned button the box lent us is named by its action (wish 6b); the
++    // box itself, holding only popped-out buttons, rides like any unnamed one.
++    auto* pinned_button = views::AsViewClass<PinnedActionToolbarButton>(child);
+     std::optional<std::string> name =
+-        id == kPinnedToolbarActionsContainerElementId ? pinned_box_name
+-                                                      : OwnButtonName(id);
++        pinned_button
++            ? actions::ActionIdMap::ActionIdToString(pinned_button->GetActionId())
++            : OwnButtonName(id);
+     if (name && !runs.contains(*name) && std::ranges::contains(order, *name)) {
+       runs[*name].push_back(child);
+       previous = *name;
+@@ -193,10 +208,17 @@ void ApplyToolbarOrder(ToolbarView* tool
+     return;
+   }
+   // DefaultOrder copies ToolbarView::Init by hand: if a rebase changes Init,
+-  // the first layout of a toolbar with nothing saved would move buttons.
+-  DCHECK(!first_layout || !saved.empty() ||
+-         std::equal(wanted.begin(), wanted.end(), toolbar->children().begin(),
+-                    toolbar->children().end()))
++  // the first layout of a toolbar with nothing saved would move buttons --
++  // other than the pinned ones the box just lent us (appended last).
++  const auto not_lent = [](views::View* view) {
++    return !views::IsViewClass<PinnedActionToolbarButton>(view);
++  };
++  std::vector<views::View*> before;
++  std::ranges::copy_if(toolbar->children(), std::back_inserter(before),
++                       not_lent);
++  std::vector<views::View*> after;
++  std::ranges::copy_if(wanted, std::back_inserter(after), not_lent);
++  DCHECK(!first_layout || !saved.empty() || before == after)
+       << "toolbar_order::DefaultOrder no longer matches ToolbarView::Init";
+   for (size_t i = 0; i < wanted.size(); ++i) {
+     if (toolbar->children()[i] != wanted[i]) {

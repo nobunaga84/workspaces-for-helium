@@ -1,0 +1,1984 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -142,7 +142,7 @@
+ // stop at 34091 and the upstream block above ends at 34108.
+ //
+ // CLOSE, RENAME, MOVE_TAB_TO and TOGGLE_RAIL are named so that the range is
+-// visibly spoken for; every other id is wired. 34132-34139 is left spare.
++// visibly spoken for; every other id is wired. 34133-34139 is left spare.
+ #define IDC_HELIUM_WORKSPACE_NEXT     34110
+ #define IDC_HELIUM_WORKSPACE_PREV     34111
+ #define IDC_HELIUM_WORKSPACE_1        34112
+@@ -167,6 +167,9 @@
+ #define IDC_HELIUM_WORKSPACE_PIN_TAB  34129
+ #define IDC_HELIUM_WORKSPACE_CLEAR    34130
+ #define IDC_HELIUM_WORKSPACE_ARCHIVE  34131
++// C1: the quick search box over the page -- open tabs, pinned pages and the
++// Archive of every workspace, one field.
++#define IDC_HELIUM_QUICK_SEARCH       34132
+ 
+ // Page-related commands
+ #define IDC_BOOKMARK_THIS_TAB           35000
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -275,12 +275,13 @@ const AcceleratorMapping kAcceleratorMap
+      IDC_HELIUM_WORKSPACE_MOVE_UP},
+     {ui::VKEY_DOWN, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
+      IDC_HELIUM_WORKSPACE_MOVE_DOWN},
+-    // C13 + C22: the digits, D, K and H are free with Shift+Alt in every map
+-    // and conditional append of this file. Workspace N by its place on the
+-    // bar, 0 back to the last one -- Ctrl+1..9 stay Chromium's tab keys. D
+-    // pins the page in front (Arc's Ctrl+D is Bookmark this tab here), K
+-    // clears Today, H opens the Archive. No numpad digits: with NumLock on,
+-    // Shift turns them into navigation keys.
++    // C13 + C22 + C1: the digits, D, K, H and F are free with Shift+Alt in
++    // every map and conditional append of this file. Workspace N by its place
++    // on the bar, 0 back to the last one -- Ctrl+1..9 stay Chromium's tab
++    // keys. D pins the page in front (Arc's Ctrl+D is Bookmark this tab
++    // here), K clears Today, H opens the Archive, F the quick search box (C1;
++    // Ctrl+F stays Find and Alt+F the app menu). No numpad digits: with
++    // NumLock on, Shift turns them into navigation keys.
+     {ui::VKEY_1, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_1},
+     {ui::VKEY_2, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_2},
+     {ui::VKEY_3, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_WORKSPACE_3},
+@@ -298,6 +299,7 @@ const AcceleratorMapping kAcceleratorMap
+      IDC_HELIUM_WORKSPACE_CLEAR},
+     {ui::VKEY_H, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
+      IDC_HELIUM_WORKSPACE_ARCHIVE},
++    {ui::VKEY_F, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_HELIUM_QUICK_SEARCH},
+     {ui::VKEY_HOME, ui::EF_ALT_DOWN, IDC_HOME},
+     {ui::VKEY_E, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+     {ui::VKEY_F, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.cc
+@@ -17,6 +17,7 @@
+ #include "base/notreached.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/strings/whitespace_constants.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -443,6 +444,60 @@ bool MatchesQuery(std::u16string_view se
+       });
+ }
+ 
++std::u16string ShownTitle(std::string_view custom_title,
++                          std::string_view title,
++                          std::string_view url) {
++  return base::UTF8ToUTF16(!custom_title.empty() ? custom_title
++                           : !title.empty()      ? title
++                                                 : url);
++}
++
++std::vector<std::u16string> QueryWords(std::u16string_view query) {
++  return base::SplitString(base::i18n::FoldCase(query), base::kWhitespaceUTF16,
++                           base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++}
++
++namespace {
++
++// Whether `word` occurs in `text` at a word's start: at index 0, or right
++// after a character that is not an ASCII letter or digit.
++// ponytail: ASCII only -- an accented letter before the match counts as a
++// break; use ICU's u_isalnum if a non-English name ranks oddly.
++bool FindsAtWordStart(std::u16string_view text, std::u16string_view word) {
++  for (size_t at = text.find(word); at != std::u16string_view::npos;
++       at = text.find(word, at + 1)) {
++    if (at == 0 || !base::IsAsciiAlphaNumeric(text[at - 1])) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++int MatchScore(std::u16string_view folded_name,
++               std::u16string_view folded_rest,
++               const std::vector<std::u16string>& words) {
++  if (words.empty()) {
++    return 0;
++  }
++  int score = 0;
++  for (const std::u16string& word : words) {
++    // The best place only: a word at a name's word start that also sits in
++    // the address scores 3, not 3 + 1.
++    if (FindsAtWordStart(folded_name, word)) {
++      score += 3;
++    } else if (folded_name.find(word) != std::u16string_view::npos) {
++      score += 2;
++    } else if (folded_rest.find(word) != std::u16string_view::npos) {
++      score += 1;
++    } else {
++      return 0;  // Every word must match somewhere (MatchesQuery's rule).
++    }
++  }
++  return score;
++}
++
+ std::string_view SweepVerdictName(SweepVerdict verdict) {
+   switch (verdict) {
+     case SweepVerdict::kDue:
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive.h
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive.h
+@@ -214,6 +214,25 @@ std::u16string SearchTextFor(const Archi
+ // any order. An empty or all-space query matches every row.
+ bool MatchesQuery(std::u16string_view search_text, std::u16string_view query);
+ 
++// Find tabs and pages (C1). What a row says: the name the user gave, else the
++// title, else the address -- the pinned section's and the Archive's one rule.
++std::u16string ShownTitle(std::string_view custom_title,
++                          std::string_view title,
++                          std::string_view url);
++
++// The query, case-folded (base::i18n::FoldCase) and split on whitespace, once
++// per keystroke. Empty for an empty or all-space query.
++std::vector<std::u16string> QueryWords(std::u16string_view query);
++
++// How well an item matches `words` (QueryWords()): 0 when any word is in
++// neither text, else the sum over the words of 3 (the word starts a word of
++// `folded_name`: at its start or after a character that is not a letter or a
++// digit), 2 (elsewhere in `folded_name`) or 1 (only in `folded_rest`: the
++// address, a folder's name). Both texts already case-folded. No words: 0.
++int MatchScore(std::u16string_view folded_name,
++               std::u16string_view folded_rest,
++               const std::vector<std::u16string>& words);
++
+ // The auto-archive's rules (E14d.3, design 5 "Auto-archive"), free functions
+ // over plain values so workspaces_unittests reaches them. The sweep itself --
+ // the timer, the tabs, the close -- is WorkspaceService's.
+--- a/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_archive_unittest.cc
+@@ -578,6 +578,82 @@ TEST(WorkspaceArchiveTest, SearchFoldsCa
+   EXPECT_TRUE(MatchesQuery(text, u"\u00C4PFEL"));
+ }
+ 
++// ------------------------------------------------ the quick search (C1)
++
++using Words = std::vector<std::u16string>;
++
++TEST(WorkspaceQuickSearchTest, ShownTitleIsTheNameThenTheTitleThenTheAddress) {
++  EXPECT_EQ(ShownTitle("Mine", "A page", "https://a.example/"), u"Mine");
++  EXPECT_EQ(ShownTitle("", "A page", "https://a.example/"), u"A page");
++  EXPECT_EQ(ShownTitle("", "", "https://a.example/"), u"https://a.example/");
++  EXPECT_EQ(ShownTitle("", "", ""), u"");
++  // UTF-8 in, UTF-16 out.
++  EXPECT_EQ(ShownTitle("", "\xC3\x84pfel", ""), u"\u00C4pfel");
++}
++
++TEST(WorkspaceQuickSearchTest, QueryWordsAreFoldedAndSplitOnWhitespace) {
++  EXPECT_EQ(QueryWords(u"GitHub  Pull\trequests "),
++            (Words{u"github", u"pull", u"requests"}));
++  // ICU's folding, as the texts the words are looked for in.
++  EXPECT_EQ(QueryWords(u"\u00C4PFEL"), Words{u"\u00E4pfel"});
++  EXPECT_TRUE(QueryWords(u"").empty());
++  EXPECT_TRUE(QueryWords(u" \t\n ").empty());
++}
++
++// MatchScore's contract (workspace_archive.h): per word 3 when it starts a
++// word of the name, 2 when it is only inside the name, 1 when it is only in
++// the rest; 0 for the whole item when any word is in neither text.
++constexpr std::u16string_view kName = u"github pull requests";
++constexpr std::u16string_view kRest = u"https://example.com/hub";
++
++TEST(WorkspaceQuickSearchTest, AWordStartingTheNameScoresThree) {
++  EXPECT_EQ(MatchScore(kName, kRest, {u"git"}), 3);
++  EXPECT_EQ(MatchScore(kName, kRest, {u"pull"}), 3);
++  EXPECT_EQ(MatchScore(kName, kRest, {u"req"}), 3);
++}
++
++TEST(WorkspaceQuickSearchTest, AWordInsideTheNameScoresTwo) {
++  // Also in the rest ("/hub"): the name wins.
++  EXPECT_EQ(MatchScore(kName, kRest, {u"hub"}), 2);
++  EXPECT_EQ(MatchScore(kName, kRest, {u"ull"}), 2);
++}
++
++TEST(WorkspaceQuickSearchTest, AWordOnlyInTheRestScoresOne) {
++  EXPECT_EQ(MatchScore(kName, kRest, {u"example"}), 1);
++  // A folder's name is part of the rest, after a newline.
++  EXPECT_EQ(MatchScore(kName, u"https://a.example/\nwork", {u"work"}), 1);
++}
++
++TEST(WorkspaceQuickSearchTest, AMissingWordMakesTheWholeScoreZero) {
++  EXPECT_EQ(MatchScore(kName, kRest, {u"gitlab"}), 0);
++  EXPECT_EQ(MatchScore(kName, kRest, {u"pull", u"gitlab"}), 0);
++  EXPECT_EQ(MatchScore(kName, kRest, {u"gitlab", u"pull"}), 0);
++}
++
++TEST(WorkspaceQuickSearchTest, SeveralWordsSum) {
++  EXPECT_EQ(MatchScore(kName, kRest, {u"pull", u"hub", u"example"}), 6);
++  EXPECT_EQ(MatchScore(kName, kRest, {u"requests", u"git"}), 6);
++}
++
++TEST(WorkspaceQuickSearchTest, NoWordsScoreZero) {
++  EXPECT_EQ(MatchScore(kName, kRest, {}), 0);
++  EXPECT_EQ(MatchScore(u"", u"", {}), 0);
++}
++
++TEST(WorkspaceQuickSearchTest, AWordStartsAfterAnythingButALetterOrDigit) {
++  EXPECT_EQ(MatchScore(u"foo-bar", u"", {u"bar"}), 3);
++  EXPECT_EQ(MatchScore(u"foo.bar", u"", {u"bar"}), 3);
++  // The name is the custom name and the title, joined by a newline.
++  EXPECT_EQ(MatchScore(u"mine\ngithub", u"", {u"github"}), 3);
++  // A digit before it is part of the same word.
++  EXPECT_EQ(MatchScore(u"tab2go", u"", {u"go"}), 2);
++}
++
++TEST(WorkspaceQuickSearchTest, AWordAtAStartScoresThreeAfterAMidWordHit) {
++  // "way" is inside "subway" first, then starts the second word.
++  EXPECT_EQ(MatchScore(u"subway way", u"", {u"way"}), 3);
++}
++
+ // ------------------------------------------------ the auto-archive (E14d.3)
+ 
+ constexpr base::TimeDelta kDay = base::Days(1);
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -17,6 +17,7 @@ source_set("vertical") {
+     "workspace_arc_importer.h",
+     "workspace_archive_view.h",
+     "workspace_pinned_section_view.h",
++    "workspace_quick_search_view.h",
+     "workspace_rail_view.h",
+     "workspace_edit_bubble_view.h",
+   ]
+@@ -57,6 +58,7 @@ source_set("impl") {
+     "workspace_arc_importer.cc",
+     "workspace_archive_view.cc",
+     "workspace_pinned_section_view.cc",
++    "workspace_quick_search_view.cc",
+     "workspace_rail_view.cc",
+     "workspace_edit_bubble_view.cc",
+   ]
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.cc
+@@ -161,11 +161,10 @@ constexpr ClearRange kClearRanges[] = {
+ constexpr int kCommandClearFirst = 10;
+ 
+ // What a row says: the name the user gave the tab, else its title, else its
+-// address -- the pinned section's rule (RowText there).
++// address -- one rule with the pinned section and the quick search box (C1).
+ std::u16string EntryText(const ArchiveEntry& entry) {
+-  return base::UTF8ToUTF16(!entry.custom_title.empty() ? entry.custom_title
+-                           : !entry.title.empty()      ? entry.title
+-                                                       : entry.url);
++  return workspaces::archive::ShownTitle(entry.custom_title, entry.title,
++                                         entry.url);
+ }
+ 
+ // What the heading over `bucket`'s entries says, `time` one of them (design 5
+@@ -1108,11 +1107,24 @@ void WorkspaceArchiveView::OnArchiveChan
+                                 weak_factory_.GetWeakPtr()));
+ }
+ 
+-void WorkspaceArchiveView::RestoreEntry(const std::string& id) {
+-  const auto it =
+-      std::ranges::find(store_->entries(), id, &ArchiveEntry::id);
+-  if (it == store_->entries().end()) {
+-    return;
++// static
++bool WorkspaceArchiveView::Restore(BrowserWindowInterface* browser,
++                                   const std::string& id) {
++  // Not with Workspaces switched off while the screen stays open: the rail,
++  // its door, is gone, and a restore would land at the strip's end with its
++  // entry spent (code review). Checked first, so a refusal never creates the
++  // store (C1: the quick search box calls this too).
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  if (!service || !service->IsEnabled()) {
++    return false;
++  }
++  Profile* const profile = browser->GetProfile();
++  ArchiveStore* const store =
++      ArchiveStore::GetOrCreate(profile, profile->GetPath());
++  const auto it = std::ranges::find(store->entries(), id, &ArchiveEntry::id);
++  if (it == store->entries().end()) {
++    return false;
+   }
+   // A copy: the Remove() below changes the store's vector.
+   const ArchiveEntry entry = *it;
+@@ -1120,15 +1132,7 @@ void WorkspaceArchiveView::RestoreEntry(
+   if (!url.is_valid()) {
+     LOG(WARNING) << "[workspaces] archive: an entry has no address a tab can "
+                     "open";
+-    return;
+-  }
+-  // Not with Workspaces switched off while the screen stays open: the rail,
+-  // its door, is gone, and a restore would land at the strip's end with its
+-  // entry spent (code review).
+-  workspaces::WorkspaceService* const service =
+-      workspaces::WorkspaceService::From(browser_);
+-  if (!service || !service->IsEnabled()) {
+-    return;
++    return false;
+   }
+ 
+   // Home for a deleted workspace, as the list draws it (design 2.4).
+@@ -1143,7 +1147,7 @@ void WorkspaceArchiveView::RestoreEntry(
+   service->EnterWorkspaceForInsert(guid);
+   // At the top of the list, where a new tab opens (E15c.1); the end when the
+   // workspace has no tab.
+-  TabStripModel* const model = browser_->GetTabStripModel();
++  TabStripModel* const model = browser->GetTabStripModel();
+   int index = service->TopOfListIndex(nullptr);
+   if (index < 0) {
+     index = model->count();
+@@ -1162,7 +1166,7 @@ void WorkspaceArchiveView::RestoreEntry(
+     extra_data[workspaces::kCustomTitleExtraDataKey] = entry.custom_title;
+   }
+   chrome::AddRestoredTab(
+-      browser_, base::span_from_ref(navigation), index,
++      browser, base::span_from_ref(navigation), index,
+       /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
+       /*group=*/std::nullopt, /*select=*/true, /*pin=*/false,
+       base::TimeTicks::Now(), base::Time::Now(),
+@@ -1172,10 +1176,16 @@ void WorkspaceArchiveView::RestoreEntry(
+       chrome::RestoredTabLoadPolicy::kLoadIfVisible);
+   // The page lives in one place, as in Arc: out of the archive now, and out
+   // of Recently Closed.
+-  store_->Remove(id);
++  store->Remove(id);
+   LOG(INFO) << "[workspaces] archive: restored an entry into '" << guid << "'";
+-  RemoveRecentlyClosedTab(browser_->GetProfile(), id);
+-  GetWidget()->Close();
++  RemoveRecentlyClosedTab(profile, id);
++  return true;
++}
++
++void WorkspaceArchiveView::RestoreEntry(const std::string& id) {
++  if (Restore(browser_, id)) {
++    GetWidget()->Close();
++  }
+ }
+ 
+ void WorkspaceArchiveView::DeleteEntry(const std::string& id) {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h
+@@ -165,6 +165,13 @@ class WorkspaceArchiveView : public view
+   // The Archive shortcut's (C22): centred over the page, since zen mode
+   // usually hides the bar and its button.
+   static void ShowOverPage(BrowserWindowInterface* browser);
++  // Restores the archive entry `id` into `browser` (the class comment's
++  // road: its workspace entered, the page at the top of the list, the entry
++  // out of the archive and of Recently Closed). False, with nothing changed,
++  // while Workspaces is off in `browser`, when the entry is gone, or when its
++  // address is not one a tab can open. The screen's rows and the quick search
++  // box (C1) both restore through it; neither closes anything here.
++  static bool Restore(BrowserWindowInterface* browser, const std::string& id);
+ 
+   WorkspaceArchiveView(const WorkspaceArchiveView&) = delete;
+   WorkspaceArchiveView& operator=(const WorkspaceArchiveView&) = delete;
+@@ -207,7 +214,8 @@ class WorkspaceArchiveView : public view
+   // The store's changed callback: posts one Rebuild(), coalesced.
+   void OnArchiveChanged();
+ 
+-  // Restores the entry `id` (see the class comment) and closes the screen.
++  // Restore()s the entry `id` and closes the screen; a refusal keeps it
++  // open.
+   void RestoreEntry(const std::string& id);
+ 
+   // Removes the entry `id`; the store's callback redraws.
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -42,6 +42,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
+@@ -284,11 +285,10 @@ std::string NewRowId() {
+   return base::Uuid::GenerateRandomV4().AsLowercaseString();
+ }
+ 
++// What a row says -- one rule with the Archive and the quick search box (C1).
+ std::u16string RowText(const PinNode& node) {
+-  const std::string& text = !node.custom_title.empty() ? node.custom_title
+-                            : !node.title.empty()      ? node.title
+-                                                       : node.url;
+-  return base::UTF8ToUTF16(text);
++  return workspaces::archive::ShownTitle(node.custom_title, node.title,
++                                         node.url);
+ }
+ 
+ // The colour a folder is drawn and ticked in: its own, else its workspace's
+@@ -374,6 +374,29 @@ void CollectItems(const PinNode& row, st
+   }
+ }
+ 
++// The item `id` in any workspace of `tree`, and in `key` the tree's key for
++// the workspace whose rows hold it -- a deleted workspace's too (C1: the quick
++// search box finds items outside the section on screen). Null for a folder or
++// no such row.
++const PinNode* FindItem(const workspaces::pins::PinTree& tree,
++                        std::string_view id,
++                        std::string& key) {
++  std::vector<const PinNode*> items;
++  for (const auto& [workspace, roots] : tree) {
++    items.clear();
++    for (const PinNode& root : roots) {
++      CollectItems(root, items);
++    }
++    for (const PinNode* const item : items) {
++      if (item->id == id) {
++        key = workspace;
++        return item;
++      }
++    }
++  }
++  return nullptr;
++}
++
+ // The workspace the section shows (E17b, design 5 "E17 spec" 3): its mark --
+ // its symbol, else its emoji or letter, on the fill its chip has on the bar
+ // -- then its name, 12 px semibold. Made once, by the section; each rebuild
+@@ -1924,31 +1947,7 @@ void WorkspacePinnedSectionView::ShowFol
+ }
+ 
+ void WorkspacePinnedSectionView::OnItemPressed(const std::string& id) {
+-  const PinNode* const item = store_ ? store_->Find(id) : nullptr;
+-  if (!item || item->type != PinNode::Type::kItem) {
+-    return;
+-  }
+-  const TabStripUserGestureDetails gesture(
+-      TabStripUserGestureDetails::GestureType::kOther);
+-  TabStripModel* const model = browser_->GetTabStripModel();
+-  if (tabs::TabInterface* const tab = LinkedTab(model, id)) {
+-    model->ActivateTabAt(model->GetIndexOfTab(tab), gesture);
+-    return;
+-  }
+-  // One place: an item open in another window of this profile is shown
+-  // there, not opened a second time here.
+-  for (BrowserWindowInterface* const window :
+-       WindowsOf(browser_->GetProfile())) {
+-    TabStripModel* const other = window->GetTabStripModel();
+-    if (tabs::TabInterface* const tab = LinkedTab(other, id)) {
+-      other->ActivateTabAt(other->GetIndexOfTab(tab), gesture);
+-      window->GetWindow()->Activate();
+-      LOG(INFO) << "[workspaces] pins: item '" << id
+-                << "' is open in another window; showed it there";
+-      return;
+-    }
+-  }
+-  OpenItem(*item);
++  ShowItem(browser_, id);
+ }
+ 
+ void WorkspacePinnedSectionView::OnItemClosePressed(const std::string& id) {
+@@ -1971,7 +1970,10 @@ void WorkspacePinnedSectionView::OnItemR
+   }
+ }
+ 
+-void WorkspacePinnedSectionView::OpenItem(const PinNode& item) {
++// static
++void WorkspacePinnedSectionView::OpenItem(BrowserWindowInterface* browser,
++                                          const PinNode& item,
++                                          std::string_view guid) {
+   const GURL url(item.url);
+   if (!url.is_valid()) {
+     LOG(WARNING) << "[workspaces] pins: item '" << item.id
+@@ -1980,9 +1982,10 @@ void WorkspacePinnedSectionView::OpenIte
+   }
+   // The importer's road (LOCAL.md 43): one history entry, the item's address,
+   // and everything the tab is -- linked and anchored -- on the contents BEFORE
+-  // the insert, so the list never draws it for a moment. The workspace tag is
+-  // left to stamping: a new tab joins the workspace on screen, which is the
+-  // one whose row was clicked.
++  // the insert, so the list never draws it for a moment. Without `guid` the
++  // workspace tag is left to stamping: a new tab joins the workspace on
++  // screen, which is Unpin's. ShowItem names the item's own workspace, which
++  // it entered first (C1: an item of another workspace).
+   sessions::SerializedNavigationEntry navigation;
+   navigation.set_index(0);
+   navigation.set_virtual_url(url);
+@@ -1995,12 +1998,15 @@ void WorkspacePinnedSectionView::OpenIte
+   if (!item.custom_title.empty()) {
+     extra_data[workspaces::kCustomTitleExtraDataKey] = item.custom_title;
+   }
++  if (!guid.empty()) {
++    extra_data[workspaces::kWorkspaceExtraDataKey] = std::string(guid);
++  }
+   // Appended: the session service re-records every tab after an insert point
+   // (E14c), and where a hidden tab sits does not matter. Unpin moves it from
+   // here, still linked, so the list does not scroll to it (E15d).
+-  TabStripModel* const model = browser_->GetTabStripModel();
++  TabStripModel* const model = browser->GetTabStripModel();
+   chrome::AddRestoredTab(
+-      browser_, base::span_from_ref(navigation), model->count(),
++      browser, base::span_from_ref(navigation), model->count(),
+       /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
+       /*group=*/std::nullopt, /*select=*/true, /*pin=*/false,
+       base::TimeTicks::Now(), base::Time::Now(),
+@@ -2040,7 +2046,7 @@ void WorkspacePinnedSectionView::UnpinIt
+     }
+     if (!page) {
+       const PinNode item = *found;
+-      OpenItem(item);
++      OpenItem(browser_, item);
+     } else if (index >= 0) {
+       here->InsertDetachedTabAt(
+           here->count(),
+@@ -2306,6 +2312,81 @@ void WorkspacePinnedSectionView::ToggleP
+   PinTabs(browser, {tab});
+ }
+ 
++// static
++bool WorkspacePinnedSectionView::ShowItem(BrowserWindowInterface* browser,
++                                          std::string_view id) {
++  workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  if (!service || !service->IsEnabled()) {
++    return false;
++  }
++  Profile* const profile = browser->GetProfile();
++  workspaces::pins::PinStore* const store =
++      workspaces::pins::PinStore::GetOrCreate(profile, profile->GetPath());
++  std::string key;
++  const PinNode* const found = FindItem(store->tree(), id, key);
++  if (!found) {
++    return false;
++  }
++  // A copy: entering a workspace below runs its observers, and nothing reads
++  // the store's rows after anything changed.
++  const PinNode item = *found;
++  // Checked before any workspace is entered: a refusal changes nothing (C1).
++  if (!GURL(item.url).is_valid()) {
++    LOG(WARNING) << "[workspaces] pins: item '" << item.id
++                 << "' has no address a tab can open";
++    return false;
++  }
++  if (tabs::TabInterface* const tab =
++          LinkedTab(browser->GetTabStripModel(), id)) {
++    return ShowTab(browser, *tab);
++  }
++  // One place: an item open in another window of this profile is shown
++  // there, not opened a second time here.
++  for (BrowserWindowInterface* const window : WindowsOf(profile)) {
++    if (tabs::TabInterface* const tab =
++            LinkedTab(window->GetTabStripModel(), id)) {
++      ShowTab(browser, *tab);
++      LOG(INFO) << "[workspaces] pins: item '" << item.id
++                << "' is open in another window; showed it there";
++      return true;
++    }
++  }
++  // Home for a deleted workspace, as the section draws its rows (design 2.4).
++  const std::string guid(
++      workspaces::ResolveTabGuid(key, service->known_guids()));
++  service->EnterWorkspaceForInsert(guid);
++  OpenItem(browser, item, guid);
++  return true;
++}
++
++// static
++bool WorkspacePinnedSectionView::ShowTab(BrowserWindowInterface* browser,
++                                         tabs::TabInterface& tab) {
++  BrowserWindowInterface* const window = tab.GetBrowserWindowInterface();
++  TabStripModel* const model = window ? window->GetTabStripModel() : nullptr;
++  const int index = model ? model->GetIndexOfTab(&tab) : TabStripModel::kNoTab;
++  if (index == TabStripModel::kNoTab) {
++    return false;
++  }
++  if (!tab.IsPinned()) {
++    if (workspaces::WorkspaceService* const service =
++            workspaces::WorkspaceService::From(window)) {
++      const std::string tag =
++          workspaces::WorkspaceGuidForTab(tab.GetContents());
++      service->EnterWorkspaceForInsert(
++          workspaces::ResolveTabGuid(tag, service->known_guids()));
++    }
++  }
++  model->ActivateTabAt(index,
++                       TabStripUserGestureDetails(
++                           TabStripUserGestureDetails::GestureType::kOther));
++  if (window != browser) {
++    window->GetWindow()->Activate();
++  }
++  return true;
++}
++
+ WorkspacePinnedSectionView::DropTarget::DropTarget() = default;
+ WorkspacePinnedSectionView::DropTarget::DropTarget(const DropTarget&) = default;
+ WorkspacePinnedSectionView::DropTarget&
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -177,6 +177,24 @@ class WorkspacePinnedSectionView
+   // page of a pinned page is unpinned to the top of the list, as the row's
+   // Unpin. A tab neither can take does nothing. ONLY FROM A COMMAND HANDLER.
+   static void TogglePin(BrowserWindowInterface* browser);
++  // Shows the page of item `id`, found in ANY workspace of the store (C1: the
++  // quick search box; a row's press too): its open page activated -- here,
++  // or in the window of this profile that has it (one place), brought to the
++  // front -- after the window enters that tab's workspace, unless the tab is
++  // a favorite, drawn in every workspace; else opened here, in the item's own
++  // workspace (Home for a deleted one), which the window enters first. Never
++  // SwitchToWorkspace: it would activate a tab, or spawn a New Tab, first.
++  // False, with nothing changed, while Workspaces is off in `browser`, for a
++  // folder or no such row, and for an item whose address is not one a tab
++  // can open. ONLY FROM A MENU, BUTTON OR COMMAND HANDLER.
++  static bool ShowItem(BrowserWindowInterface* browser, std::string_view id);
++  // Activates `tab` in its own window, `browser` or another of its profile:
++  // that window enters the tab's workspace first (EnterWorkspaceForInsert, so
++  // the rail remembers the tab it leaves), unless the tab is a favorite, drawn
++  // in every workspace; another window comes to the front. ShowItem's road to
++  // an open page, and the quick search box's to a tab (C1). False when the tab
++  // is in no tab strip. ONLY FROM A MENU, BUTTON OR COMMAND HANDLER.
++  static bool ShowTab(BrowserWindowInterface* browser, tabs::TabInterface& tab);
+ 
+  private:
+   // The list's glide under the mouse wheel (E18); in the .cc.
+@@ -246,14 +264,16 @@ class WorkspacePinnedSectionView
+   void ShowFolderPages(const std::string& id, const ui::Event& event);
+   // The card the rows sit on, in this theme; null before there is one.
+   std::unique_ptr<views::Background> CardBackground() const;
+-  // Shows the item's page: activates it here, or in the window of this
+-  // profile that has it open (one place), or opens it.
++  // Shows the item's page: ShowItem().
+   void OnItemPressed(const std::string& id);
+   void OnItemClosePressed(const std::string& id);
+   void OnItemResetPressed(const std::string& id);
+-  // Opens `item` as a tab of this window, active, linked to the item and
+-  // anchored at its address.
+-  void OpenItem(const workspaces::pins::PinNode& item);
++  // Opens `item` as a tab of `browser`, active, linked to the item and
++  // anchored at its address; tagged for workspace `guid` when one is given
++  // (ShowItem), else stamped with the one on screen.
++  static void OpenItem(BrowserWindowInterface* browser,
++                       const workspaces::pins::PinNode& item,
++                       std::string_view guid = {});
+   // The item becomes a Today tab: its page if it has one, opened first
+   // otherwise. At model index `index` of this window, in `group` if given,
+   // when it was dropped there (E15d) -- a page open in another window comes
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_quick_search_view.cc
+@@ -0,0 +1,1071 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/workspace_quick_search_view.h"
++
++#include <algorithm>
++#include <array>
++#include <iterator>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <tuple>
++#include <utility>
++#include <vector>
++
++#include "base/containers/flat_map.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/functional/function_ref.h"
++#include "base/i18n/case_conversion.h"
++#include "base/logging.h"
++#include "base/memory/ptr_util.h"
++#include "base/no_destructor.h"
++#include "base/strings/strcat.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/cancelable_task_tracker.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "base/timer/elapsed_timer.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/favicon/favicon_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/tabs/tab_data.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_archive.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_session_data.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_stamping.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_tab_data.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/favicon/core/favicon_service.h"
++#include "components/favicon_base/favicon_types.h"
++#include "components/keyed_service/core/service_access_type.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/vector_icons/vector_icons.h"
++#include "content/public/browser/web_contents.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/accelerators/accelerator.h"
++#include "ui/base/base_window.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/events/event.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/favicon_size.h"
++#include "ui/gfx/geometry/point_f.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/bubble/bubble_border.h"
++#include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/controls/button/label_button.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/controls/textfield/textfield.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/layout/layout_provider.h"
++#include "ui/views/layout/layout_types.h"
++#include "ui/views/layout/proposed_layout.h"
++#include "ui/views/style/typography.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++using workspaces::archive::ArchiveEntry;
++using workspaces::archive::ArchiveStore;
++using workspaces::pins::PinNode;
++using workspaces::pins::PinStore;
++
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kQuickSearchFieldId);
++
++// D15: wider than the Archive's 360, so a name and a workspace's name sit
++// side by side. The Archive's corners, row height, search box and icon
++// (design 5 "E17 spec" 4).
++constexpr int kWidth = 480;
++constexpr int kBubbleRadius = 12;
++constexpr int kRowHeight = 30;
++constexpr int kSearchHeight = 34;
++constexpr int kIconSize = 16;
++// Each side of a row and a heading, and between the box's parts and above a
++// heading (the Archive's).
++constexpr int kRowInset = 8;
++constexpr int kSpacing = 8;
++// D9: at most this many rows a group, in a list of FIXED height -- about ten
++// rows -- that scrolls, so the box never moves while typing.
++constexpr size_t kMaxRows = 20;
++constexpr int kListHeight = 10 * kRowHeight;
++// The highlighted row's fill: a pinned row's roundness.
++constexpr float kHighlightRadius = 8;
++// The dot before a row's workspace name, and the gap each side of it (the
++// Archive's "All workspaces" dot).
++constexpr int kDotSize = 7;
++constexpr int kDotGap = 6;
++
++// The three groups, in the owner's order (grouped by kind): a candidate's kind
++// is its group's index in the pool.
++enum class ResultKind { kTab = 0, kPin = 1, kArchive = 2 };
++constexpr size_t kGroupCount = 3;
++constexpr int kGroupHeadings[kGroupCount] = {IDS_HELIUM_QUICK_SEARCH_TABS,
++                                             IDS_HELIUM_QUICK_SEARCH_PINNED,
++                                             IDS_HELIUM_QUICK_SEARCH_ARCHIVED};
++// The log's words for what was opened.
++constexpr const char* kOpenedNames[kGroupCount] = {"a tab", "a pinned page",
++                                                   "an archived tab"};
++
++// C2's clock (c2-progress.md D2), as a key that sorts: a tab the user LEFT
++// (WorkspaceTabData::left_at) above one never left since the start, each by
++// its time -- the leave, else when it was last shown. A pinned page that is
++// not open and an Archive entry are never "left": their time is when the page
++// was last used, or closed.
++using MruKey = std::pair<bool, base::Time>;
++
++// What the highlight follows across a refresh (D20): the kind, then a pinned
++// page's or an entry's id, or a tab's handle (null for the other two, whose
++// open page may come and go).
++using Identity = std::tuple<ResultKind, std::string, tabs::TabHandle>;
++
++MruKey TabClock(content::WebContents* contents) {
++  if (!contents) {
++    return {};
++  }
++  if (const workspaces::WorkspaceTabData* const data =
++          workspaces::WorkspaceTabData::FromWebContents(contents);
++      data && !data->left_at().is_null()) {
++    return {true, data->left_at()};
++  }
++  return {false, contents->GetLastActiveTime()};
++}
++
++// D18: the address a candidate is matched by, without a leading "http://" or
++// "https://" and then "www.": every pinned page starts with them, and one
++// letter "h" or "w" would match everything through its address.
++std::string_view WithoutScheme(std::string_view url) {
++  for (const std::string_view prefix : {"https://", "http://"}) {
++    if (url.starts_with(prefix)) {
++      url.remove_prefix(prefix.size());
++      break;
++    }
++  }
++  if (constexpr std::string_view kWww = "www."; url.starts_with(kWww)) {
++    url.remove_prefix(kWww.size());
++  }
++  return url;
++}
++
++// Calls `add` for every item under `rows`, all the way down, with the names
++// of the folders it is in, joined by newlines (C1: a pinned page matches by
++// its folders' names too, the owner).
++void ForEachItem(
++    const std::vector<PinNode>& rows,
++    const std::string& folders,
++    base::FunctionRef<void(const PinNode&, const std::string&)> add) {
++  for (const PinNode& row : rows) {
++    if (row.type == PinNode::Type::kItem) {
++      add(row, folders);
++    } else {
++      ForEachItem(row.children,
++                  folders.empty() ? row.title
++                                  : base::StrCat({folders, "\n", row.title}),
++                  add);
++    }
++  }
++}
++
++// Each window's open box, for the toggle (D12). A key is never dereferenced;
++// the box takes its window's out as it goes.
++base::flat_map<const BrowserWindowInterface*,
++               base::WeakPtr<WorkspaceQuickSearchView>>&
++OpenBoxes() {
++  static base::NoDestructor<base::flat_map<
++      const BrowserWindowInterface*, base::WeakPtr<WorkspaceQuickSearchView>>>
++      boxes;
++  return *boxes;
++}
++
++// Opens a result AFTER the box has closed, from copies: nothing here touches
++// the box, whose window may no longer be the active one. A pinned page -- a
++// recent one too -- goes through the pinned section's road, an Archive entry
++// through the Archive's.
++void OpenResult(BrowserWindowInterface* browser,
++                ResultKind kind,
++                const std::string& id,
++                const std::string& guid,
++                tabs::TabHandle handle) {
++  bool opened = false;
++  switch (kind) {
++    case ResultKind::kTab:
++      if (tabs::TabInterface* const tab = handle.Get()) {
++        opened = WorkspacePinnedSectionView::ShowTab(browser, *tab);
++      }
++      break;
++    case ResultKind::kPin:
++      opened = WorkspacePinnedSectionView::ShowItem(browser, id);
++      break;
++    case ResultKind::kArchive:
++      opened = WorkspaceArchiveView::Restore(browser, id);
++      break;
++  }
++  if (!opened) {
++    LOG(INFO) << "[workspaces] quick search: result gone";
++    return;
++  }
++  LOG(INFO) << "[workspaces] quick search: opened "
++            << kOpenedNames[static_cast<size_t>(kind)] << " in '" << guid
++            << "'";
++}
++
++}  // namespace
++
++// One row of the pool (the header's class comment): the page's icon -- a
++// globe until one is known --, its name and, at the right, its workspace's
++// name after a dot of its colour (D11). The Archive's row (ArchiveRow) with a
++// workspace where its time is, re-labelled rather than made per result.
++// Outside the anonymous namespace only so the header can name it.
++class WorkspaceQuickSearchRow : public views::LabelButton {
++  METADATA_HEADER(WorkspaceQuickSearchRow, views::LabelButton)
++
++ public:
++  explicit WorkspaceQuickSearchRow(PressedCallback callback)
++      : views::LabelButton(std::move(callback)) {
++    // An option of the list (the omnibox's rows): the keyboard stays in the
++    // text field, which names the highlighted row its active descendant.
++    GetViewAccessibility().SetRole(ax::mojom::Role::kListBoxOption);
++    SetFocusBehavior(FocusBehavior::NEVER);
++    SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(0, kRowInset)));
++    SetMinSize(gfx::Size(0, kRowHeight));
++    // The ink drop draws the row on a layer that is not opaque, and subpixel
++    // text on one DCHECKs (the rail's E9a trap; ArchiveRow does the same).
++    SetTextSubpixelRenderingEnabled(false);
++    ConfigureInkDrop(this);
++    // The workspace's name, in secondary text over the same ink drop: not part
++    // of the row's name, which says the workspace by its rail mark, and never
++    // the target of a click.
++    workspace_ = AddChildView(std::make_unique<views::Label>(
++        std::u16string(), views::style::CONTEXT_LABEL,
++        views::style::STYLE_SECONDARY));
++    workspace_->SetSubpixelRenderingEnabled(false);
++    workspace_->SetCanProcessEventsWithinSubtree(false);
++    workspace_->GetViewAccessibility().SetIsIgnored(true);
++    SetIcon(ui::ImageModel());
++    SetVisible(false);
++  }
++  WorkspaceQuickSearchRow(const WorkspaceQuickSearchRow&) = delete;
++  WorkspaceQuickSearchRow& operator=(const WorkspaceQuickSearchRow&) = delete;
++  ~WorkspaceQuickSearchRow() override = default;
++
++  // The candidate the row shows, an index into the box's list.
++  size_t candidate() const { return candidate_; }
++
++  // Re-labels the row. `color` is the workspace's (0-8,
++  // prefs::EffectiveColors), or -1 with an empty `workspace` for none.
++  void Set(size_t candidate,
++           const std::u16string& text,
++           const std::u16string& tooltip,
++           const std::u16string& name,
++           const std::u16string& workspace,
++           int color) {
++    candidate_ = candidate;
++    color_ = color;
++    SetText(text);
++    workspace_->SetText(workspace);
++    SetTooltipText(tooltip);
++    // Last: SetText names the button after its text, and a new tooltip can
++    // rename it too (Button::OnTooltipTextChanged).
++    GetViewAccessibility().SetName(name);
++    SchedulePaint();
++  }
++
++  // An empty image shows the globe.
++  void SetIcon(const ui::ImageModel& icon) {
++    SetImageModel(views::Button::STATE_NORMAL,
++                  icon.IsEmpty() ? ui::ImageModel::FromVectorIcon(
++                                       vector_icons::kGlobeIcon, ui::kColorIcon,
++                                       gfx::kFaviconSize)
++                                 : icon);
++  }
++
++  // The highlight: selected to assistive tech, and filled with the selected
++  // tab's colour (the Archive's switch, design 5 "E17 spec").
++  void SetHighlighted(bool highlighted) {
++    GetViewAccessibility().SetIsSelected(highlighted);
++    SetBackground(highlighted ? views::CreateRoundedRectBackground(
++                                    kColorTabBackgroundActiveFrameActive,
++                                    kHighlightRadius)
++                              : nullptr);
++  }
++
++  // Cancelled at every re-label, so a late icon never lands on another page.
++  base::CancelableTaskTracker& favicon_tasks() { return favicon_tasks_; }
++
++  // views::LabelButton:
++  //
++  // The button places the icon and the name; the workspace goes at the right
++  // end, and the name stops before its dot.
++  views::ProposedLayout CalculateProposedLayout(
++      const views::SizeBounds& size_bounds) const override {
++    views::ProposedLayout layouts =
++        views::LabelButton::CalculateProposedLayout(size_bounds);
++    if (!size_bounds.is_fully_bounded()) {
++      return layouts;
++    }
++    const gfx::Rect contents = GetContentsBounds();
++    const bool has_workspace = !workspace_->GetText().empty();
++    const int workspace_width =
++        has_workspace ? std::min(workspace_->GetPreferredSize().width(),
++                                 contents.width() / 3)
++                      : 0;
++    const gfx::Rect workspace_bounds(contents.right() - workspace_width,
++                                     contents.y(), workspace_width,
++                                     contents.height());
++    const int title_end =
++        has_workspace ? workspace_bounds.x() - kDotGap - kDotSize - kDotGap
++                      : contents.right();
++    for (views::ChildLayout& child : layouts.child_layouts) {
++      if (child.child_view.get() == label()) {
++        child.bounds.set_width(
++            std::clamp(title_end - child.bounds.x(), 0, child.bounds.width()));
++      }
++    }
++    layouts.child_layouts.emplace_back(workspace_.get(), has_workspace,
++                                       workspace_bounds, views::SizeBounds());
++    return layouts;
++  }
++
++ protected:
++  // views::Button:
++  //
++  // The dot, in the colour the bar draws the workspace in, resolved here.
++  // Always as for an active frame: the box closes when it loses the focus.
++  void PaintButtonContents(gfx::Canvas* canvas) override {
++    views::LabelButton::PaintButtonContents(canvas);
++    if (color_ < 0 || workspace_->GetText().empty()) {
++      return;
++    }
++    const int x = GetMirroredXWithWidthInView(
++        workspace_->x() - kDotGap - kDotSize, kDotSize);
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(WorkspaceRailView::WorkspaceColor(
++        *GetColorProvider(), color_, /*active_frame=*/true));
++    canvas->DrawCircle(gfx::PointF(x + kDotSize / 2.f, height() / 2.f),
++                       kDotSize / 2.f, flags);
++  }
++
++ private:
++  size_t candidate_ = 0;
++  int color_ = -1;
++  raw_ptr<views::Label> workspace_ = nullptr;
++  base::CancelableTaskTracker favicon_tasks_;
++};
++
++BEGIN_METADATA(WorkspaceQuickSearchRow)
++END_METADATA
++
++struct WorkspaceQuickSearchView::Candidate {
++  ResultKind kind = ResultKind::kTab;
++  // A pinned page's or an Archive entry's id; empty for a tab.
++  std::string id;
++  // A tab's; for a pinned page, its open page in THIS window, null when it
++  // has none here (M3: the recent list shows it, by its tab's clock).
++  tabs::TabHandle tab;
++  // Its workspace, resolved (a deleted one's things are Home's, design 2.4);
++  // empty for a favorite.
++  std::string guid;
++  // What the row says (ShownTitle), and what it is matched by, case-folded:
++  // the custom name and the title; the address (D18) and a pinned page's
++  // folder names.
++  std::u16string name;
++  std::u16string folded_name;
++  std::u16string folded_rest;
++  GURL url;
++  MruKey recency;
++  // A tab drawn in this window now, a favorite included (D7); a pinned page
++  // or an entry of the workspace this window shows.
++  bool on_screen = false;
++  // MatchScore() for the text in the field, set by each ApplyQuery().
++  int score = 0;
++  // Its workspace's rail mark and two spaces (the row's accessible name
++  // starts with it), its name and its colour; empty and -1 for a favorite.
++  std::u16string mark;
++  std::u16string workspace_name;
++  int color = -1;
++};
++
++// static
++void WorkspaceQuickSearchView::ShowOverPage(BrowserWindowInterface* browser) {
++  const base::ElapsedTimer timer;
++  LOG(INFO) << "[workspaces] shortcut: quick search";
++  // The gate before anything else: no store is made for a window that has
++  // Workspaces off.
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser);
++  BrowserView* const browser_view =
++      BrowserView::GetBrowserViewForBrowser(browser);
++  if (!service || !service->IsEnabled() || !browser_view) {
++    LOG(INFO) << "[workspaces] quick search: off in this window";
++    return;
++  }
++  // D12: the key closes this window's box when it is open. Pressed in the
++  // box, the box hears it first (AcceleratorPressed); this is the rest.
++  if (const auto open = OpenBoxes().find(browser); open != OpenBoxes().end()) {
++    // A box already closing (Enter posted its widget's close) does not count:
++    // the press opens a new one (code review).
++    if (WorkspaceQuickSearchView* const box = open->second.get();
++        box && box->GetWidget() && !box->GetWidget()->IsClosed()) {
++      box->ToggleClosed();
++      return;
++    }
++    OpenBoxes().erase(open);
++  }
++
++  auto view = base::WrapUnique(new WorkspaceQuickSearchView(browser));
++  WorkspaceQuickSearchView* const box = view.get();
++  // A bare box (the owner): no title on screen -- it is the box's accessible
++  // title only -- no x, no buttons. Escape is the bubble's own; the field
++  // takes the focus, so typing searches at once.
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetAccessibleTitle(
++              l10n_util::GetStringUTF16(IDS_HELIUM_QUICK_SEARCH))
++          .OverrideShowCloseButton(false)
++          .AddCustomField(
++              std::make_unique<views::BubbleDialogModelHost::CustomView>(
++                  std::move(view),
++                  views::BubbleDialogModelHost::FieldType::kControl,
++                  box->search_.get()),
++              kQuickSearchFieldId)
++          .SetInitiallyFocusedField(kQuickSearchFieldId)
++          .Build();
++
++  // Centred over the page, as the Archive's shortcut (C22): zen mode usually
++  // hides the bar.
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), browser_view->contents_container(),
++      views::BubbleBorder::FLOAT);
++  bubble->set_fixed_width(kWidth);
++  bubble->set_corner_radius(kBubbleRadius);
++  views::Widget* const widget =
++      views::BubbleDialogDelegate::CreateBubbleDeprecated(
++          std::move(bubble),
++          views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET);
++  OpenBoxes()[browser] = box->weak_factory_.GetWeakPtr();
++  widget->Show();
++  // Laid out inside the timing, so the number is what the user waited for.
++  widget->LayoutRootViewIfNecessary();
++
++  const auto count = [box](ResultKind kind) {
++    return std::ranges::count(box->candidates_, kind, &Candidate::kind);
++  };
++  LOG(INFO) << "[workspaces] quick search: opened, " << count(ResultKind::kTab)
++            << " tab(s) " << count(ResultKind::kPin) << " pinned "
++            << count(ResultKind::kArchive) << " archived in "
++            << timer.Elapsed().InMilliseconds() << " ms";
++  LOG(INFO) << "[workspaces] quick search: recent, " << box->shown_.size()
++            << " shown";
++}
++
++WorkspaceQuickSearchView::WorkspaceQuickSearchView(
++    BrowserWindowInterface* browser)
++    : browser_(browser),
++      pins_(PinStore::GetOrCreate(browser->GetProfile(),
++                                  browser->GetProfile()->GetPath())),
++      archive_(ArchiveStore::GetOrCreate(browser->GetProfile(),
++                                         browser->GetProfile()->GetPath())) {
++  SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical, gfx::Insets(), kSpacing));
++
++  // The Archive's search field (E17c): its icon inside the field's own
++  // border, so the field keeps Chromium's outline and focus ring.
++  // ponytail: placed for left-to-right text, as the Archive's.
++  search_ = AddChildView(std::make_unique<views::Textfield>());
++  search_->SetPlaceholderText(
++      l10n_util::GetStringUTF16(IDS_HELIUM_QUICK_SEARCH));
++  search_->GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_HELIUM_QUICK_SEARCH));
++  search_->set_controller(this);
++  search_->SetExtraInsets(gfx::Insets::TLBR(0, kIconSize + kSpacing, 0, 0));
++  search_->SetPreferredSize(gfx::Size(0, kSearchHeight));
++  auto* const search_icon = search_->AddChildView(
++      std::make_unique<views::ImageView>(ui::ImageModel::FromVectorIcon(
++          vector_icons::kSearchIcon, ui::kColorIcon, kIconSize)));
++  search_icon->SetBounds(views::LayoutProvider::Get()->GetDistanceMetric(
++                             views::DISTANCE_TEXTFIELD_HORIZONTAL_TEXT_PADDING),
++                         (kSearchHeight - kIconSize) / 2, kIconSize, kIconSize);
++  search_icon->SetCanProcessEventsWithinSubtree(false);
++  search_icon->GetViewAccessibility().SetIsIgnored(true);
++
++  // D12: the shortcut, as the browser has it, closes the box.
++  if (const BrowserView* const browser_view =
++          BrowserView::GetBrowserViewForBrowser(browser)) {
++    ui::Accelerator accelerator;
++    if (browser_view->GetAccelerator(IDC_HELIUM_QUICK_SEARCH, &accelerator)) {
++      AddAccelerator(accelerator);
++    }
++  }
++
++  // Without layers, as the Archive's list: a label over a layer that is not
++  // opaque DCHECKs on subpixel text, and the bubble's own colour behind the
++  // rows keeps their text on an opaque background.
++  scroll_view_ = AddChildView(std::make_unique<views::ScrollView>(
++      views::ScrollView::ScrollWithLayers::kDisabled));
++  scroll_view_->SetBackgroundColor(ui::kColorBubbleBackground);
++  scroll_view_->SetHorizontalScrollBarMode(
++      views::ScrollView::ScrollBarMode::kDisabled);
++  scroll_view_->ClipHeightTo(kListHeight, kListHeight);
++
++  // The pool, made here, off the widget, and attached with one SetContents
++  // (the class comment).
++  auto list = std::make_unique<views::View>();
++  list->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical));
++  list->GetViewAccessibility().SetRole(ax::mojom::Role::kListBox);
++  empty_ = list->AddChildView(std::make_unique<views::Label>(
++      std::u16string(), views::style::CONTEXT_LABEL,
++      views::style::STYLE_SECONDARY));
++  empty_->SetMultiLine(true);
++  empty_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  empty_->SetBorder(
++      views::CreateEmptyBorder(gfx::Insets::VH(kSpacing, kRowInset)));
++  empty_->SetVisible(false);
++  for (size_t group = 0; group < kGroupCount; ++group) {
++    auto* const heading = list->AddChildView(std::make_unique<views::Label>(
++        l10n_util::GetStringUTF16(kGroupHeadings[group]),
++        views::style::CONTEXT_LABEL, views::style::STYLE_SECONDARY));
++    heading->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    heading->SetBorder(views::CreateEmptyBorder(
++        gfx::Insets::TLBR(kSpacing, kRowInset, kSpacing / 2, kRowInset)));
++    heading->GetViewAccessibility().SetRole(ax::mojom::Role::kHeading);
++    heading->SetVisible(false);
++    headings_.push_back(heading);
++    for (size_t row = 0; row < kMaxRows; ++row) {
++      const size_t slot = rows_.size();
++      rows_.push_back(
++          list->AddChildView(std::make_unique<WorkspaceQuickSearchRow>(
++              base::BindRepeating(&WorkspaceQuickSearchView::OnRowPressed,
++                                  base::Unretained(this), slot))));
++    }
++  }
++  scroll_view_->SetContents(std::move(list));
++
++  pins_observation_.Observe(pins_.get());
++  // Unretained: the subscription is a member, so it ends with this view.
++  archive_changed_subscription_ =
++      archive_->RegisterChangedCallback(base::BindRepeating(
++          &WorkspaceQuickSearchView::PostRefresh, base::Unretained(this)));
++  Collect();
++  ApplyQuery();
++}
++
++WorkspaceQuickSearchView::~WorkspaceQuickSearchView() {
++  // The toggle's entry for this window goes with its box.
++  if (const auto open = OpenBoxes().find(browser_.get());
++      open != OpenBoxes().end() &&
++      (!open->second || open->second.get() == this)) {
++    OpenBoxes().erase(open);
++  }
++}
++
++bool WorkspaceQuickSearchView::AcceleratorPressed(
++    const ui::Accelerator& accelerator) {
++  ToggleClosed();
++  return true;
++}
++
++void WorkspaceQuickSearchView::ContentsChanged(
++    views::Textfield* sender,
++    const std::u16string& new_contents) {
++  const base::ElapsedTimer timer;
++  const bool recent = ApplyQuery();
++  // Back to the top, where the first row -- highlighted -- and its heading
++  // are; laid out inside the timing, the layout being most of a keystroke.
++  scroll_view_->ScrollToOffset(gfx::PointF());
++  if (views::Widget* const widget = GetWidget()) {
++    widget->LayoutRootViewIfNecessary();
++  }
++  if (recent) {
++    LOG(INFO) << "[workspaces] quick search: recent, " << shown_.size()
++              << " shown";
++    return;
++  }
++  LOG(INFO) << "[workspaces] quick search: filter of " << new_contents.size()
++            << " char(s) -> " << ShownInGroup(0) << "/" << ShownInGroup(1)
++            << "/" << ShownInGroup(2) << " shown in "
++            << timer.Elapsed().InMilliseconds() << " ms";
++}
++
++bool WorkspaceQuickSearchView::HandleKeyEvent(views::Textfield* sender,
++                                              const ui::KeyEvent& key_event) {
++  // A key an input method is composing with is the method's.
++  if (key_event.type() != ui::EventType::kKeyPressed ||
++      sender->IsIMEComposing()) {
++    return false;
++  }
++  switch (key_event.key_code()) {
++    case ui::VKEY_UP:
++      MoveHighlight(-1);
++      return true;
++    case ui::VKEY_DOWN:
++      MoveHighlight(1);
++      return true;
++    case ui::VKEY_RETURN:
++      if (!highlighted_) {
++        return false;
++      }
++      Open(highlighted_->candidate());
++      return true;
++    default:
++      return false;
++  }
++}
++
++void WorkspaceQuickSearchView::OnPinsChanged() {
++  PostRefresh();
++}
++
++void WorkspaceQuickSearchView::Collect() {
++  candidates_.clear();
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service) {
++    return;
++  }
++  const std::string& active = service->active_guid();
++  const std::vector<std::string>& known = service->known_guids();
++
++  // Each workspace's rail mark, name and colour (the bar's, E17a), by guid:
++  // the Archive's Rebuild.
++  struct Mark {
++    std::u16string text;
++    std::u16string name;
++    int color;
++  };
++  std::map<std::string, Mark, std::less<>> marks;
++  const std::vector<workspaces::prefs::WorkspaceEntry> workspace_list =
++      service->GetWorkspaces();
++  const std::vector<int> colors =
++      workspaces::prefs::EffectiveColors(workspace_list);
++  for (size_t i = 0; i < workspace_list.size(); ++i) {
++    marks[workspace_list[i].guid] = {
++        WorkspaceRailView::ButtonText(workspace_list[i], i),
++        WorkspaceRailView::DisplayName(workspace_list[i]), colors[i]};
++  }
++
++  // A new candidate with its texts and its workspace's look. The reference
++  // lasts until the next one is added.
++  const auto add = [&](ResultKind kind, std::string_view guid,
++                       std::string_view custom, std::string_view title,
++                       std::string_view url,
++                       std::string_view folders) -> Candidate& {
++    Candidate& candidate = candidates_.emplace_back();
++    candidate.kind = kind;
++    candidate.guid = std::string(guid);
++    candidate.name = workspaces::archive::ShownTitle(custom, title, url);
++    candidate.folded_name = base::i18n::FoldCase(
++        base::UTF8ToUTF16(base::StrCat({custom, "\n", title})));
++    candidate.folded_rest = base::i18n::FoldCase(base::UTF8ToUTF16(
++        folders.empty() ? std::string(WithoutScheme(url))
++                        : base::StrCat({WithoutScheme(url), "\n", folders})));
++    candidate.url = GURL(url);
++    if (const auto mark = marks.find(candidate.guid); mark != marks.end()) {
++      candidate.mark = mark->second.text + u"  ";
++      candidate.workspace_name = mark->second.name;
++      candidate.color = mark->second.color;
++    }
++    return candidate;
++  };
++
++  // The tabs of every window of this profile that has Workspaces (D6), each
++  // by its own window's service. An open pinned page is listed once, under
++  // "Pinned pages" (D8): here only this window's are noted, by item id, for
++  // its row's handle (M3).
++  Profile* const profile = browser_->GetProfile();
++  std::map<std::string, tabs::TabHandle, std::less<>> open_pages;
++  for (BrowserWindowInterface* const window : GetAllBrowserWindowInterfaces()) {
++    const workspaces::WorkspaceService* const window_service =
++        window->GetProfile() == profile
++            ? workspaces::WorkspaceService::From(window)
++            : nullptr;
++    TabStripModel* const model = window->GetTabStripModel();
++    if (!window_service || !model) {
++      continue;
++    }
++    const bool here = window == browser_;
++    for (int i = 0; i < model->count(); ++i) {
++      tabs::TabInterface* const tab = model->GetTabAtIndex(i);
++      content::WebContents* const contents = tab->GetContents();
++      if (!contents) {
++        continue;
++      }
++      if (window_service->IsPinItemTab(tab)) {
++        if (here) {
++          open_pages.emplace(workspaces::PinItemForTab(contents),
++                             tab->GetHandle());
++        }
++        continue;
++      }
++      // A favorite is drawn in every workspace: no workspace of its own (D7).
++      const std::string tag = tab->IsPinned()
++                                  ? std::string()
++                                  : workspaces::WorkspaceGuidForTab(contents);
++      Candidate& candidate = add(
++          ResultKind::kTab,
++          tab->IsPinned()
++              ? std::string_view()
++              : workspaces::ResolveTabGuid(tag, window_service->known_guids()),
++          workspaces::CustomTitleForTab(contents),
++          base::UTF16ToUTF8(contents->GetTitle()),
++          contents->GetLastCommittedURL().spec(), {});
++      candidate.tab = tab->GetHandle();
++      candidate.recency = TabClock(contents);
++      candidate.on_screen = here && window_service->IsTabOnScreen(tab);
++    }
++  }
++
++  // Every pinned page of every workspace, with its folders' names; one open
++  // here carries its page's handle and clock.
++  for (const auto& [key, roots] : pins_->tree()) {
++    const std::string_view guid = workspaces::ResolveTabGuid(key, known);
++    ForEachItem(roots, std::string(),
++                [&](const PinNode& item, const std::string& folders) {
++                  Candidate& candidate =
++                      add(ResultKind::kPin, guid, item.custom_title, item.title,
++                          item.url, folders);
++                  candidate.id = item.id;
++                  candidate.on_screen = guid == active;
++                  const auto page = open_pages.find(item.id);
++                  tabs::TabInterface* const tab =
++                      page != open_pages.end() ? page->second.Get() : nullptr;
++                  if (tab) {
++                    candidate.tab = tab->GetHandle();
++                    candidate.recency = TabClock(tab->GetContents());
++                  } else {
++                    candidate.recency = {false, item.last_active};
++                  }
++                });
++  }
++
++  // Every Archive entry.
++  for (const ArchiveEntry& entry : archive_->entries()) {
++    const std::string_view guid =
++        workspaces::ResolveTabGuid(entry.workspace, known);
++    Candidate& candidate = add(ResultKind::kArchive, guid, entry.custom_title,
++                               entry.title, entry.url, {});
++    candidate.id = entry.id;
++    candidate.recency = {false, entry.archived_at};
++    candidate.on_screen = guid == active;
++  }
++}
++
++bool WorkspaceQuickSearchView::ApplyQuery() {
++  const std::vector<std::u16string> words =
++      workspaces::archive::QueryWords(search_->GetText());
++  const bool recent = words.empty();
++  // Candidate indices per group, best first, at most kMaxRows.
++  std::array<std::vector<size_t>, kGroupCount> picked;
++  const auto keep_best = [](std::vector<size_t>& indices, auto better) {
++    const size_t count = std::min(indices.size(), kMaxRows);
++    std::partial_sort(indices.begin(), indices.begin() + count, indices.end(),
++                      better);
++    indices.resize(count);
++  };
++  if (recent) {
++    // D16 as M3 revised it: this window's on-screen tabs and open pinned
++    // pages, the active tab left out, most recent first, all under the first
++    // heading.
++    const tabs::TabInterface* const active =
++        browser_->GetTabStripModel()->GetActiveTab();
++    for (size_t i = 0; i < candidates_.size(); ++i) {
++      const Candidate& candidate = candidates_[i];
++      const tabs::TabInterface* const tab = candidate.tab.Get();
++      if (candidate.kind != ResultKind::kArchive && candidate.on_screen &&
++          tab && tab != active) {
++        picked[0].push_back(i);
++      }
++    }
++    keep_best(picked[0], [this](size_t a, size_t b) {
++      return candidates_[a].recency > candidates_[b].recency;
++    });
++  } else {
++    for (size_t i = 0; i < candidates_.size(); ++i) {
++      Candidate& candidate = candidates_[i];
++      candidate.score = workspaces::archive::MatchScore(
++          candidate.folded_name, candidate.folded_rest, words);
++      if (candidate.score > 0) {
++        picked[static_cast<size_t>(candidate.kind)].push_back(i);
++      }
++    }
++    // Inside a group: the workspace on screen first, then the best match,
++    // then the most recent (the owner). The time alone (D10), not the empty
++    // box's MRU key: its "left" flag would rank any page left once above a
++    // page used later but never left (code review QS-1).
++    for (std::vector<size_t>& group : picked) {
++      keep_best(group, [this](size_t a, size_t b) {
++        const Candidate& x = candidates_[a];
++        const Candidate& y = candidates_[b];
++        return std::tie(x.on_screen, x.score, x.recency.second) >
++               std::tie(y.on_screen, y.score, y.recency.second);
++      });
++    }
++  }
++
++  // The pool re-labelled and shown or hidden; nothing added or removed.
++  shown_.clear();
++  for (size_t group = 0; group < kGroupCount; ++group) {
++    headings_[group]->SetText(l10n_util::GetStringUTF16(
++        recent && group == 0 ? IDS_HELIUM_QUICK_SEARCH_RECENT
++                             : kGroupHeadings[group]));
++    headings_[group]->SetVisible(!picked[group].empty());
++    for (size_t slot = 0; slot < kMaxRows; ++slot) {
++      WorkspaceQuickSearchRow* const row = rows_[group * kMaxRows + slot];
++      const bool show = slot < picked[group].size();
++      if (show) {
++        ShowCandidate(*row, picked[group][slot]);
++        shown_.push_back(row);
++      }
++      row->SetVisible(show);
++    }
++  }
++  empty_->SetText(l10n_util::GetStringUTF16(
++      recent ? IDS_HELIUM_QUICK_SEARCH_NONE : IDS_HELIUM_ARCHIVE_NO_MATCHES));
++  empty_->SetVisible(shown_.empty());
++  SetHighlight(shown_.empty() ? nullptr : shown_.front().get());
++  return recent;
++}
++
++void WorkspaceQuickSearchView::ShowCandidate(WorkspaceQuickSearchRow& row,
++                                             size_t index) {
++  const Candidate& candidate = candidates_[index];
++  row.Set(
++      index, candidate.name,
++      base::StrCat({candidate.name, u"\n",
++                    base::UTF8ToUTF16(candidate.url.possibly_invalid_spec())}),
++      candidate.mark + candidate.name, candidate.workspace_name,
++      candidate.color);
++  row.favicon_tasks().TryCancelAll();
++  // A tab's own icon, as its tab draws it (TabData: TabUIHelper's favicon).
++  if (candidate.kind == ResultKind::kTab) {
++    tabs::TabInterface* const tab = candidate.tab.Get();
++    row.SetIcon(tab ? tabs::TabData::FromTabInterface(tab).favicon
++                    : ui::ImageModel());
++    return;
++  }
++  if (const auto known = favicons_.find(candidate.url);
++      known != favicons_.end()) {
++    row.SetIcon(known->second);
++    return;
++  }
++  row.SetIcon(ui::ImageModel());
++  // A pinned page or an entry: asked as the Archive's row asks, with
++  // fallback_to_host -- another page of the same site often has one
++  // (LOCAL.md 43).
++  favicon::FaviconService* const favicons =
++      candidate.url.is_valid()
++          ? FaviconServiceFactory::GetForProfile(
++                browser_->GetProfile(), ServiceAccessType::EXPLICIT_ACCESS)
++          : nullptr;
++  if (!favicons) {
++    return;
++  }
++  favicons->GetRawFaviconForPageURL(
++      candidate.url, {favicon_base::IconType::kFavicon}, gfx::kFaviconSize * 2,
++      /*fallback_to_host=*/true,
++      // The row's tracker cancels it at the row's next re-label, or with the
++      // row; the row lives as long as the box.
++      base::BindOnce(&WorkspaceQuickSearchView::OnFavicon,
++                     weak_factory_.GetWeakPtr(), base::Unretained(&row),
++                     candidate.url),
++      &row.favicon_tasks());
++}
++
++void WorkspaceQuickSearchView::OnFavicon(
++    WorkspaceQuickSearchRow* row,
++    const GURL& url,
++    const favicon_base::FaviconRawBitmapResult& result) {
++  // Asked for at twice the icon size, so it is crisp at 200 %.
++  ui::ImageModel icon;
++  if (result.is_valid()) {
++    const SkBitmap bitmap =
++        gfx::PNGCodec::Decode(base::span<const uint8_t>(*result.bitmap_data));
++    if (!bitmap.isNull()) {
++      icon = ui::ImageModel::FromImageSkia(gfx::ImageSkia::CreateFromBitmap(
++          bitmap, static_cast<float>(bitmap.width()) / gfx::kFaviconSize));
++    }
++  }
++  favicons_[url] = icon;
++  row->SetIcon(icon);
++}
++
++int WorkspaceQuickSearchView::ShownInGroup(size_t group) const {
++  return static_cast<int>(std::ranges::count_if(
++      shown_, [this, group](const WorkspaceQuickSearchRow* row) {
++        return static_cast<size_t>(candidates_[row->candidate()].kind) == group;
++      }));
++}
++
++void WorkspaceQuickSearchView::SetHighlight(WorkspaceQuickSearchRow* row) {
++  if (highlighted_) {
++    highlighted_->SetHighlighted(false);
++  }
++  highlighted_ = row;
++  if (!row) {
++    search_->GetViewAccessibility().ClearActiveDescendant();
++    return;
++  }
++  row->SetHighlighted(true);
++  search_->GetViewAccessibility().SetActiveDescendant(*row);
++}
++
++void WorkspaceQuickSearchView::MoveHighlight(int delta) {
++  if (shown_.empty()) {
++    return;
++  }
++  // D13: no wrap; the ends hold.
++  const auto at = std::ranges::find(shown_, highlighted_);
++  const int from = at == shown_.end()
++                       ? 0
++                       : static_cast<int>(std::distance(shown_.begin(), at));
++  const size_t to = static_cast<size_t>(
++      std::clamp(from + delta, 0, static_cast<int>(shown_.size()) - 1));
++  SetHighlight(shown_[to]);
++  shown_[to]->ScrollViewToVisible();
++}
++
++void WorkspaceQuickSearchView::OnRowPressed(size_t slot) {
++  if (rows_[slot]->GetVisible()) {
++    Open(rows_[slot]->candidate());
++  }
++}
++
++void WorkspaceQuickSearchView::Open(size_t index) {
++  // Not with Workspaces switched off while the box stays open (the Archive's
++  // restore, code review).
++  const workspaces::WorkspaceService* const service =
++      workspaces::WorkspaceService::From(browser_);
++  if (!service || !service->IsEnabled() || index >= candidates_.size()) {
++    return;
++  }
++  const Candidate& candidate = candidates_[index];
++
++  // D19: checked while the box is still open, so a result that went -- its
++  // tab closed, its entry restored in another window -- leaves the box, made
++  // again, where it was (D14).
++  bool there = false;
++  switch (candidate.kind) {
++    case ResultKind::kTab: {
++      tabs::TabInterface* const tab = candidate.tab.Get();
++      BrowserWindowInterface* const window =
++          tab ? tab->GetBrowserWindowInterface() : nullptr;
++      TabStripModel* const model =
++          window ? window->GetTabStripModel() : nullptr;
++      there = model && model->GetIndexOfTab(tab) != TabStripModel::kNoTab;
++      break;
++    }
++    case ResultKind::kPin: {
++      const PinNode* const item = pins_->Find(candidate.id);
++      there = item && item->type == PinNode::Type::kItem &&
++              GURL(item->url).is_valid();
++      break;
++    }
++    case ResultKind::kArchive: {
++      const auto entry = std::ranges::find(archive_->entries(), candidate.id,
++                                           &ArchiveEntry::id);
++      there = entry != archive_->entries().end() && GURL(entry->url).is_valid();
++      break;
++    }
++  }
++  if (!there) {
++    LOG(INFO) << "[workspaces] quick search: result gone";
++    PostRefresh();
++    return;
++  }
++
++  // Copies, then the box closes, then the result opens from them: opening
++  // can activate another window, after which nothing of this box is touched.
++  BrowserWindowInterface* const browser = browser_;
++  const ResultKind kind = candidate.kind;
++  const std::string id = candidate.id;
++  const std::string guid = candidate.guid;
++  const tabs::TabHandle tab = candidate.tab;
++  GetWidget()->Close();
++  OpenResult(browser, kind, id, guid, tab);
++}
++
++void WorkspaceQuickSearchView::ToggleClosed() {
++  LOG(INFO) << "[workspaces] quick search: toggled closed";
++  if (views::Widget* const widget = GetWidget();
++      widget && !widget->IsClosed()) {
++    widget->Close();
++  }
++}
++
++void WorkspaceQuickSearchView::PostRefresh() {
++  // Posted, never run here: the Archive's Add() calls this from inside
++  // TabStripModel's close (design 2.2). One refresh however many changes
++  // come first.
++  if (std::exchange(refresh_posted_, true)) {
++    return;
++  }
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&WorkspaceQuickSearchView::Refresh,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void WorkspaceQuickSearchView::Refresh() {
++  refresh_posted_ = false;
++  views::Widget* const widget = GetWidget();
++  // An open result closes the box right after its change posted this.
++  if (!widget || widget->IsClosed()) {
++    return;
++  }
++  // D20: the highlight follows its result -- a tab by its handle, a pinned
++  // page or an entry by its id -- else the first row.
++  const auto identity = [](const Candidate& candidate) {
++    return Identity(
++        candidate.kind, candidate.id,
++        candidate.kind == ResultKind::kTab ? candidate.tab : tabs::TabHandle());
++  };
++  std::optional<Identity> kept;
++  if (highlighted_) {
++    kept = identity(candidates_[highlighted_->candidate()]);
++  }
++  Collect();
++  ApplyQuery();
++  if (kept) {
++    for (WorkspaceQuickSearchRow* const row : shown_) {
++      if (identity(candidates_[row->candidate()]) == *kept) {
++        SetHighlight(row);
++        break;
++      }
++    }
++  }
++  widget->LayoutRootViewIfNecessary();
++  if (highlighted_) {
++    highlighted_->ScrollViewToVisible();
++  }
++  LOG(INFO) << "[workspaces] quick search: refreshed after a change";
++}
++
++BEGIN_METADATA(WorkspaceQuickSearchView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_quick_search_view.h
+@@ -0,0 +1,224 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_QUICK_SEARCH_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_QUICK_SEARCH_VIEW_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/tabs/workspaces/workspace_pins.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/views/controls/textfield/textfield_controller.h"
++#include "ui/views/view.h"
++#include "url/gurl.h"
++
++class BrowserWindowInterface;
++class WorkspaceQuickSearchRow;
++
++namespace favicon_base {
++struct FaviconRawBitmapResult;
++}  // namespace favicon_base
++
++namespace ui {
++class Accelerator;
++class KeyEvent;
++}  // namespace ui
++
++namespace views {
++class Label;
++class ScrollView;
++class Textfield;
++}  // namespace views
++
++namespace workspaces::archive {
++class ArchiveStore;
++}  // namespace workspaces::archive
++
++// Find tabs and pages (C1, Arc's command bar; c2-progress.md "The view"):
++// Shift+Alt+F opens a bare box centred over the page -- a text field and the
++// results, no title, no x -- that finds open tabs, pinned pages and Archive
++// entries of EVERY workspace as it is typed. Escape closes it, and so does
++// Shift+Alt+F again (D12).
++//
++//   [ (search) Find tabs and pages                     ]
++//   Open tabs
++//     (icon) A page                       (dot) Work
++//   Pinned pages
++//     (icon) Another page                 (dot) Home
++//   Archived
++//     (icon) A closed page                (dot) Work
++//
++// - Empty, the box lists this window's on-screen open tabs and open pinned
++//   pages, most recent first by C2's clock (the time the user LEFT a tab, then
++//   the time it was last shown), the active tab left out, under "Recent tabs"
++//   (D16 as the design review's M3 revised it); with none, one line says so.
++// - Typed, the text is split into words and every candidate scored
++//   (workspaces::archive::MatchScore: a word starting a word of the name beats
++//   one inside it, which beats one only in the address or a pinned page's
++//   folder names -- the address without "http://", "https://" and "www.",
++//   D18). Grouped by kind, in the owner's order: open tabs (of every window of
++//   this profile that has Workspaces, favorites counted as the workspace on
++//   screen, D6, D7), then pinned pages (an open one listed here once, D8),
++//   then Archive entries; inside a group the workspace on screen first, then
++//   the best match, then the most recent; at most 20 rows a group (D9).
++// - Each row: the page's icon, its name (ShownTitle: the name the user gave,
++//   else the title, else the address) and, at the right, its workspace's name
++//   after a dot of its colour (D11); a favorite has neither.
++// - The list has a FIXED height, about ten rows, and scrolls (D9), so the box
++//   never moves while typing. Its rows are a pool made before the box is in a
++//   widget -- 3 headings and 3 x 20 rows, all hidden -- and a keystroke only
++//   re-labels and shows or hides them, never adds a view (E15b: an add under
++//   a widget walks the whole subtree).
++// - The keyboard stays in the text field: Up / Down move the highlight over
++//   the shown rows and stop at the ends, the first row is highlighted after
++//   each keystroke, Enter opens the highlighted row, and a click opens a row
++//   (D13). The highlight is the text field's active descendant.
++// - A result is checked before the box closes (D19): a tab still there, a
++//   pinned page still in the pins file, an Archive entry still in the
++//   Archive, each with an address a tab can open. Gone: nothing happens, the
++//   list is made again, and the box stays (D14). Else the box closes, then a
++//   tab is activated in its window -- that window entering its workspace
++//   first, unless it is a favorite, and coming to the front -- a pinned page
++//   is shown through WorkspacePinnedSectionView::ShowItem, and an Archive
++//   entry restored through WorkspaceArchiveView::Restore.
++// - A change of the pins or of the Archive while the box is open (a close in
++//   any window, the files' load) posts ONE refresh, never runs it inside the
++//   store's callback, which can be inside TabStripModel's close: the
++//   candidates are collected again, the text filtered again, and the
++//   highlight follows the result it was on (D20).
++//
++// Logs, never a title, an address or the search text (47's rule):
++//   "[workspaces] shortcut: quick search"
++//   "[workspaces] quick search: off in this window" (Workspaces is off)
++//   "[workspaces] quick search: opened, T tab(s) P pinned A archived in N ms"
++//   "[workspaces] quick search: recent, n shown"
++//   "[workspaces] quick search: filter of L char(s) -> t/p/a shown in N ms"
++//   "[workspaces] quick search: opened a tab in '<guid>'" / "... opened a
++//   pinned page in '<guid>'" / "... opened an archived tab in '<guid>'" (a
++//   favorite: "in ''")
++//   "[workspaces] quick search: toggled closed"
++//   "[workspaces] quick search: result gone"
++//   "[workspaces] quick search: refreshed after a change"
++//
++// Accessible names the hands-free test reads (MSAA): the box's title and the
++// text field "Find tabs and pages"; the headings "Recent tabs", "Open tabs",
++// "Pinned pages", "Archived"; each row, a list box option,
++// "<rail mark>  <name>" (WorkspaceRailView::ButtonText of its workspace, two
++// spaces, the name; a favorite: the name alone), selected while highlighted;
++// "No matches"; and
++// "No open tabs. Type to find pinned pages and archived tabs." The rows kept
++// hidden are INVISIBLE there, not gone.
++//
++// A plain view in a views::BubbleDialogModelHost, the Archive's kind of
++// bubble (its constructors are private to an upstream friend list,
++// workspace_archive_view.h).
++class WorkspaceQuickSearchView : public views::View,
++                                 public views::TextfieldController,
++                                 public workspaces::pins::PinStore::Observer {
++  METADATA_HEADER(WorkspaceQuickSearchView, views::View)
++
++ public:
++  // The shortcut's (IDC_HELIUM_QUICK_SEARCH): opens the box for `browser`'s
++  // profile and window, centred over the page, or closes this window's box
++  // if it is open. Does nothing while Workspaces is off in `browser`.
++  static void ShowOverPage(BrowserWindowInterface* browser);
++
++  WorkspaceQuickSearchView(const WorkspaceQuickSearchView&) = delete;
++  WorkspaceQuickSearchView& operator=(const WorkspaceQuickSearchView&) = delete;
++  ~WorkspaceQuickSearchView() override;
++
++  // views::View: the shortcut, pressed while the box has the keyboard,
++  // closes it (D12): the box's widget hears it, not the browser's.
++  bool AcceleratorPressed(const ui::Accelerator& accelerator) override;
++
++  // views::TextfieldController:
++  void ContentsChanged(views::Textfield* sender,
++                       const std::u16string& new_contents) override;
++  bool HandleKeyEvent(views::Textfield* sender,
++                      const ui::KeyEvent& key_event) override;
++
++  // workspaces::pins::PinStore::Observer:
++  void OnPinsChanged() override;
++
++ private:
++  // One thing the box can find (the .cc): ids and handles only, never a
++  // pointer into a store or a tab strip.
++  struct Candidate;
++
++  explicit WorkspaceQuickSearchView(BrowserWindowInterface* browser);
++
++  // Collects every candidate again, from every window's tabs, the pins file
++  // and the Archive.
++  void Collect();
++
++  // Shows the rows for the text in the field: the recent list when it is
++  // empty, the best matches per group otherwise; highlights the first row.
++  // Answers whether it showed the recent list.
++  bool ApplyQuery();
++
++  // Labels `row` with candidate `index`: its text, names, dot and icon.
++  void ShowCandidate(WorkspaceQuickSearchRow& row, size_t index);
++  void OnFavicon(WorkspaceQuickSearchRow* row,
++                 const GURL& url,
++                 const favicon_base::FaviconRawBitmapResult& result);
++
++  // How many shown rows are of the group at `group` (the log's t/p/a).
++  int ShownInGroup(size_t group) const;
++
++  // The highlight (null: none), and Up / Down over the shown rows.
++  void SetHighlight(WorkspaceQuickSearchRow* row);
++  void MoveHighlight(int delta);
++
++  // A click on the pool's row `slot`, and opening candidate `index`.
++  void OnRowPressed(size_t slot);
++  void Open(size_t index);
++
++  // Closes the box from the shortcut (D12).
++  void ToggleClosed();
++
++  // The stores' change callbacks: one refresh, posted and coalesced.
++  void PostRefresh();
++  void Refresh();
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  // The profile's; they outlive every window's views.
++  const raw_ptr<workspaces::pins::PinStore> pins_;
++  const raw_ptr<workspaces::archive::ArchiveStore> archive_;
++
++  raw_ptr<views::Textfield> search_ = nullptr;
++  raw_ptr<views::ScrollView> scroll_view_ = nullptr;
++  // "No matches", or the recent list's line when nothing is recent: the
++  // list's first child.
++  raw_ptr<views::Label> empty_ = nullptr;
++  // The pool (the class comment): a heading per group, and kMaxRows rows per
++  // group, group by group, in drawn order.
++  std::vector<raw_ptr<views::Label>> headings_;
++  std::vector<raw_ptr<WorkspaceQuickSearchRow>> rows_;
++  // The rows shown now, in drawn order -- what Up / Down walk.
++  std::vector<raw_ptr<WorkspaceQuickSearchRow>> shown_;
++  raw_ptr<WorkspaceQuickSearchRow> highlighted_ = nullptr;
++
++  std::vector<Candidate> candidates_;
++  // Every icon the favicon service answered for a pinned page or an Archive
++  // entry, by address, for the box's life: a row re-labelled to a page asked
++  // for before shows its icon at once, never a globe first. An empty image:
++  // none was found.
++  std::map<GURL, ui::ImageModel> favicons_;
++
++  bool refresh_posted_ = false;
++  base::ScopedObservation<workspaces::pins::PinStore,
++                          workspaces::pins::PinStore::Observer>
++      pins_observation_{this};
++  base::CallbackListSubscription archive_changed_subscription_;
++  base::WeakPtrFactory<WorkspaceQuickSearchView> weak_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_QUICK_SEARCH_VIEW_H_
+--- a/chrome/browser/ui/workspace_command_hooks.cc
++++ b/chrome/browser/ui/workspace_command_hooks.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_archive_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/workspace_quick_search_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h"
+ #include "chrome/grit/generated_resources.h"
+ 
+@@ -111,6 +112,10 @@ bool ExecuteWorkspaceCommand(BrowserWind
+     case IDC_HELIUM_WORKSPACE_ARCHIVE:
+       WorkspaceArchiveView::ShowOverPage(browser);
+       break;
++    // C1: the box toggles -- a second press while it is open closes it.
++    case IDC_HELIUM_QUICK_SEARCH:
++      WorkspaceQuickSearchView::ShowOverPage(browser);
++      break;
+     default:
+       return false;
+   }
+@@ -153,6 +158,8 @@ WorkspaceShortcutLabel(int id) {
+       return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_CLEAR};
+     case IDC_HELIUM_WORKSPACE_ARCHIVE:
+       return Label{IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_ARCHIVE};
++    case IDC_HELIUM_QUICK_SEARCH:
++      return Label{IDS_SHORTCUT_COMMAND_HELIUM_QUICK_SEARCH};
+     default:
+       return std::nullopt;
+   }

@@ -1,0 +1,452 @@
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+@@ -40,10 +40,11 @@ VerticalTabStripBottomContainer::Vertica
+   // sits at the bottom of the strip the way Arc's and Zen's do. It keeps no
+   // pointer here and needs nothing from UpdateButtonStyles below -- it takes
+   // the collapse state from the same controller this container does, which is
+-  // what keeps this feature to one hunk in one file. It hides itself unless
+-  // the profile has more than one workspace.
+-  AddChildView(
+-      std::make_unique<WorkspaceRailView>(browser_, state_controller));
++  // what keeps this feature to one hunk in one file. It is shown whenever
++  // Workspaces is on, and then hides the new tab button: its own "+" menu
++  // opens new tabs (E13).
++  AddChildView(std::make_unique<WorkspaceRailView>(browser_, state_controller,
++                                                   new_tab_button_));
+ 
+   OnCollapseStateChanged(state_controller->GetCollapseState());
+   collapsed_state_change_subscription_ =
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -15,10 +15,12 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
++#include "base/logging.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_prefs.h"
+ #include "chrome/browser/ui/tabs/workspaces/workspace_service.h"
+@@ -28,12 +30,17 @@
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/mojom/menu_source_type.mojom-shared.h"
+ #include "ui/base/models/dialog_model.h"
++#include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/bubble/bubble_border.h"
+ #include "ui/views/bubble/bubble_dialog_model_host.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/controls/menu/menu_runner.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/layout/flex_layout_types.h"
+ #include "ui/views/layout/layout_types.h"
++#include "ui/views/view_class_properties.h"
+ #include "ui/views/widget/widget.h"
+ 
+ namespace {
+@@ -74,6 +81,17 @@ constexpr int kIconPresetNames[] = {
+ };
+ static_assert(std::size(kIconPresetNames) == std::size(kIconPresets));
+ 
++// The "+" menu (E13), numbered after the six presets.
++constexpr int kMenuCommandNewTab = 17;
++constexpr int kMenuCommandNewWorkspace = 18;
++constexpr int kMenuCommandTabSearch = 19;
++static_assert(kMenuCommandIconPresetFirst + std::size(kIconPresets) <=
++              kMenuCommandNewTab);
++
++// The arrows are narrower than the 32 px squares: at the owner's 200 px strip
++// every pixel they do not take is a workspace button shown.
++constexpr int kArrowWidth = 20;
++
+ // What a workspace's button says.
+ //
+ // TopContainerButton is a fixed square -- CalculatePreferredSize returns
+@@ -175,6 +193,10 @@ std::unique_ptr<WorkspaceRailButton> Mak
+   auto button = std::make_unique<WorkspaceRailButton>();
+   button->SetText(text);
+   button->SetTooltipText(tooltip);
++  // The tooltip is the name a screen reader says. SetText named the button
++  // after its glyph first, and Button replaces only an empty name or one equal
++  // to the old tooltip (button.cc), so an arrow read as its glyph without this.
++  button->GetViewAccessibility().SetName(tooltip);
+   button->SetCallback(std::move(callback));
+   return button;
+ }
+@@ -205,12 +227,62 @@ class WorkspaceNameDialogDelegate : publ
+ 
+ WorkspaceRailView::WorkspaceRailView(
+     BrowserWindowInterface* browser,
+-    tabs::VerticalTabStripStateController* state_controller)
++    tabs::VerticalTabStripStateController* state_controller,
++    views::View* new_tab_button)
+     : browser_(browser) {
+   // Hidden until AddedToWidget() has looked at the list. Starting hidden rather
+   // than starting shown and hiding later is what keeps a profile with
+   // Workspaces switched off from seeing the rail flash on at startup.
+   SetVisible(false);
++  new_tab_button_.SetView(new_tab_button);
++
++  back_button_ = AddChildView(MakeRailButton(
++      u"\u2039", l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_SCROLL_BACK),
++      base::BindRepeating(&WorkspaceRailView::SlideBy, base::Unretained(this),
++                          -1)));
++
++  // Set up the way the horizontal tab strip sets up its own
++  // (TabStripView::SetScrollViewProperties): no scroll bar, and the vertical
++  // wheel read as sideways, which is the mouse-wheel slide the owner asked for.
++  scroll_view_ = AddChildView(std::make_unique<views::ScrollView>(
++      views::ScrollView::ScrollWithLayers::kEnabled));
++  scroll_view_->SetUseContentsPreferredSize(true);
++  scroll_view_->SetBackgroundColor(std::nullopt);
++  scroll_view_->SetVerticalScrollBarMode(
++      views::ScrollView::ScrollBarMode::kDisabled);
++  scroll_view_->SetTreatAllScrollEventsAsHorizontal(true);
++  scroll_contents_ =
++      scroll_view_->SetContents(std::make_unique<views::FlexLayoutView>());
++
++  forward_button_ = AddChildView(MakeRailButton(
++      u"\u203A", l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_SCROLL_FORWARD),
++      base::BindRepeating(&WorkspaceRailView::SlideBy, base::Unretained(this),
++                          1)));
++  const int size =
++      GetLayoutConstant(LayoutConstant::kVerticalTabStripCollapseButtonSize);
++  back_button_->SetPreferredSize(gfx::Size(kArrowWidth, size));
++  forward_button_->SetPreferredSize(gfx::Size(kArrowWidth, size));
++
++  add_button_ = AddChildView(MakeRailButton(
++      u"+", l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_ADD_MENU),
++      base::BindRepeating(&WorkspaceRailView::OnAddPressed,
++                          base::Unretained(this))));
++
++  // Unretained is safe on both: the scroll view is a child, so it and the
++  // subscription die with this view.
++  scrolled_subscription_ = scroll_view_->AddContentsScrolledCallback(
++      base::BindRepeating(&WorkspaceRailView::UpdateArrows,
++                          base::Unretained(this)));
++  // After every layout, the arrows re-greyed (a resize changes what fits), and
++  // a switch or rebuild still waiting for its button's bounds brought into
++  // view (UpdateHighlight). Scrolling from this callback is what it exists
++  // for (scroll_view.h).
++  scroll_view_->RegisterPostLayoutCallback(base::BindRepeating(
++      [](WorkspaceRailView* self, views::ScrollView*) {
++        self->UpdateHighlight();
++        self->UpdateArrows();
++      },
++      base::Unretained(this)));
+ 
+   if (state_controller) {
+     OnCollapseStateChanged(state_controller->GetCollapseState());
+@@ -249,12 +321,18 @@ void WorkspaceRailView::Rebuild() {
+   // with the dangling-pointer detector on and invisible in one without.
+   buttons_.clear();
+   guids_.clear();
+-  RemoveAllChildViews();
++  scrolled_to_guid_.clear();
++  scroll_contents_->RemoveAllChildViews();
+ 
+   workspaces::WorkspaceService* service =
+       workspaces::WorkspaceService::From(browser_);
+-  if (!service || !service->IsEnabled()) {
+-    SetVisible(false);
++  const bool enabled = service && service->IsEnabled();
++  SetVisible(enabled);
++  // One or the other, never both: the "+" menu's first item is New tab.
++  if (views::View* const new_tab_button = new_tab_button_.view()) {
++    new_tab_button->SetVisible(!enabled);
++  }
++  if (!enabled) {
+     return;
+   }
+ 
+@@ -275,29 +353,9 @@ void WorkspaceRailView::Rebuild() {
+     button->set_context_menu_controller(this);
+ 
+     guids_.push_back(entries[i].guid);
+-    buttons_.push_back(AddChildView(std::move(button)));
++    buttons_.push_back(scroll_contents_->AddChildView(std::move(button)));
+   }
+ 
+-  // The "+" is last and is NOT in `buttons_`, which stays parallel to `guids_`.
+-  // It is also why the rail no longer hides itself at one workspace: it is the
+-  // only way to get a second one (see the header).
+-  AddChildView(MakeRailButton(
+-      u"+", l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_NEW),
+-      base::BindRepeating(&WorkspaceRailView::OnNewWorkspacePressed,
+-                          base::Unretained(this))));
+-
+-  // Tab search, last of all (E11): the owner wanted it "around the workspace
+-  // UI", and Ctrl+Shift+A is Arc's global hotkey on this machine (LOCAL.md
+-  // 31). A magnifier glyph, drawn like every other rail label. It runs
+-  // Chromium's own IDC_TAB_SEARCH, which pins the toolbar button for a moment
+-  // and opens the panel from it.
+-  AddChildView(MakeRailButton(
+-      u"\U0001F50D",  // magnifying glass, escaped like kIconPresets
+-      l10n_util::GetStringUTF16(IDS_TOOLTIP_TAB_SEARCH),
+-      base::BindRepeating(&WorkspaceRailView::OnTabSearchPressed,
+-                          base::Unretained(this))));
+-
+-  SetVisible(true);
+   UpdateHighlight();
+ }
+ 
+@@ -312,9 +370,21 @@ void WorkspaceRailView::UpdateHighlight(
+   // highlight Chromium already uses for "this button's thing is the one that is
+   // currently up", so it follows the theme, dark mode and the strip's own
+   // colours without this file naming a single ui::ColorId.
++  //
++  // The active one is also slid into view, so a switch by keyboard never
++  // leaves the highlight out of sight -- but once per switch, not on every
++  // call. This runs on every tag change and after every layout, and scrolling
++  // each time snapped the rail back after every slide the user made (E13
++  // review). A button with no bounds yet has not been laid out; it stays
++  // pending, and the post-layout callback brings it into view.
+   const std::string& active_guid = service->active_guid();
+   for (size_t i = 0; i < buttons_.size(); ++i) {
+     buttons_[i]->SetHighlighted(guids_[i] == active_guid);
++    if (guids_[i] == active_guid && active_guid != scrolled_to_guid_ &&
++        !buttons_[i]->bounds().IsEmpty()) {
++      buttons_[i]->ScrollViewToVisible();
++      scrolled_to_guid_ = active_guid;
++    }
+   }
+ }
+ 
+@@ -333,11 +403,49 @@ void WorkspaceRailView::OnWorkspacePress
+   service->SwitchToWorkspace(guid);
+ }
+ 
+-void WorkspaceRailView::OnTabSearchPressed() {
+-  // browser_commands.h belongs to //chrome/browser/ui, which depends on this
+-  // target, so no GN dep can name it; the build does not run gn check, and
+-  // the include resolves. The same one-liner new_tab_button.cc uses (15).
+-  chrome::ExecuteCommand(browser_, IDC_TAB_SEARCH);
++void WorkspaceRailView::OnAddPressed() {
++  // Same model, runner and delegate as a workspace's context menu; an empty
++  // context_menu_guid_ is how ExecuteCommand tells the two apart.
++  context_menu_guid_.clear();
++  context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  context_menu_model_->AddItemWithStringId(kMenuCommandNewTab, IDS_NEW_TAB);
++  context_menu_model_->AddItemWithStringId(kMenuCommandNewWorkspace,
++                                           IDS_HELIUM_WORKSPACE_NEW);
++  context_menu_model_->AddItemWithStringId(kMenuCommandTabSearch,
++                                           IDS_TAB_SEARCH_MENU);
++  context_menu_runner_ = std::make_unique<views::MenuRunner>(
++      context_menu_model_.get(), views::MenuRunner::HAS_MNEMONICS);
++  context_menu_runner_->RunMenuAt(
++      GetWidget(), nullptr, add_button_->GetBoundsInScreen(),
++      views::MenuAnchorPosition::kTopLeft, ui::mojom::MenuSourceType::kNone);
++}
++
++void WorkspaceRailView::SlideBy(int direction) {
++  // Whole buttons, via ScrollViewToVisible, which stops at the ends;
++  // ScrollView::ScrollByOffset does not clamp. Both rects are in
++  // scroll_contents_'s coordinates.
++  const gfx::Rect visible = scroll_view_->GetVisibleRect();
++  if (direction > 0) {
++    for (TopContainerButton* button : buttons_) {
++      if (button->bounds().right() > visible.right()) {
++        button->ScrollViewToVisible();
++        return;
++      }
++    }
++    return;
++  }
++  for (auto it = buttons_.rbegin(); it != buttons_.rend(); ++it) {
++    if ((*it)->x() < visible.x()) {
++      (*it)->ScrollViewToVisible();
++      return;
++    }
++  }
++}
++
++void WorkspaceRailView::UpdateArrows() {
++  const gfx::Rect visible = scroll_view_->GetVisibleRect();
++  back_button_->SetEnabled(visible.x() > 0);
++  forward_button_->SetEnabled(visible.right() < scroll_contents_->width());
+ }
+ 
+ void WorkspaceRailView::OnNewWorkspacePressed() {
+@@ -494,6 +602,28 @@ bool WorkspaceRailView::IsCommandIdEnabl
+ }
+ 
+ void WorkspaceRailView::ExecuteCommand(int command_id, int event_flags) {
++  // The "+" menu's three, which act on the window rather than a workspace.
++  // browser_commands.h belongs to //chrome/browser/ui, which depends on this
++  // target, so no GN dep can name it; the build does not run gn check, and
++  // the include resolves. The same one-liner new_tab_button.cc uses (15).
++  // Logged, because the tab a New tab opens is otherwise indistinguishable in
++  // the log from the tabs Chromium reopens at startup (E13 review).
++  switch (command_id) {
++    case kMenuCommandNewTab:
++      LOG(INFO) << "[workspaces] rail + menu: new tab";
++      chrome::ExecuteCommand(browser_, IDC_NEW_TAB);
++      return;
++    case kMenuCommandNewWorkspace:
++      LOG(INFO) << "[workspaces] rail + menu: new workspace";
++      OnNewWorkspacePressed();
++      return;
++    case kMenuCommandTabSearch:
++      // Ctrl+Shift+A is Arc's global hotkey on this machine (LOCAL.md 31).
++      LOG(INFO) << "[workspaces] rail + menu: tab search";
++      chrome::ExecuteCommand(browser_, IDC_TAB_SEARCH);
++      return;
++  }
++
+   workspaces::WorkspaceService* service =
+       workspaces::WorkspaceService::From(browser_);
+   if (!service || context_menu_guid_.empty()) {
+@@ -633,13 +763,41 @@ void WorkspaceRailView::ShowNameBubble(
+ 
+ void WorkspaceRailView::OnCollapseStateChanged(
+     tabs::VerticalTabStripCollapseState state) {
+-  // Follows the parent container: a row beside the new tab button when the
+-  // strip is expanded, a column under it when the strip is an icon rail. Taking
+-  // this from the controller rather than from the container is what keeps
+-  // vertical_tab_strip_bottom_container.h out of this patch entirely.
++  // Follows the parent container: a row when the strip is expanded, a column
++  // when it is an icon rail. Taking this from the controller rather than from
++  // the container is what keeps vertical_tab_strip_bottom_container.h out of
++  // this patch entirely.
+   const bool collapsed = state != tabs::VerticalTabStripCollapseState::kExpanded;
+-  SetOrientation(collapsed ? views::LayoutOrientation::kVertical
+-                           : views::LayoutOrientation::kHorizontal);
++  const views::LayoutOrientation orientation =
++      collapsed ? views::LayoutOrientation::kVertical
++                : views::LayoutOrientation::kHorizontal;
++  SetOrientation(orientation);
++  scroll_contents_->SetOrientation(orientation);
++
++  // Only the row can run out of room. The column shows every button, so it
++  // neither scrolls nor has arrows, and nothing in it flexes.
++  back_button_->SetVisible(!collapsed);
++  forward_button_->SetVisible(!collapsed);
++  scroll_view_->SetHorizontalScrollBarMode(
++      collapsed ? views::ScrollView::ScrollBarMode::kDisabled
++                : views::ScrollView::ScrollBarMode::kHiddenButEnabled);
++  if (collapsed) {
++    ClearProperty(views::kFlexBehaviorKey);
++    scroll_view_->ClearProperty(views::kFlexBehaviorKey);
++    return;
++  }
++  // The rail fills the bottom row and may shrink to its fixed parts; the
++  // scroller is the part that gives, which is the whole fix (LOCAL.md 33).
++  SetProperty(
++      views::kFlexBehaviorKey,
++      views::FlexSpecification(views::LayoutOrientation::kHorizontal,
++                               views::MinimumFlexSizeRule::kScaleToMinimum,
++                               views::MaximumFlexSizeRule::kUnbounded));
++  scroll_view_->SetProperty(
++      views::kFlexBehaviorKey,
++      views::FlexSpecification(views::LayoutOrientation::kHorizontal,
++                               views::MinimumFlexSizeRule::kScaleToZero,
++                               views::MaximumFlexSizeRule::kUnbounded));
+ }
+ 
+ BEGIN_METADATA(WorkspaceRailView)
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.h
+@@ -16,6 +16,7 @@
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/layout/flex_layout_view.h"
++#include "ui/views/view_tracker.h"
+ 
+ class BrowserWindowInterface;
+ class TopContainerButton;
+@@ -27,12 +28,23 @@ enum class VerticalTabStripCollapseState
+ 
+ namespace views {
+ class MenuRunner;
++class ScrollView;
+ }  // namespace views
+ 
+-// The workspace switcher: one button per workspace plus a trailing "+", at the
+-// bottom of the vertical tab strip beside the new tab button (design 5, and the
+-// owner request recorded there on 2026-09-10 -- "a small control at the bottom
+-// of the tab strip, to switch workspaces or add one").
++// The workspace switcher at the bottom of the vertical tab strip (design 5, and
++// the owner request recorded there on 2026-09-10 -- "a small control at the
++// bottom of the tab strip, to switch workspaces or add one").
++//
++// Since E13 it is a row of fixed parts around a scroller, the owner's design:
++//
++//   < [ one button per workspace ] >  +
++//
++// The workspace buttons slide under the mouse wheel and the two arrows, and
++// the "+" opens a menu: New tab, New workspace, Tab search. Before E13 the
++// buttons sat beside the new tab button in one row that never shrank, so five
++// workspaces squeezed the new tab button to nothing (LOCAL.md 33). The new tab
++// button is now hidden while the rail is shown, since "+" covers it. With the
++// strip collapsed the rail is a column, with no arrows and "+" last.
+ //
+ // Switching shipped at E9a; adding, renaming and deleting arrive here at E9b.
+ // Reordering does not: it is the one edit that needs a drag interaction rather
+@@ -65,8 +77,12 @@ class WorkspaceRailView : public views::
+   // VerticalTabStripBottomContainer::UpdateButtonStyles would have cost a
+   // forward declaration, a raw_ptr member and a third hunk, all of them inside
+   // hunks layout/vertical.patch already owns (LOCAL.md 1).
++  //
++  // `new_tab_button` is the sibling this rail stands in for: hidden while the
++  // rail is shown, back when Workspaces is switched off. Tracked, not owned.
+   WorkspaceRailView(BrowserWindowInterface* browser,
+-                    tabs::VerticalTabStripStateController* state_controller);
++                    tabs::VerticalTabStripStateController* state_controller,
++                    views::View* new_tab_button);
+   WorkspaceRailView(const WorkspaceRailView&) = delete;
+   WorkspaceRailView& operator=(const WorkspaceRailView&) = delete;
+   ~WorkspaceRailView() override;
+@@ -102,7 +118,14 @@ class WorkspaceRailView : public views::
+ 
+   void OnWorkspacePressed(const std::string& guid);
+   void OnNewWorkspacePressed();
+-  void OnTabSearchPressed();
++  void OnAddPressed();
++
++  // Brings the next workspace button past the visible edge into view, one
++  // whole button at a time: `direction` -1 for earlier, +1 for later.
++  void SlideBy(int direction);
++
++  // Greys each arrow when there is nothing more on its side.
++  void UpdateArrows();
+ 
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+ 
+@@ -124,10 +147,23 @@ class WorkspaceRailView : public views::
+   std::vector<std::string> guids_;
+   std::vector<raw_ptr<TopContainerButton>> buttons_;
+ 
++  // The workspace whose button was last slid into view, so a switch scrolls
++  // the rail once and a slide by the user is not undone by the next layout.
++  std::string scrolled_to_guid_;
++
++  // The fixed parts, made once in the constructor; Rebuild() refills only
++  // `scroll_contents_`.
++  raw_ptr<views::View> back_button_ = nullptr;
++  raw_ptr<views::ScrollView> scroll_view_ = nullptr;
++  raw_ptr<views::FlexLayoutView> scroll_contents_ = nullptr;
++  raw_ptr<views::View> forward_button_ = nullptr;
++  raw_ptr<views::View> add_button_ = nullptr;
++  views::ViewTracker new_tab_button_;
++
+   // Which workspace the open context menu belongs to. A menu is modal to the
+   // user but not to this class: the menu runs, this returns, and ExecuteCommand
+   // arrives later with nothing but a command id, so the subject has to be
+-  // remembered here.
++  // remembered here. Empty while the "+" menu is open.
+   std::string context_menu_guid_;
+ 
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
+@@ -140,6 +176,7 @@ class WorkspaceRailView : public views::
+   base::CallbackListSubscription workspace_changed_subscription_;
+   base::CallbackListSubscription workspace_list_changed_subscription_;
+   base::CallbackListSubscription collapse_changed_subscription_;
++  base::CallbackListSubscription scrolled_subscription_;
+ 
+   // For the name bubble's accept callback, which outlives this call stack and
+   // can outlive the rail: the bubble is owned by its own widget, and closing

@@ -1,0 +1,527 @@
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -434,43 +434,64 @@ void TabMenuModel::Build(int index) {
+     }
+   }
+ 
+-  // Helium Workspaces: "Move tab to workspace", beside the tab-group submenu
+-  // because it is the same kind of action -- put this tab somewhere else in
+-  // the strip's organisation -- and because the group submenu is the shape it
+-  // copies. Hidden entirely when there is nowhere to move a tab to.
+-  if (ExistingWorkspaceSubMenuModel::ShouldShowSubmenu(
++  // Helium Workspaces, in three groups, each under a divider (polish E): how
++  // the tab looks, what keeps it, and where it lives -- the last running on
++  // into the group and window items below. Only while Workspaces is on, the
++  // dividers too: off, the menu is Chromium's.
++  if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
+           tab_strip_->delegate()->GetBrowserWindowInterface())) {
+-    move_to_workspace_submenu_ =
+-        std::make_unique<ExistingWorkspaceSubMenuModel>(
+-            tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
+-            index);
+-    AddSubMenuWithStringId(TabStripModel::CommandMoveToWorkspace,
+-                           IDS_HELIUM_WORKSPACE_MOVE_TAB_TO,
+-                           move_to_workspace_submenu_.get());
+-  }
++    AddSeparator(ui::NORMAL_SEPARATOR);
++    // E11: rename, as a plain item where the owner looks for it. C16: the
++    // emoji drawn in place of the favicon, beside the name.
++    AddItemWithStringId(TabStripModel::CommandRenameTab,
++                        IDS_HELIUM_WORKSPACE_RENAME_TAB);
++    AddItemWithStringId(TabStripModel::CommandSetTabEmoji,
++                        IDS_HELIUM_SET_EMOJI);
+ 
+-  // C33: "Snooze tab", right under the move -- both send the tab elsewhere,
+-  // this one into the Archive until a time. Shown only when a tab it would
+-  // act on can be snoozed.
+-  if (WorkspaceSnoozeSubMenuModel::ShouldShowSubmenu(
+-          tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
+-          index)) {
+-    snooze_submenu_ = std::make_unique<WorkspaceSnoozeSubMenuModel>(
++    AddSeparator(ui::NORMAL_SEPARATOR);
++    // E15d: Arc's "Pin tab", the menu's half of pinning; the drag is the other.
++    AddItemWithStringId(TabStripModel::CommandPinToWorkspace,
++                        IDS_HELIUM_WORKSPACE_PIN_TAB);
++    // The anchor submenu (design 5, E10 spec).
++    anchor_submenu_ = std::make_unique<WorkspaceAnchorSubMenuModel>(
+         tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
+         index);
+-    AddSubMenuWithStringId(TabStripModel::CommandSnoozeTab,
+-                           IDS_HELIUM_WORKSPACE_SNOOZE_SUBMENU,
+-                           snooze_submenu_.get());
+-  }
+-
+-  // C5: "Always open <site> in <workspace>", or "Stop always opening ..."
+-  // when the site already opens there -- beside the move, as both say where
+-  // a page belongs. A plain item whose words flip: the tab menu keeps no
+-  // checked state for our commands. Under Rename tab's gate, for the
+-  // right-clicked tab's web page; the workspace is the one on screen, which
+-  // every tab this menu opens on is drawn in.
+-  if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
+-          tab_strip_->delegate()->GetBrowserWindowInterface())) {
++    AddSubMenuWithStringId(TabStripModel::CommandAnchorTab,
++                           IDS_HELIUM_WORKSPACE_ANCHOR_SUBMENU,
++                           anchor_submenu_.get());
++    // C33: "Snooze tab", into the Archive until a time. Shown only when a tab
++    // it would act on can be snoozed.
++    if (WorkspaceSnoozeSubMenuModel::ShouldShowSubmenu(
++            tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
++            index)) {
++      snooze_submenu_ = std::make_unique<WorkspaceSnoozeSubMenuModel>(
++          tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
++          index);
++      AddSubMenuWithStringId(TabStripModel::CommandSnoozeTab,
++                             IDS_HELIUM_WORKSPACE_SNOOZE_SUBMENU,
++                             snooze_submenu_.get());
++    }
++
++    AddSeparator(ui::NORMAL_SEPARATOR);
++    // "Move tab to workspace", right above the tab-group submenu: the same
++    // kind of action, and the shape it copies. Hidden entirely when there is
++    // nowhere to move a tab to.
++    if (ExistingWorkspaceSubMenuModel::ShouldShowSubmenu(
++            tab_strip_->delegate()->GetBrowserWindowInterface())) {
++      move_to_workspace_submenu_ =
++          std::make_unique<ExistingWorkspaceSubMenuModel>(
++              tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
++              index);
++      AddSubMenuWithStringId(TabStripModel::CommandMoveToWorkspace,
++                             IDS_HELIUM_WORKSPACE_MOVE_TAB_TO,
++                             move_to_workspace_submenu_.get());
++    }
++    // C5: "Always open <site> in the <workspace> workspace", or "Stop always
++    // opening ..." when the site already opens there -- beside the move, as
++    // both say where a page belongs. A plain item whose words flip: the tab
++    // menu keeps no checked state for our commands. For the right-clicked
++    // tab's web page; the workspace is the one on screen, which every tab
++    // this menu opens on is drawn in.
+     const workspaces::WorkspaceService* const service =
+         workspaces::WorkspaceService::From(
+             tab_strip_->delegate()->GetBrowserWindowInterface());
+@@ -492,32 +513,6 @@ void TabMenuModel::Build(int index) {
+     }
+   }
+ 
+-  // Helium Workspaces (E11): rename, as a plain item where the owner looks
+-  // for it. Shown under the same gate as the submenus below.
+-  if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
+-          tab_strip_->delegate()->GetBrowserWindowInterface())) {
+-    AddItemWithStringId(TabStripModel::CommandRenameTab,
+-                        IDS_HELIUM_WORKSPACE_RENAME_TAB);
+-    // C16: the emoji drawn in place of the favicon, beside the name.
+-    AddItemWithStringId(TabStripModel::CommandSetTabEmoji,
+-                        IDS_HELIUM_SET_EMOJI);
+-    // E15d: Arc's "Pin tab", the menu's half of pinning; the drag is the other.
+-    AddItemWithStringId(TabStripModel::CommandPinToWorkspace,
+-                        IDS_HELIUM_WORKSPACE_PIN_TAB);
+-  }
+-
+-  // Helium Workspaces: the anchor submenu (design 5, E10 spec), right beside
+-  // the one above -- both are "what this tab is, in the workspace sense".
+-  if (WorkspaceAnchorSubMenuModel::ShouldShowSubmenu(
+-          tab_strip_->delegate()->GetBrowserWindowInterface())) {
+-    anchor_submenu_ = std::make_unique<WorkspaceAnchorSubMenuModel>(
+-        tab_strip_->delegate()->GetBrowserWindowInterface(), tab_strip_,
+-        index);
+-    AddSubMenuWithStringId(TabStripModel::CommandAnchorTab,
+-                           IDS_HELIUM_WORKSPACE_ANCHOR_SUBMENU,
+-                           anchor_submenu_.get());
+-  }
+-
+   if (ExistingTabGroupSubMenuModel::ShouldShowSubmenu(
+           tab_strip_, index, tab_menu_model_delegate_)) {
+     // Create submenu with existing groups
+@@ -620,7 +615,7 @@ void TabMenuModel::Build(int index) {
+ 
+   bool will_pin = tab_strip_->WillContextMenuPin(index);
+   // Helium Workspaces (the owner, after C16's try): "Add to Favorites", so it
+-  // is told apart from "Pin to workspace" in the same menu, and
++  // is told apart from "Pin to this workspace" in the same menu, and
+   // "Remove from Favorites" (LOCAL.md 120's renames).
+   AddItemWithStringId(
+       TabStripModel::CommandTogglePinned,
+--- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
+@@ -115,8 +115,12 @@ void ShowTabTextDialog(tabs::TabInterfac
+   TabTitleDialogDelegate* const delegate_ptr = delegate.get();
+   constrained_window::ShowWebModal(
+       ui::DialogModel::Builder(std::move(delegate))
+-          .SetTitle(l10n_util::GetStringUTF16(
+-              emoji ? IDS_HELIUM_SET_EMOJI : IDS_HELIUM_WORKSPACE_RENAME_TAB))
++          // The menu item's words without its "...", as the rail's name box
++          // titles itself (polish E).
++          .SetTitle(std::u16string(base::TrimString(
++              l10n_util::GetStringUTF16(emoji ? IDS_HELIUM_SET_EMOJI
++                                              : IDS_HELIUM_WORKSPACE_RENAME_TAB),
++              u"…", base::TRIM_TRAILING)))
+           .AddOkButton(base::BindOnce(&TabTitleDialogDelegate::OnAccepted,
+                                       base::Unretained(delegate_ptr)))
+           .AddCancelButton(base::DoNothing())
+--- a/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
++++ b/chrome/browser/ui/tabs/workspaces/workspaces_strings.grdp
+@@ -33,7 +33,7 @@
+   <message name="IDS_SHORTCUT_COMMAND_HELIUM_WORKSPACE_ARCHIVE" desc="Command name shown on the Settings shortcuts page for opening the Archive of closed tabs.">
+     Open the Archive
+   </message>
+-  <message name="IDS_SHORTCUT_COMMAND_HELIUM_QUICK_SEARCH" desc="Command name shown on the Settings shortcuts page for opening the quick search box, which finds open tabs, pinned pages and archived tabs of every workspace.">
++  <message name="IDS_SHORTCUT_COMMAND_HELIUM_QUICK_SEARCH" desc="Command name shown on the Settings shortcuts page, and the item of the workspace rail's + menu, for opening the quick search box, which finds open tabs, pinned pages and archived tabs of every workspace.">
+     Find tabs and pages
+   </message>
+   <message name="IDS_HELIUM_LITTLE_WINDOW_OPEN" desc="Tooltip and accessible name of the button at the right end of the address row of the small window a link from another app opens in: moves the page into the main browser window as a tab, at the top of the tab list, and closes the small window.">
+@@ -85,19 +85,19 @@
+     Icon (an emoji; empty for none)
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_SAVE_AS_BOOKMARKS" desc="Menu item on a workspace in the workspace rail: saves the workspace's pinned pages, with their folders, and its open tabs as bookmarks, in a new folder named after the workspace and the date and time, under Other bookmarks, Workspaces. Nothing is closed.">
+-    Save as bookmarks
++    Bookmark all tabs
+   </message>
+-  <message name="IDS_HELIUM_WORKSPACE_BOOKMARKS_FOLDER" desc="Name of the bookmark folder in Other bookmarks that holds the folders made by the Save as bookmarks item of the workspace rail, one per save.">
++  <message name="IDS_HELIUM_WORKSPACE_BOOKMARKS_FOLDER" desc="Name of the bookmark folder in Other bookmarks that holds the folders made by the Bookmark all tabs item of the workspace rail, one per save.">
+     Workspaces
+   </message>
+-  <message name="IDS_HELIUM_WORKSPACE_BOOKMARKS_TODAY" desc="Name of the sub-folder, in a bookmark folder made by Save as bookmarks, that holds the workspace's open tabs (its Today tabs, below its pinned pages).">
++  <message name="IDS_HELIUM_WORKSPACE_BOOKMARKS_TODAY" desc="Name of the sub-folder, in a bookmark folder made by Bookmark all tabs, that holds the workspace's open tabs (its Today tabs, below its pinned pages).">
+     Today
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_UNLOAD" desc="Menu item on a workspace in the workspace rail that hibernates the tabs in that workspace to free memory, keeping them in the tab strip.">
+-    Unload workspace
++    Hibernate this workspace
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_UNLOAD_OTHERS" desc="Menu item on a workspace in the workspace rail that hibernates the tabs of every other workspace to free memory, keeping them in the tab strip.">
+-    Unload other workspaces
++    Hibernate other workspaces
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_CLOSE_ALL" desc="Menu item on a workspace in the workspace rail that closes every tab in that workspace; the workspace itself stays and the tabs can be reopened from Recently Closed.">
+     Close all tabs
+@@ -127,8 +127,8 @@
+   <message name="IDS_HELIUM_WORKSPACE_SCROLL_FORWARD" desc="Tooltip and accessible name of the arrow at the right end of the workspace rail, which slides the workspace buttons to show later workspaces.">
+     More workspaces
+   </message>
+-  <message name="IDS_HELIUM_WORKSPACE_ADD_MENU" desc="Tooltip and accessible name of the plus button on the workspace rail, which opens a menu with New tab, New workspace and Tab search.">
+-    New tab, workspace or tab search
++  <message name="IDS_HELIUM_WORKSPACE_ADD_MENU" desc="Tooltip and accessible name of the plus button on the workspace rail, which opens a menu with New tab, New workspace, Find tabs and pages and Tab search, among others.">
++    New tab, workspace or search
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_CONFIRM_CLOSE_ALL" desc="Title of the confirmation shown before Close all tabs on a workspace in the workspace rail closes more tabs than Recently Closed can reopen.">
+     {NUM_TABS, plural,
+@@ -369,7 +369,7 @@
+     Back to the pinned page
+   </message>
+   <message name="IDS_HELIUM_PINNED_ITEM_REPLACE_URL" desc="Menu item on an open pinned page that has navigated away from its pinned address: makes the address it shows now the pinned page's address.">
+-    Replace pinned URL with current
++    Use current page
+   </message>
+   <message name="IDS_HELIUM_PINNED_NEW_FOLDER" desc="Menu item on a row of a workspace's pinned section that makes a new folder just below that row, and the new folder's name until the user types one.">
+     New folder
+@@ -419,7 +419,7 @@
+      other {# anchored tabs}}
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_PIN_TAB" desc="Tab context menu item: the tab becomes a pinned page at the end of its workspace's pinned section, and stays open.">
+-    Pin to workspace
++    Pin to this workspace
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_FROM_GROUP" desc="Tab context menu item on a tab of a tab group: makes a new workspace with the group's name and colour, moves the group's tabs into it, still grouped, and switches the window to it.">
+     Make this group a workspace
+@@ -436,10 +436,10 @@
+     Move tab to workspace
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_SITE_RULE" desc="Tab context menu item: from now on, a link to this site opened in a new tab -- from a page, a bookmark or another app -- opens in this workspace. $1 is the site (a host such as github.com), $2 the name of the workspace the window is showing.">
+-    Always open <ph name="SITE">$1<ex>github.com</ex></ph> in <ph name="WORKSPACE">$2<ex>Work</ex></ph>
++    Always open <ph name="SITE">$1<ex>github.com</ex></ph> in the <ph name="WORKSPACE">$2<ex>Work</ex></ph> workspace
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_STOP_SITE_RULE" desc="Tab context menu item, in place of 'Always open ... in ...' when the site already always opens in this workspace: links to it open where the user is again. $1 is the site, $2 the name of the workspace.">
+-    Stop always opening <ph name="SITE">$1<ex>github.com</ex></ph> in <ph name="WORKSPACE">$2<ex>Work</ex></ph>
++    Stop always opening <ph name="SITE">$1<ex>github.com</ex></ph> in the <ph name="WORKSPACE">$2<ex>Work</ex></ph> workspace
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_EDIT_SITES" desc="Heading over the list of sites in the Edit workspace bubble: links to these sites opened in a new tab always open in this workspace.">
+     Sites
+@@ -454,7 +454,7 @@
+     Anchor
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_RENAME_TAB" desc="Tab context menu item and dialog title for giving a tab a title of the user's own.">
+-    Rename tab
++    Rename tab…
+   </message>
+   <message name="IDS_HELIUM_WORKSPACE_TAB_TITLE_LABEL" desc="Label of the text field for a tab's custom title. Leaving it empty restores the page's own title.">
+     Title (empty restores the page's own)
+@@ -462,7 +462,7 @@
+   <message name="IDS_HELIUM_SET_EMOJI" desc="Menu item on a tab, and on a pinned page or a folder of a workspace's pinned section, and the title of the box it opens: the emoji typed there is drawn in place of the tab's or pinned page's icon, or inside the folder's box. Leaving the box empty removes it.">
+     Set emoji…
+   </message>
+-  <message name="IDS_HELIUM_PIN_AS_FAVORITE" desc="Tab context menu item, in place of Chromium's 'Pin': makes the tab a favorite -- a pinned tab, shown at the top of the sidebar in every workspace -- told apart from 'Pin to workspace', which pins it in the workspace's pinned section.">
++  <message name="IDS_HELIUM_PIN_AS_FAVORITE" desc="Tab context menu item, in place of Chromium's 'Pin': makes the tab a favorite -- a pinned tab, shown at the top of the sidebar in every workspace -- told apart from 'Pin to this workspace', which pins it in the workspace's pinned section.">
+     Add to Favorites
+   </message>
+   <message name="IDS_HELIUM_REMOVE_FROM_FAVORITES" desc="Tab context menu item on a favorite, in place of Chromium's 'Unpin tab': makes the favorite an ordinary tab again, the opposite of Add to Favorites.">
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -442,8 +442,8 @@ tabs::TabInterface* LinkedTab(TabStripMo
+   return nullptr;
+ }
+ 
+-// C31: the tab of item `id` in `browser` when "Replace pinned URL with
+-// current" can give the item the page that tab shows -- an item's page, not a
++// C31: the tab of item `id` in `browser` when "Use current page" (once
++// "Replace pinned URL with current") can give the item the page that tab shows -- an item's page, not a
+ // favorite's, away from its home and on a web page; null otherwise. Asked as
+ // the menu is built and again when it is pressed: the page can load elsewhere,
+ // or back home, while the menu is open.
+@@ -3153,14 +3153,18 @@ bool WorkspacePinnedSectionView::BuildSe
+   context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+   // What the whole selection can do. Rename, New folder, Colour and a folder's
+   // own actions stay one row's (the owner's D2).
++  // In one row's menu's order and groups (polish E).
+   if (any_open) {
+     context_menu_model_->AddItemWithStringId(kCommandClose, IDS_APP_CLOSE);
+   }
++  context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  AddMoveToWorkspaceMenu();
++  context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   if (any_item) {
+     context_menu_model_->AddItemWithStringId(kCommandUnpin,
+                                              IDS_HELIUM_PINNED_ITEM_UNPIN);
+   }
+-  AddMoveToWorkspaceMenu();
++  context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   context_menu_model_->AddItemWithStringId(kCommandDelete,
+                                            IDS_HELIUM_PINNED_ITEM_DELETE);
+   LOG(INFO) << "[workspaces] pins: menu for " << context_menu_selection_.size()
+@@ -4868,33 +4872,23 @@ void WorkspacePinnedSectionView::ShowCon
+           kCommandClose, row->page_count() == 2 ? IDS_APP_CLOSE
+                                                 : IDS_HELIUM_PINNED_ITEM_CLOSE);
+     }
+-    // C31, Arc's item on a pinned page that moved: for the page the menu was
+-    // opened on, a split's half alone.
+-    if (ReplaceUrlTab(browser_, context_menu_page_id_)) {
+-      context_menu_model_->AddItemWithStringId(
+-          kCommandReplaceUrl, IDS_HELIUM_PINNED_ITEM_REPLACE_URL);
+-    }
+-    if (!row->folder()) {
+-      context_menu_model_->AddItemWithStringId(kCommandUnpin,
+-                                               IDS_HELIUM_PINNED_ITEM_UNPIN);
+-    }
+-    // Chromium's plain "Rename" (the bookmark menu's); the rail's says
+-    // "Rename workspace" (the owner's check of E15d.1).
+-    context_menu_model_->AddItemWithStringId(kCommandRename,
+-                                             IDS_BOOKMARKS_RENAME);
++    // Then in groups, each under a divider (polish E): its name and look;
++    // where it goes; a folder's own actions; letting go of the pin; Delete,
++    // alone at the bottom as in the workspace menu. ui::SimpleMenuModel draws
++    // no divider first, nor two in a row.
++    context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++    // Chromium's "Rename..." (the bookmark bar's), the box it opens titled
++    // "Rename"; the rail's says "Rename workspace" (the owner's check of
++    // E15d.1). Without its "&R": no other item here has an Alt-key letter.
++    context_menu_model_->AddItem(
++        kCommandRename, gfx::RemoveAccelerator(l10n_util::GetStringUTF16(
++                            IDS_BOOKMARK_BAR_RENAME_FOLDER)));
+     // C16: a folder's or a page's; a split's two pages draw their own icons
+     // (D2).
+     if (row->page_count() != 2) {
+       context_menu_model_->AddItemWithStringId(kCommandSetEmoji,
+                                                IDS_HELIUM_SET_EMOJI);
+     }
+-    AddMoveToWorkspaceMenu();
+-    // Not on a peek row (C12): its place is inside the closed folder, where a
+-    // new folder would land unseen (design review).
+-    if (!row->peek()) {
+-      context_menu_model_->AddItemWithStringId(kCommandNewFolder,
+-                                               IDS_HELIUM_PINNED_NEW_FOLDER);
+-    }
+     if (row->folder()) {
+       // Each folder its own colour (E17b): Chromium's nine, named and drawn
+       // as its tab-group menu draws them, the one drawn ticked.
+@@ -4913,6 +4907,17 @@ void WorkspacePinnedSectionView::ShowCon
+       context_menu_model_->AddSubMenuWithStringId(
+           kCommandColor, IDS_HELIUM_WORKSPACE_EDIT_COLOR,
+           color_menu_model_.get());
++    }
++    context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++    AddMoveToWorkspaceMenu();
++    // Not on a peek row (C12): its place is inside the closed folder, where a
++    // new folder would land unseen (design review).
++    if (!row->peek()) {
++      context_menu_model_->AddItemWithStringId(kCommandNewFolder,
++                                               IDS_HELIUM_PINNED_NEW_FOLDER);
++    }
++    if (row->folder()) {
++      context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+       // C17, each shown only when it can do something (D7). Which pages are
+       // open: one walk of every window's tabs (M6).
+       if (const PinNode* const folder =
+@@ -4950,6 +4955,20 @@ void WorkspacePinnedSectionView::ShowCon
+               kCommandCopyLinks, IDS_HELIUM_PINNED_FOLDER_COPY_LINKS);
+         }
+       }
++    }
++    context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++    // C31, Arc's item on a pinned page that moved: for the page the menu was
++    // opened on, a split's half alone.
++    if (ReplaceUrlTab(browser_, context_menu_page_id_)) {
++      context_menu_model_->AddItemWithStringId(
++          kCommandReplaceUrl, IDS_HELIUM_PINNED_ITEM_REPLACE_URL);
++    }
++    if (!row->folder()) {
++      context_menu_model_->AddItemWithStringId(kCommandUnpin,
++                                               IDS_HELIUM_PINNED_ITEM_UNPIN);
++    }
++    context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++    if (row->folder()) {
+       context_menu_model_->AddItemWithStringId(kCommandDeleteFolder,
+                                                IDS_HELIUM_PINNED_FOLDER_DELETE);
+     } else {
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -95,6 +95,7 @@
+ #include "ui/base/mojom/menu_source_type.mojom-shared.h"
+ #include "ui/base/models/dialog_model.h"
+ #include "ui/base/models/image_model.h"
++#include "ui/base/ui_base_features.h"
+ #include "ui/color/color_id.h"
+ #include "ui/color/color_provider.h"
+ #include "ui/compositor/layer.h"
+@@ -167,6 +168,8 @@ constexpr int kMenuCommandExportWorkspac
+ constexpr int kMenuCommandImportWorkspaces = 31;
+ // The "+" menu's Workspace settings... (the slim chunk, patch 93).
+ constexpr int kMenuCommandWorkspacesSettings = 32;
++// The "+" menu's Find tabs and pages (polish E).
++constexpr int kMenuCommandQuickSearch = 33;
+ 
+ // Every menu item carries a Chromium icon (design 5 "E17 spec" 5).
+ constexpr int kMenuIconSize = 16;
+@@ -515,7 +518,7 @@ int AddPinBookmarks(bookmarks::BookmarkM
+   return 1;
+ }
+ 
+-// C11b, "Save as bookmarks": workspace `guid` into Other bookmarks >
++// C11b, "Bookmark all tabs": workspace `guid` into Other bookmarks >
+ // Workspaces > "<name> YYYY-MM-DD HH:MM", a new folder each time -- the time
+ // tells two saves of one day apart (D14). Its pinned rows with their
+ // folders, then `browser`'s Today tabs of it in a "Today" folder, groups
+@@ -1628,9 +1631,16 @@ void WorkspaceRailView::OnAddPressed(con
+   context_menu_model_->AddItemWithStringIdAndIcon(
+       kMenuCommandNewWorkspace, IDS_HELIUM_WORKSPACE_NEW,
+       MenuIcon(kAddCircleIcon));
++  // Polish E: the fork's own search, over every workspace's open tabs, pinned
++  // pages and Archive -- only its shortcut reached it before. Chromium's Tab
++  // search stays, under Chromium's own icon for it (app_menu_model.cc's).
+   context_menu_model_->AddItemWithStringIdAndIcon(
+-      kMenuCommandTabSearch, IDS_TAB_SEARCH_MENU,
++      kMenuCommandQuickSearch, IDS_SHORTCUT_COMMAND_HELIUM_QUICK_SEARCH,
+       MenuIcon(vector_icons::kSearchIcon));
++  context_menu_model_->AddItemWithStringIdAndIcon(
++      kMenuCommandTabSearch, IDS_TAB_SEARCH_MENU,
++      MenuIcon(features::IsRoundedIconsEnabled() ? kManageSearchIcon
++                                                 : kTabSearchTabStripOldIcon));
+   context_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   context_menu_model_->AddItemWithStringIdAndIcon(
+       kMenuCommandImportArc, IDS_HELIUM_WORKSPACE_IMPORT_ARC,
+@@ -2204,7 +2214,7 @@ bool WorkspaceRailView::IsCommandIdEnabl
+     return context_menu_guid_ != workspaces::kDefaultWorkspaceGuid;
+   }
+ 
+-  // "Unload other workspaces" with nothing other is the same enabled-but-
++  // "Hibernate other workspaces" with nothing other is the same enabled-but-
+   // does-nothing item the rest of this function greys out.
+   if (command_id == kMenuCommandUnloadOthers) {
+     return guids_.size() > 1;
+@@ -2274,6 +2284,10 @@ void WorkspaceRailView::ExecuteCommand(i
+       LOG(INFO) << "[workspaces] rail + menu: tab search";
+       chrome::ExecuteCommand(browser_, IDC_TAB_SEARCH);
+       return;
++    case kMenuCommandQuickSearch:
++      LOG(INFO) << "[workspaces] rail + menu: find tabs and pages";
++      chrome::ExecuteCommand(browser_, IDC_HELIUM_QUICK_SEARCH);
++      return;
+     case kMenuCommandImportArc:
+       LOG(INFO) << "[workspaces] rail + menu: import from Arc";
+       arc_importer_.Start(base::BindOnce(&WorkspaceRailView::OnArcImportDone,
+@@ -2289,7 +2303,10 @@ void WorkspaceRailView::ExecuteCommand(i
+       return;
+     case kMenuCommandWorkspacesSettings:
+       LOG(INFO) << "[workspaces] rail + menu: workspaces settings";
+-      ShowWorkspaceSettingsBubble(browser_, this);
++      // A mouse click carries its button; Enter and a screen reader's press
++      // carry none (MenuController::Accept).
++      ShowWorkspaceSettingsBubble(browser_, this,
++                                  !(event_flags & ui::EF_MOUSE_BUTTON));
+       return;
+   }
+ 
+@@ -2492,9 +2509,13 @@ void WorkspaceRailView::ShowNameBubble(
+       std::make_unique<WorkspaceNameDialogDelegate>(std::move(on_accept));
+   WorkspaceNameDialogDelegate* const delegate_ptr = delegate.get();
+ 
++  // The menu item's words without its "...": the box is what the item opens
++  // (polish E; "Set emoji..." titles a box "Set emoji").
+   std::unique_ptr<ui::DialogModel> model =
+       ui::DialogModel::Builder(std::move(delegate))
+-          .SetTitle(l10n_util::GetStringUTF16(title_string_id))
++          .SetTitle(std::u16string(
++              base::TrimString(l10n_util::GetStringUTF16(title_string_id),
++                               u"…", base::TRIM_TRAILING)))
+           .AddOkButton(
+               base::BindOnce(&WorkspaceNameDialogDelegate::OnAccepted,
+                              base::Unretained(delegate_ptr)))
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_settings_bubble_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_settings_bubble_view.cc
+@@ -154,7 +154,8 @@ void AddSwitch(views::View* parent,
+ }  // namespace
+ 
+ void ShowWorkspaceSettingsBubble(BrowserWindowInterface* browser,
+-                                 views::View* anchor) {
++                                 views::View* anchor,
++                                 bool from_keyboard) {
+   PrefService* const prefs =
+       browser->GetProfile()->GetOriginalProfile()->GetPrefs();
+   auto contents = std::make_unique<views::View>();
+@@ -176,19 +177,22 @@ void ShowWorkspaceSettingsBubble(Browser
+   AddSwitch(contents.get(), prefs, p::kHeliumWorkspacesWideSidebar,
+             IDS_SETTINGS_WIDE_SIDEBAR, IDS_SETTINGS_WIDE_SIDEBAR_DESCRIPTION);
+ 
+-  // No buttons: every control applies as it changes. The first dropdown takes
+-  // the focus, so the keyboard starts in the bubble.
+-  std::unique_ptr<ui::DialogModel> model =
+-      ui::DialogModel::Builder()
+-          .SetTitle(
+-              l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_SETTINGS_TITLE))
+-          .AddCustomField(
+-              std::make_unique<views::BubbleDialogModelHost::CustomView>(
+-                  std::move(contents),
+-                  views::BubbleDialogModelHost::FieldType::kControl, first),
+-              kSettingsFieldId)
+-          .SetInitiallyFocusedField(kSettingsFieldId)
+-          .Build();
++  // No buttons: every control applies as it changes. From the keyboard the
++  // first dropdown takes the focus, so the keyboard starts in it (the Close
++  // button would come first); from the mouse nothing does -- a ring on the
++  // first dropdown read as something wrong (polish E).
++  ui::DialogModel::Builder builder;
++  builder.SetTitle(
++      l10n_util::GetStringUTF16(IDS_HELIUM_WORKSPACE_SETTINGS_TITLE));
++  builder.AddCustomField(
++      std::make_unique<views::BubbleDialogModelHost::CustomView>(
++          std::move(contents),
++          views::BubbleDialogModelHost::FieldType::kControl, first),
++      kSettingsFieldId);
++  if (from_keyboard) {
++    builder.SetInitiallyFocusedField(kSettingsFieldId);
++  }
++  std::unique_ptr<ui::DialogModel> model = builder.Build();
+   auto bubble = MakeSidebarBubble(std::move(model), anchor,
+                                   views::BubbleBorder::BOTTOM_LEFT);
+   bubble->set_fixed_width(kWidth);
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_settings_bubble_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_settings_bubble_view.h
+@@ -41,7 +41,10 @@ class View;
+ //
+ // Anchored to the rail, never to the "+" button, as the edit bubble is -- or
+ // over the page while zen mode floats the sidebar (MakeSidebarBubble).
++// `from_keyboard`: the first dropdown takes the focus, so the keyboard starts
++// in it; opened by the mouse, nothing does (no focus ring, polish E).
+ void ShowWorkspaceSettingsBubble(BrowserWindowInterface* browser,
+-                                 views::View* anchor);
++                                 views::View* anchor,
++                                 bool from_keyboard);
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_WORKSPACE_SETTINGS_BUBBLE_VIEW_H_
