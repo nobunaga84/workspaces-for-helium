@@ -28,6 +28,12 @@ $rv = Get-Content -Raw "$src\chrome\browser\ui\views\frame\vertical_tab_strip_re
 if (([regex]::Matches($rv, 'bottom_button_container_->SetProperty\(\s*views::kFlexBehaviorKey')).Count -ne 1) {
     Write-Host "STOP: Helium sets the bottom container's flex rule in more than one place (or none) -- 109's collapsed bar may run off the window again (LOCAL.md 143, R2-21)"; exit 1
 }
+#    And (LOCAL.md 146, patch 112): the rail keeps its height first only while the tab list has order 2 (set in
+#    AddTabStripView) and nothing else in the column sets a flex rule; 4 rules there on 157 -- a new one, or the
+#    order gone, compiles and silently shares the shrink between rail and tab list again.
+if ($rv -notmatch '(?s)::AddTabStripView\((?:(?!\n\}).)*?\.WithOrder\(2\)' -or ([regex]::Matches($rv, 'views::kFlexBehaviorKey')).Count -ne 4) {
+    Write-Host "STOP: the tab list's order 2 is gone or the column has a new flex rule -- 112's rail-first order may be lost (LOCAL.md 146)"; exit 1
+}
 #    And (LOCAL.md 144, I1): 110's Today list remembers its layouts until UnpinnedTabContainerViewLayout's
 #    OnLayoutChanged(), which hears every invalidation only while the animating manager OWNS that layout and
 #    LayoutManagerBase passes invalidations on to owned layouts. Either change compiles and leaves the list stale.

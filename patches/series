@@ -478,3 +478,4 @@ local/workspaces/108-big-profile-speed.patch
 local/workspaces/109-small-rest.patch
 local/workspaces/110-tab-switch-speed.patch
 local/workspaces/111-tab-switch-recolour.patch
+local/workspaces/112-rail-flex-order.patch

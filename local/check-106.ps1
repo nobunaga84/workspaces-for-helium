@@ -303,9 +303,12 @@ try {
         $before = @(Popups)
         $p = PickFile $file
         $read = WaitLog "$holds|$refused" 1 15
+        # Sampled at the decision, before Confirm's wait: a refused import shows no confirm, so that wait runs out,
+        # and on Dcheck it outlasted the Arc import (LOCAL.md 146: refused at 21:06:18, the Arc import done 21:06:30,
+        # sampled after both -- a FAIL of the check, not the browser).
+        $still = $started -and -not (Count $arcEnd)
         $c = Confirm $before 6
         if ($c) { $null = WaitLog "$applied|$refused" 1 15 }
-        $still = $started -and -not (Count $arcEnd)
         $why = First $refused; $did = Count $applied
         Say "A2 window B $b; $import in A ($mi), the Open box up $boxUp; $arc in B ($ma), reading $started; the Open box: $p; confirm $(if ($c) { "shown, Replace $($c.pressed)" } else { 'none' }); refused '$why'; applied x$did; the Arc import still reading then: $still"
         Verdict "A2 R2-20 picked while an Arc import reads: refused with 'Import from Arc is still running', nothing applied (want both, decided while it read: $still)" (

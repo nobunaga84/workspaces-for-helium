@@ -1,0 +1,219 @@
+--- a/chrome/browser/ui/tabs/workspaces/BUILD.gn
++++ b/chrome/browser/ui/tabs/workspaces/BUILD.gn
+@@ -309,6 +309,7 @@ source_set("unit_tests") {
+ 
+   sources = [
+     "arc_import_plan_unittest.cc",
++    "column_order_unittest.cc",
+     "workspace_archive_unittest.cc",
+     "workspace_pins_unittest.cc",
+     "workspace_prefs_unittest.cc",
+@@ -337,6 +338,12 @@ source_set("unit_tests") {
+     "//components/prefs",
+     "//components/prefs:test_support",
+     "//testing/gtest",
++
++    # The column's flex order (patch 112) on views' own FlexLayout: a library,
++    # not //chrome, so the rule above still holds. Adding a child view asks the
++    # accessibility platform, which views' own test runner sets up.
++    "//ui/accessibility:test_support",
++    "//ui/views",
+   ]
+ }
+ 
+--- /dev/null
++++ b/chrome/browser/ui/tabs/workspaces/column_order_unittest.cc
+@@ -0,0 +1,149 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// The vertical strip's column (patch 112): the bottom container, which holds
++// the workspaces rail, keeps FlexLayout's default order 1 and the tab list has
++// order 2, so the rail gets its height first (R2-21). Patch 109 used 0 and 1,
++// and FlexSpecification DCHECKs order >= 1. The rules below are copied from
++// WorkspaceRailView::PlaceInParent and VerticalTabStripRegionView::
++// AddTabStripView (a rebase tripwire in rebase-overnight.ps1 stops if those
++// change); these tests lock what FlexLayout does with them.
++
++#include <memory>
++
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/accessibility/platform/ax_platform_for_test.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/views/layout/flex_layout.h"
++#include "ui/views/layout/flex_layout_types.h"
++#include "ui/views/layout/proposed_layout.h"
++#include "ui/views/view.h"
++#include "ui/views/view_class_properties.h"
++
++namespace {
++
++// A child with a fixed preferred and minimum height.
++class FixedView : public views::View {
++  METADATA_HEADER(FixedView, views::View)
++
++ public:
++  FixedView(int preferred, int minimum)
++      : preferred_(preferred), minimum_(minimum) {}
++
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(100, preferred_);
++  }
++  gfx::Size GetMinimumSize() const override {
++    return gfx::Size(100, minimum_);
++  }
++
++ private:
++  const int preferred_;
++  const int minimum_;
++};
++
++BEGIN_METADATA(FixedView)
++END_METADATA
++
++// Patch 112's tab list (AddTabStripView) and the same without its order.
++views::FlexSpecification TabList() {
++  return views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToMinimum,
++                                  views::MaximumFlexSizeRule::kPreferred)
++      .WithOrder(2);
++}
++views::FlexSpecification HeliumTabList() {
++  return views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToMinimum,
++                                  views::MaximumFlexSizeRule::kPreferred);
++}
++// The bottom container while the rail is shown (PlaceInParent), and Helium's
++// own rule, put back when Workspaces is off.
++views::FlexSpecification RailShown() {
++  return views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToMinimum,
++                                  views::MaximumFlexSizeRule::kUnbounded);
++}
++views::FlexSpecification HeliumBottom() {
++  return views::FlexSpecification(views::MinimumFlexSizeRule::kPreferred,
++                                  views::MaximumFlexSizeRule::kUnbounded);
++}
++
++struct Heights {
++  int tabs;
++  int bottom;
++};
++
++// The column as Helium builds it (vertical_tab_strip_region_view.cc): the tab
++// list (preferred 600, minimum 100), the bottom container (preferred 300,
++// minimum 50), then an empty view where the Gemini button sits under the
++// column's default rule; margins collapse, a gap between the two.
++Heights Lay(int height,
++            const views::FlexSpecification& tabs_rule,
++            const views::FlexSpecification& bottom_rule) {
++  // Before any view: AddChildView asks it whether accessibility is on (views'
++  // own tests get it from ViewsTestBase).
++  ui::AXPlatformForTest ax_platform;
++  views::View host;
++  views::FlexLayout* const layout =
++      host.SetLayoutManager(std::make_unique<views::FlexLayout>());
++  layout->SetOrientation(views::LayoutOrientation::kVertical)
++      .SetCollapseMargins(true)
++      .SetDefault(views::kFlexBehaviorKey,
++                  views::FlexSpecification(
++                      views::LayoutOrientation::kVertical,
++                      views::MinimumFlexSizeRule::kPreferred,
++                      views::MaximumFlexSizeRule::kPreferred));
++  views::View* const tabs =
++      host.AddChildView(std::make_unique<FixedView>(600, 100));
++  tabs->SetProperty(views::kFlexBehaviorKey, tabs_rule);
++  tabs->SetProperty(views::kMarginsKey, gfx::Insets::TLBR(0, 0, 8, 0));
++  views::View* const bottom =
++      host.AddChildView(std::make_unique<FixedView>(300, 50));
++  bottom->SetProperty(views::kFlexBehaviorKey, bottom_rule);
++  bottom->SetProperty(views::kMarginsKey, gfx::Insets::TLBR(8, 4, 0, 4));
++  host.AddChildView(std::make_unique<views::View>());
++  const views::ProposedLayout proposed =
++      layout->GetProposedLayout(gfx::Size(100, height));
++  return {proposed.child_layouts[0].bounds.height(),
++          proposed.child_layouts[1].bounds.height()};
++}
++
++TEST(WorkspaceColumnOrderTest, RailKeepsItsHeightBeforeTheTabList) {
++  // Room for both: each its preferred height.
++  Heights h = Lay(1200, TabList(), RailShown());
++  EXPECT_EQ(600, h.tabs);
++  EXPECT_GE(h.bottom, 300);
++  // Too little room: the tab list gives up height first...
++  h = Lay(700, TabList(), RailShown());
++  EXPECT_EQ(300, h.bottom);
++  EXPECT_LT(h.tabs, 600);
++  EXPECT_GE(h.tabs, 100);
++  // ...down to its minimum; only then is the rail's container cut.
++  h = Lay(300, TabList(), RailShown());
++  EXPECT_EQ(100, h.tabs);
++  EXPECT_LT(h.bottom, 300);
++  EXPECT_GE(h.bottom, 50);
++}
++
++TEST(WorkspaceColumnOrderTest, WithoutTheOrderTheRailShrinksToo) {
++  // What the order prevents, and the rebase tripwire guards: one order level,
++  // and the shortfall is shared.
++  const Heights h = Lay(700, HeliumTabList(), RailShown());
++  EXPECT_LT(h.bottom, 300);
++}
++
++TEST(WorkspaceColumnOrderTest, WithWorkspacesOffTheOrderChangesNothing) {
++  // Helium's own bottom rule never shrinks, so the tab list's order 2 must give
++  // Helium's heights at every column height.
++  for (int height = 0; height <= 1400; height += 10) {
++    const Heights with_order = Lay(height, TabList(), HeliumBottom());
++    const Heights helium = Lay(height, HeliumTabList(), HeliumBottom());
++    EXPECT_EQ(helium.tabs, with_order.tabs) << height;
++    EXPECT_EQ(helium.bottom, with_order.bottom) << height;
++  }
++}
++
++}  // namespace
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -883,10 +883,15 @@ void VerticalTabStripRegionView::RegionV
+ 
+ void VerticalTabStripRegionView::AddTabStripView(
+     std::unique_ptr<views::View> view) {
++  // Order 2, after the bottom container's default 1: the workspaces rail gets
++  // its height before the tab list (WorkspaceRailView::PlaceInParent).
++  // Helium's own container rule never shrinks, so with Workspaces off the
++  // order changes nothing.
+   view->SetProperty(
+       views::kFlexBehaviorKey,
+       views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToMinimum,
+-                               views::MaximumFlexSizeRule::kPreferred));
++                               views::MaximumFlexSizeRule::kPreferred)
++          .WithOrder(2));
+   view->SetProperty(views::kMarginsKey,
+                     gfx::Insets::TLBR(0, 0, kBottomContainerGap, 0));
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_rail_view.cc
+@@ -2637,8 +2637,10 @@ void WorkspaceRailView::PlaceInParent()
+   // Helium's container never shrinks below its own height
+   // (vertical_tab_strip_region_view.cc), so a column of many chips ran off the
+   // window (R2-21). While the rail is shown it may, but it still gets its own
+-  // height before the tab list (order 0, the tab list's is 1), as it did: only
+-  // what does not fit at all is taken from the rail's scroller. Hidden
++  // height before the tab list, as it did (this rule keeps FlexLayout's default
++  // order 1, the tab list has 2: AddTabStripView; an order below 1 trips
++  // FlexSpecification's DCHECK): only what does not fit at all is taken from
++  // the rail's scroller. Hidden
+   // (Workspaces off), Helium's own rule is put back. Only on a change: this
+   // runs at every rebuild. A rebase tripwire stops if Helium sets the rule
+   // anywhere else (rebase-overnight.ps1).
+@@ -2659,8 +2661,7 @@ void WorkspaceRailView::PlaceInParent()
+   box->SetProperty(views::kFlexBehaviorKey,
+                    views::FlexSpecification(
+                        views::MinimumFlexSizeRule::kScaleToMinimum,
+-                       views::MaximumFlexSizeRule::kUnbounded)
+-                       .WithOrder(0));
++                       views::MaximumFlexSizeRule::kUnbounded));
+ }
+ 
+ void WorkspaceRailView::OnCollapseStateChanged(
