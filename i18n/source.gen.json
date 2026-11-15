@@ -660,6 +660,42 @@
     "message": "Force context menu with Shift+Right Click"
   },
   {
+    "name": "IDS_SETTINGS_SUGGEST_PREF_DESC_HELIUM",
+    "source": "chrome/app/settings_chromium_strings.grdp",
+    "context": "The description of the checkbox to enable/disable sending omnibox input to the user's default search engine to get additional suggestions.",
+    "message": "When you type in the address bar, Helium sends what you type to your default search engine to get suggestions. This is off in Incognito."
+  },
+  {
+    "name": "IDS_SETTINGS_ADDRESS_BAR",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Title of the settings page section which holds the address bar suggestion options.",
+    "message": "Address bar"
+  },
+  {
+    "name": "IDS_SETTINGS_LOCAL_SUGGESTIONS",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Title of the subsection holding the options for suggestions that are generated locally.",
+    "message": "Local suggestions"
+  },
+  {
+    "name": "IDS_SETTINGS_LOCAL_SUGGESTIONS_SHOW_HISTORY",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Label for the option to include browsing history in the locally generated address bar suggestions.",
+    "message": "Show browsing history"
+  },
+  {
+    "name": "IDS_SETTINGS_LOCAL_SUGGESTIONS_SHOW_BOOKMARKS",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Label for the option to include bookmarks in the locally generated address bar suggestions.",
+    "message": "Show bookmarks"
+  },
+  {
+    "name": "IDS_SETTINGS_SUGGEST_PREF_HELIUM",
+    "source": "chrome/app/shared_settings_strings.grdp",
+    "context": "The label of the checkbox to enable/disable sending omnibox input to the user's default search engine to get additional suggestions.",
+    "message": "Suggestions from the search engine"
+  },
+  {
     "name": "IDS_SETTINGS_PERMISSIONS_DESCRIPTION_NORMAL",
     "source": "chrome/app/settings_strings.grdp",
     "context": "Description of the controls available on the permissions and site content settings page",
@@ -670,18 +706,6 @@
     "source": "chrome/app/settings_strings.grdp",
     "context": "Description of the section on the Cookies settings page that lets users manage which sites are allowed to use third-party cookies. Explains how to use a wildcard to create an exception for an entire domain.",
     "message": "Affects the sites listed here. Inserting “[*.]” before a domain name creates an exception for the entire domain. For example, adding “[*.]example.com” means that third-party cookies can also be active for second.example.com, because it’s part of example.com."
-  },
-  {
-    "name": "IDS_SETTINGS_SUGGEST_PREF_DESC_HELIUM",
-    "source": "chrome/app/settings_chromium_strings.grdp",
-    "context": "The description of the checkbox to enable/disable sending omnibox input to the user's default search engine to get additional suggestions.",
-    "message": "When you type in the address bar, Helium sends what you type to your default search engine to get suggestions. This is off in Incognito."
-  },
-  {
-    "name": "IDS_SETTINGS_SUGGEST_PREF_HELIUM",
-    "source": "chrome/app/shared_settings_strings.grdp",
-    "context": "The label of the checkbox to enable/disable sending omnibox input to the user's default search engine to get additional suggestions.",
-    "message": "Suggestions from the search engine"
   },
   {
     "name": "IDS_SETTINGS_AUTO_PIN_NEW_TAB_GROUPS_HELIUM",
@@ -955,6 +979,42 @@
     "message": "Warn about insecure public sites"
   },
   {
+    "name": "IDS_SETTINGS_HELIUM_SERVICES_WEB_PUSH",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Toggle for receiving web push notifications",
+    "message": "Allow receiving push notifications"
+  },
+  {
+    "name": "IDS_SETTINGS_HELIUM_SERVICES_WEB_PUSH_DESCRIPTION",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Description of the toggle for receiving web push notifications",
+    "message": "Websites you allow to send notifications can deliver them through a push server, even when they aren't open. Helium only connects to the push server while at least one website is subscribed. Push messages are end-to-end encrypted. When disabled, websites can't subscribe to push notifications."
+  },
+  {
+    "name": "IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_HELIUM",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Radio button for using the default Helium push server",
+    "message": "Helium push server"
+  },
+  {
+    "name": "IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_CUSTOM",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Radio button for using a custom push server",
+    "message": "Other"
+  },
+  {
+    "name": "IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_ARIA_LABEL",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "ARIA label of the text input for a custom push server",
+    "message": "Custom push server URL"
+  },
+  {
+    "name": "IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_INVALID",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Validation error shown when the custom push server URL is invalid.",
+    "message": "Invalid push server URL"
+  },
+  {
     "name": "IDS_SETTINGS_HIBERNATED_APPEARANCE_LABEL",
     "source": "chrome/app/settings_strings.grdp",
     "context": "Label for a performance setting that controls whether hibernated tabs are visually differentiated.",
@@ -977,6 +1037,30 @@
     "source": "chrome/app/settings_strings.grdp",
     "context": "Label for the toggle which enables or disables a rounded frame around web contents.",
     "message": "Show a rounded frame around web contents"
+  },
+  {
+    "name": "IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "The label of the check-box that enables the prompt to translate a page.",
+    "message": "Offer to translate pages"
+  },
+  {
+    "name": "IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "The sublabel of the check-box that enables the prompt to translate a page.",
+    "message": "When on, Helium will offer to translate sites into your preferred language. It can also automatically translate sites."
+  },
+  {
+    "name": "IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL_WITH_PDF",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "The sublabel of the check-box that enables the prompt to translate a page or PDF.",
+    "message": "When on, Helium will offer to translate sites and PDFs into your preferred language. It can also automatically translate sites."
+  },
+  {
+    "name": "IDS_SETTINGS_TRANSLATE_PAGE_TITLE",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Name of the settings page which displays translate preferences.",
+    "message": "Translate"
   },
   {
     "name": "IDS_DOWNLOAD_BUBBLE_INTERRUPTED_SUBPAGE_SUMMARY_HELIUM_SERVICES_DISABLED",

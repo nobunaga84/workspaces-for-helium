@@ -44,6 +44,18 @@ if ($base -notmatch '(?s)::PropagateInvalidateLayout\(\) \{(?:(?!\n\}).)*?owned_
 if ($lm -notmatch 'AddOwnedLayout\(std::move\(target_layout_manager\)\)') {
     Write-Host "STOP: the animating manager no longer owns its target layout -- 110's remembered list layouts would go stale (LOCAL.md 144)"; exit 1
 }
+#    And (LOCAL.md 147, B1): 113's fallback gives the saved width to a window whose init state carries none.
+#    Chromium 157 writes each window's width at every session rewrite (156 did not: the owner's width was lost on the
+#    upgrade), and a window's own width still reaches Init() from BrowserInitState. Either change compiles: the first
+#    makes 113 the only thing keeping the width, the second makes 113 override every window's own width.
+$ssb = Get-Content -Raw "$src\chrome\browser\sessions\session_service_base.cc"
+if ($ssb -notmatch '(?s)AppendRebuildCommand\(\s*sessions::CreateAddWindowExtraDataCommand\(\s*browser->GetSessionID\(\),\s*tabs::VerticalTabStripStateController::kUncollapsedWidthKey') {
+    Write-Host "STOP: the session rewrite no longer stores each window's sidebar width -- B1's fallback is all that keeps it now (LOCAL.md 147)"; exit 1
+}
+$bwf = Get-Content -Raw "$src\chrome\browser\ui\browser_window\internal\browser_window_features.cc"
+if ($bwf -notmatch 'restored_state_uncollapsed_width\s*=\s*BrowserInitState::From\(browser\)\s*->\s*get_vertical_tabs_initial_uncollapsed_width\(\)') {
+    Write-Host "STOP: a window's own sidebar width no longer reaches Init() from BrowserInitState -- 113's fallback would override it (LOCAL.md 147)"; exit 1
+}
 
 # 1. the browser and the fork's tests, one graph walk
 $log = "$ws\$Chunk-$(Stamp).log"

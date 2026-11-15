@@ -50,6 +50,7 @@ public static class UiShot {
   [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
   [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
   [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
   [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
@@ -119,7 +120,14 @@ public static class UiShot {
     GetUserObjectInformation(d, 2, name, 256, out needed); CloseDesktop(d);
     if (name.ToString() != "Default") return "the input desktop is '" + name + "'";
     POINT p; p.x = x; p.y = y;
-    if (GetAncestor(WindowFromPoint(p), 2) != hwnd) return "another window is at " + x + "," + y;
+    IntPtr top = GetAncestor(WindowFromPoint(p), 2);
+    if (top != hwnd) {
+      // Which window, so a refusal can be told apart: the browser's own popup (a hover card, a tooltip) or another
+      // program's window.
+      uint pid; GetWindowThreadProcessId(top, out pid); StringBuilder cls = new StringBuilder(128); GetClassName(top, cls, 128);
+      string owner = "?"; try { owner = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; } catch {}
+      return "another window is at " + x + "," + y + " (" + owner + " pid " + pid + ", class " + cls + ")";
+    }
     return null;
   }
 

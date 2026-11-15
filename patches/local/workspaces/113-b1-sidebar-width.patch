@@ -1,0 +1,20 @@
+--- a/chrome/browser/ui/browser_window/internal/browser_window_features.cc
++++ b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+@@ -642,6 +642,17 @@ void BrowserWindowFeatures::Init(Browser
+       restored_state_uncollapsed_width =
+           profile->GetPrefs()->GetInteger(prefs::kVerticalTabsUncollapsedWidth);
+     }
++    // Helium Workspaces (B1): a window whose init state carries no width -- one
++    // session restore brings back from a session Chromium 156 wrote (it dropped
++    // the width at every rewrite), or a new window given only a collapsed state
++    // -- opens at the saved width, not the built-in 200: OnBrowserCreated()
++    // copies the window's width into the pref, so the 200 would replace the
++    // saved one. A window whose init state holds its own width keeps it;
++    // whether it opens collapsed stays as Helium has it.
++    if (!restored_state_uncollapsed_width.has_value()) {
++      restored_state_uncollapsed_width =
++          profile->GetPrefs()->GetInteger(prefs::kVerticalTabsUncollapsedWidth);
++    }
+ 
+     helium_layout_state_controller_ =
+         GetUserDataFactory().CreateInstance<HeliumLayoutStateController>(

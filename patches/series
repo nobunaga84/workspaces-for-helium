@@ -129,6 +129,7 @@ helium/core/sync/vault-store.patch
 helium/core/sync/loopback-server-in-memory.patch
 helium/core/sync/history-expiration-threshold.patch
 helium/core/sync/vault-engine-backend.patch
+helium/core/sync/provider/host.patch
 helium/core/sync/provider/api.patch
 helium/core/sync/provider/manifest-handler.patch
 helium/core/sync/provider/service.patch
@@ -180,6 +181,7 @@ helium/core/ublock-reconfigure-defaults.patch
 helium/core/ublock-helium-services.patch
 helium/core/ublock-dns-uncloaking.patch
 helium/core/clean-omnibox-suggestions.patch
+helium/core/omnibox-suggestions.patch
 helium/core/increase-incognito-storage-quota.patch
 
 helium/core/noise/core.patch
@@ -193,6 +195,11 @@ helium/core/network/quic-v2-flag.patch
 helium/core/network/split-clienthello.patch
 helium/core/network/dns-providers.patch
 helium/core/network/ignore-system-proxy-server-flag.patch
+
+helium/core/translate/provider-api.patch
+helium/core/translate/text-translator.patch
+helium/core/translate/page-script.patch
+helium/core/translate/translate-manager.patch
 
 helium/core/reduce-accept-language-headers.patch
 helium/core/disable-ad-topics-and-etc.patch
@@ -233,22 +240,22 @@ helium/core/lazy-session-restore.patch
 helium/core/enable-back-to-opener.patch
 helium/core/ridiculous-google-compat-exceptions.patch
 helium/core/disable-password-manager.patch
+helium/core/web-push-service.patch
 
 helium/settings/settings-page-icons.patch
 helium/settings/move-search-suggest.patch
+helium/settings/omnibox-suggestions-settings.patch
 helium/settings/remove-autofill.patch
 helium/settings/remove-profile-page-sections.patch
 helium/settings/fix-page-names.patch
 helium/settings/disable-safety-hub-page.patch
 helium/settings/remove-results-help-link.patch
 helium/settings/about-page-tweaks.patch
-helium/settings/remove-translate-section.patch
 helium/settings/remove-safety-hub-entry-points.patch
 helium/settings/reenable-update-status.patch
 helium/settings/privacy-page-tweaks.patch
 helium/settings/fix-section-separators.patch
 helium/settings/fix-text-on-cookies-page.patch
-helium/settings/update-search-suggest-text.patch
 helium/settings/fix-appearance-page.patch
 helium/settings/reorder-settings-menu.patch
 helium/settings/add-search-engine-button.patch
@@ -259,6 +266,7 @@ helium/settings/crash-reporting-settings.patch
 helium/settings/helium-noise-settings.patch
 helium/settings/network-and-security-page.patch
 helium/settings/sync-setup-contract.patch
+helium/settings/web-push-settings.patch
 
 helium/ui/layout-constants.patch
 helium/ui/layout-provider.patch
@@ -292,9 +300,12 @@ helium/ui/multi-contents-drop-target.patch
 helium/ui/fix-customize-side-panel.patch
 helium/ui/side-panel.patch
 helium/ui/remove-dead-toolbar-actions.patch
+helium/ui/translate-ui.patch
+helium/ui/generic-translate-icon.patch
 helium/ui/remove-dead-profile-actions.patch
 helium/ui/clean-up-installed-extension-bubble.patch
 helium/ui/add-specific-error-for-disabled-extension-downloads.patch
+helium/ui/add-copy-download-link-context-menu.patch
 helium/ui/selected-keyword-view.patch
 helium/ui/bookmark-button-bg-fix.patch
 helium/ui/restyle-ntp-tiles.patch
@@ -479,3 +490,4 @@ local/workspaces/109-small-rest.patch
 local/workspaces/110-tab-switch-speed.patch
 local/workspaces/111-tab-switch-recolour.patch
 local/workspaces/112-rail-flex-order.patch
+local/workspaces/113-b1-sidebar-width.patch
