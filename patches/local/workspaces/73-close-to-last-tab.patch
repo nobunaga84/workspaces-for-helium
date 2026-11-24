@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
 +++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
-@@ -462,6 +462,16 @@ base::Time BrowserTabStripModelDelegate:
+@@ -468,6 +468,16 @@ base::Time BrowserTabStripModelDelegate:
    return data ? data->left_at() : base::Time();
  }
  
@@ -30,7 +30,7 @@
                                          const char* via) override;
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -6153,6 +6153,14 @@ std::optional<int> TabStripModel::Determ
+@@ -6279,6 +6279,14 @@ std::optional<int> TabStripModel::Determ
    const gfx::Range block_tabs =
        gfx::Range(start_index, start_index + block_size);
  
@@ -100,7 +100,7 @@
  #include "url/gurl.h"
  
  namespace workspaces {
-@@ -187,4 +191,37 @@ void SelectMRUTab(TabStripModel* model,
+@@ -188,4 +192,37 @@ void SelectMRUTab(TabStripModel* model,
    model->ActivateTab(tabs::TabHandle(cycle->front()).Get(), detail);
  }
  
@@ -140,7 +140,7 @@
  }  // namespace workspaces
 --- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
 +++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
-@@ -5,14 +5,20 @@
+@@ -5,15 +5,21 @@
  #ifndef CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
  #define CHROME_BROWSER_UI_TABS_WORKSPACE_TAB_STRIP_HOOKS_H_
  
@@ -149,6 +149,7 @@
  
  #include "base/functional/callback.h"
 +#include "components/tabs/public/tab_collection_types.h"
+ #include "components/tabs/public/tab_interface.h"
  
  class TabStripModel;
  class TabStripModelDelegate;
@@ -161,7 +162,7 @@
  namespace tabs {
  class TabInterface;
  }
-@@ -55,6 +61,18 @@ void SelectMRUTab(TabStripModel* model,
+@@ -56,6 +62,18 @@ void SelectMRUTab(TabStripModel* model,
                    bool next,
                    TabStripUserGestureDetails detail);
  

@@ -23,7 +23,7 @@
 @@ -518,9 +519,10 @@ void NormalizeDisposition(NavigateParams
      if (workspace_service && workspace_service->ShouldDivertTypedNavigation(
                                   params->source_contents, params->url)) {
-       params->disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+       params->disposition = WindowOpenDisposition::kNewForegroundTab;
 -      LOG(INFO)
 -          << "[workspaces] typed url diverted off anchored tab -> new tab: "
 -          << params->url.spec();

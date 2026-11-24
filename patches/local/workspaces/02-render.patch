@@ -151,7 +151,7 @@
  }  // namespace workspaces
 --- a/chrome/browser/ui/views/tabs/common/BUILD.gn
 +++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
-@@ -88,6 +88,13 @@ source_set("impl") {
+@@ -96,6 +96,13 @@ source_set("impl") {
      "vertical_tab_style_views.h",
    ]
  
@@ -165,7 +165,7 @@
    deps = [
      "//base:i18n",
      "//cc/paint",
-@@ -117,6 +124,7 @@ source_set("impl") {
+@@ -126,6 +133,7 @@ source_set("impl") {
      "//chrome/browser/ui/tabs:utils",
      "//chrome/browser/ui/tabs/organizer:impl",
      "//chrome/browser/ui/tabs/saved_tab_groups",
@@ -175,7 +175,7 @@
      "//chrome/browser/ui/views/frame",
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
-@@ -27,6 +27,7 @@
+@@ -30,6 +30,7 @@
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
@@ -183,7 +183,7 @@
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/views/frame/browser_frame_view.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
-@@ -564,6 +565,16 @@ void TabStripCollectionController::OnTab
+@@ -586,6 +587,16 @@ void TabStripCollectionController::OnTab
    expand_on_hover_lock_.reset();
  }
  
@@ -202,7 +202,7 @@
      std::optional<tab_groups::TabGroupId> old_focused_group_id) {
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
-@@ -125,6 +125,13 @@ class TabStripCollectionController : pub
+@@ -131,6 +131,13 @@ class TabStripCollectionController : pub
    // changed.
    void TabKeyboardFocusChangedTo(const tabs::TabInterface* tab);
  
@@ -216,54 +216,29 @@
    void TabGroupFocusChanged(
        std::optional<tab_groups::TabGroupId> new_focused_group_id,
        std::optional<tab_groups::TabGroupId> old_focused_group_id);
---- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
-+++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
-@@ -15,6 +15,7 @@
- #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
- #include "chrome/browser/ui/views/tabs/common/tab_strip_layout_utils.h"
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.cc
+@@ -12,6 +12,7 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
  #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
 +#include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
- #include "chrome/browser/ui/views/tabs/horizontal/horizontal_tab_closing_helper.h"
  #include "components/tab_groups/tab_group_id.h"
- #include "components/tabs/public/tab_group.h"
-@@ -242,7 +243,11 @@ views::ProposedLayout UnpinnedTabContain
-   const int horizontal_padding =
-       GetLayoutConstant(LayoutConstant::kVerticalTabStripHorizontalPadding);
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/geometry/size.h"
+@@ -37,17 +38,25 @@ gfx::Size UnpinnedTabContainerViewVertic
  
--  for (auto* child : children) {
-+  // Indexed rather than range-for, matching CalculateHorizontalLayout above:
-+  // the workspace predicate needs the child's position to reach its collection
-+  // node, and GetDirectChildren() returns views in collection-node order.
-+  for (size_t child_index = 0; child_index < children.size(); ++child_index) {
-+    views::View* child = children[child_index];
-     int x =
-         views::AsViewClass<TabGroupView>(child) &&
-                 collapse_state != tabs::VerticalTabStripCollapseState::kExpanded
-@@ -270,6 +275,11 @@ views::ProposedLayout UnpinnedTabContain
-     bool should_show_child =
-         IsChildVisibleInContainer(tab_container_view, focused_group_id, child);
+   std::optional<tab_groups::TabGroupId> focused_group_id = GetFocusedGroupId();
  
-+    // Helium Workspaces: and only a child of the window's workspace.
-+    should_show_child = should_show_child &&
-+                        workspaces::IsChildDrawnForWorkspace(
-+                            tab_container_view->collection_node_, child_index);
-+
-     if (!should_show_child) {
-       layouts.child_layouts.emplace_back(
-           child, false,
-@@ -352,17 +362,25 @@ gfx::Size UnpinnedTabContainerViewLayout
-   std::optional<tab_groups::TabGroupId> focused_group_id =
-       GetFocusedGroupId(tab_container_view);
- 
-+  // Must apply the same predicates as CalculateVerticalLayout. A child hidden
++  // Must apply the same predicates as CalculateProposedLayout. A child hidden
 +  // there but counted here gives the strip a minimum size for tabs it is not
 +  // drawing.
 +  const auto children =
-+      tab_container_view->collection_node_->GetDirectChildren();
++      UnpinnedTabContainerView().collection_node_->GetDirectChildren();
 +
    int num_children = 0;
 -  for (const auto* child :
--       tab_container_view->collection_node_->GetDirectChildren()) {
+-       UnpinnedTabContainerView().collection_node_->GetDirectChildren()) {
 +  for (size_t child_index = 0; child_index < children.size(); ++child_index) {
      bool should_show = true;
      if (focused_group_id.has_value()) {
@@ -276,10 +251,36 @@
      }
 +    should_show = should_show &&
 +                  workspaces::IsChildDrawnForWorkspace(
-+                      tab_container_view->collection_node_, child_index);
++                      UnpinnedTabContainerView().collection_node_, child_index);
      if (should_show) {
        num_children++;
      }
+@@ -82,7 +91,11 @@ UnpinnedTabContainerViewVerticalLayout::
+   const int horizontal_padding =
+       GetLayoutConstant(LayoutConstant::kVerticalTabStripHorizontalPadding);
+ 
+-  for (auto* child : children) {
++  // Indexed rather than range-for: the workspace predicate needs the child's
++  // position to reach its collection node, and GetDirectChildren() returns
++  // views in collection-node order.
++  for (size_t child_index = 0; child_index < children.size(); ++child_index) {
++    views::View* child = children[child_index];
+     int x =
+         views::AsViewClass<TabGroupView>(child) &&
+                 collapse_state != tabs::VerticalTabStripCollapseState::kExpanded
+@@ -110,6 +123,12 @@ UnpinnedTabContainerViewVerticalLayout::
+         UnpinnedTabContainerView().GetVisualDataForDraggedView(*child);
+     bool should_show_child = IsChildVisibleInContainer(focused_group_id, child);
+ 
++    // Helium Workspaces: and only a child of the window's workspace.
++    should_show_child = should_show_child &&
++                        workspaces::IsChildDrawnForWorkspace(
++                            UnpinnedTabContainerView().collection_node_,
++                            child_index);
++
+     if (!should_show_child) {
+       layouts.child_layouts.emplace_back(
+           child, false,
 --- /dev/null
 +++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
 @@ -0,0 +1,59 @@
@@ -363,7 +364,7 @@
 +// reach.
 +namespace workspaces {
 +
-+// UnpinnedTabContainerViewLayout's vertical layout and minimum size: whether
++// UnpinnedTabContainerViewVerticalLayout's layout and minimum size: whether
 +// the direct child at `child_index` of `parent` -- the container's collection
 +// node, whose children GetDirectChildren() returns in the same order -- is
 +// drawn, given the workspace its window shows. A group or split is drawn when

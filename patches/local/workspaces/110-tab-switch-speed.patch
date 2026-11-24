@@ -156,7 +156,7 @@
  // against that window's active guid. If these two ever disagree, opening a tab
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
-@@ -634,8 +634,7 @@ bool TabStripCollectionController::IsTab
+@@ -656,8 +656,7 @@ bool TabStripCollectionController::IsTab
    const workspaces::WorkspaceService* service =
        workspaces::WorkspaceService::From(browser_view_->browser());
    // An open pinned item's page is drawn as its row instead (E15c).
@@ -166,30 +166,25 @@
  }
  
  bool TabStripCollectionController::IsTabDrawnAsPinnedRow(
---- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
-+++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
-@@ -45,6 +45,10 @@ views::ProposedLayout UnpinnedTabContain
-   if (orientation_ == TabStripOrientation::kHorizontal) {
-     return CalculateHorizontalLayout(tab_container_view, size_bounds);
-   }
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.cc
+@@ -73,6 +73,62 @@ gfx::Size UnpinnedTabContainerViewVertic
+ views::ProposedLayout
+ UnpinnedTabContainerViewVerticalLayout::CalculateProposedLayout(
+     const views::SizeBounds& size_bounds) const {
 +  if (const views::ProposedLayout* const layout =
-+          RememberedVerticalLayout(tab_container_view, size_bounds)) {
++          RememberedVerticalLayout(size_bounds)) {
 +    return *layout;
 +  }
-   return CalculateVerticalLayout(tab_container_view, size_bounds);
- }
- 
-@@ -62,6 +66,54 @@ gfx::Size UnpinnedTabContainerViewLayout
-   return CalculateVerticalMinimumSize(tab_container_view);
- }
- 
-+gfx::Size UnpinnedTabContainerViewLayout::GetPreferredSize(
++  return CalculateVerticalLayout(size_bounds);
++}
++
++gfx::Size UnpinnedTabContainerViewVerticalLayout::GetPreferredSize(
 +    const views::View* host,
 +    const views::SizeBounds& available_size) const {
-+  const auto* const list = views::AsViewClass<UnpinnedTabContainerView>(host);
-+  if (orientation_ == TabStripOrientation::kVertical && list) {
++  if (host == host_view()) {
 +    if (const views::ProposedLayout* const layout =
-+            RememberedVerticalLayout(list, available_size)) {
++            RememberedVerticalLayout(available_size)) {
 +      return layout->host_size;  // no copy of every child's entry
 +    }
 +  }
@@ -197,8 +192,7 @@
 +}
 +
 +const views::ProposedLayout*
-+UnpinnedTabContainerViewLayout::RememberedVerticalLayout(
-+    const UnpinnedTabContainerView* list,
++UnpinnedTabContainerViewVerticalLayout::RememberedVerticalLayout(
 +    const views::SizeBounds& size_bounds) const {
 +  // Helium Workspaces (I1): LayoutManagerBase never caches a bounded width, and
 +  // the vertical strip asks this list its size 30-40 times per layout --
@@ -210,7 +204,7 @@
 +  // remembers its rows' height. Not while a drag runs or a group is focused:
 +  // what those draw moves without an invalidation -- the drag is why LayoutImpl
 +  // recomputes at all (its TODO).
-+  if (list->IsHandlingDrag() || GetFocusedGroupId(list)) {
++  if (UnpinnedTabContainerView().IsHandlingDrag() || GetFocusedGroupId()) {
 +    layouts_.clear();
 +    return nullptr;
 +  }
@@ -222,32 +216,38 @@
 +  if (layouts_.size() == 8) {  // a window being resized asks each width
 +    layouts_.erase(layouts_.begin());
 +  }
-+  layouts_.emplace_back(size_bounds, CalculateVerticalLayout(list, size_bounds));
++  layouts_.emplace_back(size_bounds, CalculateVerticalLayout(size_bounds));
 +  return &layouts_.back().second;
 +}
 +
-+void UnpinnedTabContainerViewLayout::OnLayoutChanged() {
++void UnpinnedTabContainerViewVerticalLayout::OnLayoutChanged() {
 +  layouts_.clear();
 +  LayoutManagerBase::OnLayoutChanged();
 +}
 +
- int UnpinnedTabContainerViewLayout::GetUnconstrainedPreferredWidth(
-     const UnpinnedTabContainerView* host) const {
-   if (!host->collection_node_) {
---- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.h
-+++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.h
-@@ -6,6 +6,8 @@
- #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_UNPINNED_TAB_CONTAINER_VIEW_LAYOUT_H_
++views::ProposedLayout
++UnpinnedTabContainerViewVerticalLayout::CalculateVerticalLayout(
++    const views::SizeBounds& size_bounds) const {
+   views::ProposedLayout layouts;
+   if (!UnpinnedTabContainerView().collection_node_) {
+     return layouts;
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.h
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.h
+@@ -5,7 +5,11 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_UNPINNED_TAB_CONTAINER_VIEW_VERTICAL_LAYOUT_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_UNPINNED_TAB_CONTAINER_VIEW_VERTICAL_LAYOUT_H_
  
- #include <optional>
 +#include <utility>
 +#include <vector>
++
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
++#include "ui/views/layout/proposed_layout.h"
  
- #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
- #include "components/tab_groups/tab_group_id.h"
-@@ -29,12 +31,21 @@ class UnpinnedTabContainerViewLayout : p
-   views::ProposedLayout CalculateProposedLayout(
-       const views::SizeBounds& size_bounds) const override;
+ namespace views {
+ class SizeBounds;
+@@ -24,11 +28,32 @@ class UnpinnedTabContainerViewVerticalLa
+ 
+   // views::LayoutManagerBase:
    gfx::Size GetMinimumSize(const views::View* host) const override;
 +  // Helium Workspaces (I1): remembered until the next invalidation.
 +  using views::LayoutManagerBase::GetPreferredSize;
@@ -255,39 +255,26 @@
 +      const views::View* host,
 +      const views::SizeBounds& available_size) const override;
  
-   // Returns the total preferred width of all visible children at their standard
-   // unconstrained sizes, ignoring any active tab closing mode override.
-   int GetUnconstrainedPreferredWidth(
-       const UnpinnedTabContainerView* host) const;
- 
-+ protected:
-+  // views::LayoutManagerBase:
+  protected:
+   // views::LayoutManagerBase:
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override;
 +  void OnLayoutChanged() override;
 +
-  private:
-   views::ProposedLayout CalculateHorizontalLayout(
-       const UnpinnedTabContainerView* host,
-@@ -42,6 +53,11 @@ class UnpinnedTabContainerViewLayout : p
-   views::ProposedLayout CalculateVerticalLayout(
-       const UnpinnedTabContainerView* host,
-       const views::SizeBounds& size_bounds) const;
++ private:
++  // Chromium's CalculateProposedLayout body, renamed so that its result can
++  // be remembered (I1).
++  views::ProposedLayout CalculateVerticalLayout(
++      const views::SizeBounds& size_bounds) const;
 +  // CalculateVerticalLayout(), remembered (I1); null while a drag runs or a
 +  // group is focused. Valid until the next call.
 +  const views::ProposedLayout* RememberedVerticalLayout(
-+      const UnpinnedTabContainerView* list,
 +      const views::SizeBounds& size_bounds) const;
- 
-   gfx::Size CalculateHorizontalMinimumSize(
-       const UnpinnedTabContainerView* host) const;
-@@ -61,6 +77,11 @@ class UnpinnedTabContainerViewLayout : p
-       const UnpinnedTabContainerView* tab_container_view) const;
- 
-   const TabStripOrientation orientation_;
 +
-+  // The vertical layouts computed since the last OnLayoutChanged(), by the size
-+  // asked with (I1).
++  // The layouts computed since the last OnLayoutChanged(), by the size asked
++  // with (I1).
 +  mutable std::vector<std::pair<views::SizeBounds, views::ProposedLayout>>
 +      layouts_;
  };
  
- #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_UNPINNED_TAB_CONTAINER_VIEW_LAYOUT_H_
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_UNPINNED_TAB_CONTAINER_VIEW_VERTICAL_LAYOUT_H_

@@ -1,8 +1,8 @@
 --- a/chrome/app/chrome_command_ids.h
 +++ b/chrome/app/chrome_command_ids.h
-@@ -141,8 +141,9 @@
+@@ -131,8 +131,9 @@
  // never has to reopen it. 34110-34999 is entirely free -- Helium's own ids
- // stop at 34091 and the upstream block above ends at 34108.
+ // stop at 34091 and the upstream block above ends at 34107.
  //
 -// Only NEXT and PREV are wired today. The others are named so that the
 -// range is visibly spoken for, and 34126-34139 is left spare.
@@ -12,7 +12,7 @@
  #define IDC_HELIUM_WORKSPACE_NEXT     34110
  #define IDC_HELIUM_WORKSPACE_PREV     34111
  #define IDC_HELIUM_WORKSPACE_1        34112
-@@ -159,6 +160,8 @@
+@@ -149,6 +150,8 @@
  #define IDC_HELIUM_WORKSPACE_RENAME   34123
  #define IDC_HELIUM_WORKSPACE_MOVE_TAB_TO 34124
  #define IDC_HELIUM_WORKSPACE_TOGGLE_RAIL 34125
@@ -23,7 +23,7 @@
  #define IDC_BOOKMARK_THIS_TAB           35000
 --- a/chrome/browser/ui/accelerator_table.cc
 +++ b/chrome/browser/ui/accelerator_table.cc
-@@ -261,9 +261,20 @@ const AcceleratorMapping kAcceleratorMap
+@@ -157,9 +157,20 @@ constexpr AcceleratorMapping kAccelerato
      // S because W is taken (IDC_CLOSE_TAB_GROUP) and so is N
      // (IDC_NEW_SPLIT_TAB, appended conditionally further down this file, which
      // is why it does not show up in the map above). S for Space, Arc's name

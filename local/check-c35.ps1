@@ -209,7 +209,7 @@ function NewTab([string]$path, [string]$title) {
     $t = try { Invoke-RestMethod -Method Put -TimeoutSec 10 -Uri "$(Base)/new?$([uri]::EscapeDataString((Url $path)))" } catch { $null }
     if (-not $t) { throw "DevTools opened no tab for '$path'" }
     $t0 = Get-Date
-    while ((Evaluate $t.webSocketDebuggerUrl "document.readyState === 'complete' ? document.title : ''") -ne $title -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
+    while (-not (PageReady (Base) $t $title) -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
     Start-Sleep -Milliseconds (500 * $slow)
     $t
 }

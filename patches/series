@@ -1,3 +1,5 @@
+upstream-fixes/wasm-interpreter-trustedcast-raw.patch
+upstream-fixes/wasm-interpreter-sharedfunctioninfo.patch
 upstream-fixes/missing-dependencies.patch
 
 inox-patchset/fix-building-without-safebrowsing.patch
@@ -153,6 +155,7 @@ helium/core/disable-history-clusters.patch
 helium/core/unbreak-chromium-link.patch
 helium/core/update-credits.patch
 helium/core/disable-user-education-nags.patch
+helium/core/remove-history-sync-promo.patch
 helium/core/replace-default-profile-name.patch
 helium/core/disable-live-caption-completely.patch
 helium/core/spoof-extension-downloader-platform.patch
@@ -172,6 +175,7 @@ helium/core/exclude-irrelevant-flags.patch
 
 helium/core/disable-outdated-build-detector.patch
 helium/core/remove-dead-toolbar-actions.patch
+helium/core/disable-reading-mode-omnibox-chip.patch
 helium/core/add-component-l10n-support.patch
 helium/core/add-component-managed-schema-support.patch
 helium/core/prioritize-platform-policy-loading.patch
@@ -241,6 +245,15 @@ helium/core/enable-back-to-opener.patch
 helium/core/ridiculous-google-compat-exceptions.patch
 helium/core/disable-password-manager.patch
 helium/core/web-push-service.patch
+helium/core/ui-density-prefs.patch
+helium/core/pins/pin-state.patch
+helium/core/pins/pin-sync.patch
+helium/core/pins/sync-splits.patch
+helium/core/pins/sync-drags.patch
+helium/core/pins/hibernate-on-close.patch
+helium/core/pins/pinned-url.patch
+helium/core/pins/open-links-outside.patch
+helium/core/pins/migrate-legacy-pins.patch
 
 helium/settings/settings-page-icons.patch
 helium/settings/move-search-suggest.patch
@@ -267,6 +280,8 @@ helium/settings/helium-noise-settings.patch
 helium/settings/network-and-security-page.patch
 helium/settings/sync-setup-contract.patch
 helium/settings/web-push-settings.patch
+helium/settings/ui-density-settings.patch
+helium/settings/simplify-side-panel-position.patch
 
 helium/ui/layout-constants.patch
 helium/ui/layout-provider.patch
@@ -361,6 +376,7 @@ helium/ui/layout/zen-mode-wiring.patch
 helium/ui/layout/zen-caption-buttons.patch
 helium/ui/layout/zen-mode.patch
 helium/ui/layout/min-window-width.patch
+helium/ui/pins-ui.patch
 
 helium/ui/generate-standard-qr-codes.patch
 helium/ui/pdf-viewer.patch
@@ -491,3 +507,4 @@ local/workspaces/110-tab-switch-speed.patch
 local/workspaces/111-tab-switch-recolour.patch
 local/workspaces/112-rail-flex-order.patch
 local/workspaces/113-b1-sidebar-width.patch
+local/workspaces/114-favorites-refit.patch

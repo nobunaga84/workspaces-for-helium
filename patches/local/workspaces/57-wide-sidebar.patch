@@ -1,13 +1,13 @@
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
-@@ -4026,6 +4026,7 @@ source_set("browser") {
-       "//chrome/browser/ui/tabs/tab_drag_api",
+@@ -3154,6 +3154,7 @@ source_set("browser") {
        "//chrome/browser/ui/tabs/tab_strip_api",
+       "//chrome/browser/ui/tabs/tab_strip_api/tab_strip_model_impl",
        "//chrome/browser/ui/tabs/workspaces",
 +      "//chrome/browser/ui/tabs/workspaces:prefs",
        "//chrome/browser/ui/tabs/workspaces:tab_data",
+       "//chrome/browser/ui/task_manager",
        "//chrome/browser/ui/toasts",
-       "//chrome/browser/ui/toasts:impl",
 --- a/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
 +++ b/chrome/browser/ui/tabs/workspaces/workspace_prefs.cc
 @@ -66,6 +66,9 @@ void RegisterProfilePrefs(PrefRegistrySi
@@ -129,7 +129,7 @@
  TEST(WorkspacePrefsTest, RegistersWorkspacesPref) {
 --- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
-@@ -81,6 +81,12 @@
+@@ -82,6 +82,12 @@
  #include "ui/views/view.h"
  #include "ui/views/view_class_properties.h"
  #include "ui/views/view_utils.h"
@@ -142,7 +142,7 @@
  
  namespace {
  constexpr int kResizeAreaWidth = 5;
-@@ -725,10 +731,18 @@ void VerticalTabStripRegionView::OnResiz
+@@ -746,10 +752,18 @@ void VerticalTabStripRegionView::OnResiz
        floating_style_ != FloatingStyle::kDetached &&
        proposed_width <= tabs::kVerticalTabStripCollapseSnapWidth;
    new_state.uncollapsed_width = target_collapse_state_.uncollapsed_width;
@@ -161,10 +161,10 @@
 -                   tabs::kVerticalTabStripUncollapsedMaxWidth);
 +    new_state.uncollapsed_width = std::clamp(
 +        proposed_width, tabs::kVerticalTabStripUncollapsedMinWidth, max_width);
-     if (std::abs(new_state.uncollapsed_width -
-                  tabs::kVerticalTabStripDefaultUncollapsedWidth) <
-         kSnapDistance) {
-@@ -781,6 +795,27 @@ void VerticalTabStripRegionView::OnResiz
+     const int default_uncollapsed_width =
+         GetVerticalTabStripDefaultUncollapsedWidth();
+     if (std::abs(new_state.uncollapsed_width - default_uncollapsed_width) <
+@@ -800,6 +814,27 @@ void VerticalTabStripRegionView::OnResiz
      // If we are still in the expanding animation, invalidating the layout will
      // happen in AnimationProgressed, instead of here.
      InvalidateLayout();

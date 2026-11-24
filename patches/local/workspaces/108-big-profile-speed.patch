@@ -1,31 +1,6 @@
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -4047,6 +4047,10 @@ bool TabStripModel::HasIndicesClosedByCo
-           : gfx::Range(index, index + 1);
- 
-   std::optional<tab_groups::TabGroupId> focused_group = GetFocusedGroup();
-+  // Workspaces: the tabs read once, at the first ask (R2-8). GetTabAtIndex(i)
-+  // walks the collection tree from the start, and the check below asks of
-+  // every tab; a loop that asks of none reads none.
-+  std::vector<tabs::TabInterface*> all_tabs;
-   for (int i = count() - 1; i > last_unclosed_tab; --i) {
-     if (id == CommandCloseTabsToLeft && i >= first_unclosed_tab) {
-       continue;
-@@ -4061,8 +4065,11 @@ bool TabStripModel::HasIndicesClosedByCo
-     // close. Without this, "Close other tabs" in one workspace silently closes
-     // every tab of all the others, and Recently Closed is the only way back.
-     // Nor an anchored one: it is skipped the way a pinned tab is (E14a).
--    if (!delegate_->IsTabVisibleInActiveWorkspace(GetTabAtIndex(i)) ||
--        delegate_->IsTabAnchored(GetTabAtIndex(i))) {
-+    if (all_tabs.empty()) {
-+      all_tabs = contents_data_->GetTabsRecursive();
-+    }
-+    if (!delegate_->IsTabVisibleInActiveWorkspace(all_tabs[i]) ||
-+        delegate_->IsTabAnchored(all_tabs[i])) {
-       continue;
-     }
-     if (!indices_to_exclude.Contains(gfx::Range(i, i + 1)) && !IsTabPinned(i) &&
-@@ -4649,19 +4656,30 @@ void TabStripModel::SelectRelativeTab(Ta
+@@ -4755,19 +4755,30 @@ void TabStripModel::SelectRelativeTab(Ta
    const int delta = direction == TabRelativeDirection::kNext ? 1 : -1;
    int index = (start_index + count() + delta) % count();
  

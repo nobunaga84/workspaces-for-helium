@@ -261,7 +261,7 @@ function NewTab([string]$name, [string]$on = "127.0.0.1") {
     $t = try { Invoke-RestMethod -Method Put -TimeoutSec 10 -Uri "$(Base)/new?$([uri]::EscapeDataString((Url $name $on)))" } catch { $null }
     if (-not $t) { throw "DevTools opened no tab for '$name'" }
     $t0 = Get-Date
-    while ((Evaluate $t.webSocketDebuggerUrl "document.readyState === 'complete' ? document.title : ''") -ne "E18 $name" -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
+    while (-not (PageReady (Base) $t "E18 $name") -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
     Start-Sleep -Milliseconds (500 * $slow)
     $t
 }
@@ -405,10 +405,19 @@ Set-Content -Encoding UTF8 -LiteralPath "$pages\c5home.html" -Value @'
 $other = try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 "http://localhost:$($script:srv.port)/c5a.html").Content -match "E18 c5a" } catch { $false }
 if (-not $other) { Stop-Process -Id $script:srv.server.Id -EA SilentlyContinue; Abort "c5a.html is not served on localhost:$($script:srv.port)" }
 # R3's bookmark on the bookmarks bar: "C5 bookmark" -> sub.localhost/c5k, the next free id; the checksum dropped.
+# The made-up smoke base (LOCAL.md 133) has no Bookmarks: then the empty file a new profile writes (Chromium's three
+# roots, their fixed guids, version 1). Single quotes only: the code goes through python -c.
 $bm = @'
-import json, sys, uuid
+import json, os, sys, uuid
 p, url = sys.argv[1], sys.argv[2]
-d = json.load(open(p, encoding='utf-8'))
+def root(i, guid, name):
+    return {'children': [], 'date_added': '13434309301290036', 'date_last_used': '0', 'date_modified': '0', 'guid': guid, 'id': str(i), 'name': name, 'type': 'folder'}
+if os.path.exists(p):
+    d = json.load(open(p, encoding='utf-8'))
+else:
+    d = {'roots': {'bookmark_bar': root(1, '0bc5d13f-2cba-5d74-951f-3f233fe6c908', 'Bookmarks bar'),
+                   'other': root(2, '82b081ec-3dd3-529c-8475-ab6c344590dd', 'Other bookmarks'),
+                   'synced': root(3, '4cf2e351-0e85-532b-bb37-df045d8f8d0f', 'Mobile bookmarks')}, 'version': 1}
 d.pop('checksum', None)
 def ids(n):
     yield int(n.get('id', 0))

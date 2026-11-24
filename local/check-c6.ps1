@@ -193,7 +193,7 @@ function NewTab([string]$name) {
     $t = try { Invoke-RestMethod -Method Put -TimeoutSec 10 -Uri "$(Base)/new?$([uri]::EscapeDataString((Url "$name.html")))" } catch { $null }
     if (-not $t) { throw "DevTools opened no tab for '$name'" }
     $t0 = Get-Date
-    while ((Evaluate $t.webSocketDebuggerUrl "document.readyState === 'complete' ? document.title : ''") -ne "E18 $name" -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
+    while (-not (PageReady (Base) $t "E18 $name") -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
     Start-Sleep -Milliseconds (500 * $slow)
 }
 # The parentheses unroll the JSON array: piped bare, Invoke-RestMethod hands it on as ONE object and every lookup
@@ -206,7 +206,7 @@ function Loaded([string]$name) {
     $t0 = Get-Date
     do {
         $t = Target $name
-        if ($t -and (Evaluate $t.webSocketDebuggerUrl "document.readyState === 'complete' ? document.title : ''") -eq "E18 $name") { return $t }
+        if (PageReady (Base) $t "E18 $name") { return $t }
         Start-Sleep -Milliseconds 300
     } while (((Get-Date) - $t0).TotalSeconds -lt 10 * $slow)
     $null

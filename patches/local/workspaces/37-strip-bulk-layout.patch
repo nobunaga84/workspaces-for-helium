@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.cc
-@@ -10,6 +10,7 @@
+@@ -11,6 +11,7 @@
  #include "base/check_deref.h"
  #include "base/containers/flat_map.h"
  #include "base/containers/flat_set.h"
@@ -8,7 +8,7 @@
  #include "third_party/abseil-cpp/absl/container/inlined_vector.h"
  #include "ui/base/class_property.h"
  #include "ui/compositor/layer.h"
-@@ -231,9 +232,14 @@ TabCollectionAnimatingLayoutManager::~Ta
+@@ -254,9 +255,14 @@ TabCollectionAnimatingLayoutManager::~Ta
  
  bool TabCollectionAnimatingLayoutManager::OnViewAdded(views::View* host,
                                                        views::View* view) {
@@ -24,7 +24,7 @@
        !delegate_->IsViewDragging(*view) &&
        delegate_->ShouldAnimateOpacityForAddAndRemove(*view)) {
      // Added views should animate opacity from invisible to fully opaque.
-@@ -260,7 +266,8 @@ gfx::Size TabCollectionAnimatingLayoutMa
+@@ -283,7 +289,8 @@ gfx::Size TabCollectionAnimatingLayoutMa
    // layout manager.
    gfx::Size target_preferred_size =
        target_layout_manager_->GetPreferredSize(host);
@@ -34,7 +34,7 @@
      if (IsVerticalOrWrappingVertically()) {
        target_preferred_size.set_height(current_layout_content_size_);
      } else {
-@@ -281,7 +288,8 @@ gfx::Size TabCollectionAnimatingLayoutMa
+@@ -304,7 +311,8 @@ gfx::Size TabCollectionAnimatingLayoutMa
    // layout manager.
    gfx::Size target_preferred_size =
        target_layout_manager_->GetPreferredSize(host, available_size);
@@ -44,37 +44,48 @@
      if (IsVerticalOrWrappingVertically()) {
        target_preferred_size.set_height(current_layout_content_size_);
      } else {
-@@ -315,6 +323,19 @@ int TabCollectionAnimatingLayoutManager:
- }
+@@ -339,6 +347,20 @@ int TabCollectionAnimatingLayoutManager:
  
  void TabCollectionAnimatingLayoutManager::OnLayoutChanged() {
+   LayoutManagerBase::OnLayoutChanged();
 +  // Helium Workspaces (E14c.1): during a bulk change, dirty only. The
-+  // recompute this function would do per changed view is done once by
-+  // LayoutImpl() at the next layout pass -- it calls RecalculateTarget()
-+  // first thing, and it is the only caller of ApplyLayout(). Until then
-+  // target_layout_ is the previous one: GetPreferredSize() stops using the
-+  // interpolated size while `target_stale_`, drag code recomputes first
-+  // (ResetViewsToTargetLayout), and tab_strip_utils falls back to a view's
-+  // own bounds for a view the target does not know yet.
++  // recompute this function would start per changed view is done once by
++  // LayoutImpl() at the next layout pass -- it recalculates a stale target
++  // first (below; 158 recalculates there only when the size changed), and it
++  // is the only caller of ApplyLayout(). Until then target_layout_ is the
++  // previous one: GetPreferredSize() stops using the interpolated size while
++  // `target_stale_`, drag code recomputes first (ResetViewsToTargetLayout),
++  // and tab_strip_utils falls back to a view's own bounds for a view the
++  // target does not know yet. Before the top-level test, so a nested
++  // manager is marked stale as well.
 +  if (workspaces::IsBulkLayoutInProgress()) {
 +    target_stale_ = true;
-+    LayoutManagerBase::OnLayoutChanged();
 +    return;
 +  }
-   // If a new layout target was computed ensure we recalculate and update the
-   // current layout to ensure layout metadata is available for preferred size
-   // calculations. Running this once to compute metadata is more efficient than
-@@ -468,6 +489,7 @@ bool TabCollectionAnimatingLayoutManager
+   if (suppress_recalculate_target_ ||
+       GetTopLevelAnimatingLayoutManager(this) != this) {
+     // `View::InvalidateLayout()` always bubbles up to `parent()`, whose own
+@@ -399,7 +421,8 @@ TabCollectionAnimatingLayoutManager::Cal
+ void TabCollectionAnimatingLayoutManager::LayoutImpl() {
+   // Recalculate the target layout if the available size bounds changed (e.g.
+   // when the host or parent container is resized without invalidating layout).
+-  if (GetAvailableHostSize() != last_target_size_bounds_) {
++  // Helium Workspaces (E14c.1): or if a bulk change left it stale.
++  if (target_stale_ || GetAvailableHostSize() != last_target_size_bounds_) {
+     RecalculateTarget();
+   }
+ 
+@@ -579,6 +602,7 @@ bool TabCollectionAnimatingLayoutManager
    if (!host_view()) {
      return false;
    }
 +  target_stale_ = false;  // Helium Workspaces (E14c.1)
  
-   // Calculate the target layout with unbounded height for vertical or
-   // horizontal-wrapping-vertically axes, or bounded by available parent width
+   const views::SizeBounds size_bounds = GetAvailableHostSize();
+   last_target_size_bounds_ = size_bounds;
 --- a/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h
 +++ b/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h
-@@ -324,6 +324,10 @@ class TabCollectionAnimatingLayoutManage
+@@ -337,6 +337,10 @@ class TabCollectionAnimatingLayoutManage
    // to its target size. In such cases animating the host's preferred size
    // avoids clipping close / fade-out animations.
    const bool animate_host_size_ = false;

@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
 +++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
-@@ -455,6 +455,19 @@ bool BrowserTabStripModelDelegate::Reset
+@@ -461,6 +461,19 @@ bool BrowserTabStripModelDelegate::Reset
    return true;
  }
  
@@ -33,7 +33,7 @@
                     split_tabs::SplitTabCreatedSource source) override;
 --- a/chrome/browser/ui/tabs/tab_list_bridge.cc
 +++ b/chrome/browser/ui/tabs/tab_list_bridge.cc
-@@ -164,6 +164,12 @@ tabs::TabInterface* TabListBridge::OpenT
+@@ -167,6 +167,12 @@ tabs::TabInterface* TabListBridge::OpenT
    // It's a bit of a code smell to reach in and grab the delegate from
    // TabStripModel, but it avoids introducing new dependencies here.
    TabStripModelDelegate* delegate = tab_strip_->delegate();
@@ -48,7 +48,7 @@
        index == tab_list::kNoTabIndex ? tab_strip_->count() - 1 : index;
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -1786,6 +1786,8 @@ void TabStripModel::AddTab(std::unique_p
+@@ -1827,6 +1827,8 @@ void TabStripModel::AddTab(std::unique_p
    // to inherit the parent's opener attribute, so that if this tab is then
    // closed we'll jump back to the parent tab.
    bool inherit_opener = (add_types & ADD_INHERIT_OPENER) == ADD_INHERIT_OPENER;
@@ -57,7 +57,7 @@
  
    if (ui::PageTransitionTypeIncludingQualifiersIs(transition,
                                                    ui::PAGE_TRANSITION_LINK) &&
-@@ -1795,7 +1797,13 @@ void TabStripModel::AddTab(std::unique_p
+@@ -1836,7 +1838,13 @@ void TabStripModel::AddTab(std::unique_p
      // drag-and-drops a link to the tab strip), callers aren't really handling
      // link clicks, they just want to score the navigation like a link click in
      // the history backend, so we don't inherit the opener in this case.
@@ -72,7 +72,7 @@
      inherit_opener = true;
  
      // The current active index is our opener. If the tab we are adding is not
-@@ -1804,6 +1812,9 @@ void TabStripModel::AddTab(std::unique_p
+@@ -1845,6 +1853,9 @@ void TabStripModel::AddTab(std::unique_p
        group = GetTabGroupForTab(active_index());
      }
    } else {
@@ -82,7 +82,7 @@
      // For all other types, respect what was passed to us, normalizing -1s and
      // values that are too large.
      if (index < 0 || index > count()) {
-@@ -1855,9 +1866,10 @@ void TabStripModel::AddTab(std::unique_p
+@@ -1896,9 +1907,10 @@ void TabStripModel::AddTab(std::unique_p
      index = GetIndexRangeOfSplit(split_id.value()).GetMax();
    }
  
@@ -94,7 +94,7 @@
      // Also, any tab opened at the end of the TabStrip with a "TYPED"
      // transition inherit opener as well. This covers the cases where the user
      // creates a New Tab (e.g. Ctrl+T, or clicks the New Tab button), or types
-@@ -4105,9 +4117,13 @@ std::vector<tabs::TabInterface*> TabStri
+@@ -4232,9 +4244,13 @@ std::vector<tabs::TabHandle> TabStripMod
  
  bool TabStripModel::IsNewTabAtEndOfTabStrip(WebContents* contents) const {
    const GURL& url = contents->GetLastCommittedURL();
@@ -143,7 +143,7 @@
  
  namespace workspaces {
  
-@@ -29,4 +33,18 @@ base::RepeatingCallback<std::vector<tabs
+@@ -30,4 +34,18 @@ base::RepeatingCallback<std::vector<tabs
        base::Unretained(delegate), std::move(get_tabs));
  }
  
@@ -164,17 +164,17 @@
  }  // namespace workspaces
 --- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
 +++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
-@@ -9,6 +9,7 @@
- 
+@@ -10,6 +10,7 @@
  #include "base/functional/callback.h"
+ #include "components/tabs/public/tab_interface.h"
  
 +class TabStripModel;
  class TabStripModelDelegate;
  
  namespace tabs {
-@@ -31,6 +32,12 @@ base::RepeatingCallback<std::vector<tabs
+@@ -32,6 +33,12 @@ base::RepeatingCallback<std::vector<tabs
      const TabStripModelDelegate* delegate,
-     base::RepeatingCallback<std::vector<tabs::TabInterface*>()> get_tabs);
+     base::RepeatingCallback<std::vector<tabs::TabHandle>()> get_tabs);
  
 +// AddTab, for a tab that is not a link's: true when it opens at the top of
 +// the list, as in Arc (E15c.1), with `index` set there. False, and `index`

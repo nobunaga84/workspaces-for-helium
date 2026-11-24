@@ -1,8 +1,8 @@
 --- a/chrome/app/chrome_command_ids.h
 +++ b/chrome/app/chrome_command_ids.h
-@@ -134,6 +134,33 @@
+@@ -123,6 +123,33 @@
+ #define IDC_GROUP_UNGROUPED_TABS      34105
  #define IDC_ADD_NEW_TAB_RECENT_GROUP  34107
- #define IDC_UNFOCUS_TAB_GROUP         34108
  
 +// Helium Workspaces commands.
 +//
@@ -10,7 +10,7 @@
 +// this file, so every extra hunk here is another conflict to resolve at
 +// every rebase; taking the whole range now means the rest of the feature
 +// never has to reopen it. 34110-34999 is entirely free -- Helium's own ids
-+// stop at 34091 and the upstream block above ends at 34108.
++// stop at 34091 and the upstream block above ends at 34107.
 +//
 +// Only NEXT and PREV are wired today. The others are named so that the
 +// range is visibly spoken for, and 34126-34139 is left spare.
@@ -48,7 +48,7 @@
          <part file="chromeos_shared_strings.grdp" />
 --- a/chrome/app/generated_resources.grd.gritdeps
 +++ b/chrome/app/generated_resources.grd.gritdeps
-@@ -108,4 +108,5 @@ chrome/app/skills_strings.grdp
+@@ -109,4 +109,5 @@ chrome/app/skills_strings.grdp
  chrome/app/support_tool_strings.grdp
  chrome/app/vr_strings.grdp
  chrome/app/whats_new_strings.grdp
@@ -56,39 +56,43 @@
  components/helium_onboarding/helium_onboarding_strings.grdp
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
-@@ -4025,6 +4025,7 @@ source_set("browser") {
-       "//chrome/browser/ui/tabs/back_to_opener",
+@@ -3153,6 +3153,7 @@ source_set("browser") {
        "//chrome/browser/ui/tabs/tab_drag_api",
        "//chrome/browser/ui/tabs/tab_strip_api",
+       "//chrome/browser/ui/tabs/tab_strip_api/tab_strip_model_impl",
 +      "//chrome/browser/ui/tabs/workspaces",
+       "//chrome/browser/ui/task_manager",
        "//chrome/browser/ui/toasts",
        "//chrome/browser/ui/toasts:impl",
-       "//chrome/browser/ui/toolbar/cast",
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -676,7 +676,18 @@ if (!is_android) {
+@@ -683,7 +683,22 @@ if (!is_android) {
  
    source_set("browser_command_controller_impl") {
      sources = [ "browser_command_controller.cc" ]
 -    public_deps = [ ":browser_command_controller" ]
 +
-+    # Helium Workspaces: the bodies of its command hooks (review #16). They reach the
-+    # workspaces model and the vertical views, so they keep the catch-all public dep
-+    # this target had until 157 (see browser_public_dependencies in chrome/browser).
++    # Helium Workspaces: the bodies of its command hooks (review #16), and what
++    # they include -- the workspaces model, the vertical views' headers, the
++    # strings -- one by one since 158 dropped the catch-all group this target
++    # carried until 157 (browser_public_dependencies).
 +    sources += [
 +      "workspace_command_hooks.cc",
 +      "workspace_command_hooks.h",
 +    ]
 +    public_deps = [
 +      ":browser_command_controller",
-+      "//chrome/browser:browser_public_dependencies",
++      "//chrome/app:generated_resources",
++      "//chrome/browser/ui/browser_shortcuts",
++      "//chrome/browser/ui/tabs/workspaces",
++      "//chrome/browser/ui/views/tabs/vertical",
 +    ]
      deps = [
        ":accelerator_table",
        ":browser_actions",
 --- a/chrome/browser/ui/accelerator_table.cc
 +++ b/chrome/browser/ui/accelerator_table.cc
-@@ -241,6 +241,16 @@ const AcceleratorMapping kAcceleratorMap
+@@ -144,6 +144,16 @@ constexpr AcceleratorMapping kAccelerato
      {ui::VKEY_T, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, IDC_FOCUS_TOOLBAR},
      {ui::VKEY_RIGHT, ui::EF_ALT_DOWN, IDC_FORWARD},
      {ui::VKEY_RIGHT, ui::EF_ALTGR_DOWN, IDC_FORWARD},
@@ -107,7 +111,7 @@
      {ui::VKEY_F, ui::EF_ALT_DOWN, IDC_SHOW_APP_MENU},
 --- a/chrome/browser/ui/browser_command_controller.cc
 +++ b/chrome/browser/ui/browser_command_controller.cc
-@@ -106,6 +106,7 @@
+@@ -108,6 +108,7 @@
  #include "chrome/browser/ui/webui/side_panel/customize_chrome/customize_chrome_section.h"
  #include "chrome/browser/ui/webui/util/webui_util_desktop.h"
  #include "chrome/browser/ui/window_feature_controller/window_feature_controller.h"
@@ -115,7 +119,7 @@
  #include "chrome/browser/web_applications/web_app_install_params.h"
  #include "chrome/browser/web_applications/web_app_utils.h"
  #include "chrome/common/channel_info.h"
-@@ -697,6 +698,11 @@ void BrowserCommandController::HandleCom
+@@ -702,6 +703,11 @@ void BrowserCommandController::HandleCom
      base::TimeTicks time_stamp) {
    DCHECK(IsCommandEnabled(id)) << "Invalid/disabled command " << id;
  
@@ -124,12 +128,12 @@
 +    return;
 +  }
 +
-   // The order of commands in this switch statement must match the function
-   // declaration order in browser.h!
-   switch (id) {
-@@ -1893,6 +1899,9 @@ void BrowserCommandController::InitComma
+   // LINT.IfChange
+   // ===========================================================================
+   // When adding a new command below, you MUST also create a corresponding
+@@ -1909,6 +1915,9 @@ void BrowserCommandController::InitComma
+   command_updater_->UpdateCommandEnabled(IDC_GROUP_UNGROUPED_TABS, true);
    command_updater_->UpdateCommandEnabled(IDC_ADD_NEW_TAB_RECENT_GROUP, true);
-   command_updater_->UpdateCommandEnabled(IDC_UNFOCUS_TAB_GROUP, true);
  
 +  // Helium Workspaces: the fork's commands (workspace_command_hooks.cc).
 +  workspaces::EnableWorkspaceCommands(command_updater_.get());
@@ -1076,15 +1080,15 @@
 +</grit-part>
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
-@@ -4,6 +4,7 @@
- 
+@@ -5,6 +5,7 @@
  #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
  
+ #include <algorithm>
 +#include <utility>
  #include <variant>
  
  #include "base/check_deref.h"
-@@ -575,6 +576,20 @@ bool TabStripCollectionController::IsTab
+@@ -597,6 +598,20 @@ bool TabStripCollectionController::IsTab
    return !service || service->IsTabVisible(tab);
  }
  
@@ -1107,7 +1111,7 @@
      std::optional<tab_groups::TabGroupId> old_focused_group_id) {
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
-@@ -132,6 +132,16 @@ class TabStripCollectionController : pub
+@@ -138,6 +138,16 @@ class TabStripCollectionController : pub
    // renders exactly as stock Helium does.
    bool IsTabVisibleForWorkspace(const tabs::TabInterface* tab) const;
  
@@ -1126,15 +1130,14 @@
        std::optional<tab_groups::TabGroupId> old_focused_group_id);
 --- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
-@@ -109,6 +109,28 @@ UnpinnedTabContainerView::UnpinnedTabCon
-   node_destroyed_subscription_ = collection_node_->RegisterWillDestroyCallback(
+@@ -120,6 +120,28 @@ UnpinnedTabContainerView::UnpinnedTabCon
        base::BindOnce(&UnpinnedTabContainerView::ResetCollectionNode,
                       base::Unretained(this)));
-+
+ 
 +  // Lay out again whenever this window's Workspace changes. The visibility
-+  // predicate in UnpinnedTabContainerViewLayout is re-read on every layout,
-+  // so an invalidation is the whole of what a switch needs -- and it has to
-+  // be an invalidation rather than cached state, because switching
++  // predicate in UnpinnedTabContainerViewVerticalLayout is re-read on every
++  // layout, so an invalidation is the whole of what a switch needs -- and it
++  // has to be an invalidation rather than cached state, because switching
 +  // kHeliumLayout destroys and rebuilds this view entirely.
 +  //
 +  // Both ends of this already exist by the time we get here, which is the
@@ -1152,19 +1155,20 @@
 +            &views::View::InvalidateLayout, base::Unretained(this),
 +            /*avoid_propagate_during_layout=*/false));
 +  }
- }
- 
- UnpinnedTabContainerView::~UnpinnedTabContainerView() = default;
++
+   if (orientation_ == TabStripOrientation::kVertical) {
+     auto* state_controller =
+         collection_node_->GetController()->GetStateController();
 --- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
 +++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
-@@ -91,6 +91,7 @@ class UnpinnedTabContainerView
+@@ -108,6 +108,7 @@ class UnpinnedTabContainerView
    const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
  
    base::CallbackListSubscription node_destroyed_subscription_;
 +  base::CallbackListSubscription workspace_changed_subscription_;
+   base::CallbackListSubscription collapsed_state_changed_subscription_;
  };
  
- #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_UNPINNED_TAB_CONTAINER_VIEW_H_
 --- /dev/null
 +++ b/chrome/browser/ui/workspace_command_hooks.cc
 @@ -0,0 +1,74 @@

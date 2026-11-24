@@ -20,10 +20,15 @@ param([ValidateSet("Default", "Dcheck")][Alias("Build")][string]$OutDir = "Defau
 #   D1  C25: Example D dragged onto the LOWER part of the github row (Smoke folder's LAST row): "pins: moved 'd1' after
 #       'c1'", f1 holds b1,c1,d1, Work's roots a1,f1,g1; then Example A onto the UPPER part of Closed folder (the row
 #       below the folder's end): "moved 'a1' before 'g1'", roots f1,a1,g1, f1 unchanged -- after the folder
-#   F1  C27: c16fav made a favorite by its menu's "Pin", then its menu's Close: "archived a manual close in '<Work>'
-#       (favorite)"; the archive file's entry: "favorite": true, workspace Work, reason manual
-#   F2  the bar's Archive: the row NAMED "Favorite: E18 c16fav" (the star is only drawn) pressed: "archive: restored an
-#       entry into '<Work>' a favorite"; "E18 c16fav - Pinned" drawn again, no switch, the entry gone from the file
+#   F1  c16fav made a favorite by its menu's "Add to Favorites", then its menu's Close: it SLEEPS (R9: Helium 0.22
+#       hibernates a pin on a user's close, hibernate-on-close.patch), drawn "E18 c16fav - Pinned - Inactive tab ...";
+#       no "archived" / "not archived" line within 3 s, no archive entry, the window still on Work. C27's "archive a
+#       closed favorite" branch (patch 87) is no longer reached: kept for now, removed at the next rebase (the owner,
+#       2026-11-25)
+#   F2  the sleeping c16fav's menu > "Remove from Favorites": drawn as a Today tab; its Close: "archived a manual close
+#       in '<Work>'" (no " (favorite)"), the entry in Work, reason manual, no favorite mark; the bar's Archive: its row
+#       ("E18 c16fav", by title or address) pressed: "archive: restored an entry into '<Work>'" (no " a favorite"),
+#       c16fav drawn again as a Today tab, no switch, the entry gone from the file
 #   B1  C11b: the Work chip's menu > "Bookmark all tabs": "bookmarks: saved '<Work>' as N pinned + M Today", N = Work's
 #       pinned pages in the pins file, M = the Today tabs drawn; after the quit the Bookmarks file has Other bookmarks >
 #       Workspaces > "Work YYYY-MM-DD HH:MM" holding Work's pinned rows in order (folders as folders), then "Today" (M)
@@ -85,8 +90,11 @@ $tabSet   = "\[workspaces\] tab emoji set at index (\d+)"
 $tabClr   = "\[workspaces\] tab emoji cleared at index (\d+)"
 $restored = "\[workspaces\] restored tab emoji"
 function Moved([string]$id, [string]$where, [string]$to) { "\[workspaces\] pins: moved '$id' $where '$to'" }
-function FavFiled([string]$g) { "\[workspaces\] archived a manual close in '$g' \(favorite\)" }
-function FavBack([string]$g) { "\[workspaces\] archive: restored an entry into '$g' a favorite" }
+# Any archive verdict (F1 wants none), and an ordinary Today close / restore: anchored, so " (favorite)" and
+# " a favorite" (C27's) do not match.
+$anyArch  = "\[workspaces\] (not )?archived"
+function Filed([string]$g) { "\[workspaces\] archived a manual close in '$g'$" }
+function Back([string]$g) { "\[workspaces\] archive: restored an entry into '$g'$" }
 $screen   = "archive screen: opened"
 $saved    = "\[workspaces\] bookmarks: saved '([^']*)' as (\d+) pinned \+ (\d+) Today"
 function Nothing([string]$g) { "\[workspaces\] bookmarks: nothing to save in '$g'" }
@@ -123,7 +131,8 @@ function TabIn($nodes, [string]$title) {
     $page = if ($title -like "E18 *") { "*/$($title.Substring(4)).html" } else { $null }
     @($nodes | Where-Object { $_.shown -and $_.role -eq 0x25 -and ($_.name -eq $title -or $_.name.StartsWith("$title - ") -or ($page -and $_.name -like $page)) }) | Select-Object -First 1
 }
-function Today($nodes) { @($nodes | Where-Object { $_.shown -and $_.role -eq 0x25 -and $_.name -notmatch ' - Pinned$' } | Sort-Object t, l) }
+# Favorites left out: "<title> - Pinned", or asleep "<title> - Pinned - Inactive tab - N MB freed up" (R9).
+function Today($nodes) { @($nodes | Where-Object { $_.shown -and $_.role -eq 0x25 -and $_.name -notmatch ' - Pinned($| - )' } | Sort-Object t, l) }
 function Names($list) { @($list | ForEach-Object { $_.name }) -join ", " }
 function Popups { $wins = @([E18Input]::Windows([uint32]$script:bpid)); @([E18Input]::Others([uint32]$script:bpid, $script:main) | Where-Object { $wins -notcontains $_ }) }
 function NoPopups { foreach ($i in 1..3) { if (-not @(Popups).Count) { return }; $null = [E18Input]::Tap([uint32]$script:bpid, 0x1B) } }
@@ -278,7 +287,8 @@ function PinShape($n) {
     else { "url:$($n.url)" }
 }
 function BmShape($n) { if ($n.type -eq "url") { "url:$($n.url)" } else { "folder:$($n.name)[$((@($n.children | Where-Object { $_ } | ForEach-Object { BmShape $_ })) -join ',')]" } }
-function Entries { Start-Sleep (4 * $slow); try { @((Get-Content -Raw -Encoding UTF8 -LiteralPath "$dflt\Workspace Archive" | ConvertFrom-Json).entries) } catch { @() } }
+# No file yet (nothing archived) = no entries, quietly.
+function Entries { Start-Sleep (4 * $slow); try { @((Get-Content -Raw -Encoding UTF8 -LiteralPath "$dflt\Workspace Archive" -ErrorAction Stop | ConvertFrom-Json).entries) } catch { @() } }
 function EntryOf([string]$name) { @(Entries | Where-Object { $_.url -like "*/$name.html" }) | Select-Object -First 1 }
 
 # ---- the pages, DevTools, one launch, the quit ---------------------------------------------------------------------
@@ -288,7 +298,7 @@ function NewTab([string]$name) {
     $t = try { Invoke-RestMethod -Method Put -TimeoutSec 10 -Uri "$(Base)/new?$([uri]::EscapeDataString((Url "$name.html")))" } catch { $null }
     if (-not $t) { throw "DevTools opened no tab for '$name'" }
     $t0 = Get-Date
-    while ((Evaluate $t.webSocketDebuggerUrl "document.readyState === 'complete' ? document.title : ''") -ne "E18 $name" -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
+    while (-not (PageReady (Base) $t "E18 $name") -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
     Start-Sleep -Milliseconds (500 * $slow)
 }
 function Launch {
@@ -497,34 +507,55 @@ try {
         $r = TabMenu "E18 c16fav" @('^Add to Favorites')
         $fav = $false; $t0 = Get-Date
         while (-not $fav -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep 1; $fav = [bool](NodeIn (Nodes $script:main) "E18 c16fav - Pinned" 0x25) }
-        $cf = Count (FavFiled $work)
+        $cn = Count $anyArch; $ca = Count $active
+        # ONE close: a second would close the tab shown in its place (check-e14d2-auto's J).
         $r += "; $(TabMenu 'E18 c16fav' @('^Close( Ctrl\+W)?$'))"
-        $ok = WaitLog (FavFiled $work) ($cf + 1) 10
-        $why = @(Lines "\[workspaces\] (not )?archived" | Select-Object -Last 2 | ForEach-Object { $_.Line -replace '^.*\[workspaces\] ', '' }) -join " | "
+        $asleep = $null; $t0 = Get-Date
+        do {
+            Start-Sleep 1
+            $asleep = @(Nodes $script:main | Where-Object { $_.shown -and $_.role -eq 0x25 -and $_.name -like "E18 c16fav - Pinned - Inactive tab*" }) | Select-Object -First 1
+        } while (-not $asleep -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow)
+        # 3 s for a late line, so it fails F1 and is not counted against F2.
+        $late = WaitLog $anyArch ($cn + 1) 3
+        $why = @(Lines $anyArch | Select-Object -Skip $cn | ForEach-Object { $_.Line -replace '^.*\[workspaces\] ', '' }) -join " | "
+        $acts = (Count $active) - $ca
         $e = EntryOf "c16fav"
-        Verdict "F1 c16fav made a favorite ('E18 c16fav - Pinned' drawn: $fav), then closed ($r): 'archived a manual close in Work (favorite)' $ok (the last archive lines: $why); the file's entry $(if ($e) { "favorite $($e.favorite), workspace $($e.workspace), reason $($e.reason)" } else { 'MISSING' }) (want True, Work, manual)" ($fav -and $ok -and $e -and $e.favorite -eq $true -and $e.workspace -eq $work -and $e.reason -eq "manual")
+        Verdict "F1 c16fav made a favorite ('E18 c16fav - Pinned' drawn: $fav), then closed once ($r): it SLEPT, not closed: '$(if ($asleep) { $asleep.name } else { 'no sleeping favorite drawn' })'; archive lines since: $(if ($late) { $why } else { 'none' }) (want none); the file's entry $(if ($e) { "PRESENT (favorite $($e.favorite))" } else { 'none' }) (want none); switches +$acts (want 0)" ($fav -and $asleep -and -not $late -and -not $e -and $acts -eq 0)
     }
     Row "F2" {
-        $ca = Count $active; $cb = Count (FavBack $work); $co = Count $screen
+        # The sleeping favorite made an ordinary Today tab again, then closed: archived as any Today tab, and restored.
+        $r = TabMenu "E18 c16fav" @('^Remove from Favorites$')
+        # Only a favorite's menu has the item: without this an F2 run alone (c16fav never a favorite) passed untested.
+        $unfav = $r -like "right-clicked; *" -and $r -notlike "*nothing matching*"
+        $plain = $null; $t0 = Get-Date
+        while (-not $plain -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep 1; $plain = TabIn (Today (Nodes $script:main)) "E18 c16fav" }
+        $cf = Count (Filed $work)
+        $r += "; $(TabMenu 'E18 c16fav' @('^Close( Ctrl\+W)?$'))"
+        $filed = WaitLog (Filed $work) ($cf + 1) 10
+        $why = @(Lines $anyArch | Select-Object -Last 2 | ForEach-Object { $_.Line -replace '^.*\[workspaces\] ', '' }) -join " | "
+        $e = EntryOf "c16fav"
+        $mark = $e -and $e.PSObject.Properties["favorite"] -and $e.favorite
+        $ca = Count $active; $cb = Count (Back $work); $co = Count $screen
         $p = Press $script:main "Archive" 0x2B
         $null = WaitLog $screen ($co + 1) 10
         Start-Sleep (1 * $slow)
-        # The screen's rows, in a popup or the window itself: the favorite's is NAMED "Favorite: <title>".
+        # The screen's rows, in a popup (looked at first) or the window itself; never a tab (role 0x25). A row is
+        # named by its title, or by its address when the page had none.
         $hit = $null; $seen = @()
-        foreach ($w in @($script:main) + @(Popups)) {
-            $n = @(Nodes $w | Where-Object { $_.shown })
-            $seen += @($n | Where-Object { $_.name -match 'c16|Favorite' } | ForEach-Object { $_.name })
-            $x = @($n | Where-Object { $_.name -match 'Favorite: E18 c16fav$' }) | Select-Object -First 1
+        foreach ($w in @(Popups) + @($script:main)) {
+            $n = @(Nodes $w | Where-Object { $_.shown -and $_.role -ne 0x25 })
+            $seen += @($n | Where-Object { $_.name -match 'c16' } | ForEach-Object { $_.name })
+            $x = @($n | Where-Object { $_.name -like "E18 c16fav*" -or $_.name -like "*/c16fav.html*" }) | Select-Object -First 1
             if ($x -and -not $hit) { $hit = [pscustomobject]@{ w = $w; n = $x } }
         }
-        $r = if ($hit) { PressNode $hit.w $hit.n } else { "no row named 'Favorite: E18 c16fav'" }
-        $ok = WaitLog (FavBack $work) ($cb + 1) 10
+        $r2 = if ($hit) { PressNode $hit.w $hit.n } else { "no row for E18 c16fav" }
+        $ok = WaitLog (Back $work) ($cb + 1) 10
         NoPopups
-        $back = $false; $t0 = Get-Date
-        while (-not $back -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep 1; $back = [bool](NodeIn (Nodes $script:main) "E18 c16fav - Pinned" 0x25) }
+        $back = $null; $t0 = Get-Date
+        while (-not $back -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep 1; $back = TabIn (Today (Nodes $script:main)) "E18 c16fav" }
         $acts = (Count $active) - $ca
-        $e = EntryOf "c16fav"
-        Verdict "F2 the Archive ($p) shows [$($seen -join ' | ')]; the favorite's row pressed ($r): 'restored an entry into Work a favorite' $ok; 'E18 c16fav - Pinned' drawn again $back; switches +$acts (want 0); the entry $(if ($e) { 'STILL in the file' } else { 'gone from the file' })" ($hit -and $ok -and $back -and $acts -eq 0 -and -not $e)
+        $gone = -not (EntryOf "c16fav")
+        Verdict "F2 c16fav's Remove from Favorites + Close ($r): the item pressed $unfav; a Today tab $(if ($plain) { "'$($plain.name)'" } else { 'NOT drawn' }); 'archived a manual close in Work' $filed (the last archive lines: $why); the file's entry $(if ($e) { "workspace $($e.workspace), reason $($e.reason), favorite mark $([bool]$mark)" } else { 'MISSING' }) (want Work, manual, False); the Archive ($p) shows [$($seen -join ' | ')]; its row pressed ($r2): 'restored an entry into Work' $ok; a Today tab again $(if ($back) { "'$($back.name)'" } else { 'NOT drawn' }); switches +$acts (want 0); the entry $(if ($gone) { 'gone from the file' } else { 'STILL in the file' })" ($unfav -and $plain -and $filed -and $e -and $e.workspace -eq $work -and $e.reason -eq "manual" -and -not $mark -and $hit -and $ok -and $back -and $acts -eq 0 -and $gone)
     }
     Row "B1" {
         $null = Go $script:main "Work" $work

@@ -702,10 +702,10 @@
  // no row, no observer call, no file.
 --- a/chrome/browser/ui/views/tabs/common/tab_group_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_group_view.cc
-@@ -360,8 +360,9 @@ bool TabGroupView::IsCollapsed() const {
- }
- 
- views::ScrollView* TabGroupView::GetScrollViewForContainer() const {
+@@ -399,8 +399,9 @@ views::ScrollView* TabGroupView::GetScro
+   if (!collection_node_) {
+     return nullptr;
+   }
 -  return views::ScrollView::GetScrollViewForContents(
 -      const_cast<views::View*>(parent()));
 +  // Helium Workspaces (E15b): the tab list holding this group is not the
@@ -716,15 +716,15 @@
  void TabGroupView::UpdateTargetLayoutForDrag(
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
-@@ -17,6 +17,7 @@
+@@ -19,6 +19,7 @@
  #include "chrome/browser/ui/browser_commands.h"
  #include "chrome/browser/ui/browser_element_identifiers.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
 +#include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
  #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
- #include "chrome/browser/ui/tabs/split_tab_util.h"
-@@ -43,6 +44,7 @@
+@@ -47,6 +48,7 @@
  #include "chrome/browser/ui/views/tabs/groups/tab_group_editor_bubble_view.h"
  #include "chrome/browser/ui/views/tabs/horizontal/horizontal_tab_closing_helper.h"
  #include "chrome/browser/ui/views/tabs/tab/tab_context_menu_controller.h"
@@ -732,7 +732,7 @@
  #include "chrome/grit/generated_resources.h"
  #include "components/tab_groups/tab_group_id.h"
  #include "components/tabs/public/tab_collection_types.h"
-@@ -599,6 +601,20 @@ TabStripCollectionController::RegisterWo
+@@ -621,6 +623,20 @@ TabStripCollectionController::RegisterWo
    return service->RegisterWorkspaceChangedCallback(std::move(callback));
  }
  
@@ -762,8 +762,8 @@
 +#include <memory>
  #include <optional>
  
- #include "base/callback_list.h"
-@@ -142,6 +143,14 @@ class TabStripCollectionController : pub
+ #include "base/auto_reset.h"
+@@ -148,6 +149,14 @@ class TabStripCollectionController : pub
    base::CallbackListSubscription RegisterWorkspaceChangedCallback(
        base::RepeatingClosure callback);
  
@@ -788,7 +788,7 @@
  #include "ui/views/layout/layout_types.h"
  #include "ui/views/layout/proposed_layout.h"
  #include "ui/views/view.h"
-@@ -529,6 +530,21 @@ views::View* TabStripView::AddScrollView
+@@ -536,6 +537,21 @@ views::View* TabStripView::AddScrollView
    if (auto* container =
            views::AsViewClass<UnpinnedTabContainerView>(view.get())) {
      unpinned_tabs_container_view_ = container;
@@ -812,10 +812,10 @@
    // `view` should only ever be UnpinnedTabContainerView or
 --- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
-@@ -281,8 +281,21 @@ void UnpinnedTabContainerView::ResetColl
- }
- 
- views::ScrollView* UnpinnedTabContainerView::GetScrollViewForContainer() const {
+@@ -339,8 +339,21 @@ views::ScrollView* UnpinnedTabContainerV
+   if (!collection_node_) {
+     return nullptr;
+   }
 -  return views::ScrollView::GetScrollViewForContents(
 -      const_cast<UnpinnedTabContainerView*>(this));
 +  // Helium Workspaces (E15b): see NearestScrollView().
@@ -838,9 +838,9 @@
  void UnpinnedTabContainerView::UpdateTargetLayoutForDrag(
 --- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
 +++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
-@@ -65,6 +65,13 @@ class UnpinnedTabContainerView
-   void SetAvailableSpace(views::SizeBound space) { available_space_ = space; }
-   views::SizeBound available_space() const { return available_space_; }
+@@ -81,6 +81,13 @@ class UnpinnedTabContainerView
+   // ignoring any active tab closing mode override.
+   int GetUnconstrainedPreferredWidth() const;
  
 +  // Helium Workspaces (E15b): the nearest ScrollView above `view`, for this
 +  // container and the groups in it. The scroll view's contents is not this
@@ -850,8 +850,8 @@
 +  static views::ScrollView* NearestScrollView(const views::View& view);
 +
   private:
-   // DraggedTabsContainer:
-   views::ScrollView* GetScrollViewForContainer() const override;
+   friend class UnpinnedTabContainerViewVerticalLayout;
+   friend class UnpinnedTabContainerViewHorizontalLayout;
 --- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
 +++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
 @@ -16,10 +16,16 @@ source_set("vertical") {

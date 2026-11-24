@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/tabs/tab_menu_model.cc
 +++ b/chrome/browser/ui/tabs/tab_menu_model.cc
-@@ -434,43 +434,64 @@ void TabMenuModel::Build(int index) {
+@@ -462,43 +462,64 @@ void TabMenuModel::Build(int index) {
      }
    }
  
@@ -98,7 +98,7 @@
      const workspaces::WorkspaceService* const service =
          workspaces::WorkspaceService::From(
              tab_strip_->delegate()->GetBrowserWindowInterface());
-@@ -492,32 +513,6 @@ void TabMenuModel::Build(int index) {
+@@ -520,32 +541,6 @@ void TabMenuModel::Build(int index) {
      }
    }
  
@@ -131,8 +131,8 @@
    if (ExistingTabGroupSubMenuModel::ShouldShowSubmenu(
            tab_strip_, index, tab_menu_model_delegate_)) {
      // Create submenu with existing groups
-@@ -620,7 +615,7 @@ void TabMenuModel::Build(int index) {
- 
+@@ -642,7 +637,7 @@ void TabMenuModel::Build(int index) {
+   AddSeparator(ui::NORMAL_SEPARATOR);
    bool will_pin = tab_strip_->WillContextMenuPin(index);
    // Helium Workspaces (the owner, after C16's try): "Add to Favorites", so it
 -  // is told apart from "Pin to workspace" in the same menu, and

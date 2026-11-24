@@ -161,7 +161,7 @@
    if (to_tab) {
 +    content::OpenURLParams params =
 +        LinkParams(url, referrer_, initiator_,
-+                   WindowOpenDisposition::NEW_FOREGROUND_TAB);
++                   WindowOpenDisposition::kNewForegroundTab);
      // From the card's page, as the request was; the link's own when the
      // download is the card's first page. The default policy: an origin only
      // across sites.
@@ -172,7 +172,7 @@
 -            page.is_valid() ? content::Referrer(
 -                                  page, network::mojom::ReferrerPolicy::kDefault)
 -                            : referrer_,
--            WindowOpenDisposition::NEW_FOREGROUND_TAB,
+-            WindowOpenDisposition::kNewForegroundTab,
 -            ui::PAGE_TRANSITION_LINK, /*is_renderer_initiated=*/false),
 -        /*navigation_handle_callback=*/{});
 +    if (page.is_valid()) {
@@ -194,13 +194,13 @@
 -          content::OpenURLParams(
 -              url, referrer,
 -              std::string_view(trigger) == "pinned page"
--                  ? WindowOpenDisposition::CURRENT_TAB
--                  : WindowOpenDisposition::NEW_FOREGROUND_TAB,
+-                  ? WindowOpenDisposition::kCurrentTab
+-                  : WindowOpenDisposition::kNewForegroundTab,
 -              ui::PAGE_TRANSITION_LINK, /*is_renderer_initiated=*/false),
 +          LinkParams(url, referrer, initiator,
 +                     std::string_view(trigger) == "pinned page"
-+                         ? WindowOpenDisposition::CURRENT_TAB
-+                         : WindowOpenDisposition::NEW_FOREGROUND_TAB),
++                         ? WindowOpenDisposition::kCurrentTab
++                         : WindowOpenDisposition::kNewForegroundTab),
            /*navigation_handle_callback=*/{});
      }
      return;

@@ -1,7 +1,7 @@
 --- a/chrome/browser/resources/side_panel/customize_chrome/BUILD.gn
 +++ b/chrome/browser/resources/side_panel/customize_chrome/BUILD.gn
-@@ -33,6 +33,8 @@ build_webui("build") {
-     "customize_toolbar/customize_toolbar_api_proxy.ts",
+@@ -31,6 +31,8 @@ build_webui("build") {
+     "common.ts",
      "customize_toolbar/toolbar.html.ts",
      "customize_toolbar/toolbar.ts",
 +    "customize_toolbar/workspace_toolbar_list.html.ts",
@@ -9,7 +9,7 @@
      "footer.html.ts",
      "footer.ts",
      "hover_button.html.ts",
-@@ -63,6 +65,7 @@ build_webui("build") {
+@@ -60,6 +62,7 @@ build_webui("build") {
      "categories.css",
      "check_mark_wrapper.css",
      "customize_toolbar/toolbar.css",
@@ -137,7 +137,7 @@
 +    @dragend="${this.onRowDragend_}" @keydown="${this.onRowKeydown_}">
 +${
 +    this.actions_.map(
-+        (action, index) => this.isAddressBar_(action) ?
++        (action, index) => html`${this.isAddressBar_(action) ?
 +            html`
 +  <div class="choose-icons-row-container choose-icons-row address-bar-row ${
 +                this.dropClass_(index)}"
@@ -178,13 +178,13 @@
 +        title="$i18n{managedA11yLabel}">
 +    </img>
 +  </div>
-+`}`)}
++`}`}`)}
 +</div>
 +<!--_html_template_end_-->`;
 +}
 --- /dev/null
 +++ b/chrome/browser/resources/side_panel/customize_chrome/customize_toolbar/workspace_toolbar_list.ts
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,293 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -199,10 +199,9 @@
 +import {assert} from 'chrome://resources/js/assert.js';
 +import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
 +
-+import type {Action} from '../customize_toolbar.mojom-webui.js';
-+import {ActionId, CategoryId} from '../customize_toolbar.mojom-webui.js';
++import type {Action, BrowserProxy} from '../customize_toolbar.mojom-webui.js';
++import {ActionId, browserProxyFactory, CategoryId} from '../customize_toolbar.mojom-webui.js';
 +
-+import {CustomizeToolbarApiProxy} from './customize_toolbar_api_proxy.js';
 +import {getCss as getToolbarCss} from './toolbar.css.js';
 +import {getCss} from './workspace_toolbar_list.css.js';
 +import {getHtml} from './workspace_toolbar_list.html.js';
@@ -237,8 +236,7 @@
 +    };
 +  }
 +
-+  private apiProxy_: CustomizeToolbarApiProxy =
-+      CustomizeToolbarApiProxy.getInstance();
++  private apiProxy_: BrowserProxy = browserProxyFactory.getInstance();
 +  private listenerIds_: number[] = [];
 +
 +  protected accessor actions_: Action[] = [];
@@ -904,7 +902,7 @@
      "//chrome/browser/ui/views:layout_provider",
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
 +++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
-@@ -122,6 +122,7 @@
+@@ -123,6 +123,7 @@
  #include "chrome/browser/ui/views/toolbar/toolbar_icon_container_view.h"
  #include "chrome/browser/ui/views/toolbar/webui_back_forward_control.h"
  #include "chrome/browser/ui/views/toolbar/webui_toolbar_web_view.h"
@@ -912,7 +910,7 @@
  #include "chrome/browser/ui/views/zoom/zoom_view_controller.h"
  #include "chrome/browser/ui/waap/initial_webui_window_metrics_manager.h"
  #include "chrome/browser/ui/web_applications/app_browser_controller.h"
-@@ -2289,6 +2290,9 @@ void ToolbarView::UpdateToolbarLayout()
+@@ -2292,6 +2293,9 @@ void ToolbarView::UpdateToolbarLayout()
    }
  
    InvalidateLayout();
@@ -1174,10 +1172,10 @@
    public_deps = [
      "//chrome/browser/ui/webui/side_panel/customize_chrome:mojo_bindings",
      "//content/public/browser",
-@@ -21,7 +27,11 @@ source_set("customize_toolbar") {
-     "//chrome/browser/ui:ui_features",
+@@ -23,7 +29,11 @@ source_set("customize_toolbar") {
      "//chrome/browser/ui/actions",
      "//chrome/browser/ui/actions:actions_headers",
+     "//chrome/browser/ui/actions:actions_util",
 +    "//chrome/browser/ui/helium:helium_layout_state_controller",
      "//chrome/browser/ui/tabs:features",
 +    "//chrome/browser/ui/tabs:tabs",
@@ -1188,18 +1186,18 @@
      "//chrome/browser/ui/webui:webui_util",
 --- a/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar.mojom
 +++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar.mojom
-@@ -42,6 +42,9 @@ enum ActionId {
-   kTabSearch,
-   kSplitTab,
+@@ -44,6 +44,9 @@ enum ActionId {
    kContextualTasks,
+   kTtc,
+   kShowTabsFromOtherDevices,
 +  // Helium Workspaces (wish 6): not a button -- the address bar's place in
 +  // the toolbar order, a row of its own in the list.
 +  kAddressBar,
  };
  
  // Unique identifiers for categories the actions can belong to.
-@@ -95,6 +98,9 @@ interface CustomizeToolbarHandler {
-   GetIsCustomized() => (bool customized);
+@@ -101,6 +104,9 @@ interface CustomizeToolbarHandler {
+ 
    // Resets the set of pinned action items to default.
    ResetToDefault();
 +  // Helium Workspaces (wish 6): saves the toolbar's order, left to right,
@@ -1210,7 +1208,7 @@
  // WebUI-side handler for requests from the browser.
 --- a/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar_handler.cc
 +++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar_handler.cc
-@@ -16,6 +16,7 @@
+@@ -18,6 +18,7 @@
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar.mojom.h"
@@ -1218,7 +1216,7 @@
  #include "chrome/browser/ui/webui/util/image_util.h"
  #include "chrome/browser/ui/webui/webui_embedding_context.h"
  #include "chrome/common/chrome_features.h"
-@@ -234,6 +235,12 @@ CustomizeToolbarHandler::CustomizeToolba
+@@ -301,6 +302,12 @@ CustomizeToolbarHandler::CustomizeToolba
        base::BindRepeating(&CustomizeToolbarHandler::OnActionPinnedChanged,
                            base::Unretained(this), kActionMediaControls,
                            prefs::kShowMediaButton));
@@ -1231,7 +1229,7 @@
  }
  
  CustomizeToolbarHandler::~CustomizeToolbarHandler() = default;
-@@ -512,6 +519,12 @@ void CustomizeToolbarHandler::ListAction
+@@ -589,6 +596,12 @@ void CustomizeToolbarHandler::ListAction
    add_action(kActionShowChromeLabs,
               side_panel::customize_chrome::mojom::CategoryId::kTools);
  
@@ -1244,7 +1242,7 @@
    std::move(callback).Run(std::move(actions));
  }
  
-@@ -593,11 +606,23 @@ void CustomizeToolbarHandler::PinAction(
+@@ -670,11 +683,23 @@ void CustomizeToolbarHandler::PinAction(
  
  void CustomizeToolbarHandler::GetIsCustomized(
      GetIsCustomizedCallback callback) {

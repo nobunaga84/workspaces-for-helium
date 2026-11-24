@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
 +++ b/chrome/browser/ui/tabs/existing_base_sub_menu_model.h
-@@ -48,18 +48,23 @@ class ExistingBaseSubMenuModel : public
+@@ -47,18 +47,23 @@ class ExistingBaseSubMenuModel : public
    static constexpr int kMinSplitTabSwapMenuModelCommandId = 1801;
    static constexpr int kMinSplitViewLayoutMenuModelCommandId = 1901;
    static constexpr int kMinSplitTabMuteMenuModelCommandId = 2001;
@@ -35,7 +35,7 @@
    ExistingBaseSubMenuModel& operator=(const ExistingBaseSubMenuModel&) = delete;
 --- a/chrome/browser/ui/tabs/tab_menu_model.cc
 +++ b/chrome/browser/ui/tabs/tab_menu_model.cc
-@@ -512,11 +512,13 @@ void TabMenuModel::Build(int index) {
+@@ -531,11 +531,13 @@ void TabMenuModel::Build(int index) {
          std::ranges::find(entries, service->active_guid(),
                            &workspaces::prefs::WorkspaceEntry::guid);
      if (!site.empty() && entry != entries.end()) {
@@ -76,7 +76,7 @@
  #if BUILDFLAG(ENABLE_EXTENSIONS)
    // Returns the `ContextMenuMatcher` managing the extension-provided menu
    // items. This must be public because `TabContextMenuController`, which
-@@ -96,6 +104,8 @@ class TabMenuModel : public ui::SimpleMe
+@@ -100,6 +108,8 @@ class TabMenuModel : public ui::SimpleMe
    std::unique_ptr<ui::SimpleMenuModel> move_to_workspace_submenu_;
    std::unique_ptr<ui::SimpleMenuModel> anchor_submenu_;
    std::unique_ptr<ui::SimpleMenuModel> snooze_submenu_;
@@ -87,7 +87,7 @@
    std::unique_ptr<ui::SimpleMenuModel>
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -1598,6 +1598,7 @@ void TabStripModel::ExtendSelectionTo(in
+@@ -1641,6 +1641,7 @@ void TabStripModel::ExtendSelectionTo(in
          {tabs_to_append.begin(), tabs_to_append.end()});
    }
  
@@ -95,7 +95,7 @@
    SetSelection(new_model, TabStripModelObserver::CHANGE_REASON_NONE,
                 /*triggered_by_other_operation=*/false);
  }
-@@ -1700,6 +1701,7 @@ void TabStripModel::AddSelectionFromAnch
+@@ -1743,6 +1744,7 @@ void TabStripModel::AddSelectionFromAnch
      new_model.SetActiveTab(tab);
    }
  
@@ -187,7 +187,7 @@
  DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSnoozeUnitFieldId);
 --- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
 +++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
-@@ -47,6 +47,21 @@ base::RepeatingCallback<std::vector<tabs
+@@ -48,6 +48,21 @@ base::RepeatingCallback<std::vector<tabs
        base::Unretained(delegate), std::move(get_tabs));
  }
  
@@ -211,7 +211,7 @@
        (model.count() >= 1 &&
 --- a/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
 +++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
-@@ -21,6 +21,7 @@ class Range;
+@@ -22,6 +22,7 @@ class Range;
  
  namespace tabs {
  class TabInterface;
@@ -219,9 +219,9 @@
  }
  
  // Helium Workspaces: what TabStripModel's workspace hooks do. Each hook there
-@@ -39,6 +40,16 @@ base::RepeatingCallback<std::vector<tabs
+@@ -40,6 +41,16 @@ base::RepeatingCallback<std::vector<tabs
      const TabStripModelDelegate* delegate,
-     base::RepeatingCallback<std::vector<tabs::TabInterface*>()> get_tabs);
+     base::RepeatingCallback<std::vector<tabs::TabHandle>()> get_tabs);
  
 +// ExtendSelectionTo and AddSelectionFromAnchorTo (review 2, R2-5): the range
 +// they select holds every tab between its two ends in the model, and tabs keep
@@ -310,7 +310,7 @@
    // C33: closes those of `tabs` that CanSnooze(), each marked to wake at
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
-@@ -565,12 +565,18 @@ void TabStripCollectionController::Execu
+@@ -587,12 +587,18 @@ void TabStripCollectionController::Execu
      }
      return;
    }

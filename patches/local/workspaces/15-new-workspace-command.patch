@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/accelerator_table.cc
 +++ b/chrome/browser/ui/accelerator_table.cc
-@@ -251,6 +251,12 @@ const AcceleratorMapping kAcceleratorMap
+@@ -154,6 +154,12 @@ constexpr AcceleratorMapping kAccelerato
       IDC_HELIUM_WORKSPACE_PREV},
      {ui::VKEY_RIGHT, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
       IDC_HELIUM_WORKSPACE_NEXT},
@@ -34,15 +34,15 @@
    prefs::WriteWorkspaces(
 --- a/chrome/browser/ui/views/tabs/shared/BUILD.gn
 +++ b/chrome/browser/ui/views/tabs/shared/BUILD.gn
-@@ -53,6 +53,8 @@ source_set("impl") {
+@@ -52,6 +52,8 @@ source_set("impl") {
      "//chrome/browser/ui/tabs:tab_strip",
      "//chrome/browser/ui/tabs/organizer",
      "//chrome/browser/ui/tabs/saved_tab_groups",
 +    # Helium Workspaces: the "New workspace" item (15).
 +    "//chrome/browser/ui/tabs/workspaces",
      "//chrome/browser/ui/toolbar/pinned_toolbar",
-     "//chrome/browser/ui/user_education",
      "//chrome/browser/ui/views:tab_search_bubble_host",
+     "//chrome/browser/ui/views/bookmarks",
 --- a/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.cc
 +++ b/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.cc
 @@ -15,6 +15,7 @@
@@ -53,7 +53,7 @@
  #include "chrome/grit/generated_resources.h"
  #include "components/tab_groups/tab_group_id.h"
  #include "components/tabs/public/tab_group.h"
-@@ -46,6 +47,22 @@ NewTabButtonMenuModel::NewTabButtonMenuM
+@@ -52,6 +53,22 @@ NewTabButtonMenuModel::NewTabButtonMenuM
  
    AddSeparator(ui::NORMAL_SEPARATOR);
    AddNewSplitTabItem();

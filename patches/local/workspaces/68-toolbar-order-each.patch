@@ -3,13 +3,13 @@
 @@ -13,7 +13,7 @@ import {assert} from 'chrome://resources
  import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
  
- import type {Action} from '../customize_toolbar.mojom-webui.js';
--import {ActionId, CategoryId} from '../customize_toolbar.mojom-webui.js';
-+import {ActionId} from '../customize_toolbar.mojom-webui.js';
+ import type {Action, BrowserProxy} from '../customize_toolbar.mojom-webui.js';
+-import {ActionId, browserProxyFactory, CategoryId} from '../customize_toolbar.mojom-webui.js';
++import {ActionId, browserProxyFactory} from '../customize_toolbar.mojom-webui.js';
  
- import {CustomizeToolbarApiProxy} from './customize_toolbar_api_proxy.js';
  import {getCss as getToolbarCss} from './toolbar.css.js';
-@@ -150,23 +150,9 @@ export class WorkspaceToolbarListElement
+ import {getCss} from './workspace_toolbar_list.css.js';
+@@ -148,23 +148,9 @@ export class WorkspaceToolbarListElement
    protected onRowDrop_(e: DragEvent) {
      e.preventDefault();
      if (this.dragIndex_ >= 0 && this.dropTarget_) {
@@ -36,7 +36,7 @@
      }
      this.onRowDragend_();
    }
-@@ -185,45 +171,14 @@ export class WorkspaceToolbarListElement
+@@ -183,45 +169,14 @@ export class WorkspaceToolbarListElement
      e.preventDefault();
      const up = e.key === 'ArrowUp';
      const from = Number(row.dataset['index']);
@@ -84,7 +84,7 @@
    private refocus_(fromServer = false) {
      const id = this.focusedId_;
      const moves = this.moves_;
-@@ -243,15 +198,15 @@ export class WorkspaceToolbarListElement
+@@ -241,15 +196,15 @@ export class WorkspaceToolbarListElement
      return (e.target as HTMLElement).closest<HTMLElement>('[data-index]');
    }
  

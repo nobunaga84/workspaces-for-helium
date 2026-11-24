@@ -1,5 +1,5 @@
 param([ValidateSet("Default", "Dcheck")][Alias("OutDir")][string]$Build = "Default", [string]$Tag = "p109", [double]$IdleMinutes = 15,
-      [string]$BinDir = "", [string[]]$Rows = @())
+      [string]$BinDir = "", [string[]]$Rows = @(), [switch]$Diag)
 # Patch 109 (review 2's chunk 7, <local-path>\Helium-workspace\patch-review-2-findings.md): R2-9, R2-13, R2-14, R2-21. R2-7 is
 # check-98's case F; R2-22 is workspace_archive_unittest's ASnoozedEntryIsKeptUntilItWakes.
 # On a throwaway copy of the smoke profile (Home, Work, Canary, Private, Unpin; every workspace's pinned rows
@@ -21,7 +21,8 @@ param([ValidateSet("Default", "Dcheck")][Alias("OutDir")][string]$Build = "Defau
 #               u14f still in front
 #   U13  R2-13  the second window presses "U13 page"; Workspaces off (settingsPrivate); that window's u13 tab pinned
 #               (a favorite, from its menu); Workspaces on; the FIRST window's "U13 page" menu > Unpin: the favorite is
-#               not brought over -- no "brought" line, a page opened here instead, two u13 pages open
+#               not brought over -- no "brought" line, a page opened here instead; since R9 (Helium 0.22's shared
+#               Favorites) the pin also sleeps in the first window: three u13 pages, one of them a Favorite here
 #   R21  R2-21  a second launch: 30 workspaces, the sidebar collapsed (expand on hover off), the window 720 px tall:
 #               "+" inside the window; the last chip (W30) pressed: it scrolls into the window, "+" still in; the wheel
 #               up over the column brings Home's chip back down; a picture of the window (<Tag>-r21.png); expand on
@@ -96,8 +97,19 @@ function OtherPress([string]$re) {
     } while (((Get-Date) - $t0).TotalSeconds -lt 10 * $slow)
     "nothing matching '$re' (shown: $((@(PopupNames) | Select-Object -First 40) -join ' | '))"
 }
+# -Diag (R9): the MSAA nodes behind a row that failed, one line each. `nodes` is a scriptblock run only under the
+# switch: without it nothing is walked (a Nodes call is a powershell.exe and an MSAA walk) or printed.
+function Diag([string]$what, [scriptblock]$nodes) {
+    if (-not $Diag) { return }
+    $list = @(& $nodes)
+    Say "  diag: $what ($($list.Count) node(s))"
+    foreach ($n in $list) { Say ("    {0,-64} 0x{1:X2} shown={2} t={3}..{4} l={5}..{6}" -f "'$($n.name)'", $n.role, $n.shown, $n.t, ($n.t + $n.h), $n.l, ($n.l + $n.w)) }
+}
 function RightClick([IntPtr]$h, $n, [string]$what) {
-    if (-not $n) { return "no $what drawn" }
+    if (-not $n) {
+        Diag "no ${what}: the window's tabs and test pages" { Nodes $h | Where-Object { $_.role -eq 0x25 -or $_.name -match 'E18 |\.html' } }
+        return "no $what drawn"
+    }
     $r = [E18Input]::Click($h, $n.l + [int]($n.w / 3), $n.t + [int]($n.h / 2), $true)
     Start-Sleep -Milliseconds (800 * $slow)
     $r
@@ -170,7 +182,7 @@ function WaitPage([string]$name) {
     $t0 = Get-Date
     do {
         $t = PageOf $name
-        if ($t -and (Evaluate $t.webSocketDebuggerUrl "document.readyState") -eq "complete") { return $t }
+        if (PageReady (Base) $t "E18 $name") { return $t }
         Start-Sleep -Milliseconds 300
     } while (((Get-Date) - $t0).TotalSeconds -lt 10 * $slow)
     $null
@@ -179,13 +191,13 @@ function NewTab([string]$name) {
     $t = try { Invoke-RestMethod -Method Put -TimeoutSec 10 -Uri "$(Base)/new?$([uri]::EscapeDataString((Url $name)))" } catch { $null }
     if (-not $t) { throw "DevTools opened no tab for '$name'" }
     $t0 = Get-Date
-    while ((Evaluate $t.webSocketDebuggerUrl "document.readyState === 'complete' ? document.title : ''") -ne "E18 $name" -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
+    while (-not (PageReady (Base) $t "E18 $name") -and ((Get-Date) - $t0).TotalSeconds -lt 10 * $slow) { Start-Sleep -Milliseconds 300 }
     Start-Sleep -Milliseconds (500 * $slow)
     $t
 }
 function Show($t) { if (-not $t) { return }; try { $null = Invoke-RestMethod -TimeoutSec 10 "$(Base)/activate/$($t.id)" } catch {}; Start-Sleep -Milliseconds (500 * $slow) }
 # Whether page `name` is the one on screen in its window: "visible" or "hidden".
-function Visible([string]$name) { $t = PageOf $name; if ($t) { "$(Evaluate $t.webSocketDebuggerUrl 'document.visibilityState')" } else { "no page" } }
+function Visible([string]$name) { $t = PageOf $name; if (PageReady (Base) $t "E18 $name") { "$(Evaluate $t.webSocketDebuggerUrl 'document.visibilityState')" } elseif ($t) { "not loaded" } else { "no page" } }
 # Workspaces on or off through chrome.settingsPrivate on one settings tab, opened the first time; true once logged.
 function SetEnabled([bool]$on) {
     if (-not $script:set) { $script:set = OpenSettings $prof }
@@ -365,7 +377,15 @@ try {
         $broughtN = (Count "pins: brought the page of 'u13'") - $br
         $openedN = (Count "pins: opened item 'u13'") - $o
         $n = PagesOf "u13"
-        Verdict "U13 R2-13 second window $sw, on Work $bw, 'U13 page' pressed there ($pr): open $there; Workspaces off $off; its u13 tab's menu ($rc) > Pin ($q): a favorite $fav; Workspaces on $on; the first window on Work $h, 'U13 page' menu ($rc2) > Unpin ($q2): unpinned $un; brought from the other window $broughtN (want 0), opened here $openedN (want 1), u13 pages $n (want 2: the favorite kept)" ($bw -and $there -and $off -and $fav -and $on -and $h -and $un -and $broughtN -eq 0 -and $openedN -eq 1 -and $n -eq 2)
+        # Helium 0.22 (R9, the owner's A): one set of Favorites in every window, so the second window's pin also
+        # sleeps here -- a third u13 page, which must be that Favorite, not a second page opened. Exactly one pinned u13
+        # tab and one plain one here: the page opened here left pinned (and no copy) is one pinned, no plain.
+        $tabsA = @(Nodes $script:main | Where-Object { $_.role -eq 0x25 })
+        $u13A = @($tabsA | Where-Object { $_.shown -and (IsTab $_.name "E18 u13") })
+        $pinA = @($u13A | Where-Object { $_.name -match ' - Pinned($| - )' }).Count
+        $favA = $pinA -eq 1 -and $u13A.Count - $pinA -eq 1
+        if (-not $favA) { Diag "no Favorite copy of u13 in the first window (pinned u13 tabs $pinA, plain $($u13A.Count - $pinA); want 1 and 1): its tabs" { $tabsA } }
+        Verdict "U13 R2-13 second window $sw, on Work $bw, 'U13 page' pressed there ($pr): open $there; Workspaces off $off; its u13 tab's menu ($rc) > Pin ($q): a favorite $fav; Workspaces on $on; the first window on Work $h, 'U13 page' menu ($rc2) > Unpin ($q2): unpinned $un; brought from the other window $broughtN (want 0), opened here $openedN (want 1), the Favorite's shared copy here $favA; u13 pages $n (want 3: the Favorite, its copy here, the page opened here)" ($bw -and $there -and $off -and $fav -and $on -and $h -and $un -and $broughtN -eq 0 -and $openedN -eq 1 -and $favA -and $n -eq 3)
     }
     if ($want -contains "R21") {
         Say "quit for R21: $(Quit)"
@@ -402,11 +422,16 @@ open(p, 'w', encoding='utf-8').write(json.dumps(d, ensure_ascii=False))
             # The wheel up over that chip: the column scrolls back, Home's chip moves down. Home's chip is the "Home"
             # push button in W30's column (a toolbar Home button is elsewhere).
             function HomeChip($nodes) { @($nodes | Where-Object { $_.shown -and $_.role -eq 0x2B -and $_.name -eq "Home" -and $last -and [Math]::Abs($_.l - $last.l) -le 6 }) | Select-Object -First 1 }
+            # -Diag: what sits in the column's bottom 200 px (W30, "+", the chips above them), top to bottom.
+            function Bottom($nodes) { @($nodes | Where-Object { $_.l -lt $c[0] + 80 -and $_.t + $_.h -gt $c[1] + $c[3] - 200 } | Sort-Object t) }
             $home1 = HomeChip $n
-            $wh = if ($last -and (Inside $last)) { [E18Input]::Wheel($script:main, $last.l + [int]($last.w / 2), $last.t + [int]($last.h / 2), @(120, 120, 120, 120, 120, 120, 120, 120, 120, 120), 60) } else { "W30 not on screen" }
+            Diag "the column's bottom 200 px after W30 pressed" { Bottom $n }
+            $aimY = if ($last) { $last.t + [int]($last.h / 2) }
+            $wh = if ($last -and (Inside $last)) { [E18Input]::Wheel($script:main, $last.l + [int]($last.w / 2), $aimY, @(120, 120, 120, 120, 120, 120, 120, 120, 120, 120), 60) } else { "W30 not on screen" }
             Start-Sleep (1 * $slow)
             $n = @(Nodes $script:main)
             $home2 = HomeChip $n
+            Diag "the column's bottom 200 px after the wheel (aimed at y $aimY)" { Bottom $n }
             $scrolled = $home1 -and $home2 -and $home2.t -gt $home1.t -and (Inside $home2)
             $pic = Snap "$ws\$Tag$suffix-r21.png"
             # Expand on hover on (what users may have): the pointer rested on the bar widens the strip; "+" stays

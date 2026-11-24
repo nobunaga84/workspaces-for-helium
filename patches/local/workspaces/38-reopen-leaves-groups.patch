@@ -1,21 +1,23 @@
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -553,7 +553,18 @@ if (!is_android) {
+@@ -553,7 +553,20 @@ if (!is_android) {
  
    source_set("browser_live_tab_context_impl") {
      sources = [ "browser_live_tab_context.cc" ]
 -    public_deps = [ ":browser_live_tab_context" ]
 +
-+    # Helium Workspaces: the bodies of its restore hooks (review #23). They reach
-+    # the workspaces model and saved tab groups, so they keep the catch-all public
-+    # dep this target had until 157 (see browser_public_dependencies in chrome/browser).
++    # Helium Workspaces: the bodies of its restore hooks (review #23), and what
++    # they include -- the workspaces model and its session data -- one by one
++    # since 158 dropped the catch-all group this target carried until 157
++    # (browser_public_dependencies).
 +    sources += [
 +      "workspace_restore_hooks.cc",
 +      "workspace_restore_hooks.h",
 +    ]
 +    public_deps = [
 +      ":browser_live_tab_context",
-+      "//chrome/browser:browser_public_dependencies",
++      "//chrome/browser/ui/tabs/workspaces",
++      "//chrome/browser/ui/tabs/workspaces:tab_data",
 +    ]
      deps = [
        ":browser_commands",

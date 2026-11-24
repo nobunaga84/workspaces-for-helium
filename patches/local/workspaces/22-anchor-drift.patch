@@ -1,8 +1,8 @@
 --- a/chrome/browser/ui/navigator/BUILD.gn
 +++ b/chrome/browser/ui/navigator/BUILD.gn
-@@ -94,6 +94,10 @@ source_set("impl") {
-       "//chrome/browser/ui/browser_window",
+@@ -98,6 +98,10 @@ source_set("impl") {
        "//chrome/browser/ui/location_bar",
+       "//chrome/browser/ui/tabs:features",
        "//chrome/browser/ui/tabs:tab_strip",
 +
 +      # The omnibox rule in NormalizeDisposition asks WorkspaceService one
@@ -21,8 +21,8 @@
  #include "chrome/browser/ui/toasts/api/toast_id.h"
  #include "chrome/browser/ui/toasts/toast_controller.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
-@@ -500,6 +501,29 @@ void NormalizeDisposition(NavigateParams
-     params->disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+@@ -572,6 +573,29 @@ void NormalizeDisposition(NavigateParams
+     params->disposition = WindowOpenDisposition::kNewForegroundTab;
    }
  
 +  // Helium Workspaces: an address typed into an anchored tab opens a new tab
@@ -35,13 +35,13 @@
 +  // Typing the anchor itself is not drift, so going home still lands in place.
 +  // The service lookup sits inside the branch because this runs for every
 +  // navigation in the browser and only address-bar ones can be diverted.
-+  if (params->disposition == WindowOpenDisposition::CURRENT_TAB &&
++  if (params->disposition == WindowOpenDisposition::kCurrentTab &&
 +      (params->transition & ui::PAGE_TRANSITION_FROM_ADDRESS_BAR)) {
 +    const workspaces::WorkspaceService* const workspace_service =
 +        workspaces::WorkspaceService::From(params->browser);
 +    if (workspace_service && workspace_service->ShouldDivertTypedNavigation(
 +                                 params->source_contents, params->url)) {
-+      params->disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++      params->disposition = WindowOpenDisposition::kNewForegroundTab;
 +      LOG(INFO)
 +          << "[workspaces] typed url diverted off anchored tab -> new tab: "
 +          << params->url.spec();
@@ -49,7 +49,7 @@
 +  }
 +
    switch (params->disposition) {
-     case WindowOpenDisposition::NEW_BACKGROUND_TAB:
+     case WindowOpenDisposition::kNewBackgroundTab:
        // Disposition trumps add types. ADD_ACTIVE is a default, so we need to
 --- a/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc
 +++ b/chrome/browser/ui/tabs/workspace_anchor_sub_menu_model.cc

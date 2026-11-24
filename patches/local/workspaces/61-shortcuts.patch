@@ -1,8 +1,8 @@
 --- a/chrome/app/chrome_command_ids.h
 +++ b/chrome/app/chrome_command_ids.h
-@@ -141,9 +141,8 @@
+@@ -131,9 +131,8 @@
  // never has to reopen it. 34110-34999 is entirely free -- Helium's own ids
- // stop at 34091 and the upstream block above ends at 34108.
+ // stop at 34091 and the upstream block above ends at 34107.
  //
 -// NEXT, PREV, NEW, MOVE_UP and MOVE_DOWN are wired today. The others are
 -// named so that the range is visibly spoken for, and 34128-34139 is left
@@ -12,7 +12,7 @@
  #define IDC_HELIUM_WORKSPACE_NEXT     34110
  #define IDC_HELIUM_WORKSPACE_PREV     34111
  #define IDC_HELIUM_WORKSPACE_1        34112
-@@ -162,6 +161,12 @@
+@@ -152,6 +151,12 @@
  #define IDC_HELIUM_WORKSPACE_TOGGLE_RAIL 34125
  #define IDC_HELIUM_WORKSPACE_MOVE_UP 34126
  #define IDC_HELIUM_WORKSPACE_MOVE_DOWN 34127
@@ -27,7 +27,7 @@
  #define IDC_BOOKMARK_THIS_TAB           35000
 --- a/chrome/browser/ui/accelerator_table.cc
 +++ b/chrome/browser/ui/accelerator_table.cc
-@@ -275,6 +275,29 @@ const AcceleratorMapping kAcceleratorMap
+@@ -171,6 +171,29 @@ constexpr AcceleratorMapping kAccelerato
       IDC_HELIUM_WORKSPACE_MOVE_UP},
      {ui::VKEY_DOWN, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
       IDC_HELIUM_WORKSPACE_MOVE_DOWN},

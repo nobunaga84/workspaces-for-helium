@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
 +++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
-@@ -413,7 +413,9 @@ bool BrowserTabStripModelDelegate::IsTab
+@@ -419,7 +419,9 @@ bool BrowserTabStripModelDelegate::IsTab
    // Workspaces does not apply to, and every such tab is shown.
    const workspaces::WorkspaceService* service =
        workspaces::WorkspaceService::From(browser_);
@@ -11,7 +11,7 @@
  }
  
  bool BrowserTabStripModelDelegate::IsTabAnchored(
-@@ -436,6 +438,11 @@ bool BrowserTabStripModelDelegate::Reset
+@@ -442,6 +444,11 @@ bool BrowserTabStripModelDelegate::Reset
    // is not anchored, a split, and everything while the feature is off.
    workspaces::WorkspaceService* const service =
        workspaces::WorkspaceService::From(browser_);
@@ -25,7 +25,7 @@
          return g_browser_process->GetTabManager()->DiscardTabByExtension(
 --- a/chrome/browser/ui/tabs/BUILD.gn
 +++ b/chrome/browser/ui/tabs/BUILD.gn
-@@ -393,6 +393,12 @@ if (!is_android) {
+@@ -402,6 +402,12 @@ if (!is_android) {
        "tab_strip_scrubbing_metrics.cc",
      ]
  
@@ -40,28 +40,28 @@
        ":tab_model",
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -75,6 +75,7 @@
+@@ -79,6 +79,7 @@
  #include "chrome/browser/ui/tabs/tab_utils.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_metrics.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
 +#include "chrome/browser/ui/tabs/workspace_tab_strip_hooks.h"
  #include "chrome/browser/ui/thumbnails/thumbnail_tab_helper.h"
- #include "chrome/browser/ui/ui_features.h"
- #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
-@@ -3602,6 +3603,10 @@ void TabStripModel::ExecuteCloseTabsComm
-     base::RepeatingCallback<std::vector<tabs::TabInterface*>()>
-         get_tabs_to_close,
+ #include "chrome/browser/ui/toasts/api/toast_id.h"
+ #include "chrome/browser/ui/toasts/toast_controller.h"
+@@ -3754,6 +3755,10 @@ void TabStripModel::MarkTabGroupsForClos
+ void TabStripModel::ExecuteCloseTabsCommand(
+     base::RepeatingCallback<std::vector<tabs::TabHandle>()> get_tabs_to_close,
      bool delete_groups) {
 +  // Helium Workspaces: a close of several tabs closes only the tabs this
 +  // window draws (E15c).
 +  get_tabs_to_close =
 +      workspaces::DrawnTabsOnly(delegate_.get(), std::move(get_tabs_to_close));
-   std::vector<tabs::TabInterface*> tabs_to_close = get_tabs_to_close.Run();
-   std::vector<tab_groups::TabGroupId> groups_to_delete =
-       GetGroupsDestroyedFromRemovingTabs(get_tabs_to_close.Run());
+   std::vector<tabs::TabHandle> tab_handles_to_close = get_tabs_to_close.Run();
+   std::vector<tabs::TabInterface*> tabs_to_close;
+   for (tabs::TabHandle handle : tab_handles_to_close) {
 --- /dev/null
 +++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.cc
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -75,17 +75,18 @@
 +
 +namespace workspaces {
 +
-+base::RepeatingCallback<std::vector<tabs::TabInterface*>()> DrawnTabsOnly(
++base::RepeatingCallback<std::vector<tabs::TabHandle>()> DrawnTabsOnly(
 +    const TabStripModelDelegate* delegate,
-+    base::RepeatingCallback<std::vector<tabs::TabInterface*>()> get_tabs) {
++    base::RepeatingCallback<std::vector<tabs::TabHandle>()> get_tabs) {
 +  return base::BindRepeating(
 +      [](const TabStripModelDelegate* drawn_by,
-+         const base::RepeatingCallback<std::vector<tabs::TabInterface*>()>&
-+             get) {
-+        std::vector<tabs::TabInterface*> tabs = get.Run();
++         const base::RepeatingCallback<std::vector<tabs::TabHandle>()>& get) {
++        std::vector<tabs::TabHandle> tabs = get.Run();
 +        if (tabs.size() > 1) {
-+          std::erase_if(tabs, [drawn_by](const tabs::TabInterface* tab) {
-+            return !drawn_by->IsTabVisibleInActiveWorkspace(tab);
++          // A handle whose tab is gone stays: the caller skips it.
++          std::erase_if(tabs, [drawn_by](const tabs::TabHandle& handle) {
++            const tabs::TabInterface* const tab = handle.Get();
++            return tab && !drawn_by->IsTabVisibleInActiveWorkspace(tab);
 +          });
 +        }
 +        return tabs;
@@ -96,7 +97,7 @@
 +}  // namespace workspaces
 --- /dev/null
 +++ b/chrome/browser/ui/tabs/workspace_tab_strip_hooks.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,37 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -107,6 +108,7 @@
 +#include <vector>
 +
 +#include "base/functional/callback.h"
++#include "components/tabs/public/tab_interface.h"
 +
 +class TabStripModelDelegate;
 +
@@ -126,9 +128,9 @@
 +// which can hold tabs this window does not draw -- another workspace's, an
 +// open pinned item's page (E15c). A close of several tabs closes only the
 +// drawn ones, as a move does (E13); one tab is closed as asked.
-+base::RepeatingCallback<std::vector<tabs::TabInterface*>()> DrawnTabsOnly(
++base::RepeatingCallback<std::vector<tabs::TabHandle>()> DrawnTabsOnly(
 +    const TabStripModelDelegate* delegate,
-+    base::RepeatingCallback<std::vector<tabs::TabInterface*>()> get_tabs);
++    base::RepeatingCallback<std::vector<tabs::TabHandle>()> get_tabs);
 +
 +}  // namespace workspaces
 +
@@ -650,7 +652,7 @@
  }  // namespace workspaces
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
-@@ -582,7 +582,19 @@ bool TabStripCollectionController::IsTab
+@@ -606,7 +606,19 @@ bool TabStripCollectionController::IsTab
    }
    const workspaces::WorkspaceService* service =
        workspaces::WorkspaceService::From(browser_view_->browser());
@@ -673,7 +675,7 @@
  base::CallbackListSubscription
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h
-@@ -127,6 +127,11 @@ class TabStripCollectionController : pub
+@@ -139,6 +139,11 @@ class TabStripCollectionController : pub
    // renders exactly as stock Helium does.
    bool IsTabVisibleForWorkspace(const tabs::TabInterface* tab) const;
  
@@ -687,7 +689,7 @@
    // IsTabVisibleForWorkspace().
 --- a/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
-@@ -329,6 +329,13 @@ void TabStripView::OnTabChanged(const ta
+@@ -323,6 +323,13 @@ void TabStripView::OnTabChanged(const ta
      return;
    }
  
@@ -701,7 +703,7 @@
    if (collection_node_->GetController()->GetDragHandler().IsDragging()) {
      return;
    }
-@@ -363,6 +370,12 @@ void TabStripView::ScrollToFitTabs(const
+@@ -357,6 +364,12 @@ void TabStripView::ScrollToFitTabs(const
      return;
    }
  

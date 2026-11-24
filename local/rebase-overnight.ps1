@@ -11,9 +11,11 @@ function Stamp { (Get-Date).ToString("HHmmss") }
 # 0. Tripwire (LOCAL.md 1, 41): 37-strip-bulk-layout is correct only while LayoutImpl() recomputes
 #    the target first. Upstream's TODO (crbug.com/490964477) wants that call gone, and the patch
 #    would still apply and compile -- leaving the strip stale after every restore.
+#    R9 (Chromium 158): LayoutImpl() recalculates only on a size change, and the old pattern still matched (the call
+#    sits inside the new `if`). 37 now adds the stale case itself, so the check is that ITS condition is in place.
 $lm = Get-Content -Raw "$src\chrome\browser\ui\views\tabs\common\tab_collection_animating_layout_manager.cc"
-if ($lm -notmatch '(?s)::LayoutImpl\(\) \{(?:(?!\n\}).)*?RecalculateTarget\(\);') {
-    Write-Host "STOP: LayoutImpl() no longer calls RecalculateTarget() -- 37-strip-bulk-layout would leave the strip stale (LOCAL.md 41)"; exit 1
+if ($lm -notmatch '(?s)::LayoutImpl\(\) \{(?:(?!\n\}).)*?if \(target_stale_ \|\|[^{]*\{\s*RecalculateTarget\(\);') {
+    Write-Host "STOP: LayoutImpl() no longer recalculates a stale target first -- 37-strip-bulk-layout would leave the strip stale (LOCAL.md 41)"; exit 1
 }
 #    And (LOCAL.md 138, R2-5): 104 drops hidden tabs where a shift-click range is made; a selection made in the
 #    classic layout, where every tab is drawn, never reaches vertical only because Chromium's own

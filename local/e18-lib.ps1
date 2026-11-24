@@ -258,6 +258,16 @@ function Evaluate([string]$wsUrl, [string]$expr) {
     } catch { "error: $_" } finally { $sock.Dispose() }
 }
 
+# Page `t` (a /json/new or /json/list target) loaded: its own <title> `title` in the browser's list (`base` =
+# http://127.0.0.1:<port>/json) first, then document.readyState "complete". Only a committed document has its title in
+# the list; a Runtime.evaluate while the first load is still provisional trips blink's DCHECK(!frame->IsProvisional())
+# (main_thread_debugger.cc) and kills a Dcheck build's renderer (R9: 31-37 ms after /json/new, check-109's u14f twice).
+function PageReady([string]$base, $t, [string]$title) {
+    if (-not $t) { return $false }
+    $listed = try { @((Invoke-RestMethod -TimeoutSec 10 "$base/list") | Where-Object { $_.id -eq $t.id -and $_.title -eq $title }) } catch { @() }
+    $listed.Count -gt 0 -and (Evaluate $t.webSocketDebuggerUrl "document.readyState") -eq "complete"
+}
+
 # chrome://settings/appearance opened as a tab of profile `prof`'s browser through the DevTools port
 # (--remote-debugging-port=0 writes the port to <profile>\DevToolsActivePort), then up to 20 s for chrome.settingsPrivate:
 # base (the port's /json), page (its webSocketDebuggerUrl, id, url; $null when none opened), ready, and a note on how it went.

@@ -191,21 +191,21 @@
  
    // Moves the workspace tag onto a tab's replacement WebContents.
    //
---- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
-+++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
-@@ -268,9 +268,6 @@ views::ProposedLayout UnpinnedTabContain
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.cc
+@@ -116,9 +116,6 @@ UnpinnedTabContainerViewVerticalLayout::
                                ? (size_bounds.width() - (x + horizontal_padding))
                                : size_bounds.width(),
                            child_height_bound);
 -    gfx::Rect bounds = gfx::Rect(child->GetPreferredSize(child_size_bounds));
 -    bounds.set_x(x);
 -
-     auto drag_data = tab_container_view->GetVisualDataForDraggedView(*child);
-     bool should_show_child =
-         IsChildVisibleInContainer(tab_container_view, focused_group_id, child);
-@@ -280,14 +277,25 @@ views::ProposedLayout UnpinnedTabContain
-                         workspaces::IsChildDrawnForWorkspace(
-                             tab_container_view->collection_node_, child_index);
+     auto drag_data =
+         UnpinnedTabContainerView().GetVisualDataForDraggedView(*child);
+     bool should_show_child = IsChildVisibleInContainer(focused_group_id, child);
+@@ -129,14 +126,25 @@ UnpinnedTabContainerViewVerticalLayout::
+                             UnpinnedTabContainerView().collection_node_,
+                             child_index);
  
 +    // Decided BEFORE the child is asked for its size: a hidden child's size is
 +    // never drawn, and asking is not free -- it runs the tab's own layout. This

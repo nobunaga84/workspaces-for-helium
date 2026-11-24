@@ -1,6 +1,6 @@
 --- a/chrome/app/chrome_command_ids.h
 +++ b/chrome/app/chrome_command_ids.h
-@@ -373,6 +373,7 @@
+@@ -364,6 +364,7 @@
  #define IDC_CONTENT_CONTEXT_OPENLINKSPLITVIEW 50111
  #define IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST 50112
  #define IDC_CONTENT_CONTEXT_OPENLINK_ISOLATED 50113
@@ -10,7 +10,7 @@
  #define IDC_CONTENT_CONTEXT_COPYIMAGELOCATION 50121
 --- a/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
 +++ b/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
-@@ -42,6 +42,7 @@
+@@ -45,6 +45,7 @@
  #include "chrome/browser/ui/login/login_navigation_throttle.h"
  #include "chrome/browser/ui/passwords/password_manager_navigation_throttle.h"
  #include "chrome/browser/ui/passwords/well_known_change_password_navigation_throttle.h"
@@ -18,19 +18,19 @@
  #include "chrome/browser/ui/web_applications/navigation_capturing_redirection_throttle.h"
  #include "chrome/common/chrome_features.h"
  #include "chrome/common/chrome_switches.h"
-@@ -417,6 +418,9 @@ void CreateAndAddChromeThrottlesForNavig
+@@ -422,6 +423,9 @@ void CreateAndAddChromeThrottlesForNavig
  #endif  // BUILDFLAG(ENABLE_PDF)
  
    TabUnderNavigationThrottle::MaybeCreateAndAdd(registry);
 +  // Helium Workspaces (C20): a pinned page's link to another site opens in
 +  // the link preview (Arc's rule).
 +  workspaces::MaybeAddLinkPreviewThrottle(registry);
+   AdScriptNavigationThrottle::MaybeCreateAndAdd(registry);
  
    WellKnownChangePasswordNavigationThrottle::MaybeCreateAndAdd(registry);
- 
 --- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
 +++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
-@@ -379,6 +379,7 @@
+@@ -396,6 +396,7 @@
  #include "chrome/browser/ui/toasts/toast_controller.h"
  #include "chrome/browser/ui/toasts/toast_features.h"
  #include "chrome/browser/ui/views/context_hub/save_to_memory_bank_bubble_controller.h"
@@ -38,7 +38,7 @@
  #include "chrome/browser/ui/webui/webui_embedding_context.h"
  #include "components/split_tabs/split_tab_id.h"
  #include "components/tabs/public/split_tab_data.h"
-@@ -499,6 +500,9 @@ int UmaEnumForCommand(int key, UmaEnumId
+@@ -525,6 +526,9 @@ int UmaEnumForCommand(int key, UmaEnumId
         // ContextMenuMatcher::IsExtensionsCustomCommandId()
         {IDC_CONTENT_CONTEXT_PROTOCOL_HANDLER_FIRST, 2},
         {IDC_CONTENT_CONTEXT_OPENLINKNEWTAB, 3},
@@ -48,7 +48,7 @@
         {IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW, 4},
         {IDC_CONTENT_CONTEXT_OPENLINKOFFTHERECORD, 5},
         {IDC_CONTENT_CONTEXT_SAVELINKAS, 6},
-@@ -1960,6 +1964,12 @@ void RenderViewContextMenu::AppendLinkIt
+@@ -2008,6 +2012,12 @@ void RenderViewContextMenu::AppendLinkIt
            in_app ? IDS_CONTENT_CONTEXT_OPENLINKNEWTAB_INAPP
                   : IDS_CONTENT_CONTEXT_OPENLINKNEWTAB);
      }
@@ -61,7 +61,7 @@
  
      if (show_open_in_new_window) {
        AddItemWithOptionalIcon(IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW,
-@@ -3396,6 +3406,8 @@ bool RenderViewContextMenu::IsCommandIdE
+@@ -3542,6 +3552,8 @@ bool RenderViewContextMenu::IsCommandIdE
      case IDC_CONTENT_CONTEXT_OPENLINKINPROFILE:
      case IDC_CONTENT_CONTEXT_OPENLINKNEWTAB:
      case IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW:
@@ -70,7 +70,7 @@
        return navigation_allowed && params_.link_url.is_valid() &&
               IsOpenLinkAllowedByDlp(params_.link_url);
  
-@@ -3750,6 +3762,17 @@ void RenderViewContextMenu::ExecuteComma
+@@ -3906,6 +3918,17 @@ void RenderViewContextMenu::ExecuteComma
        break;
      }
  
@@ -80,7 +80,7 @@
 +          source_web_contents_,
 +          GetOpenURLParamsWithExtraHeaders(
 +              params_.link_url, params_.frame_url, params_.frame_origin,
-+              WindowOpenDisposition::NEW_FOREGROUND_TAB,
++              WindowOpenDisposition::kNewForegroundTab,
 +              ui::PAGE_TRANSITION_LINK, /*extra_headers=*/std::string(),
 +              /*started_from_context_menu=*/true));
 +      break;
@@ -166,7 +166,7 @@
  }  // namespace workspaces
 --- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
 +++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
-@@ -16,6 +16,7 @@ source_set("vertical") {
+@@ -17,6 +17,7 @@ source_set("vertical") {
      "vertical_tab_strip_top_container.h",
      "workspace_arc_importer.h",
      "workspace_archive_view.h",
@@ -174,7 +174,7 @@
      "workspace_pinned_section_view.h",
      "workspace_quick_search_view.h",
      "workspace_rail_view.h",
-@@ -61,6 +62,7 @@ source_set("impl") {
+@@ -63,6 +64,7 @@ source_set("impl") {
      "vertical_tab_strip_top_container.cc",
      "workspace_arc_importer.cc",
      "workspace_archive_view.cc",
@@ -182,7 +182,7 @@
      "workspace_pinned_section_view.cc",
      "workspace_quick_search_view.cc",
      "workspace_rail_view.cc",
-@@ -96,6 +98,15 @@ source_set("impl") {
+@@ -99,6 +101,15 @@ source_set("impl") {
      "//chrome/browser/ui/select_file_policy",
      "//chrome/browser/ui/tabs/workspaces:transfer",
  
@@ -522,7 +522,7 @@
 +    base::OnceCallback<void(content::NavigationHandle&)>
 +        navigation_handle_callback) {
 +  // The page's own navigations stay in the card.
-+  if (params.disposition == WindowOpenDisposition::CURRENT_TAB) {
++  if (params.disposition == WindowOpenDisposition::kCurrentTab) {
 +    base::WeakPtr<content::NavigationHandle> handle =
 +        source->GetController().LoadURLWithParams(
 +            content::NavigationController::LoadURLParams(params));
@@ -629,7 +629,7 @@
 +            page.is_valid() ? content::Referrer(
 +                                  page, network::mojom::ReferrerPolicy::kDefault)
 +                            : referrer_,
-+            WindowOpenDisposition::NEW_FOREGROUND_TAB,
++            WindowOpenDisposition::kNewForegroundTab,
 +            ui::PAGE_TRANSITION_LINK, /*is_renderer_initiated=*/false),
 +        /*navigation_handle_callback=*/{});
 +  }
@@ -767,8 +767,8 @@
 +          content::OpenURLParams(
 +              url, referrer,
 +              std::string_view(trigger) == "pinned page"
-+                  ? WindowOpenDisposition::CURRENT_TAB
-+                  : WindowOpenDisposition::NEW_FOREGROUND_TAB,
++                  ? WindowOpenDisposition::kCurrentTab
++                  : WindowOpenDisposition::kNewForegroundTab,
 +              ui::PAGE_TRANSITION_LINK, /*is_renderer_initiated=*/false),
 +          /*navigation_handle_callback=*/{});
 +    }

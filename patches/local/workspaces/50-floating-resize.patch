@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
-@@ -469,9 +469,11 @@ void VerticalTabStripRegionView::Layout(
+@@ -486,9 +486,11 @@ void VerticalTabStripRegionView::Layout(
  
    // Manually position the resize area as it overlaps views handled by the flex
    // layout.
@@ -12,8 +12,8 @@
 +                                : width() - resize_area_width_;
    resize_area_->SetBoundsRect(
        gfx::Rect(resize_area_x, 0, resize_area_width_, bounds().height()));
-   shadow_frame_->SetBoundsRect(GetLocalBounds());
-@@ -717,7 +719,10 @@ void VerticalTabStripRegionView::OnResiz
+   UpdateResizeAreaVisibility();
+@@ -738,7 +740,10 @@ void VerticalTabStripRegionView::OnResiz
    }
  
    tabs::VerticalTabStripState new_state;
@@ -24,15 +24,16 @@
        proposed_width <= tabs::kVerticalTabStripCollapseSnapWidth;
    new_state.uncollapsed_width = target_collapse_state_.uncollapsed_width;
    if (!new_state.collapsed) {
-@@ -932,7 +937,10 @@ void VerticalTabStripRegionView::OnColla
+@@ -952,7 +957,11 @@ void VerticalTabStripRegionView::OnColla
  }
  
  void VerticalTabStripRegionView::UpdateResizeAreaVisibility() {
--  if (floating_style_ != FloatingStyle::kNone) {
+-  if (floating_style_ != FloatingStyle::kNone ||
 +  // Helium Workspaces (E16): the floating (zen mode) strip keeps its resize
-+  // edge; Helium hides it. The expand-on-hover overlay keeps Helium's rule.
-+  if (floating_style_ != FloatingStyle::kNone &&
-+      floating_style_ != FloatingStyle::kDetached) {
++  // edge; Helium hides it. The expand-on-hover overlay keeps Helium's rule,
++  // and so does an open tab organizer panel.
++  if ((floating_style_ != FloatingStyle::kNone &&
++       floating_style_ != FloatingStyle::kDetached) ||
+       organizer_panel_show_percent_ != 0.0) {
      resize_area_->SetVisible(false);
      return;
-   }

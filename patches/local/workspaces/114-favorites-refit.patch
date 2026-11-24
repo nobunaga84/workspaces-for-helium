@@ -1,0 +1,176 @@
+--- a/chrome/browser/ui/tabs/helium_pins_util.cc
++++ b/chrome/browser/ui/tabs/helium_pins_util.cc
+@@ -25,6 +25,7 @@
+ #include "chrome/browser/ui/tabs/pinned_tab_service_factory.h"
+ #include "chrome/browser/ui/tabs/tab_close_types_data.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_utils.h"
+ #include "components/performance_manager/public/performance_manager.h"
+ #include "components/split_tabs/split_tab_id.h"
+@@ -100,8 +101,12 @@ tabs::TabInterface* FindReplacementTab(
+   tabs::TabInterface* best = nullptr;
+   for (int index = 0; index < model->count(); ++index) {
+     tabs::TabInterface* const tab = model->GetTabAtIndex(index);
++    // Helium Workspaces (R9): only a tab drawn in the workspace on screen, the
++    // ones Ctrl+Tab reaches (IsTabCycleStop). Another workspace's hidden tab
++    // would take the window into that workspace; with none left, a New Tab.
+     if (closing.contains(tab) || model->IsTabInForeground(index) ||
+         model->IsTabCollapsed(index) ||
++        !model->delegate()->IsTabCycleStop(tab) ||
+         WouldShowHibernatedPin(*model, index)) {
+       continue;
+     }
+--- a/chrome/browser/ui/tabs/workspaces/workspace_service.cc
++++ b/chrome/browser/ui/tabs/workspaces/workspace_service.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/desktop_browser_window_capabilities.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -2216,6 +2217,13 @@ std::optional<int> WorkspaceService::Las
+         group && tab_strip_->IsGroupCollapsed(*group)) {
+       continue;
+     }
++    // Helium's own exclusion (R9): a sleeping favorite, or a split that shows
++    // one, is not woken to take the place of a closed tab -- the filter
++    // Helium's DetermineNewSelectedIndex applies, which this pick runs before.
++    // Last, and only of a tab that would win: it looks the index up.
++    if (helium_pins::WouldShowHibernatedPin(*tab_strip_, i)) {
++      continue;
++    }
+     best = i;
+     best_left = left;
+   }
+--- a/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/workspace_view_hooks.h"
+ 
++#include <algorithm>
+ #include <variant>
+ 
+ #include "base/check_op.h"
+@@ -140,7 +141,14 @@ int TabRowHeightFor(bool pinned, bool co
+   if (pinned || collapsed) {
+     return helium_height;
+   }
+-  return prefs::TabRowHeight();
++  // Never shorter than Helium's own tab (R9): Compact (30) grows to 32 with
++  // Helium 0.22's "Spacious" density; the taller styles stay as chosen.
++  return std::max(prefs::TabRowHeight(), helium_height);
++}
++
++int ListRowHeight() {
++  return TabRowHeightFor(/*pinned=*/false, /*collapsed=*/false,
++                         GetLayoutConstant(LayoutConstant::kVerticalTabHeight));
+ }
+ 
+ std::unique_ptr<views::Background> MakeFavoriteCard() {
+--- a/chrome/browser/ui/views/tabs/common/workspace_view_hooks.h
++++ b/chrome/browser/ui/views/tabs/common/workspace_view_hooks.h
+@@ -49,13 +49,18 @@ bool IsBulkLayoutInProgress();
+ 
+ // TabViewVerticalLayout (E18): a tab of the list -- not a favorite, not in
+ // the collapsed column, where a taller cell would be a thin tile -- is as
+-// tall as the Tab style setting says (TabRowHeightFor), its icon further in
+-// and further from its title when roomy (IsRoomyTabRow). Compact keeps
+-// Helium's own inset and gap, whatever they become. `helium_height` is the
+-// height Helium's layout gives the tab.
++// tall as the Tab style setting says and never shorter than Helium's own tab
++// (TabRowHeightFor; R9: Helium's "Spacious" density makes Compact 32), its
++// icon further in and further from its title when the setting is roomy
++// (IsRoomyTabRow). Compact keeps Helium's own inset and gap, whatever they
++// become. `helium_height` is the height Helium's layout gives the tab.
+ // A favorite outside the collapsed column is a tile (C21).
+ bool IsRoomyTabRow(bool pinned, bool collapsed);
+ int TabRowHeightFor(bool pinned, bool collapsed, int helium_height);
++// A list row that is not a TabView -- a pinned page, "+ New Tab", a dragged
++// tab's probe -- as tall as the list's tabs: TabRowHeightFor at Helium's
++// own tab height.
++int ListRowHeight();
+ 
+ // TabViewVerticalLayout::OnInstalled (C21): the faint card behind a favorite.
+ std::unique_ptr<views::Background> MakeFavoriteCard();
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -225,11 +225,10 @@ constexpr int kCardLineAbove = 6;
+ constexpr int kCardLineBelow = 5;
+ 
+ // "+ New Tab" (E18): Helium's own insets, which compact keeps
+-// (vertical_new_tab_button.cc); taller than compact, its icon starts where
+-// the pinned pages' do -- the button sits at the section's edge, the rows a
+-// card margin and a row inset in.
++// (vertical_new_tab_button.cc: kTabHorizontalPadding across, 7 or Spacious 8;
++// R9); roomy, its icon starts where the pinned pages' do -- the button sits at
++// the section's edge, the rows a card margin and a row inset in.
+ constexpr int kNewTabInsetVertical = 4;
+-constexpr int kNewTabInsetCompact = 7;
+ constexpr int kNewTabInsetRoomy = kCardMargin + kRowInset;
+ 
+ // How long the list glides for one mouse wheel step (E18, design 5 "E18
+@@ -1352,7 +1351,7 @@ class PinRow : public views::LabelButton
+     // compact, as the tabs there do.
+     SetMinSize(gfx::Size(
+         0, icon_only_ ? GetLayoutConstant(LayoutConstant::kVerticalTabHeight)
+-                      : workspaces::prefs::TabRowHeight()));
++                      : workspaces::ListRowHeight()));
+     // No opaque background under the text, as on the rail's buttons.
+     label()->SetSubpixelRenderingEnabled(false);
+     // The ring drawn inside: the rows sit in a clipping scroll view (E13).
+@@ -2169,7 +2168,7 @@ WorkspacePinnedSectionView::WorkspacePin
+     tabs::VerticalTabStripStateController* state_controller)
+     : browser_(browser),
+       state_controller_(state_controller),
+-      tabs_row_height_(workspaces::prefs::TabRowHeight()),
++      tabs_row_height_(workspaces::ListRowHeight()),
+       new_tab_row_height_(workspaces::prefs::kCompactTabRowHeight) {
+   SetLayoutManager(std::make_unique<views::BoxLayout>(
+                        views::BoxLayout::Orientation::kVertical))
+@@ -2401,7 +2400,7 @@ void WorkspacePinnedSectionView::Schedul
+ }
+ 
+ void WorkspacePinnedSectionView::ApplyTabStyle() {
+-  const int height = workspaces::prefs::TabRowHeight();
++  const int height = workspaces::ListRowHeight();
+   views::ScrollView* const scroll_view = GetScrollView();
+   if (!scroll_view || !scroll_view->parent()) {
+     return;
+@@ -2420,14 +2419,18 @@ void WorkspacePinnedSectionView::ApplyTa
+               << timer.Elapsed().InMilliseconds() << " ms";
+   }
+   if (height != new_tab_row_height_) {
+-    // "+ New Tab" is the list's first row: as tall as a tab; taller than
+-    // compact, its icon at 16 and its title at 44, as the pinned pages' are.
+-    // Helium made it once, in its constructor, at the compact numbers.
++    // "+ New Tab" is the list's first row: as tall as a tab; with a roomy Tab
++    // style (not Spacious alone), its icon at 16 and its title at 44, as the
++    // pinned pages' are. Helium made it once, in its constructor, at the
++    // compact numbers.
++    const int helium_inset =
++        GetLayoutConstant(LayoutConstant::kTabHorizontalPadding);
+     const gfx::Insets insets = gfx::Insets::TLBR(
+         kNewTabInsetVertical,
+-        height > workspaces::prefs::kCompactTabRowHeight ? kNewTabInsetRoomy
+-                                                         : kNewTabInsetCompact,
+-        kNewTabInsetVertical, kNewTabInsetCompact);
++        workspaces::IsRoomyTabRow(/*pinned=*/false, /*collapsed=*/false)
++            ? kNewTabInsetRoomy
++            : helium_inset,
++        kNewTabInsetVertical, helium_inset);
+     new_tab_button_->SetLabelInsets(insets, insets);
+     new_tab_button_->SetImageLabelSpacing(workspaces::prefs::IconTitleGap());
+     new_tab_button_->SetPreferredSize(gfx::Size(-1, height));
+@@ -4363,7 +4366,7 @@ void WorkspacePinnedSectionView::UpdateD
+       // The probe a dragged tab would be: a Today tab's height (E18).
+       const int height =
+           collapsed_ ? GetLayoutConstant(LayoutConstant::kVerticalTabHeight)
+-                     : workspaces::prefs::TabRowHeight();
++                     : workspaces::ListRowHeight();
+       drag_scroll_.OnDraggedTabPositionUpdated(
+           *scroll_view,
+           gfx::Rect(0, y - height / 2, scroll_view->width(), height));

@@ -13,10 +13,11 @@ param([string]$OutDir = "Default")
 # in the order they run, and what each proves:
 #   P  the copy can answer the rest: Workspaces on, vertical, Work listed; no archive file; Work's and Home's
 #      rail marks read from its Preferences as the rail draws them (the icon, else the name's first character)
-#   J  a favorite closed is kept in the Archive since C27 (patch 87, the owner's answer; E14d.2 had "never
-#      archived"): the copy's own favorite, or gum pinned from its tab's menu ("Pin", not the fork's "Pin to
-#      workspace"), closed with Ctrl+W -> "archived a manual close in '<Work>' (favorite)", its entry favorite
-#      and in Work; then Ctrl+Shift+T brings it back pinned and out of the Archive, so A-G start as before
+#   J  a favorite "closed" SLEEPS (R9: Helium 0.22 hibernates a pin on close, the owner's A; C27's "kept in the
+#      Archive" was R8's): the copy's own favorite, or gum pinned from its tab's menu ("Add to Favorites", not
+#      the fork's "Pin to workspace"), ONE Ctrl+W (no toast for a pin since 0.22) -> still drawn a favorite, no
+#      "archived a ..." and no "not archived: a favorite" line, the window still on Work, no entry in the file;
+#      nothing to bring back, so A-G start as before (a second Ctrl+W would close the tab shown in its place)
 #   A  amber, birch, cedar closed in Work with Ctrl+W -> three "archived a manual close in '<work>'"; the file:
 #      3 entries, manual, Work                                        (the screen has real entries to show)
 #   B  the bar's "Archive" -> "rail: archive", "opened, 3 entr(ies), 3 shown"; the three newest first under
@@ -92,7 +93,7 @@ $afile   = "$prof\Default\Workspace Archive"
 # on bind), the way Logi Options+ took 8765 at R5 (LOCAL.md 59).
 $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0); $l.Start(); $port = $l.LocalEndpoint.Port; $l.Stop()
 $work    = "2ab592d4-a80b-4a1d-aeaa-6acd51c12134"
-# Not J's favorite (C27), whose line ends " (favorite)".
+# Never a favorite's close (C27's line ends " (favorite)"; since R9 a favorite sleeps instead, J).
 $manual   = "archived a manual close in '$work'(?! \(favorite\))"
 $manualH  = "archived a manual close in 'default'"
 $archived = "\] archived a "
@@ -147,8 +148,10 @@ function Nodes([IntPtr]$h = [IntPtr]::Zero) {
 }
 function Shown($n) { (-not $n.hidden) -and $n.h -gt 0 -and $n.w -gt 0 }
 function Node([string]$name, [int]$role) { @(Nodes | Where-Object { $_.name -eq $name -and $_.role -eq $role -and (Shown $_) }) | Select-Object -First 1 }
-# The list's Today tabs as drawn, top to bottom; favorites ("<title> - Pinned") sit above it and are left out.
-function ShownTabs { @(Nodes | Where-Object { $_.role -eq 0x25 -and (Shown $_) -and $_.name -notmatch ' - Pinned$' } | Sort-Object t | ForEach-Object { $_.name }) }
+# The list's Today tabs as drawn, top to bottom; favorites sit above it and are left out: "<title> - Pinned",
+# or asleep "<title> - Pinned - Inactive tab - 24.2 MB freed up" (Chromium's discarded-tab suffix; R9).
+$pinnedRe = ' - Pinned($| - )'
+function ShownTabs { @(Nodes | Where-Object { $_.role -eq 0x25 -and (Shown $_) -and $_.name -notmatch $pinnedRe } | Sort-Object t | ForEach-Object { $_.name }) }
 # The row showing `text` among a window's nodes: of the shown nodes whose name holds it, the biggest -- the row
 # itself, not the label inside it (a press goes to the node pressed, never its parent).
 function RowOf($nodes, [string]$text) { @($nodes | Where-Object { (Shown $_) -and $_.name.Contains($text) } | Sort-Object { $_.w * $_.h } -Descending) | Select-Object -First 1 }
@@ -488,7 +491,7 @@ try {
     Verdict "setup: the six pages are loaded Today tabs of Work (named by their titles)" (@($names | Where-Object { $list -contains "E14d2 $_" }).Count -eq $names.Count)
 
     # J: a favorite closed -- the copy's own, else gum pinned from its tab's menu
-    $fav = @(Nodes | Where-Object { $_.role -eq 0x25 -and (Shown $_) -and $_.name -match ' - Pinned$' }) | Select-Object -First 1
+    $fav = @(Nodes | Where-Object { $_.role -eq 0x25 -and (Shown $_) -and $_.name -match $pinnedRe }) | Select-Object -First 1
     if (-not $fav) {
         $n = Node "E14d2 gum" 0x25
         $rc = if ($n) { [E14d2Input]::Click($script:win, $n.l + [int]($n.w / 2), $n.t + [int]($n.h / 2), $true) } else { "no tab 'E14d2 gum'" }
@@ -500,24 +503,26 @@ try {
         do { Start-Sleep 1; $fav = Node "E14d2 gum - Pinned" 0x25 } while (-not $fav -and ((Get-Date) - $t).TotalSeconds -lt 10)
     }
     Verdict "J: a favorite to close ($(if ($fav) { "'$($fav.name)'" } else { 'none' }))" ([bool]$fav)
-    $favArchived = "archived a manual close in '$work' \(favorite\)"
-    $nf = Count $notFav; $nfa = Count $favArchived
-    # Twice: Chromium's first Ctrl+W on a pinned tab only shows a toast asking for a second one
-    # (browser_commands.cc CloseTab, ToastId::kClosePinnedTab).
-    Say ("      J: " + $(if ($fav) { (CloseTab $fav.name) + "; again, as the toast asks: " + [E14d2Input]::Keys((Pid1), $false, 0x57) } else { "nothing to close" }))
+    $title = if ($fav) { $fav.name -replace ' - Pinned($| - .*$)', '' } else { "" }
+    $na = Count $archived; $nf = Count $notFav; $nw = Count "active workspace -> "
+    # ONCE: since Helium 0.22 a pin's Ctrl+W skips Chromium's "press again" toast and hibernates it
+    # (hibernate-on-close.patch, browser_commands.cc CloseTab); a second press would close the tab shown instead.
+    Say ("      J: " + $(if ($fav) { CloseTab $fav.name } else { "nothing to close" }))
     Alive
-    # C27 (patch 87, the owner's answer): a favorite closed is KEPT, filed under the workspace on screen and marked;
-    # E14d.2's "never archived" is gone. Ctrl+Shift+T then brings it back pinned and takes the close back out of the
-    # Archive, so A-G meet the archive this check was written for.
-    $title = if ($fav) { $fav.name -replace ' - Pinned$', '' } else { "" }
-    Verdict "J: kept in the Archive as a favorite (C27): '$favArchived', no 'not archived: a favorite'" ((WaitCount $favArchived ($nfa + 1) 10) -and (Count $notFav) -eq $nf)
+    # R9, the owner's A: a favorite "closed" sleeps where it is; nothing reaches the Archive (C27's favorite
+    # branch is not reached by a close any more) and the window stays on Work (patch 114, FindReplacementTab).
+    $t = Get-Date
+    do { Start-Sleep 1; $still = @(Nodes | Where-Object { $_.role -eq 0x25 -and (Shown $_) -and $_.name.StartsWith("$title - Pinned") }) | Select-Object -First 1 } while (-not $still -and ((Get-Date) - $t).TotalSeconds -lt 10)
+    # 3 s for a late line, so it fails J and is not counted against A.
+    $late = WaitCount $archived ($na + 1) 3
+    Verdict "J: it SLEPT, not closed: still a favorite ('$(if ($still) { $still.name })'), no 'archived a' and no 'not archived: a favorite' line" ($fav -and $still -and -not $late -and (Count $notFav) -eq $nf)
     $e = @(Archive | Where-Object { $_.title -eq $title })
     Show $e
-    Verdict "J: the file's entry for it: favorite, in Work" ($fav -and -not (Node $fav.name 0x25) -and $e.Count -eq 1 -and $e[0].favorite -eq $true -and $e[0].workspace -eq $work)
-    Say ("      J: Ctrl+Shift+T " + [E14d2Input]::Keys((Pid1), $true, 0x54))
-    $t = Get-Date
-    do { Start-Sleep 1; $back = if ($fav) { Node $fav.name 0x25 } } while (-not $back -and ((Get-Date) - $t).TotalSeconds -lt 10)
-    Verdict "J: Ctrl+Shift+T brought it back a favorite ('$(if ($fav) { $fav.name })' drawn) and out of the Archive" ($back -and -not @(Archive | Where-Object { $_.title -eq $title }).Count)
+    # The tab shown in its place is one of Work's, drawn in the list (patch 114, FindReplacementTab), not another
+    # workspace's hidden tab; the window's title is the active tab's.
+    $act = (Title) -replace ' - Workspaces for Helium$', ''
+    Say "      J: active after the sleep: '$act'"
+    Verdict "J: the window stayed on Work (no 'active workspace ->'), the tab shown is one of Work's, and the file has no entry for it" ($fav -and (Count "active workspace -> ") -eq $nw -and @(ShownTabs) -contains $act -and $e.Count -eq 0)
 
     # A: three manual closes in Work
     $i = 0
