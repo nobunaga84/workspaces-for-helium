@@ -17,8 +17,8 @@ param([switch]$WorkspacesOff,
 #  -WorkspacesOff: the E10b dormancy check. Chromium's stock move of the group into the reopened window; it arrives
 #                  split, so the split rebuild meets the guard instead of AddToSplitImpl's CHECK; nothing crashes.
 # Run it in its own process (pwsh -File): it compiles a C# type that a second script in one session would reuse.
-# -GradeOnly re-grades a log. The grader reads events in log order (LOCAL.md 30), from the extension's "restoring"
-# line on. A script that does not parse leaves $LASTEXITCODE untouched: read the ALL PASS / FAILED line, not the code.
+# -GradeOnly re-grades a log. The grader reads events in log order (LOCAL.md 30), from the extension's "split again"
+# line on ("restoring" without a split; see the grading below). A script that does not parse leaves $LASTEXITCODE untouched: read the ALL PASS / FAILED line, not the code.
 . "$PSScriptRoot\e18-lib.ps1"
 $ws    = "<local-path>\Helium-workspace"
 $here  = $PSScriptRoot
@@ -163,9 +163,15 @@ foreach ($line in [IO.File]::ReadLines($Log)) {
 }
 Write-Host "`n--- $OutDir, Workspaces $(if ($WorkspacesOff) { 'OFF' } else { 'on' })"
 @($ev | Where-Object K -eq 'X') | ForEach-Object { Write-Host "      extension: $($_.Text)" }
-# The reopen begins at the extension's "restoring" line: W1's close and the menu's reopen before it are the fixture.
-$start = -1; for ($n = 0; $n -lt $ev.Count; $n++) { if ($ev[$n].K -eq 'X' -and $ev[$n].Text -like 'restoring a closed window*') { $start = $n; break } }
+# The reopen is graded from the fixture's last step on: W1's close and the menu's reopen before it are the fixture.
+# The mark is the extension's "split again" line (background.js sleeps 3 s after it), not its "restoring" line: that
+# one is logged right before chrome.sessions.restore, travels apart from it, and once reached the log 43 ms AFTER the
+# restore's own lines (p115, 11-26: 0 counted, 3 FAILs on a right restore). "restoring" stays the mark with no split.
+function Mark([string]$like) { for ($n = 0; $n -lt $ev.Count; $n++) { if ($ev[$n].K -eq 'X' -and $ev[$n].Text -like $like) { return $n } }; -1 }
+$start = Mark 'restoring a closed window*'
 if ($start -lt 0) { Write-Host "INCONCLUSIVE: the fixture was not built, the window never reopened (the extension's lines above)" -ForegroundColor DarkYellow; exit 2 }
+$splitMark = Mark 'split again: split *'
+if ($splitMark -ge 0 -and $splitMark -lt $start) { $start = $splitMark }
 # .ToArray(): @() around a generic List throws "Argument types do not match" here (found by running this).
 $post = if ($start -lt $ev.Count - 1) { @($ev.ToArray()[($start + 1)..($ev.Count - 1)]) } else { @() }
 # A removal something is inserted AFTER is a move (the saved group pulled into the reopened window); the final window

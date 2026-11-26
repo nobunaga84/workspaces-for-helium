@@ -218,8 +218,11 @@ I read every report, but I fix what I can, when I can (see below).
 
 - English only.
 - Dragging the sidebar's edge sticks near its default width (Helium's own behaviour).
-- 1.21.157.00 only: after an update, the sidebar could come back once at its default width when the
-  browser reopened your windows ("Continue where you left off"). Fixed in 1.21.157.01.
+- ~~1.21.157.00 only: after an update, the sidebar could come back once at its default width when the
+  browser reopened your windows ("Continue where you left off").~~ **Fixed in 1.21.157.01.**
+- ~~In a workspace with many pinned pages, switching to another workspace and back left the tab list far
+  from where you were (in zen mode it looked as if the list jumped by itself).~~ **Fixed in 1.22.158.01:**
+  each workspace now keeps its own place in the list.
 - Start the browser from its Start menu shortcut, or a taskbar pin made from it. Started as a bare
   `chrome.exe` while official Helium is open, it opens official Helium's window instead.
 - Helium's "back to opener" (Back on a tab opened from a link closes it) stays on; an anchored tab

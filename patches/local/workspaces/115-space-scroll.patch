@@ -1,0 +1,165 @@
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
+@@ -352,6 +352,19 @@ void TabStripView::OnTabChanged(const ta
+     }
+   }
+ 
++  // Helium Workspaces: no scroll to another workspace's tab either (patch 115):
++  // like an open pinned item's page above, its hidden view is an empty slot.
++  // The window follows the tab there (the auto-switch, which can hear the
++  // activation after this), and the list may lay out first: the workspace
++  // being left lost its place to the slot before the place was saved. The
++  // pinned section fits the tab after the switch's rebuild. Favorites (pinned
++  // tabs) are drawn in every workspace.
++  if (!active_tab->IsPinned() &&
++      !collection_node_->GetController()->IsTabVisibleForWorkspace(
++          active_tab)) {
++    return;
++  }
++
+   TabCollectionNode* activated_node =
+       collection_node_->GetNodeForHandle(active_tab->GetHandle());
+   CHECK(activated_node);
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.cc
+@@ -21,6 +21,7 @@
+ #include "base/logging.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/cancelable_task_tracker.h"
+@@ -2370,12 +2371,70 @@ void WorkspacePinnedSectionView::OnWorks
+   const workspaces::WorkspaceService* const service =
+       workspaces::WorkspaceService::From(browser_);
+   if (!service || service->active_guid() != drawn_guid_) {
++    // The left workspace's place, saved now (patch 115): the shortcut and the
++    // rail notify here before anything moves the list (SwitchToWorkspace's
++    // ActivateTabAt comes after), and nothing told lays it out at once. An
++    // auto-switch activates its tab first, but TabStripView::OnTabChanged does
++    // not scroll to another workspace's tab, so the list has not moved toward
++    // it. Once per rebuild: A -> B -> C before one keeps A's place, not B's.
++    // Not at the first draw (nothing drawn yet): the list starts at its top,
++    // as without patch 115 (the owner, 11-26). Dcheck caught a renderer
++    // freezing a visible page only on builds that fitted the tab there.
++    if (!restore_scroll_ && !drawn_guid_.empty()) {
++      if (const views::ScrollView* const scroll_view = GetScrollView()) {
++        scroll_by_guid_[drawn_guid_] =
++            base::ClampRound(scroll_view->CurrentOffset().y());
++      }
++      restore_scroll_ = true;
++    }
+     ScheduleRebuild();
+   } else {
+     ScheduleRowStates();
+   }
+ }
+ 
++void WorkspacePinnedSectionView::RestoreScroll() {
++  if (!std::exchange(restore_scroll_, false) || drawn_guid_.empty()) {
++    return;
++  }
++  views::ScrollView* const scroll_view = GetScrollView();
++  views::Widget* const widget = GetWidget();
++  if (!scroll_view || !widget) {
++    return;
++  }
++  const auto saved = scroll_by_guid_.find(drawn_guid_);
++  if (saved != scroll_by_guid_.end()) {
++    // The new rows laid out first: an offset is held to the list's height as
++    // it is (ScrollView::ScrollToPosition), and it was the old workspace's.
++    // Only here: a workspace's first visit has nothing to put back, and the
++    // fit below needs no forced layout.
++    widget->LayoutRootViewIfNecessary();
++    scroll_view->ScrollToPosition(scroll_view->vertical_scroll_bar(),
++                                  saved->second);
++  }
++  // Then the active tab in view, the least scroll that shows it (the owner's
++  // pick): Chromium's own fit. Without it the activation's fit, made against
++  // the OLD workspace's pinned rows, is the last word -- that was the jump.
++  // A pinned item's page is skipped there; its row scrolls itself into view
++  // in UpdateRowStates(). The fit runs at the scroll view's next layout,
++  // before the next frame paints -- not forced here, which would lay the
++  // whole window out a second time per switch (review).
++  if (auto* const strip =
++          views::AsViewClass<TabStripView>(scroll_view->parent())) {
++    strip->ScrollToFitTabs(browser_->GetTabStripModel()->GetActiveTab(),
++                           nullptr);
++    scroll_view->InvalidateLayout();
++  }
++  // The place restored, before that fit.
++  LOG(INFO) << "[workspaces] pins: scroll '" << drawn_guid_ << "' -> "
++            << base::ClampRound(scroll_view->CurrentOffset().y())
++            << " px (saved "
++            << (saved != scroll_by_guid_.end()
++                    ? base::NumberToString(saved->second)
++                    : std::string("none"))
++            << ")";
++}
++
+ void WorkspacePinnedSectionView::ScheduleRebuild() {
+   if (rebuild_scheduled_) {
+     return;
+@@ -2535,9 +2594,23 @@ void WorkspacePinnedSectionView::Rebuild
+   SetVisible(shown);
+   if (!shown) {
+     ClearSelection();
++    // No list to put back (patch 115, review): a switch's restore left
++    // pending would run at some later rebuild no switch asked for, and keep
++    // the next switch from saving its place.
++    restore_scroll_ = false;
+     return;
+   }
+   drawn_guid_ = service->active_guid();
++  // A deleted workspace's saved place goes with it (patch 115, review): the
++  // list changing is one reason this runs, and an Arc import can bring the
++  // same id back as a new workspace.
++  std::erase_if(scroll_by_guid_, [service](const auto& entry) {
++    return !std::ranges::contains(service->known_guids(), entry.first);
++  });
++  // After a switch, the list goes back to this workspace's place (patch 115):
++  // at every way out from here -- no rows, a folded card, the rows drawn.
++  base::ScopedClosureRunner restore_scroll(base::BindOnce(
++      &WorkspacePinnedSectionView::RestoreScroll, base::Unretained(this)));
+   // C29: a selection belongs to the workspace it was made in, and to the open
+   // strip.
+   if (drawn_guid_ != previous_guid || collapsed_) {
+@@ -2636,6 +2709,8 @@ void WorkspacePinnedSectionView::Rebuild
+   LOG(INFO) << "[workspaces] pins: drew " << rows << " row(s) of '"
+             << drawn_guid_ << "' in " << timer.Elapsed().InMilliseconds()
+             << " ms";
++  // Before the focus and the name box below, which scroll to their row.
++  restore_scroll.RunAndReset();
+   // C15: a page brought to front while the card is folded has its one row
+   // scrolled into view, as an unfolded card's row is (review).
+   const bool scroll_folded = scroll_peek && folded_;
+--- a/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/workspace_pinned_section_view.h
+@@ -253,6 +253,11 @@ class WorkspacePinnedSectionView
+   // The service's "workspace changed" also fires for every tag written to a
+   // tab: only a different workspace needs new rows.
+   void OnWorkspaceChanged();
++  // After a switch's Rebuild(): the list back where it was in this workspace,
++  // then the active tab in view (patch 115). Logs the place restored, before
++  // the active tab's fit:
++  //   "[workspaces] pins: scroll '<guid>' -> <N> px (saved <M> | none)"
++  void RestoreScroll();
+ 
+   Links ReadLinks();
+   // Sets each item row of `list` sleeping, open or active.
+@@ -525,6 +530,14 @@ class WorkspacePinnedSectionView
+   mutable std::optional<int> preferred_height_;
+   bool rebuild_scheduled_ = false;
+   bool row_states_scheduled_ = false;
++  // Each workspace's place in the list, in this window, until it closes
++  // (patch 115, the owner's pick: Arc's and Zen's way). Every workspace's rows
++  // and tabs share ONE scroll view, so a switch to a workspace with a shorter
++  // pinned card and back left the list thousands of px from where it was.
++  std::map<std::string, int> scroll_by_guid_;
++  // A switch saved the left workspace's place: the next Rebuild() restores the
++  // new one's (RestoreScroll).
++  bool restore_scroll_ = false;
+ 
+   // A folder just made by New folder: its name is asked for once its row is
+   // drawn, by the next Rebuild().
